@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Handshake and auto-ingest HTTP bridge for Tampermonkey userscript.
 - Comprehensive test suites (162 Python tests, 86 Widget tests).
 - Integrated complete developer documentation wiki (`docs/wiki/`).
+- Added full Russian documentation (`README.ru.md`) and language switcher.
 
 ### Changed
 - Streamlined UI headers and action buttons (ВОЛНА, СВЕЖЕСТЬ, АУДИТ, СБОРКА, АРХИВ).

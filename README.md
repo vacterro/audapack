@@ -1,6 +1,10 @@
 # AUDAPACK [![Version](https://img.shields.io/badge/version-0.1.0-gold.svg)](CHANGELOG.md)
 
 <p align="center">
+  <b><a href="README.md">English</a></b> • <b><a href="README.ru.md">Русский</a></b>
+</p>
+
+<p align="center">
   <img src="resources/app_icon.png" width="128" height="128" alt="AUDAPACK Logo">
 </p>
 
