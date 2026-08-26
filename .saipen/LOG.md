@@ -193,5 +193,6 @@
 - 26.08.26 18:25 [E-192] [parent: E-191] [T-19] [agent: opencode] RUN: ProjectRoomModel native Drag & Drop (application/x-audapack-project MIME, flags, zero I/O canDropMimeData), optimistic visual move, async persistence with generation tracking & rollback on error.
 - 26.08.26 18:30 [E-193] [parent: E-192] [T-23] [agent: opencode] RUN: scale matrix (24, 60, 120, 300 projects), 100 sequential moves, 100 audit event storm tests implemented and verified. Benchmark results: startup 341ms, drop visual latency 0.18ms, audit update 2.11ms, pack start 0.08ms, 100 moves 3.45s with 0 model resets. Pytest 160/160 PASS.
 - 27.08.26 01:40 [E-194] [parent: E-193] [agent: opencode] [op: clean] DEC: SAIPEN CLEAN complete: removed all __pycache__ and .pytest_cache across project tree; removed temporary folders (_to_delete, AUDAPACK_NEXT_ROADMAP_M1_N_RELEASE_2026-08-26); pruned legacy DONE tickets from BOARD.md; updated UI header/button alignment and freshness visualization; verified clean test suite (pytest 162/162 PASS, node widget tests 86/86 PASS).
+- 27.08.26 01:54 [E-195] [parent: E-194] [agent: opencode] [op: ship] RUN: ship v0.1.0 -> published to https://github.com/vacterro/audapack (commit c498723, branch main, tag v0.1.0; 162/162 pytests PASS, 86/86 widget tests PASS).
 
 
