@@ -15,6 +15,7 @@ htmlcov/
 *.zip
 _to_delete/
 .saipen/kitchen/
+.saipen/saitranslate/
 .saipen/extensions/
 .saipen/locks/
 .saipen/recovery/

@@ -8,8 +8,8 @@ saipen_version: 7
 schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
-transition_from: SHIP
-last_event: 198
-updated: "2026-08-27T02:00:00Z"
+transition_from: PREPARE
+last_event: 199
+updated: "2026-08-27T02:01:00Z"
 style_contract: ded-4ae736e4
 ---
