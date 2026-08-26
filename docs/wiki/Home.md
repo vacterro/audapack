@@ -1,13 +1,31 @@
 # AUDAPACK Documentation Wiki
 
-Welcome to the **AUDAPACK** documentation wiki.
+Welcome to the comprehensive technical documentation and architecture reference for **AUDAPACK**.
 
-## Overview
-AUDAPACK is an ultra-fast, lightweight Windows desktop utility, audit room cockpit, and browser automation bridge designed for high-velocity software engineering.
+---
 
-## Architecture
-- **24-Slot Priority Room**: 4 groups (`MAIN0`, `MAIN1`, `SIDE0`, `SIDE1`), 6 slots each.
-- **Audit Temperature & Freshness**: Real-time tracking (`0/3`, `1/3`, `2/3`, `3/3`, `HOT`, `WARM`, `COOL`, `COLD`, `STALE`).
-- **Clean ZIP Packaging**: Staging via `.part`, mandatory excludes, manifest generation, and CRC validation.
-- **Tampermonkey Automation**: Browser userscript (`AUDAPACK_WIDGET.user.js`) automating 3-wave audits with runId boundary isolation.
-- **AUDAPACK Bridge**: Loopback HTTP daemon on `127.0.0.1:17843` (API v2).
+## 📑 Table of Contents
+
+1. 🏠 **[Home & System Overview](Home.md)**
+   - Mission statement, core philosophy, and high-velocity workflow.
+2. 🔌 **[Architecture & Bridge Daemon](Architecture-and-Bridge.md)**
+   - Process topology, HTTP API v2 specifications, token security, and endpoint contracts.
+3. 🤖 **[Auto3 Audit Automation Pipeline](Auto3-Audit-Pipeline.md)**
+   - 3-wave audit sequence (Core, Second Wave, Performance), Tampermonkey userscript state machine, and `runId` lease boundaries.
+4. 🎨 **[Golden Vintage UI Design System](UI-Golden-Vintage.md)**
+   - Windows 95 Dark Golden palette, 2px physical depth bevels, and zero-antialiasing typography rules.
+5. 📦 **[CLI & Silent Packaging Automation](CLI-and-Silent-Packaging.md)**
+   - Command-line arguments, silent background packing, Windows Explorer context menu hooks, and CRC validation.
+
+---
+
+## 🎯 Design Philosophy
+
+AUDAPACK was engineered around three non-negotiable principles:
+
+1. **Extreme Operational Speed**:
+   Developers should package projects, run AI audits, and hand off canonical context in single-click actions taking under 100 milliseconds.
+2. **Total Reliability & Atomic Integrity**:
+   No partial files, no corrupted ZIP archives, and no stale audit data. All write operations use two-phase staging (`.part` files + hash checks).
+3. **Fail-Closed Privacy**:
+   All communication occurs over loopback (`127.0.0.1`). Bridge authentication tokens reside in protected user application data and are never exposed in public repositories.
