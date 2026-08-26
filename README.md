@@ -1,6 +1,14 @@
 # AUDAPACK [![Version](https://img.shields.io/badge/version-0.1.0-gold.svg)](CHANGELOG.md)
 
+<p align="center">
+  <img src="resources/app_icon.png" width="128" height="128" alt="AUDAPACK Logo">
+</p>
+
 **AUDAPACK** is a lightweight Windows desktop utility and audit room controller for software projects.
+
+<p align="center">
+  <img src="resources/screenshot.png" alt="AUDAPACK UI Screenshot" width="800">
+</p>
 
 It unifies:
 1. **Clean project packaging** (robust, timestamped, verified ZIP archives with `.part` staging and optional manifest);

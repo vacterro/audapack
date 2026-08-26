@@ -5,6 +5,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from audapack import __version__
 from audapack.app import main, print_status
 
 
@@ -15,7 +16,7 @@ class TestAppCLI(unittest.TestCase):
             code = main(["--status"])
         self.assertEqual(code, 0)
         output = buf.getvalue()
-        self.assertIn("AUDAPACK v0.0.01 Status", output)
+        self.assertIn(f"AUDAPACK v{__version__} Status", output)
         self.assertIn("Audit Root:", output)
 
     def test_gui_startup_instantiation(self):
