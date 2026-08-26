@@ -1,110 +1,130 @@
-# AUDAPACK [![Version](https://img.shields.io/badge/version-0.1.0-gold.svg)](CHANGELOG.md)
-
-<p align="center">
-  <b><a href="README.md">English</a></b> • <b><a href="README.ru.md">Русский</a></b>
-</p>
+# AUDAPACK
 
 <p align="center">
   <img src="resources/app_icon.png" width="128" height="128" alt="AUDAPACK Logo">
 </p>
 
-**AUDAPACK** is a lightweight Windows desktop utility and audit room controller for software projects.
-
 <p align="center">
-  <img src="resources/screenshot.png" alt="AUDAPACK UI Screenshot" width="800">
+  <b>High-velocity Windows project packaging, audit cockpit & browser automation bridge</b>
 </p>
 
-It unifies:
-1. **Clean project packaging** (robust, timestamped, verified ZIP archives with `.part` staging and optional manifest);
-2. **Priority project room** (24 slots across `MAIN0`, `MAIN1`, `SIDE0`, `SIDE1` with 6 slots each);
-3. **Audit freshness & readiness tracking** (`0/3`, `1/3`, `2/3`, `3/3`, `ALL`, and `HOT` / `WARM` / `COOL` / `COLD` / `STALE` temperatures);
-4. **Exact 1-click audit handoff copying** (copies canonical `__00_AUDIT_ALL_3.md`, tracks SHA-256 hash, switches to `✓ COPIED`, automatically resets to `NEW` when a fresh audit arrives);
-5. **Read-only SAIPEN awareness** (detects root `.saipen`, displays current task/phase/Git dirty status, generates `_AUDAPACK_MANIFEST.json` inside archives without modifying protocol state);
-6. **Windows Explorer context menu** (`Упаковать через AUDAPACK` for folders and single files via HKCU);
-7. **Bundled browser widget** (`resources/AUDAPACK_WIDGET.user.js` for Tampermonkey with Auto3 audit automation);
-8. **AUDAPACK loopback bridge** (HTTP daemon on `127.0.0.1:17843` with token authentication, per-run transactions, receipt idempotency, collision-resistant history, and canonical ALL_3 generation).
+<p align="center">
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.1.0-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
+  <img src="https://img.shields.io/badge/Platform-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
+  <a href="tests/"><img src="https://img.shields.io/badge/Tests-162%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest"></a>
+  <a href="resources/AUDAPACK_WIDGET.user.js"><img src="https://img.shields.io/badge/Widget-86%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Widget"></a>
+  <a href="docs/wiki/UI-Golden-Vintage.md"><img src="https://img.shields.io/badge/Theme-Golden%20Vintage-75663D?style=for-the-badge" alt="Golden Vintage"></a>
+</p>
 
-Zero heavy frameworks: Built entirely on Python 3 standard library + Tkinter.
+<p align="center">
+  <b><a href="README.md">English</a></b> • <b><a href="README.ru.md">Русский</a></b>
+</p>
 
 ---
 
-## Quick Start
+<p align="center">
+  <img src="resources/screenshot.png" alt="AUDAPACK Cockpit Interface" width="900">
+</p>
+
+---
+
+## ⚡ Highlights
+
+- **📦 Clean Project Packaging**: Timestamped, CRC-verified `.zip` creation with `.part` staging, exclude filtering, and optional metadata manifests.
+- **🎛️ 24-Slot Priority Cockpit**: Structured grid across four canonical groups (`MAIN0`, `MAIN1`, `SIDE0`, `SIDE1`) with 6 slots each.
+- **⏱️ Real-Time Freshness Tracking**: Color-coded audit temperature indicators (`HOT`, `WARM`, `COOL`, `COLD`, `STALE`) showing exact elapsed time.
+- **📋 1-Click Audit Handoff**: Copies canonical `__00_AUDIT_ALL_3.md` instantly, tracks hash state, and switches between `✓ AUDIT` and `AUDIT`.
+- **🌐 Browser Auto3 Automation**: Bundled Tampermonkey userscript (`AUDAPACK_WIDGET.user.js`) automating 3-wave audits in ChatGPT with strict `runId` boundary isolation.
+- **🔌 Loopback Bridge Daemon**: High-throughput HTTP server on `127.0.0.1:17843` (API v2) with token authorization and atomic wave aggregation.
+- **🪟 Windows Integration**: Explorer right-click context menu integration (*"Упаковать через AUDAPACK"*) and silent VBScript background launchers.
+- **🎨 Golden Vintage Aesthetic**: Authentic Windows 95 Dark Golden theme with 2px raised/sunken bevels and zero antialiasing for maximum readability.
+
+---
+
+## 🧭 Cockpit Grid Layout
+
+The 24-slot interface organizes projects into a dense, high-contrast operational grid:
+
+| Column | Header | Description | Interaction |
+|:---|:---|:---|:---|
+| **0** | `✓ ⊘` | Enable / Visual Dimming Checkboxes | Toggle packing inclusion or visual dimming |
+| **1** | `SLOT` | Priority Slot Number (`#1`–`#6`) | Drag handle and priority position |
+| **2** | `Project & Path` | Name, Git Dirty badge, SAIPEN status, Source Path | Right-click name to clear copied state |
+| **3** | `WAVE` | Audit Wave Progress (`✓ 3/3`, `2/3`, `1/3`, `0/3`) | Visual status of current audit stage |
+| **4** | `FRESHNESS` | Temperature Marker (`● 14m`, `● 3h`, `● 8h`, `—`) | Color-coded age of latest audit |
+| **5** | `AUDIT` | Copy Audit Handoff Button | Copies `__00_AUDIT_ALL_3.md` to clipboard |
+| **6** | `PACK` | Single-Project Pack Button | Creates immediate timestamped `.zip` archive |
+| **7** | `ARCHIVE` | Copy Archive File Button (`ARCHIVE (14m)`) | Copies `.zip` file directly to clipboard |
+| **8** | `···` | Project Context Menu | Move, Edit, Mute, Open Folder, Delete |
+
+---
+
+## 🏗️ Architecture & Data Flow
+
+```mermaid
+flowchart TD
+    subgraph Browser ["🌐 Browser (ChatGPT)"]
+        W[AUDAPACK Widget] -->|Auto3: Core -> Second -> Perf| A3[Auto3 Wave Pipeline]
+    end
+
+    subgraph Bridge ["🔌 Local Daemon (127.0.0.1:17843)"]
+        A3 -->|HTTP POST /v1/audits + Token| B[Bridge Server]
+        B -->|Atomic Staging & runId Check| Ingest[Audit Ingest Engine]
+        Ingest -->|3/3 Waves Complete| All3[Generate __00_AUDIT_ALL_3.md]
+    end
+
+    subgraph Desktop ["🖥️ AUDAPACK Cockpit"]
+        All3 -->|Signal Generation Bump| UI[Desktop GUI]
+        UI -->|1-Click Copy| Clip[Clipboard Handoff]
+        UI -->|Pack Action| Z[Atomic .zip Packager]
+    end
+```
+
+---
+
+## 🚀 Quick Start
 
 ### 1. Launch GUI
-Double-click `AUDAPACK.vbs` (silent, no console) or run:
+Double-click `AUDAPACK.vbs` (silent background start, no black console window) or run:
 ```cmd
 pythonw AUDAPACK.pyw
 ```
 
-### 2. Silent Packing
+### 2. Silent All-Project Packaging
 Double-click `PACK_ALL_SILENT.vbs` or run:
 ```cmd
 pythonw AUDAPACK.pyw --silent
 ```
 
 ### 3. Explorer Context Menu
-Install the context menu from **Settings & Components** inside the GUI, or run:
+Install the context menu from **Settings** inside the GUI, or via command line:
 ```cmd
 python AUDAPACK.pyw --install-context-menu
 ```
-Now right-click any folder or file in Windows Explorer and select **Упаковать через AUDAPACK**.
+*Right-click any folder or file in Windows Explorer and select **Упаковать через AUDAPACK**.*
+
+### 4. Install Browser Widget
+Open Tampermonkey in your browser and install `resources/AUDAPACK_WIDGET.user.js`. When opening ChatGPT, the AUDAPACK toolbar will attach to the prompt input.
 
 ---
 
-## Architecture & Priority Room
+## 🌡️ Freshness & Temperature Matrix
 
-The main screen presents a scrollable 24-slot project room organized into four canonical priority groups:
-- **MAIN0**: Primary active projects (Slots 1–6)
-- **MAIN1**: Secondary active projects (Slots 1–6)
-- **SIDE0**: Utility / supporting projects (Slots 1–6)
-- **SIDE1**: Long-term / reserve projects (Slots 1–6)
+Audit temperature is dynamically computed from metadata timestamps (`GENERATED_AT` / `DATE_TIME`) in the audit files:
 
-Each slot shows:
-- Enable/disable checkbox
-- Slot number (`#1`..`#6`)
-- Project name and path status (`[MISSING PATH]` warning if path moved)
-- `[SAIPEN]` badge and Git status (`[CLEAN]` or `[DIRTY N]`)
-- Audit readiness (`0/3`, `1/3`, `2/3`, `3/3`, `ALL`)
-- Audit temperature (`HOT · 2h 14m`, `WARM · 18h`, `COOL`, `COLD`, `STALE`, `NONE`)
-- `КОПИРОВАТЬ АУДИТ` button (`✓ COPIED` when up-to-date, `NEW` when fresh audit is available)
-- `PACK` button for instant archive creation
-- Slot action menu (Edit, Move, Delete)
+| Marker | Temperature | Age Threshold | Color / Visual Tone |
+|:---:|:---|:---|:---|
+| `●` | **HOT** | `0` – `4 hours` | Coral Red (`#D49090` on `#451B1B`) |
+| `●` | **WARM** | `>4` – `24 hours` | Golden Amber (`#D4B875` on `#3E3014`) |
+| `●` | **COOL** | `>1` – `3 days` | Steel Blue (`#8BB4D4` on `#182E40`) |
+| `❄️` | **COLD** | `>3` – `7 days` | Slate Ice (`#A0A8B0` on `#20242B`) |
+| `○` | **STALE** | `>7 days` | Muted Dark (`#7D7565` on `#221E18`) |
+| `—` | **NONE** | *No audit found* | Muted Dash (`#6E674E`) |
 
 ---
 
-## Audit Temperature & Copying
-
-Temperature thresholds (calculated from `GENERATED_AT` or `DATE_TIME` metadata in audit markdown):
-- **HOT**: 0–6 hours
-- **WARM**: >6–24 hours
-- **COOL**: >24–72 hours
-- **COLD**: >72 hours–7 days
-- **STALE**: >7 days
-- **NONE**: No audit exists
-
-When clicking **КОПИРОВАТЬ АУДИТ**:
-1. Exact canonical `__00_AUDIT_ALL_3.md` content is copied to the clipboard.
-2. The SHA-256 hash of the content is saved in project state.
-3. The button displays `✓ COPIED`.
-4. When a new audit is delivered (or modified) with a different hash, the state automatically flips back to `NEW`.
-
----
-
-## Browser Integration & Bridge
-
-AUDAPACK includes a bundled Tampermonkey userscript: `resources/AUDAPACK_WIDGET.user.js`.
-
-### Flow:
-1. Browser widget automates audit waves (Auto3: Core, Second Wave, Performance).
-2. Completed waves are enqueued in durable browser storage (`GM_setValue`).
-3. The widget flushes waves to the AUDAPACK Bridge at `http://127.0.0.1:17843/v1/audits`.
-4. The bridge resolves destination folders via the canonical Project Registry (`MAIN0/`, `MAIN1/`, etc.).
-5. Waves are written atomically. When 3/3 waves are complete, canonical `__00_AUDIT_ALL_3.md` is generated.
-6. The GUI is notified in real time and updates the audit cockpit.
-
----
-
-## CLI Reference
+## 💻 CLI Reference
 
 ```text
 usage: AUDAPACK.pyw [-h] [--pack PATH] [--pack-project ID] [--silent]
@@ -112,31 +132,74 @@ usage: AUDAPACK.pyw [-h] [--pack PATH] [--pack-project ID] [--silent]
                     [--status] [--bridge]
 
 options:
+  -h, --help              Show this help message and exit
   --pack PATH             Pack specified directory or file into archive
-  --pack-project ID       Pack project by ID
+  --pack-project ID       Pack project by ID from registry
   --silent                Pack all enabled projects silently without UI
-  --install-context-menu  Install Explorer context menu entry
-  --remove-context-menu   Remove Explorer context menu entry
-  --status                Print registry and audit status to stdout
+  --install-context-menu  Install Windows Explorer context menu entry
+  --remove-context-menu   Remove Windows Explorer context menu entry
+  --status                Print registry and audit freshness status to stdout
   --bridge                Run AUDAPACK bridge server in foreground
 ```
 
 ---
 
-## Documentation & Wiki
+## 📁 Repository Structure
 
-Detailed architectural and developer guides are available in the [`docs/wiki/`](docs/wiki/):
-- [Wiki Home](docs/wiki/Home.md)
-- [Architecture & Bridge Daemon](docs/wiki/Architecture-and-Bridge.md)
-- [Auto3 Audit Automation Pipeline](docs/wiki/Auto3-Audit-Pipeline.md)
-- [Golden Vintage UI Design](docs/wiki/UI-Golden-Vintage.md)
-- [CLI & Silent Packaging](docs/wiki/CLI-and-Silent-Packaging.md)
+```text
+_AUDAPACK/
+├── audapack/               # Core Python application package
+│   ├── bridge/             # Local HTTP daemon (API v2) & wave storage
+│   ├── components/         # Scheduled tasks, autostart & migration
+│   ├── services/           # Framework-neutral application services
+│   ├── ui/                 # Tkinter Golden Default desktop UI
+│   ├── ui_qt/              # PySide6 Qt desktop implementation
+│   ├── config.py           # Configuration & JSON serializer
+│   ├── packing.py          # Atomic ZIP packager with .part staging
+│   └── projects.py         # 24-slot registry & priority groups
+├── docs/                   # Documentation & developer wiki
+│   └── wiki/               # 5-part comprehensive documentation
+├── resources/              # Brand assets, icons & Tampermonkey widget
+│   ├── AUDAPACK_WIDGET.user.js # Browser automation userscript
+│   ├── app_icon.ico        # Multi-size Windows application icon
+│   ├── app_icon.png        # Golden Vintage application icon
+│   └── screenshot.png      # High-resolution cockpit screenshot
+├── scripts/                # Benchmarking & performance tools
+├── tests/                  # Pytest & Node widget test suites
+│   ├── services/           # Neutral service unit tests
+│   ├── ui/                 # Model & UI component tests
+│   └── widget/             # 86 Node.js browser widget unit tests
+├── AUDAPACK.pyw            # Main GUI entry point
+├── AUDAPACK.vbs            # Silent GUI launcher
+├── PACK_ALL_SILENT.vbs     # Silent batch pack launcher
+├── CHANGELOG.md            # Monotonic release changelog
+├── README.md               # English documentation
+├── README.ru.md            # Russian documentation
+└── VERSION                 # Canonical semver release version
+```
 
 ---
 
-## Invariants & Safety
+## 📚 Documentation Wiki
 
-- **Archive safety**: Archives are written to `.part` files first, verified with `testzip()`, and only then replace target archives.
-- **Fail-closed bridge**: Requests are restricted to loopback (`127.0.0.1`), authenticated with a high-entropy secret token, and payload-size bounded.
-- **Read-only SAIPEN**: Normal AUDAPACK operations never write to or modify `.saipen` files.
+Detailed guides are available in [`docs/wiki/`](docs/wiki/):
+- 🏠 **[Wiki Home](docs/wiki/Home.md)** — Getting started and overview.
+- 🔌 **[Architecture & Bridge Daemon](docs/wiki/Architecture-and-Bridge.md)** — HTTP endpoints and security isolation.
+- 🤖 **[Auto3 Audit Pipeline](docs/wiki/Auto3-Audit-Pipeline.md)** — 3-wave audit lifecycle and userscript mechanics.
+- 🎨 **[Golden Vintage UI Design](docs/wiki/UI-Golden-Vintage.md)** — Win95 palette tokens and pixel-crisp rules.
+- 📦 **[CLI & Silent Packaging](docs/wiki/CLI-and-Silent-Packaging.md)** — Advanced automation and scripting.
 
+---
+
+## 🔒 Invariants & Safety
+
+- **Atomic Staging**: Archives are written to `.part` temporary files first, validated with `zipfile.testzip()`, and only then committed to destination.
+- **Fail-Closed Security**: The HTTP bridge strictly binds to loopback (`127.0.0.1`), requires a 256-bit authentication token stored outside project source in `%LOCALAPPDATA%`, and enforces request size boundaries.
+- **Strict RunId Isolation**: Audit handoffs enforce run-boundary separation to prevent cross-run wave badge bleed.
+- **Zero Heavy Frameworks**: Core functionality runs on Python standard library without cloud dependencies or telemetry.
+
+---
+
+<p align="center">
+  <b>AUDAPACK</b> — Built for speed, clarity, and reliability.
+</p>
