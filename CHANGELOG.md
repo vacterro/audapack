@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - Archive creation with .part staging, atomic commit, and CRC integrity check.
 - Handshake and auto-ingest HTTP bridge for Tampermonkey userscript.
 - Comprehensive test suites (162 Python tests, 86 Widget tests).
+- Integrated complete developer documentation wiki (`docs/wiki/`).
 
 ### Changed
 - Streamlined UI headers and action buttons (ВОЛНА, СВЕЖЕСТЬ, АУДИТ, СБОРКА, АРХИВ).

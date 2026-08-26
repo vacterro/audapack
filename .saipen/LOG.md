@@ -195,6 +195,9 @@
 - 27.08.26 01:40 [E-194] [parent: E-193] [agent: opencode] [op: clean] DEC: SAIPEN CLEAN complete: removed all __pycache__ and .pytest_cache across project tree; removed temporary folders (_to_delete, AUDAPACK_NEXT_ROADMAP_M1_N_RELEASE_2026-08-26); pruned legacy DONE tickets from BOARD.md; updated UI header/button alignment and freshness visualization; verified clean test suite (pytest 162/162 PASS, node widget tests 86/86 PASS).
 - 27.08.26 01:54 [E-195] [parent: E-194] [agent: opencode] [op: ship] RUN: ship v0.1.0 -> published to https://github.com/vacterro/audapack (commit c498723, branch main, tag v0.1.0; 162/162 pytests PASS, 86/86 widget tests PASS).
 - 27.08.26 01:58 [E-196] [parent: E-195] [agent: opencode] RUN: prepare saiwiki -> done (5 pages in .saipen/extensions/subs/saiwiki/kitchen/, OUTBOX.md ready).
+- 27.08.26 02:00 [E-197] [parent: E-196] [agent: opencode] [op: collect] RUN: collect saiwiki -> integrated (5 wiki pages integrated into docs/wiki/).
+- 27.08.26 02:00 [E-198] [parent: E-197] [agent: opencode] [op: ship] RUN: ship -> published to https://github.com/vacterro/audapack (branch main; 162/162 pytests PASS, 86/86 widget tests PASS).
+
 
 
 

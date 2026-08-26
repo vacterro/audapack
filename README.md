@@ -119,8 +119,20 @@ options:
 
 ---
 
+## Documentation & Wiki
+
+Detailed architectural and developer guides are available in the [`docs/wiki/`](docs/wiki/):
+- [Wiki Home](docs/wiki/Home.md)
+- [Architecture & Bridge Daemon](docs/wiki/Architecture-and-Bridge.md)
+- [Auto3 Audit Automation Pipeline](docs/wiki/Auto3-Audit-Pipeline.md)
+- [Golden Vintage UI Design](docs/wiki/UI-Golden-Vintage.md)
+- [CLI & Silent Packaging](docs/wiki/CLI-and-Silent-Packaging.md)
+
+---
+
 ## Invariants & Safety
 
 - **Archive safety**: Archives are written to `.part` files first, verified with `testzip()`, and only then replace target archives.
 - **Fail-closed bridge**: Requests are restricted to loopback (`127.0.0.1`), authenticated with a high-entropy secret token, and payload-size bounded.
 - **Read-only SAIPEN**: Normal AUDAPACK operations never write to or modify `.saipen` files.
+
