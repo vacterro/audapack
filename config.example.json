@@ -1,0 +1,61 @@
+{
+  "schema_version": 2,
+  "projects": [],
+  "packing": {
+    "output_dir": "",
+    "delete_old": true,
+    "excludes": [
+      ".claude",
+      ".codenomad",
+      ".freebuff",
+      ".saiwork",
+      "node_modules",
+      "dist",
+      "build",
+      "target",
+      ".cargo",
+      "__pycache__",
+      ".pytest_cache",
+      ".ruff_cache",
+      "*.egg-info",
+      ".venv",
+      ".build-venv",
+      "logs",
+      "*.log",
+      "*.sqlite",
+      "*.sqlite3",
+      "*.db",
+      "*.db-shm",
+      "*.db-wal",
+      "*.zip",
+      "*.part",
+      "*.tmp",
+      "token.txt",
+      "*.token",
+      "*.pid",
+      "secrets",
+      "*.pre-redact",
+      "*.secret",
+      "*.secrets"
+    ],
+    "manifest_enabled": true
+  },
+  "audits": {
+    "root": "PATH_TO_AUDITING_IMPLEMENTATION",
+    "hot_seconds": 21600,
+    "warm_seconds": 86400,
+    "cool_seconds": 259200,
+    "cold_seconds": 604800
+  },
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 17843,
+    "autostart": true,
+    "max_request_bytes": 10485760,
+    "history_retention_days": 30
+  },
+  "ui": {
+    "window_size": [860, 600],
+    "reply_language": "et"
+  }
+}

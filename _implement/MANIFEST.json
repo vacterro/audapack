@@ -1,0 +1,102 @@
+{
+  "pack": "AUDAPACK_SAIPEN_GG_WAVES_V3",
+  "version": "3.0",
+  "generated_date": "2026-08-26",
+  "current_baseline": "_AUDAPACK_26-08-2026-T04-22-28.zip",
+  "canonical_source_root": "V:\\___VAC\\__K\\__CODE\\_PY\\_AUDAPACK",
+  "saipen_root": ".saipen",
+  "legacy_task": "ACBBridge",
+  "new_task": "AUDAPACK Bridge",
+  "default_bridge": "127.0.0.1:17843",
+  "historical_waves": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I"
+  ],
+  "current_wave": "J",
+  "current_wave_file": "13_WAVE_J_INTEGRATION_CORRECTNESS_PRODUCTION_CUTOVER.md",
+  "next_after_green": "10_FINAL_ACCEPTANCE_AUDIT.md",
+  "files": [
+    {
+      "name": "00_MASTER_CONTRACT.md",
+      "size": 10105,
+      "sha256": "d5dfc93e81f449c8c3e99327c54798bdeb0dc9350cffeb757af1af660cc07356"
+    },
+    {
+      "name": "01_WAVE_A_BASELINE_REFACTOR.md",
+      "size": 3123,
+      "sha256": "66562c0faf6e6ce4b193f506ce10abc8d530b78bca5d0f12a3581c6fdff3ce41"
+    },
+    {
+      "name": "02_WAVE_B_PROJECT_REGISTRY_UI.md",
+      "size": 3160,
+      "sha256": "2c713ab1e41d43a1d752f83580e1d3c8ab269f7720c5df7c4c7b437104f7d995"
+    },
+    {
+      "name": "03_WAVE_C_AUDIT_ROOM.md",
+      "size": 3579,
+      "sha256": "d95f1b28fa842f1b41b1e1d32c9dccde371681312101eedb4177d371ddcc12b3"
+    },
+    {
+      "name": "04_WAVE_D_SAIPEN_AWARENESS.md",
+      "size": 2901,
+      "sha256": "17ae0e7b2ef99bad5d433a70cd1e0ace2d54f971dcf4535c79221c50d214c257"
+    },
+    {
+      "name": "05_WAVE_E_CONTEXT_MENU_AND_PACKING.md",
+      "size": 2388,
+      "sha256": "82783f54d01bb5b80c63f104e203fc84c716394ca50d81a72fcde20739875bdb"
+    },
+    {
+      "name": "06_WAVE_F_BROWSER_WIDGET_MIGRATION.md",
+      "size": 5329,
+      "sha256": "4f9045c1ad01b6573d58c756b69dad36d172890f547832be2c5bcaf19e2a2db3"
+    },
+    {
+      "name": "07_WAVE_G_LEGACY_ACBBRIDGE_TAKEOVER.md",
+      "size": 9181,
+      "sha256": "96301a071ecc84007fac41cf51bd7021bf15fbb65f5da90f67af02d9d7a69e01"
+    },
+    {
+      "name": "08_WAVE_H_ROUTED_AUDIT_PIPELINE.md",
+      "size": 9451,
+      "sha256": "fd7529d383db7cfeca13629a9f658a962c538c016b06e398d654cbcdec8c2b4e"
+    },
+    {
+      "name": "09_WAVE_I_HARDENING_RELEASE.md",
+      "size": 5818,
+      "sha256": "b0fef33c29294a74633611bd6983d87aa42979f504f2c0670f561eaa19e0f7a2"
+    },
+    {
+      "name": "10_FINAL_ACCEPTANCE_AUDIT.md",
+      "size": 6837,
+      "sha256": "5976f9d56737b475836c9a2c64f4eee009469a3abfd81c16c7b6d08dbefa2164"
+    },
+    {
+      "name": "11_CHAIN_CONTROLLER.md",
+      "size": 2375,
+      "sha256": "f8161f06ee853e1771b40d901480b32aa3f10a1c21ae19b7513a8e39c235a443"
+    },
+    {
+      "name": "12_LEGACY_ACBBRIDGE_EVIDENCE.md",
+      "size": 3332,
+      "sha256": "82bf19c4bb9e4fb8df84ee78045522a960a00ba82fb0d91a76e836a659e2b825"
+    },
+    {
+      "name": "13_WAVE_J_INTEGRATION_CORRECTNESS_PRODUCTION_CUTOVER.md",
+      "size": 37410,
+      "sha256": "fa6c00735ba745ff91408e74afebf6c0582054988e39fbfed8a190ed8127779e"
+    },
+    {
+      "name": "README.md",
+      "size": 3406,
+      "sha256": "5dcf4488da54a7deb314c258bad5ecd34c775d95bb7b17809b2bbb537ca829c1"
+    }
+  ]
+}

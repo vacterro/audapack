@@ -1,0 +1,19 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [0.1.0] - 2026-08-27
+
+### Added
+- Complete AUDAPACK desktop suite (Tkinter & PySide6 Qt support).
+- Real-time audit room management across 24 slots (MAIN0, MAIN1, SIDE0, SIDE1).
+- Audit freshness indicator with color-coded status (HOT, WARM, COOL, COLD, STALE).
+- Archive creation with .part staging, atomic commit, and CRC integrity check.
+- Handshake and auto-ingest HTTP bridge for Tampermonkey userscript.
+- Comprehensive test suites (162 Python tests, 86 Widget tests).
+
+### Changed
+- Streamlined UI headers and action buttons (ВОЛНА, СВЕЖЕСТЬ, АУДИТ, СБОРКА, АРХИВ).
+- Enhanced Tampermonkey widget auto-send with pointer/mouse dispatch and A3 state preservation.
+- Strict runId boundary isolation preventing stale audit wave badge display.
+- Optimized scan and regex engines across audit and packing subsystems.
