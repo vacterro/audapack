@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.1.0-D4B86A?style=for-the-badge&logo=github" alt="Релиз"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.1.1-D4B86A?style=for-the-badge&logo=github" alt="Релиз"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/Платформа-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
   <a href="tests/"><img src="https://img.shields.io/badge/Тесты-162%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest"></a>
@@ -203,3 +203,4 @@ _AUDAPACK/
 <p align="center">
   <b>AUDAPACK</b> — Скорость, наглядность и надёжность.
 </p>
+

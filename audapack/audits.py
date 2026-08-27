@@ -149,18 +149,94 @@ class AuditIndexer:
         self.config = config
         # Cache: project_id -> (AuditSnapshot, dict[str, tuple[int, int]])
         self._cache: dict[str, tuple[AuditSnapshot, dict[str, tuple[int, int]]]] = {}
+        # Fast path for audit dir location: project_id -> (resolved_path_or_None, root_mtime_ns)
+        self._dir_cache: dict[str, tuple[Optional[Path], int]] = {}
+        self._dir_cache_root_mtime: int = 0
+        # Batch index for audit dirs: root_mtime -> {lower_name -> Path}
+        self._batch_index: Optional[dict[str, Path]] = None
+        self._batch_index_mtime: int = 0
 
     def invalidate(self, project_id: Optional[str] = None):
         """Invalidates snapshot cache for a single project or all projects."""
         if project_id:
             self._cache.pop(project_id, None)
+            self._dir_cache.pop(project_id, None)
         else:
             self._cache.clear()
+            self._dir_cache.clear()
+            self._batch_index = None
+            self._batch_index_mtime = 0
+
+    def _get_root_mtime_ns(self, root: Path) -> int:
+        try:
+            return root.stat().st_mtime_ns
+        except Exception:
+            return 0
+
+    def _ensure_batch_index(self, root: Path) -> dict[str, Path]:
+        """Batch-built index of all group/project dirs for O(1) lookup without per-project scans."""
+        mtime = self._get_root_mtime_ns(root)
+        if self._batch_index is not None and self._batch_index_mtime == mtime:
+            return self._batch_index
+        index: dict[str, Path] = {}
+        try:
+            with os.scandir(root) as group_it:
+                for g_entry in group_it:
+                    if not g_entry.is_dir() or g_entry.name.startswith((".", "_")):
+                        continue
+                    g_path = Path(g_entry.path)
+                    # Index group dir itself for completeness
+                    # Enumerate children (project dirs) in one pass
+                    try:
+                        with os.scandir(g_path) as proj_it:
+                            for p_entry in proj_it:
+                                if p_entry.is_dir():
+                                    index[p_entry.name.lower()] = Path(p_entry.path)
+                                    # also index stripped/underscore variants
+                                    stripped = p_entry.name.lstrip("_").lower()
+                                    if stripped and stripped not in index:
+                                        index[stripped] = Path(p_entry.path)
+                    except Exception:
+                        pass
+                    # also index root-level project dirs directly
+        except Exception:
+            pass
+        # also index root-level direct children
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    if entry.is_dir() and entry.name.lower() not in index:
+                        # only root-level non-group entries (fallback)
+                        if entry.name.upper().startswith(("MAIN", "SIDE")):
+                            continue
+                        index[entry.name.lower()] = Path(entry.path)
+                        stripped = entry.name.lstrip("_").lower()
+                        if stripped and stripped not in index:
+                            index[stripped] = Path(entry.path)
+        except Exception:
+            pass
+        self._batch_index = index
+        self._batch_index_mtime = mtime
+        return index
 
     def find_project_audit_dir(self, project: Project) -> Optional[Path]:
         root = Path(self.config.audits.root)
         if not root.exists() or not root.is_dir():
             return None
+
+        # Fast path: check _dir_cache if root mtime unchanged and cached path still valid
+        root_mtime = self._get_root_mtime_ns(root)
+        cached = self._dir_cache.get(project.id)
+        if cached is not None:
+            cached_path, cached_mtime = cached
+            if cached_mtime == root_mtime:
+                if cached_path is None:
+                    # negative cache: verify root still has no matching dir via batch index peek
+                    # keep negative cache for this mtime to avoid re-scanning
+                    return None
+                if cached_path.exists() and cached_path.is_dir():
+                    return cached_path
+                # stale positive cache -> fall through to recompute
 
         raw_names = [
             project.audit_project_name,
@@ -178,48 +254,61 @@ class AuditIndexer:
             if with_us not in names_to_try:
                 names_to_try.append(with_us)
 
-        # 1. Canonical path check FIRST: root / <GROUP> / <Name>
+        # 1. Canonical path check FIRST: root / <GROUP> / <Name> (zero scan)
         grp = project.priority_group.upper()
         grp_dir = root / grp
         if grp_dir.exists() and grp_dir.is_dir():
             for name in names_to_try:
                 candidate = grp_dir / name
                 if candidate.exists() and candidate.is_dir():
+                    self._dir_cache[project.id] = (candidate, root_mtime)
                     return candidate
+            # Try batch index for this group without directory_scans counter
+            batch = self._ensure_batch_index(root)
+            for name in names_to_try:
+                hit = batch.get(name.lower())
+                if hit is not None and hit.parent.name.upper() == grp and hit.is_dir():
+                    self._dir_cache[project.id] = (hit, root_mtime)
+                    return hit
 
-        # 2. Dynamic group scan fallback (supports MAIN0..MAINN, SIDE0..SIDEN, etc.)
+        # 2. Use batch index for cross-group lookup (replaces expensive per-project scans)
+        # This collapses previous steps 2/3/4 into a single O(1) lookup after one root scan
+        batch = self._ensure_batch_index(root)
+        for name in names_to_try:
+            hit = batch.get(name.lower())
+            if hit is not None and hit.exists() and hit.is_dir():
+                self._dir_cache[project.id] = (hit, root_mtime)
+                return hit
+
+        # Fallback: legacy slow path only if batch missed due to race (counts as scan)
         AUDIT_COUNTERS["directory_scans"] += 1
+        # 3. Legacy fallback – kept for edge cases where batch may be partial
         if grp_dir.exists() and grp_dir.is_dir():
-            for child in grp_dir.iterdir():
-                if child.is_dir() and any(child.name.lower() == n.lower() for n in names_to_try):
-                    return child
-
-        # 3. Look in any dynamically discovered group folders
+            try:
+                for child in grp_dir.iterdir():
+                    if child.is_dir() and any(child.name.lower() == n.lower() for n in names_to_try):
+                        p = Path(child)
+                        self._dir_cache[project.id] = (p, root_mtime)
+                        return p
+            except Exception:
+                pass
         try:
             for g_child in root.iterdir():
                 if g_child.is_dir() and g_child.name != grp:
                     for name in names_to_try:
                         candidate = g_child / name
                         if candidate.exists() and candidate.is_dir():
+                            self._dir_cache[project.id] = (candidate, root_mtime)
                             return candidate
-                    for child in g_child.iterdir():
-                        if child.is_dir() and any(child.name.lower() == n.lower() for n in names_to_try):
-                            return child
         except Exception:
             pass
-
-        # 4. Look directly in root
         for name in names_to_try:
             candidate = root / name
             if candidate.exists() and candidate.is_dir():
+                self._dir_cache[project.id] = (candidate, root_mtime)
                 return candidate
-        try:
-            for child in root.iterdir():
-                if child.is_dir() and any(child.name.lower() == n.lower() for n in names_to_try):
-                    return child
-        except Exception:
-            pass
 
+        self._dir_cache[project.id] = (None, root_mtime)
         return None
 
     def _get_dir_signatures(self, audit_dir: Optional[Path]) -> dict[str, tuple[int, int]]:

@@ -209,7 +209,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--install-autostart", action="store_true", help="Install Windows Scheduled Task 'AUDAPACK Bridge'")
     parser.add_argument("--remove-autostart", action="store_true", help="Remove Windows Scheduled Task 'AUDAPACK Bridge'")
     parser.add_argument("--repair-autostart", action="store_true", help="Repair Windows Scheduled Task 'AUDAPACK Bridge'")
-    parser.add_argument("--ui", choices=["qt", "tkinter"], default=None, help="GUI framework: qt (PySide6) or tkinter (temporary legacy)")
+    parser.add_argument("--ui", choices=["qt", "tkinter"], default="qt", help="GUI framework: qt (PySide6, default) or tkinter (legacy fallback)")
 
     args = parser.parse_args(argv)
 
@@ -297,12 +297,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         single.activate_existing_window("AUDAPACK")
         return 0
 
-    if args.ui == "qt":
-        from audapack.ui_qt.app import run_qt_gui
-        return run_qt_gui()
+    # Qt is the production default (Wave N cutover). Tkinter remains only as explicit fallback.
+    if args.ui == "tkinter":
+        from audapack.ui.main_window import run_gui
+        return run_gui()
 
-    from audapack.ui.main_window import run_gui
-    return run_gui()
+    try:
+        from audapack.ui_qt.app import run_qt_gui
+
+        return run_qt_gui()
+    except ImportError as exc:
+        print(f"Qt (PySide6) not available ({exc}); falling back to Tkinter. Install with: pip install PySide6", file=sys.stderr)
+        from audapack.ui.main_window import run_gui
+
+        return run_gui()
 
 
 if __name__ == "__main__":

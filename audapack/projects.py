@@ -93,6 +93,8 @@ class ProjectRegistry:
             # Sync the caller's snapshot in place so existing references observe
             # the committed state without replacing object identity.
             self.config.projects[:] = latest.projects
+            # Invalidate id index after mutation (size/content changed)
+            self._id_index = {p.id.lower(): p for p in self.config.projects}
 
     @property
     def projects(self) -> list[Project]:
@@ -124,11 +126,26 @@ class ProjectRegistry:
         return None
 
     def get_project_by_id(self, project_id: str) -> Optional[Project]:
+        # Fast path: dict cache built on demand (O(1) vs O(N) linear scan)
         p_id = project_id.strip().lower()
+        if not hasattr(self, "_id_index") or self._id_index is None or len(self._id_index) != len(self.config.projects):
+            try:
+                self._id_index = {p.id.lower(): p for p in self.config.projects}
+            except Exception:
+                self._id_index = {}
+        hit = self._id_index.get(p_id)
+        if hit is not None:
+            return hit
+        # Fallback scan covers race where index stale due to external mutation without rebuild
         for p in self.config.projects:
             if p.id.lower() == p_id:
+                # heal index
+                self._id_index[p_id] = p
                 return p
         return None
+
+    def _rebuild_id_index(self):
+        self._id_index = {p.id.lower(): p for p in self.config.projects}
 
     def get_project_by_name(self, name: str) -> Optional[Project]:
         """Matches project by display name, audit name, slug or normalized identity."""

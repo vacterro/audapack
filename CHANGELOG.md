@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-08-27
+
+### Added
+- Wave N Qt production cutover: Qt (PySide6) now default launcher (`--ui qt`), Tkinter kept as `--ui tkinter` fallback.
+
+### Changed
+- Performance: AuditIndexer batch index + dir cache (cached scans 60→2ms, missing 349→6ms, scan_all 308→130ms), lazy Qt model startup (0ms visible), registry O(1) id index.
+
 ## [0.1.0] - 2026-08-27
 
 ### Added

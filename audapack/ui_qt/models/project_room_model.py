@@ -79,19 +79,28 @@ class ProjectRoomModel(QAbstractItemModel):
         self.beginResetModel()
         self._groups = self._service.active_groups()
         self._projects = {}
-        for p in self._service.list_projects():
+        # Single-pass load: reuse one list_projects() result and avoid double scan.
+        projects = self._service.list_projects()
+        for p in projects:
             g = p.priority_group.upper()
             self._projects[(g, p.slot)] = p
 
-        # Pre-load snapshots into memory
+        # Snapshots: startup is now lazy (0 disk reads) — async enrichment populates.
+        # Explicit reload (user Refresh All) still preloads synchronously for immediate feedback.
         self._snapshots = {}
-        for p in self._service.list_projects():
-            try:
-                snap = self._audit_service.get_snapshot(p.id)
-                if snap:
-                    self._snapshots[p.id] = snap
-            except Exception:
-                pass
+        if not initial:
+            # De-duplicate via direct project object to avoid extra registry lookup per item.
+            for p in projects:
+                try:
+                    # Use indexer directly if available to skip registry id lookup.
+                    if hasattr(self._audit_service, "indexer"):
+                        snap = self._audit_service.indexer.scan_project(p)
+                    else:
+                        snap = self._audit_service.get_snapshot(p.id)
+                    if snap:
+                        self._snapshots[p.id] = snap
+                except Exception:
+                    pass
         self.endResetModel()
 
     def reload(self):
