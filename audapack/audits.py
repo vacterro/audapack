@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from audapack.bridge.storage import parse_wave
+from audapack.bridge.storage import parse_wave, sanitize_project_name
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 
@@ -253,6 +253,18 @@ class AuditIndexer:
             with_us = f"_{stripped}"
             if with_us not in names_to_try:
                 names_to_try.append(with_us)
+        # T-13: fs-safe reconciliation — legacy raw names vs sanitized artifact dirs.
+        # Add sanitized variants so a project with display_name "A:B/C" finds dir "A_B_C".
+        sanitized_extras = []
+        for n in list(names_to_try):
+            s = sanitize_project_name(n)
+            if s and s not in names_to_try and s not in sanitized_extras:
+                sanitized_extras.append(s)
+            # also stripped/underscore of sanitized
+            s_stripped = s.lstrip("_")
+            if s_stripped and s_stripped not in names_to_try and s_stripped not in sanitized_extras:
+                sanitized_extras.append(s_stripped)
+        names_to_try.extend(sanitized_extras)
 
         # 1. Canonical path check FIRST: root / <GROUP> / <Name> (zero scan)
         grp = project.priority_group.upper()

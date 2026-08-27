@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-08-27
+
+### Fixed
+- T-13 fs-safe reconciliation: legacy raw-named artifact paths now resolve via sanitized name (sanitize_project_name) with pytest regression.
+
 ## [0.1.1] - 2026-08-27
 
 ### Added
