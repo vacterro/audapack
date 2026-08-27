@@ -24,7 +24,8 @@
 ---
 
 <p align="center">
-  <img src="resources/screenshot.png" alt="AUDAPACK Cockpit Interface" width="900">
+  <img width="937" height="784" alt="2026-08-27_210216" src="https://github.com/user-attachments/assets/9d87abbc-bb40-48c7-aa51-155e2f6ff4e7" />
+
 </p>
 
 ---
