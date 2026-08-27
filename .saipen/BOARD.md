@@ -3,10 +3,10 @@
 ## DOING
 
 ## TODO
-- [ ] T-24 [HIGH] Wave N Qt production cutover / Tkinter removal / final UI parity | verify: Qt default launcher, full feature parity, release audit
 - [ ] T-13 [LOW] Reconcile legacy raw-named canonical artifact paths with new fs-safe naming | verify: pytest regression proving fs-safe name resolution
 
 ## DONE
+- [x] T-24 [HIGH] Wave N Qt production cutover / Tkinter removal / final UI parity | verify: Qt default launcher, full feature parity, release audit | owner: opencode | claim_time: 2026-08-27T00:18:11Z
 - [x] T-19 [HIGH] Wave M model-native DnD and targeted Qt model mutation architecture | verify: model_reset_count == 0 on move/swap; Qt ItemIsDragEnabled/ItemIsDropEnabled; optimistic drop with rollback | owner: opencode | claim_time: 2026-08-26T18:05:00Z
 - [x] T-20 [HIGH] Wave M background task runner: async packing, bridge status/lifecycle, startup enrichment | verify: UI never blocks during ZIP packing or Bridge requests; task coalescing | owner: opencode | claim_time: 2026-08-26T18:05:00Z
 - [x] T-21 [HIGH] Wave M targeted audit refresh & memory-based temperature calculation | verify: single-project audit events trigger single-row dataChanged; zero disk reads on temperature ticks | owner: opencode | claim_time: 2026-08-26T18:05:00Z
