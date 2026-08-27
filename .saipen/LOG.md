@@ -19,3 +19,16 @@
 - 27.08.26 00:23 [E-220] [parent: E-219] [T-13] [agent: opencode] [op: checkpoint-9da9d3d05d804f6c9d3a34fb3315f6e9] DEC: REVIEW SHIP -- P0/P1 clear, fs-safe regression green
 - 27.08.26 00:23 [E-221] [parent: E-220] [T-13] [agent: opencode] [op: transition-436c3f00e6144b68850287c26c0f32b5] RUN: transition to SHIP
 - 27.08.26 00:24 [E-222] [parent: E-221] [T-13] [agent: opencode] [op: finish-d9400a4da9f14fd9a9832ba215fb3cd7] DEC: ticket finished via SAIOPS -- completion (from SHIP)
+- 27.08.26 04:15 [E-223] [parent: E-222] [T-25] [agent: opencode] [op: goal-pivot] DEC: gg починить открытие -> goal pivot (launcher app not opening)
+- 27.08.26 04:15 [E-224] [parent: E-223] [T-25] [agent: opencode] [op: plan-5f3a2c1b] DEC: goal_waves 0->1
+- 27.08.26 04:15 [E-225] [parent: E-224] [T-25] [agent: opencode] [op: claim-a11a3d7c8e4f] DEC: claimed via SAIOPS -- owner opencode
+- 27.08.26 04:15 [E-226] [parent: E-225] [T-25] [agent: opencode] [op: scout-f2c8a1d4b7e3] RUN: SCOUT -- root cause: windowless zombie pythonw PID 8804 holds Local\AUDAPACK_GUI_MUTEX; every launch sees is_already_running()==True, activate_existing_window finds no window, main() returns 0 silently. Killed 8804, is_already_running() now False. Code defect: single_instance trusts mutex blindly without verifying a window exists.
+- 27.08.26 04:15 [E-227] [parent: E-226] [T-25] [agent: opencode] [op: zombie-kill-bf3a8c2d1e0f] DEC: killed windowless zombie pythonw PID 8804 holding Local\AUDAPACK_GUI_MUTEX; is_already_running() now False
+- 27.08.26 04:15 [E-228] [parent: E-226] [T-25] [agent: opencode] [op: transition-7c2e1d4b9a8f] RUN: transition to BUILD
+- 27.08.26 04:30 [E-229] [parent: E-228] [T-25] [agent: opencode] [op: transition-2f8a6c4e1b9d] RUN: transition to VERIFY
+- 27.08.26 04:30 [E-230] [parent: E-229] [T-25] [agent: opencode] [op: checkpoint-6d3e8a1b9c4f] RUN: VERIFY -- pytest 167 PASS (zombie self-correct, live-with-window detect, IDE-no-false-positive, activate-returns-bool regressions), ruff clean on edited files, end-to-end two-process: real zombie subprocess (no window, holds mutex) + launcher in main process -> is_already_running()=False self-correct, Qt MainWindow opens, title 'AUDAPACK \u2014 Project Room', main() returns 0 -- conf: high
+- 27.08.26 04:30 [E-231] [parent: E-230] [T-25] [agent: opencode] [op: goal_tickets_bump] DEC: goal_tickets 0->1
+- 27.08.26 04:30 [E-232] [parent: E-231] [T-25] [agent: opencode] [op: transition-4a1c9b7e3f2d] RUN: transition to REVIEW
+- 27.08.26 04:30 [E-233] [parent: E-232] [T-25] [agent: opencode] [op: checkpoint-8b2f5d3a1c7e] DEC: REVIEW SHIP -- P0/P1 clear, single_instance hardened (zombie self-correct + IDE false-positive guard), app.py zombie-recovery branch added, 4 regression tests, e2e two-process PASS
+- 27.08.26 04:30 [E-234] [parent: E-233] [T-25] [agent: opencode] [op: transition-1c3d8a2b5e9f] RUN: transition to SHIP
+- 27.08.26 04:30 [E-235] [parent: E-234] [T-25] [agent: opencode] [op: finish-7e9b2c4a8d1f] DEC: ticket finished via SAIOPS -- completion (from SHIP)

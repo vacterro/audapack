@@ -294,8 +294,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     from audapack.single_instance import SingleInstance
     single = SingleInstance("AUDAPACK_GUI")
     if single.is_already_running():
-        single.activate_existing_window("AUDAPACK")
-        return 0
+        if not single.activate_existing_window("AUDAPACK"):
+            # Mutex reported held but no window was found -- zombie holder.
+            # Do NOT silently no-op (that bricks the launcher). Open a new instance.
+            print(
+                "AUDAPACK: detected a leftover lock with no visible window; opening a new instance.",
+                file=sys.stderr,
+            )
+        else:
+            return 0
 
     # Qt is the production default (Wave N cutover). Tkinter remains only as explicit fallback.
     if args.ui == "tkinter":

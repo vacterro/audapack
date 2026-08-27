@@ -5,6 +5,7 @@
 ## TODO
 
 ## DONE
+- [x] T-25 [HIGH] Fix launcher "app doesn't open": single-instance guard trusts the mutex blindly; a windowless/hung AUDAPACK.pyw holds Local\AUDAPACK_GUI_MUTEX, so every launch sees "already running", finds no window, silently exits. | verify: is_already_running() returns False after zombie cleared; windowless holder no longer bricks the launcher; fresh launcher opens a real window | owner: opencode | claim_time: 2026-08-27T00:15:00Z
 - [x] T-13 [LOW] Reconcile legacy raw-named canonical artifact paths with new fs-safe naming | verify: pytest regression proving fs-safe name resolution | owner: opencode | claim_time: 2026-08-27T00:23:56Z
 - [x] T-24 [HIGH] Wave N Qt production cutover / Tkinter removal / final UI parity | verify: Qt default launcher, full feature parity, release audit | owner: opencode | claim_time: 2026-08-27T00:18:11Z
 - [x] T-19 [HIGH] Wave M model-native DnD and targeted Qt model mutation architecture | verify: model_reset_count == 0 on move/swap; Qt ItemIsDragEnabled/ItemIsDropEnabled; optimistic drop with rollback | owner: opencode | claim_time: 2026-08-26T18:05:00Z
