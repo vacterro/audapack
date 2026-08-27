@@ -9,3 +9,13 @@
 - 27.08.26 00:17 [E-210] [parent: E-209] [T-24] [agent: opencode] [op: checkpoint-f376d17d98e44b91813668f1c6afbef5] DEC: REVIEW SHIP -- P0/P1 clear, 122 tests PASS, Qt launcher default, perf gains validated
 - 27.08.26 00:18 [E-211] [parent: E-210] [T-24] [agent: opencode] [op: transition-a04e85310eee4968a50e8f7c99ef0089] RUN: transition to SHIP
 - 27.08.26 00:20 [E-212] [parent: E-211] [T-24] [agent: opencode] [op: finish-ad759f314d87436aa89dab34f5af32e0] DEC: ticket finished via SAIOPS -- completion (from SHIP)
+- 27.08.26 00:21 [E-213] [parent: E-212] [T-13] [agent: opencode] [op: claim-4bea89aa141346d6b861d6e85d8641b2] DEC: claimed via SAIOPS -- owner opencode
+- 27.08.26 00:22 [E-214] [parent: E-213] [T-13] [agent: opencode] [op: checkpoint-73f401913b2942239592641a162ef603] RUN: SCOUT -- legacy raw vs fs-safe: storage sanitize_project_name, audits batch index handles both, verify needs fs-safe regression
+- 27.08.26 00:22 [E-215] [parent: E-214] [T-13] [agent: opencode] [op: transition-40dac739a8474cf0b26390b38ed718b8] RUN: transition to BUILD
+- 27.08.26 00:23 [E-216] [parent: E-215] [T-13] [agent: opencode] [op: checkpoint-445a5af023154db2a9f28929a06d31c9] RUN: build -> fs-safe reconciliation: audits sanitize lookup + batch index, regression tests
+- 27.08.26 00:23 [E-217] [parent: E-216] [T-13] [agent: opencode] [op: transition-abd3e27677b14b1886df083a03aae1b8] RUN: transition to VERIFY
+- 27.08.26 00:23 [E-218] [parent: E-217] [T-13] [agent: opencode] [op: checkpoint-0c6351a515394a58815a8b94abc78761] RUN: VERIFY -- pytest regression 2 PASS, manual fs-safe 3 PASS -- conf: high
+- 27.08.26 00:23 [E-219] [parent: E-218] [T-13] [agent: opencode] [op: transition-e96f4a0538e64e4ea1880c752de480c9] RUN: transition to REVIEW
+- 27.08.26 00:23 [E-220] [parent: E-219] [T-13] [agent: opencode] [op: checkpoint-9da9d3d05d804f6c9d3a34fb3315f6e9] DEC: REVIEW SHIP -- P0/P1 clear, fs-safe regression green
+- 27.08.26 00:23 [E-221] [parent: E-220] [T-13] [agent: opencode] [op: transition-436c3f00e6144b68850287c26c0f32b5] RUN: transition to SHIP
+- 27.08.26 00:24 [E-222] [parent: E-221] [T-13] [agent: opencode] [op: finish-d9400a4da9f14fd9a9832ba215fb3cd7] DEC: ticket finished via SAIOPS -- completion (from SHIP)
