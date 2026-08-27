@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import atexit
-import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 from audapack.config import get_state_dir

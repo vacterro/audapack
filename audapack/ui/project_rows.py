@@ -9,9 +9,9 @@ from typing import Callable, Optional
 
 from audapack.audits import format_age_str
 from audapack.models import CANONICAL_GROUPS, AuditSnapshot, AuditTemperature, Project, SaipenInfo
-from audapack.packing import find_archive_for_project, human_mb
+from audapack.packing import find_archive_for_project
 from audapack.ui.i18n import t
-from audapack.ui.theme import FONT_FAMILY, PALETTE, SPACING
+from audapack.ui.theme import FONT_FAMILY, PALETTE
 
 
 class ProjectRow(tk.Frame):
@@ -171,12 +171,14 @@ class ProjectRow(tk.Frame):
 
         # Determine audit readiness and copied state early for strikethrough styling
         completed_waves = snapshot.completed_waves if snapshot else 0
-        all3_ready = snapshot.all3_ready if snapshot else False
+        total_waves = snapshot.total_waves if snapshot else 3
+        all_ready = (snapshot.final_handoff_ready or snapshot.all3_ready) if snapshot else False
+        audit_hash = snapshot.final_handoff_sha256 or snapshot.all3_sha256 if snapshot else ""
         is_copied = bool(
-            all3_ready
+            all_ready
             and snapshot
-            and snapshot.all3_sha256
-            and project.last_copied_audit_hash == snapshot.all3_sha256
+            and audit_hash
+            and project.last_copied_audit_hash == audit_hash
         )
 
         # 2. Project Name, Badges & Path Info (Flexible Expanding Column)
@@ -271,16 +273,16 @@ class ProjectRow(tk.Frame):
         lbl_path.pack(side="bottom", anchor="w")
 
         # 3. Audit Wave Status Tag (Column 3)
-        if all3_ready:
-            ready_txt = "✓ 3/3"
+        if all_ready:
+            ready_txt = f"✓ {total_waves}/{total_waves}" if total_waves != 3 else "✓ 3/3"
             ready_bg = PALETTE["success"]
             ready_fg = PALETTE["copied"] if is_copied else PALETTE["successFg"]
         elif completed_waves > 0:
-            ready_txt = f"{completed_waves}/3"
+            ready_txt = f"{completed_waves}/{total_waves}"
             ready_bg = PALETTE["surfaceAlt"]
             ready_fg = PALETTE["warningFg"]
         else:
-            ready_txt = "0/3"
+            ready_txt = f"0/{total_waves}"
             ready_bg = PALETTE["surfaceRaised"]
             ready_fg = PALETTE["textMuted"]
 
@@ -308,18 +310,8 @@ class ProjectRow(tk.Frame):
             AuditTemperature.NONE: (PALETTE["surfaceRaised"], PALETTE["textMuted"]),
         }
         t_bg, t_fg = temp_colors.get(temp, (PALETTE["surfaceRaised"], PALETTE["textMuted"]))
-        if temp == AuditTemperature.HOT and age_str:
-            temp_display = f"● {age_str}"
-        elif temp == AuditTemperature.WARM and age_str:
-            temp_display = f"● {age_str}"
-        elif temp == AuditTemperature.COOL and age_str:
-            temp_display = f"● {age_str}"
-        elif temp == AuditTemperature.COLD and age_str:
-            temp_display = f"● {age_str}"
-        elif temp == AuditTemperature.STALE and age_str:
-            temp_display = f"○ {age_str}"
-        elif temp != AuditTemperature.NONE:
-            temp_display = temp.value
+        if age_str:
+            temp_display = f"● {age_str}" if temp != AuditTemperature.STALE else f"○ {age_str}"
         else:
             temp_display = "—"
 
@@ -340,15 +332,15 @@ class ProjectRow(tk.Frame):
             self,
             text=t("btn.copy_audit_done") if is_copied else t("btn.copy_audit"),
             bg=PALETTE["surfaceRaised"],
-            fg=PALETTE["copied"] if is_copied else PALETTE["borderHighlight"] if all3_ready else PALETTE["textMuted"],
+            fg=PALETTE["copied"] if is_copied else PALETTE["borderHighlight"] if all_ready else PALETTE["textMuted"],
             activebackground=PALETTE["surfaceAlt"],
             activeforeground=PALETTE["borderHighlight"],
-            font=(FONT_FAMILY, 8, "bold" if all3_ready else "normal"),
+            font=(FONT_FAMILY, 8, "bold" if all_ready else "normal"),
             relief="raised",
             bd=2,
             highlightthickness=0,
             width=9,
-            state="normal" if all3_ready else "disabled",
+            state="normal" if all_ready else "disabled",
             command=lambda: on_copy_audit(project, snapshot, self.btn_copy_audit) if snapshot else None,
         )
         self.btn_copy_audit.grid(row=0, column=5, sticky="e", padx=(0, 4))

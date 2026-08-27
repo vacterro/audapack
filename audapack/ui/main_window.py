@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import datetime
 import os
 import queue
-import shutil
-import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -16,28 +13,24 @@ from typing import Any, Optional
 
 from audapack import __app_name__, __version__
 from audapack.audits import AuditIndexer
-from audapack.bridge.lifecycle import is_bridge_healthy, start_bridge_background
+from audapack.bridge.lifecycle import start_bridge_background
 from audapack.bridge.server import set_audit_written_callback
 from audapack.config import (
     AppConfig,
     app_dir,
-    get_user_runtime_dir,
     load_config,
     save_config,
 )
-from audapack.packing import find_archive_for_project, human_mb, pack_single, safe_archive_stem
-from audapack.services.audit_service import AuditService
-from audapack.services.project_service import ProjectService
 from audapack.models import (
-    CANONICAL_GROUPS,
     SLOTS_PER_GROUP,
     AuditSnapshot,
-    PackResult,
     Project,
 )
 from audapack.packing import find_archive_for_project, human_mb, pack_single
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
+from audapack.services.audit_service import AuditService
+from audapack.services.project_service import ProjectService
 from audapack.ui.clipboard_files import copy_file_to_clipboard
 from audapack.ui.dialogs import ProjectEditDialog
 from audapack.ui.i18n import (
@@ -45,12 +38,14 @@ from audapack.ui.i18n import (
     get_language,
     language_display_name,
     register_reload_callback,
-    set_language as i18n_set_language,
     t,
+)
+from audapack.ui.i18n import (
+    set_language as i18n_set_language,
 )
 from audapack.ui.project_rows import EmptySlotRow, ProjectRow
 from audapack.ui.settings import SettingsDialog
-from audapack.ui.theme import FONT_FAMILY, PALETTE, SPACING
+from audapack.ui.theme import FONT_FAMILY, PALETTE
 
 
 class MainWindow:
@@ -639,11 +634,11 @@ class MainWindow:
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
 
-        sha = sha256
-        copied_at = snapshot.all3_path.stat().st_mtime if snapshot.all3_path else ""
+        target_p = snapshot.final_handoff_path or snapshot.all3_path
+        copied_at = target_p.stat().st_mtime if (target_p and target_p.exists()) else ""
         self.registry.edit_project(
             project.id,
-            lambda p: (setattr(p, "last_copied_audit_hash", sha), setattr(p, "last_copied_at", copied_at)),
+            lambda p: (setattr(p, "last_copied_audit_hash", sha256), setattr(p, "last_copied_at", copied_at)),
         )
 
         self._refresh_data()
@@ -903,6 +898,6 @@ def run_gui() -> int:
             pass
 
     root = tk.Tk()
-    app = MainWindow(root)
+    _app = MainWindow(root)
     root.mainloop()
     return 0

@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 from typing import Any, Optional
 
-from audapack import __version__
 from audapack.bridge.lifecycle import (
     check_bridge_health,
     is_bridge_healthy,
@@ -23,11 +18,10 @@ from audapack.components.autostart import (
 )
 from audapack.components.migration import detect_legacy_installation, perform_bridge_takeover
 from audapack.components.widget import (
-    get_bundled_widget_path,
     open_widget_installation,
     read_bundled_widget_metadata,
 )
-from audapack.config import AppConfig, app_dir, load_config
+from audapack.config import AppConfig, load_config
 from audapack.context_menu import (
     install_context_menu,
     is_context_menu_installed,

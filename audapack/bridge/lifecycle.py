@@ -42,7 +42,7 @@ def check_bridge_health(host: str = "127.0.0.1", port: int = 17843, timeout: flo
     """
     Queries /health on loopback.
     Returns (is_healthy, payload_or_error).
-    Ensures service == 'AUDAPACK Bridge' and api_version == 2.
+    Ensures service == 'AUDAPACK Bridge' and api_version in (2, 3).
     """
     url = f"http://{host}:{port}/health"
     try:
@@ -53,7 +53,7 @@ def check_bridge_health(host: str = "127.0.0.1", port: int = 17843, timeout: flo
                 data = json.loads(raw)
                 svc = data.get("service")
                 api_ver = data.get("api_version")
-                if svc == "AUDAPACK Bridge" and api_ver == 2:
+                if svc == "AUDAPACK Bridge" and (api_ver in (2, 3) or bool(data.get("supported_api_versions"))):
                     return True, data
                 elif svc == "ACBBridge":
                     return False, {"status": "legacy_acbbridge", "raw": data}
@@ -75,10 +75,17 @@ def start_bridge_background(config: Optional[AppConfig] = None) -> bool:
     if is_bridge_healthy(cfg.bridge.host, cfg.bridge.port):
         return True
 
-    py_dir = Path(sys.executable).parent
+    python_exe = sys.executable
+    py_dir = Path(python_exe).parent
     pythonw = py_dir / "pythonw.exe"
+    runner = str(pythonw) if (pythonw.exists() and sys.platform == "win32") else str(python_exe)
+
     entry_pyw = app_dir() / "AUDAPACK.pyw"
-    cmd = [str(pythonw), str(entry_pyw), "--bridge"]
+    if entry_pyw.exists():
+        cmd = [runner, str(entry_pyw), "--bridge"]
+    else:
+        cmd = [runner, "-m", "audapack.app", "--bridge"]
+
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
     try:
@@ -92,7 +99,7 @@ def start_bridge_background(config: Optional[AppConfig] = None) -> bool:
         return False
 
     # Poll for health
-    for _ in range(25):
+    for _ in range(30):
         time.sleep(0.1)
         if is_bridge_healthy(cfg.bridge.host, cfg.bridge.port):
             return True
@@ -105,12 +112,10 @@ def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
     url = f"http://{cfg.bridge.host}:{cfg.bridge.port}/v1/shutdown"
     token = cfg.bridge.token
 
-    stopped = False
     try:
         req = urllib.request.Request(url, data=b"{}", headers={"X-ACB-Token": token, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
-            if resp.status == 200:
-                stopped = True
+        with urllib.request.urlopen(req, timeout=1.5):
+            pass
     except Exception:
         pass
 

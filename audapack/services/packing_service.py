@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
-from audapack.models import Project
 from audapack.packing import pack_single, resolve_output_dir
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
@@ -31,7 +30,7 @@ class PackingService:
             from audapack.models import PackResult
             return PackResult(project_id=project_id, name=project_id, source_path="", success=False, error_message="No source path")
 
-        output_dir = resolve_output_dir(proj.source_path, self.config.packing, fallback=app_dir())
+        output_dir = resolve_output_dir(proj.source_path, self.config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
         excludes = set(self.config.packing.excludes)
         extra_meta = {}
         if self.config.packing.manifest_enabled and proj.source_path:
@@ -45,6 +44,7 @@ class PackingService:
             archive_stem=proj.archive_name or proj.display_name,
             excludes=excludes,
             delete_old=self.config.packing.delete_old,
+            include_timestamp=getattr(self.config.packing, "include_timestamp", True),
             cancel_event=cancel_event,
             log_callback=log_callback,
             progress_callback=progress_callback,
@@ -56,7 +56,8 @@ class PackingService:
         output_dir = resolve_output_dir(target, self.config.packing, fallback=app_dir())
         excludes = set(self.config.packing.excludes)
         stem = target.name
-        return pack_single(source_path=target, output_dir=output_dir, archive_stem=stem, excludes=excludes, **kw)
+        inc_ts = kw.pop("include_timestamp", getattr(self.config.packing, "include_timestamp", True))
+        return pack_single(source_path=target, output_dir=output_dir, archive_stem=stem, excludes=excludes, include_timestamp=inc_ts, **kw)
 
     def pack_selected(self, project_ids: Iterable[str], **kw) -> List:
         results = []

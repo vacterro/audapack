@@ -5,6 +5,7 @@
 ## TODO
 
 ## DONE
+- [x] T-28 [HIGH] AUDAPACK Super Audit / Generic Audit Campaign Engine & Super10 Profile Migration: Rebuilt Auto3 hardcoded architecture into generic, data-driven multi-wave campaign engine. Profile domain model (`audapack/data/audit_profiles.json`, `audapack/campaign.py`), Bridge API v3 & v2 compatibility (`audapack/bridge/server.py`, `storage.py`), dynamic multi-wave storage & indexer (`audapack/audits.py`, `models.py`, `ingest.py`, `services/audit_service.py`), Qt & Tk dynamic x/N progress indicators, Userscript widget multi-wave state machine with profile toggle & automated continuation recovery (`resources/AUDAPACK_WIDGET.user.js`), 189/189 Python tests PASS, 13/13 Node widget test suites PASS. | owner: opencode | claim_time: 2026-08-27T05:15:00Z
 - [x] T-26 [HIGH] Add archive output layout switch in Settings: single_folder (current, uses packing.output_dir) vs alongside_projects (archive written to source_path.parent, sibling of the project folder, NOT inside it). Resolve per-project in PackingService + CLI pack paths. Settings Packing tab: combo box with both modes + clear labels; persist via PackingConfig.output_layout. Verify: alongside writes archive as sibling of project folder; single_folder unchanged. | owner: opencode | claim_time: 2026-08-27T04:43:00Z
 
 ## BLOCKED

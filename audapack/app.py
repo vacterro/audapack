@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-import threading
 from pathlib import Path
 from typing import Optional
 
 from audapack import __app_name__, __version__
 from audapack.audits import AuditIndexer
-from audapack.config import app_dir, load_config, save_config
+from audapack.config import app_dir, load_config
 from audapack.context_menu import (
     install_context_menu,
     is_context_menu_installed,
@@ -62,13 +60,14 @@ def run_silent_pack_all() -> int:
                     "changed_files": saipen_info.git_changed_files,
                 }
 
-        output_dir = resolve_output_dir(p.source_path, config.packing, fallback=fallback)
+        output_dir = resolve_output_dir(p.source_path, config.packing, fallback=fallback, group=p.priority_group, project=p)
         res = pack_single(
             source_path=p.source_path,
             output_dir=output_dir,
             archive_stem=p.archive_name or p.display_name,
             excludes=excludes,
             delete_old=config.packing.delete_old,
+            include_timestamp=getattr(config.packing, "include_timestamp", True),
             log_callback=log,
             manifest_meta={"project_name": p.display_name, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
         )
@@ -90,7 +89,13 @@ def run_pack_path(path_str: str) -> int:
     registry = ProjectRegistry(config)
     matching_project = registry.get_project_by_path(target)
     stem = matching_project.archive_name if matching_project else target.name
-    output_dir = resolve_output_dir(target, config.packing, fallback=app_dir())
+    output_dir = resolve_output_dir(
+        target,
+        config.packing,
+        fallback=app_dir(),
+        group=matching_project.priority_group if matching_project else None,
+        project=matching_project,
+    )
     excludes = set(config.packing.excludes)
 
     extra_meta = {}
@@ -111,6 +116,7 @@ def run_pack_path(path_str: str) -> int:
         archive_stem=stem,
         excludes=excludes,
         delete_old=config.packing.delete_old,
+        include_timestamp=getattr(config.packing, "include_timestamp", True),
         manifest_meta={"project_name": stem, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
     )
     if res.success:
@@ -122,18 +128,14 @@ def run_pack_path(path_str: str) -> int:
 
 
 def run_pack_project(project_id: str) -> int:
-    """Packs a registered project by its ID using the resolved project identity."""
+    """Packs a single registered project by ID."""
     config = load_config()
     registry = ProjectRegistry(config)
     proj = registry.get_project_by_id(project_id)
     if not proj:
-        print(f"Error: Project '{project_id}' not found in registry.", file=sys.stderr)
+        print(f"Error: Project not found: {project_id}", file=sys.stderr)
         return 1
 
-    # CORE-003: stay ID-stable. Pack from the already resolved project instead of
-    # re-resolving its path (which could pick another project's archive identity),
-    # and reject blank sources before any Path.resolve() so an empty source can
-    # never fall back to the current working directory.
     if not proj.source_path or not proj.source_path.strip():
         print(f"Error: Project '{project_id}' has no source path configured.", file=sys.stderr)
         return 1
@@ -143,7 +145,7 @@ def run_pack_project(project_id: str) -> int:
         print(f"Error: Source path does not exist: {source}", file=sys.stderr)
         return 1
 
-    output_dir = resolve_output_dir(source, config.packing, fallback=app_dir())
+    output_dir = resolve_output_dir(source, config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
     excludes = set(config.packing.excludes)
     stem = proj.archive_name or proj.display_name
 
@@ -165,6 +167,7 @@ def run_pack_project(project_id: str) -> int:
         archive_stem=stem,
         excludes=excludes,
         delete_old=config.packing.delete_old,
+        include_timestamp=getattr(config.packing, "include_timestamp", True),
         manifest_meta={"project_name": stem, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
     )
     if res.success:
@@ -188,10 +191,11 @@ def print_status() -> int:
     print("-" * 50)
     for p in registry.projects:
         snap = snapshots.get(p.id)
-        ready_str = f"{snap.completed_waves}/3" if snap else "0/3"
-        all_str = "ALL" if (snap and snap.all3_ready) else ""
+        tot = snap.total_waves if snap else 3
+        ready_str = f"{snap.completed_waves}/{tot}" if snap else "0/3"
+        all_str = "ALL" if (snap and (snap.final_handoff_ready or snap.all3_ready)) else ""
         temp_str = snap.temperature.value if snap else "NONE"
-        print(f"[{p.priority_group} #{p.slot}] {p.display_name:<25} {ready_str:<4} {all_str:<4} {temp_str:<6} {p.source_path}")
+        print(f"[{p.priority_group} #{p.slot}] {p.display_name:<25} {ready_str:<6} {all_str:<4} {temp_str:<6} {p.source_path}")
     return 0
 
 
@@ -216,6 +220,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.paste:
         import tkinter as tk
+
         from audapack.ingest import ingest_audit_text
         try:
             r = tk.Tk()

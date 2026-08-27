@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Optional
 
 from audapack.audits import AuditIndexer, AuditSnapshot
@@ -38,8 +39,21 @@ class AuditService:
         self.indexer.invalidate()
         return self.indexer.scan_all_projects()
 
-    def copy_all3(self, project_id: str) -> tuple[bool, str, str]:
+    def get_preferred_audit_file_path(self, project_id: str) -> Optional[Path]:
+        """Returns Path to the preferred audit file for the project."""
+        snap = self.get_snapshot(project_id)
+        if not snap:
+            return None
+        return self.indexer.get_preferred_audit_file_path(snap)
+
+    def copy_latest_campaign(self, project_id: str) -> tuple[bool, str, str]:
+        """Reads preferred final campaign handoff (SUPER_AUDIT_FINAL, SUPER_AUDIT_ALL, or ALL_3)."""
         snap = self.get_snapshot(project_id)
         if not snap:
             return False, "", ""
-        return self.indexer.read_exact_all3(snap)
+        return self.indexer.read_preferred_handoff(snap)
+
+    def copy_all3(self, project_id: str) -> tuple[bool, str, str]:
+        """Legacy alias: copies preferred handoff text."""
+        return self.copy_latest_campaign(project_id)
+

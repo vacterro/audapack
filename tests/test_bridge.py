@@ -969,9 +969,9 @@ class TestWidgetBranding(unittest.TestCase):
         # The wrong-service handshake must still recognize the legacy service name.
         self.assertIn("ACBBridge", src)
 
-    def test_api_version_is_2(self):
+    def test_api_version_is_3(self):
         src = self._widget_source()
-        self.assertIn("BRIDGE_API_VERSION = 2", src)
+        self.assertIn("BRIDGE_API_VERSION = 3", src)
 
     def test_canonical_vbs_launchers(self):
         root = Path(__file__).resolve().parent.parent

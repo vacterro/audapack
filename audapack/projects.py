@@ -26,7 +26,7 @@ from audapack.config import (
     safe_slug,
     save_config,
 )
-from audapack.models import CANONICAL_GROUPS, SLOTS_PER_GROUP, PriorityGroup, Project
+from audapack.models import CANONICAL_GROUPS, SLOTS_PER_GROUP, Project
 
 
 class RegistrySaveError(RuntimeError):
@@ -98,7 +98,11 @@ class ProjectRegistry:
 
     @property
     def projects(self) -> list[Project]:
-        return self.config.projects
+        return list(self.config.projects)
+
+    def list_projects(self) -> list[Project]:
+        """Returns all configured projects."""
+        return list(self.config.projects)
 
     def get_active_groups(self) -> list[str]:
         """Returns ordered list of active groups: MAIN0, MAIN1, SIDE0, SIDE1, followed by any dynamic SIDE2, SIDE3, etc."""
@@ -444,7 +448,6 @@ class ProjectRegistry:
             return 0
 
         newly_added = 0
-        active_groups = self.get_active_groups()
         for group_dir in sorted(audit_root.iterdir()):
             if not group_dir.is_dir() or group_dir.name.startswith(("_", ".")):
                 continue

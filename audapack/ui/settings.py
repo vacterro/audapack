@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
 
-from audapack.components.manager import ComponentManager
 from audapack.bridge.lifecycle import is_bridge_healthy
+from audapack.components.manager import ComponentManager
 from audapack.config import AppConfig, get_user_runtime_dir, load_config, save_config
 from audapack.ui.i18n import t
-from audapack.ui.theme import FONT_FAMILY, PALETTE, make_vintage_btn
+from audapack.ui.theme import FONT_FAMILY, PALETTE
 
 
 class SettingsDialog(tk.Toplevel):
@@ -560,13 +561,17 @@ class SettingsDialog(tk.Toplevel):
 
     def _repair_all(self):
         res = self.comp_mgr.repair_all()
+
         def status(v):
             return t("settings.repair_ok") if v.get("ok") else t("settings.repair_failed")
+
         lines = [
-            t("settings.repair_summary_fmt",
-              ctx=status(v.get("context_menu", {})),
-              br=status(v.get("bridge", {})),
-              auto=status(v.get("autostart", {})))
+            t(
+                "settings.repair_summary_fmt",
+                ctx=status(res.get("context_menu", {})),
+                br=status(res.get("bridge", {})),
+                auto=status(res.get("autostart", {})),
+            )
         ]
         messagebox.showinfo("Repair Summary", "\n".join(lines), parent=self)
         self._refresh_components()

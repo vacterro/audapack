@@ -77,7 +77,7 @@ def install_context_menu(script_path: Optional[Path] = None) -> bool:
                 winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, cmd)
 
         return True
-    except Exception as exc:
+    except Exception:
         return False
 
 

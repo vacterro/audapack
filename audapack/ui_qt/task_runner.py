@@ -48,14 +48,20 @@ class _WorkerRunnable(QRunnable):
     def run(self):
         try:
             res = self.fn()
-            self.signals.finished.emit(
-                TaskResult(key=self.key, generation=self.generation, success=True, data=res)
-            )
+            try:
+                self.signals.finished.emit(
+                    TaskResult(key=self.key, generation=self.generation, success=True, data=res)
+                )
+            except RuntimeError:
+                pass
         except Exception as exc:
             logger.debug(f"Task {self.key} failed: {exc}", exc_info=True)
-            self.signals.finished.emit(
-                TaskResult(key=self.key, generation=self.generation, success=False, error=exc)
-            )
+            try:
+                self.signals.finished.emit(
+                    TaskResult(key=self.key, generation=self.generation, success=False, error=exc)
+                )
+            except RuntimeError:
+                pass
 
 
 class TaskRunner(QObject):

@@ -14,12 +14,11 @@ that it requires the Win32 layout (guarded identically).
 
 from __future__ import annotations
 
+import ctypes
 import sys
+from ctypes import wintypes
 from pathlib import Path
 from typing import Iterable, Optional
-
-import ctypes
-from ctypes import wintypes
 
 IS_WINDOWS = sys.platform == "win32"
 

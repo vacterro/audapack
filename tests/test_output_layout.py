@@ -92,6 +92,14 @@ class TestResolveOutputDir(unittest.TestCase):
         out = resolve_output_dir("/anywhere/project", cfg, fallback=self.fallback)
         self.assertEqual(out, Path("/data/archives"))
 
+    def test_grouped_by_priority_creates_group_subfolder(self):
+        cfg = PackingConfig(output_dir="/data/archives", output_layout="grouped_by_priority")
+        out_main0 = resolve_output_dir("/anywhere/project", cfg, fallback=self.fallback, group="MAIN0")
+        self.assertEqual(out_main0, Path("/data/archives/MAIN0"))
+
+        out_side1 = resolve_output_dir("/anywhere/project", cfg, fallback=self.fallback, group="side1")
+        self.assertEqual(out_side1, Path("/data/archives/SIDE1"))
+
 
 class TestPackingServiceLayout(unittest.TestCase):
     def _make_config(self, layout: str, output_dir: str = "") -> AppConfig:
@@ -190,6 +198,8 @@ class TestSettingsDialogPersistsLayout(unittest.TestCase):
             on_disk["packing"]["output_layout"],
             OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
         )
+        import shutil
+        shutil.rmtree(base_dir, ignore_errors=True)
 
     def test_legacy_config_without_layout_loads_as_default(self):
         base_dir = _HERE / "_tmp_legacy_layout"
@@ -206,6 +216,8 @@ class TestSettingsDialogPersistsLayout(unittest.TestCase):
 
         cfg = load_config(base_dir)
         self.assertEqual(cfg.packing.output_layout, DEFAULT_OUTPUT_LAYOUT)
+        import shutil
+        shutil.rmtree(base_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

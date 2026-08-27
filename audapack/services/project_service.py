@@ -124,6 +124,8 @@ class ProjectService:
     def remove_project(self, project_id: str) -> bool:
         return self.registry.remove_project(project_id)
 
+    delete_project = remove_project
+
     def update_project(self, project_id: str, editor: Callable[[Project], None]) -> bool:
         """Apply arbitrary field edits inside the registry transaction."""
         return self.registry.edit_project(project_id, editor)

@@ -6,9 +6,9 @@ never leaving mutable tokens or state in the source repository.
 
 from __future__ import annotations
 
-import contextlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -29,7 +29,7 @@ try:  # POSIX advisory locks
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-from audapack.models import CANONICAL_GROUPS, SLOTS_PER_GROUP, PriorityGroup, Project
+from audapack.models import Project
 
 CONFIG_FILE_NAME = "config.json"
 LEGACY_REPO_CONFIG_NAME = "audapack.json"
@@ -321,9 +321,11 @@ def cross_process_lock(path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
 #                         project's archive next to the project on disk.
 OUTPUT_LAYOUT_SINGLE_FOLDER = "single_folder"
 OUTPUT_LAYOUT_ALONGSIDE_PROJECTS = "alongside_projects"
+OUTPUT_LAYOUT_GROUPED_BY_PRIORITY = "grouped_by_priority"
 OUTPUT_LAYOUT_CHOICES = (
     OUTPUT_LAYOUT_SINGLE_FOLDER,
     OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
+    OUTPUT_LAYOUT_GROUPED_BY_PRIORITY,
 )
 DEFAULT_OUTPUT_LAYOUT = OUTPUT_LAYOUT_SINGLE_FOLDER
 
@@ -350,6 +352,7 @@ class PackingConfig:
     # CORE-009: archive output layout. Legacy configs without this field are
     # treated as single_folder (the old behaviour) so migration is a no-op.
     output_layout: str = DEFAULT_OUTPUT_LAYOUT
+    include_timestamp: bool = True
 
 
 @dataclass

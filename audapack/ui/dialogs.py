@@ -9,7 +9,7 @@ from typing import Optional
 
 from audapack.models import CANONICAL_GROUPS, Project
 from audapack.ui.i18n import t
-from audapack.ui.theme import FONT_FAMILY, PALETTE, SPACING
+from audapack.ui.theme import FONT_FAMILY, PALETTE
 
 
 def center_window_on_parent(window: tk.Toplevel, parent: tk.Widget, width: Optional[int] = None, height: Optional[int] = None):

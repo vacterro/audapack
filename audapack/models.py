@@ -98,6 +98,20 @@ class Project:
 class AuditSnapshot:
     project_id: str
     project_name: str
+    # Generic campaign fields
+    audit_profile_id: str = "quick3"
+    audit_profile_version: str = "1.0.0"
+    completed_waves: int = 0
+    total_waves: int = 3
+    campaign_complete: bool = False
+    final_handoff_ready: bool = False
+    final_handoff_sha256: str = ""
+    final_handoff_path: Optional[Path] = None
+    all_path: Optional[Path] = None
+    campaign_run_id: str = ""
+    wave_files: dict[str, Path] = field(default_factory=dict)
+    wave_statuses: dict[str, bool] = field(default_factory=dict)
+    # Legacy compatibility fields
     core_path: Optional[Path] = None
     core_complete: bool = False
     second_path: Optional[Path] = None
@@ -107,10 +121,11 @@ class AuditSnapshot:
     all3_path: Optional[Path] = None
     all3_ready: bool = False
     all3_sha256: str = ""
+    # Timestamp & Temperature
+    audit_dir: Optional[Path] = None
     audit_timestamp: Optional[datetime] = None
     audit_age_seconds: Optional[float] = None
     temperature: AuditTemperature = AuditTemperature.NONE
-    completed_waves: int = 0
     total_tickets: int = 0
     raw_status_line: str = ""
 

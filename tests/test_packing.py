@@ -1,7 +1,6 @@
 """Unit tests for AUDAPACK packing engine."""
 
 import json
-import os
 import shutil
 import tempfile
 import threading
@@ -262,12 +261,31 @@ class TestPackingEngine(unittest.TestCase):
             archive_stem="MyProject",
             excludes={"node_modules", "*.log"},
             delete_old=True,
+            include_timestamp=False,
             manifest_meta={"project_name": "MyProject"},
         )
         self.assertTrue(res.success)
         self.assertIsNotNone(res.output_path)
         self.assertTrue(res.output_path.exists())
+        self.assertEqual(res.output_path.name, "MyProject.zip")
         self.assertEqual(res.skipped_files, 0)
+
+    def test_timestamp_format_and_toggle(self):
+        import re
+        # With include_timestamp=True: should produce {stem}_{DD.MM.YY-THH-MM-SS}.zip
+        res_ts = pack_single(
+            source_path=self.source_dir,
+            output_dir=self.output_dir,
+            archive_stem="StampProject",
+            excludes=set(),
+            include_timestamp=True,
+        )
+        self.assertTrue(res_ts.success)
+        pattern = r"^StampProject_\d{2}\.\d{2}\.\d{2}-T\d{2}-\d{2}-\d{2}\.zip$"
+        self.assertTrue(
+            bool(re.match(pattern, res_ts.output_path.name)),
+            f"Filename {res_ts.output_path.name} did not match pattern {pattern}",
+        )
 
 
 if __name__ == "__main__":

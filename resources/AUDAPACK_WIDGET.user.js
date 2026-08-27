@@ -121,7 +121,686 @@
   const BRIDGE_FLUSH_LEASE_MS = 30000;
   const BRIDGE_REQUEST_TIMEOUT_MS = 12000;
   const BRIDGE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 120000, 300000]);
-  const BRIDGE_API_VERSION = 2;
+  const BRIDGE_API_VERSION = 3;
+
+// BEGIN_EMBEDDED_AUDIT_PROFILES
+  const AUDIT_PROFILES_MANIFEST_SHA256 = '0150e79661d7b03b2fee434b93ea0cec2ec584e2c68ebb375b7d41bfbd13ff87';
+  const EMBEDDED_AUDIT_PROFILES = Object.freeze({
+  "schema_version": 1,
+  "profiles": {
+    "quick3": {
+      "profile_id": "quick3",
+      "profile_version": "1.0.0",
+      "display_name": "Quick 3 Waves",
+      "description": "Fast 3-wave baseline audit: Core -> Second Wave -> Performance.",
+      "finalizer_wave_id": "performance",
+      "waves": [
+        {
+          "id": "core",
+          "ordinal": 1,
+          "number": "01",
+          "slug": "AUDIT_CORE",
+          "title": "AUDIT CORE",
+          "short_label": "Core",
+          "description": "Deep read-only software correctness audit for implementation handoff.",
+          "ticket_prefix": "CORE-",
+          "wave_header": "AUDIT CORE",
+          "terminal_status_key": "AUDIT_CORE",
+          "status_line": "STATUS: AUDIT_CORE: COMPLETE",
+          "done_marker": "CORE_DONE_WHEN:",
+          "prompt_focus": "SYSTEM MAP, INVARIANTS & CORRECTNESS:\nBuild compact project map first (entry points -> validation -> state owners -> transitions -> core logic -> persistence/I/O -> error paths -> UI/output -> tests).\nHunt broken invariants, contradictory logic, wrong defaults, missing validation, partial migrations, persistence faults, concurrency/idempotence flaws, and UI-state drift.",
+          "prompt_output_contract": "Return ONE code block only. Tickets in priority order ([P0|P1|P2] [CORE-001] <path/symbol> with EVIDENCE, DEFECT, REPAIR, VERIFY). End with CORE_DONE_WHEN.",
+          "depends_on": [],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED CORE DEFECTS."
+        },
+        {
+          "id": "second",
+          "ordinal": 2,
+          "number": "02",
+          "slug": "AUDIT_SECOND_WAVE",
+          "title": "AUDIT SECOND WAVE",
+          "short_label": "Second",
+          "description": "Complementary second lens hunting lifecycle, boundaries, concurrency, and persistence.",
+          "ticket_prefix": "W2-",
+          "wave_header": "AUDIT SECOND WAVE",
+          "terminal_status_key": "SECOND_WAVE",
+          "status_line": "STATUS: SECOND_WAVE: COMPLETE",
+          "done_marker": "SECOND_WAVE_DONE_WHEN:",
+          "prompt_focus": "LIFECYCLE, BOUNDARIES, REPEATABILITY & ERROR DRIFT:\nAttack startup/shutdown/cleanup, multiple writers, unusual boundary inputs, duplicate dispatch, cancellation/retry, partial writes, serializer/parser asymmetry, swallowed errors, and duplicated source of truth.",
+          "prompt_output_contract": "Return ONE code block only. New or materially re-diagnosed findings ([P0|P1|P2] [W2-001] <path/symbol> with EVIDENCE, DEFECT, REPAIR, VERIFY). End with SECOND_WAVE_DONE_WHEN.",
+          "depends_on": [
+            "core"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO NEW VERIFIED SECOND-WAVE DEFECTS."
+        },
+        {
+          "id": "performance",
+          "ordinal": 3,
+          "number": "03",
+          "slug": "AUDIT_PERFORMANCE",
+          "title": "AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS",
+          "short_label": "Perf",
+          "description": "Performance, stability, resource bounds, and hot path optimization.",
+          "ticket_prefix": "PERF-",
+          "wave_header": "AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS",
+          "terminal_status_key": "PERFORMANCE",
+          "status_line": "STATUS: PERFORMANCE: COMPLETE",
+          "done_marker": "PERFORMANCE_DONE_WHEN:",
+          "prompt_focus": "HOT PATHS, STABILITY, MEMORY BOUNDS & RESOURCE EFFICIENCY:\nInspect repeated parsing/serialization, O(n^2) loops, DOM reflows/scans, event listener leaks, async races, unbounded queues/maps/buffers, startup I/O, and hot path simplification. Invariants must stay intact.",
+          "prompt_output_contract": "Return ONE code block only. Classify each ticket: PROVEN BOTTLENECK | STRONGLY EVIDENCED WASTE | LOW-RISK SIMPLIFICATION ([P0|P1|P2] [PERF-001] <CLASS> <path/symbol> with EVIDENCE, ISSUE, OPTIMIZE, GUARDRAIL, VERIFY). End with PERFORMANCE_DONE_WHEN.",
+          "depends_on": [
+            "core",
+            "second"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "finalizer",
+          "finalizer": true,
+          "ticket_fields": [
+            "EVIDENCE",
+            "ISSUE",
+            "OPTIMIZE",
+            "GUARDRAIL",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO MATERIAL PERFORMANCE/STABILITY FINDINGS."
+        }
+      ]
+    },
+    "super10": {
+      "profile_id": "super10",
+      "profile_version": "1.0.0",
+      "display_name": "Super 10 Deep Campaign",
+      "description": "Deep 10-wave unattended audit campaign ending with adversarial synthesis and implementation handoff.",
+      "finalizer_wave_id": "redteam",
+      "waves": [
+        {
+          "id": "architecture",
+          "ordinal": 1,
+          "number": "01",
+          "slug": "AUDIT_ARCHITECTURE",
+          "title": "AUDIT ARCHITECTURE / SYSTEM INVARIANTS",
+          "short_label": "Arch",
+          "description": "Build the authoritative system map and hunt architectural root defects.",
+          "ticket_prefix": "ARCH-",
+          "wave_header": "AUDIT ARCHITECTURE / SYSTEM INVARIANTS",
+          "terminal_status_key": "AUDIT_ARCHITECTURE",
+          "status_line": "STATUS: AUDIT_ARCHITECTURE: COMPLETE",
+          "done_marker": "ARCH_DONE_WHEN:",
+          "prompt_focus": "SYSTEM MAP, SUBSYSTEM BOUNDARIES & ARCHITECTURAL INVARIANTS:\nInspect entry points, subsystem boundaries, ownership, sources of truth, invariants, routing, state topology, dependency direction, initialization/shutdown, partial migrations, duplicated implementations, stale compatibility paths, schema/config/version relationships, contracts contradicting runtime, and architecture-level failure modes.\nEstablish the authoritative project map for subsequent waves.",
+          "prompt_output_contract": "Return ONE code block only. Header with machine handoff fields + coverage ledger. Tickets: [P0|P1|P2] [ARCH-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with ARCH_DONE_WHEN.",
+          "depends_on": [],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED ARCHITECTURAL DEFECTS."
+        },
+        {
+          "id": "correctness",
+          "ordinal": 2,
+          "number": "02",
+          "slug": "AUDIT_CORRECTNESS",
+          "title": "AUDIT CORRECTNESS / DATA INTEGRITY",
+          "short_label": "Corr",
+          "description": "Logical defects, edge conditions, data loss, transformations, and atomicity.",
+          "ticket_prefix": "CORR-",
+          "wave_header": "AUDIT CORRECTNESS / DATA INTEGRITY",
+          "terminal_status_key": "AUDIT_CORRECTNESS",
+          "status_line": "STATUS: AUDIT_CORRECTNESS: COMPLETE",
+          "done_marker": "CORR_DONE_WHEN:",
+          "prompt_focus": "LOGICAL DEFECTS, DATA INTEGRITY & ATOMICITY:\nInspect wrong conditions, ordering, defaults, invalid states, transformations, parsing, validation, serialization, type/shape assumptions, off-by-one, missing branches, destructive writes, stale reads, inconsistent normalization, data loss/corruption, import/export, migrations, and atomicity at logical boundaries.\nDo not re-report ARCH findings unless discovering a deeper root cause.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [CORR-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with CORR_DONE_WHEN.",
+          "depends_on": [
+            "architecture"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED CORRECTNESS DEFECTS."
+        },
+        {
+          "id": "state",
+          "ordinal": 3,
+          "number": "03",
+          "slug": "AUDIT_STATE",
+          "title": "AUDIT STATE / CONCURRENCY / LIFECYCLE",
+          "short_label": "State",
+          "description": "Attack temporal correctness, races, leases, locks, and lifecycle transitions.",
+          "ticket_prefix": "STATE-",
+          "wave_header": "AUDIT STATE / CONCURRENCY / LIFECYCLE",
+          "terminal_status_key": "AUDIT_STATE",
+          "status_line": "STATUS: AUDIT_STATE: COMPLETE",
+          "done_marker": "STATE_DONE_WHEN:",
+          "prompt_focus": "TEMPORAL CORRECTNESS, CONCURRENCY & LIFECYCLE:\nInspect lifecycle, ownership, repeated invocation, double dispatch, race conditions, stale async completion, cancellation, idempotence, leases, locks, fencing, timers, observers, event subscriptions, startup/shutdown, restart, tab/process concurrency, state machine invalid transitions, teardown, generation counters, and transactional boundaries.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [STATE-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with STATE_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED STATE/LIFECYCLE DEFECTS."
+        },
+        {
+          "id": "recovery",
+          "ordinal": 4,
+          "number": "04",
+          "slug": "AUDIT_RECOVERY",
+          "title": "AUDIT FAILURE / RECOVERY / PERSISTENCE",
+          "short_label": "Rec",
+          "description": "Assume everything fails at inconvenient moments: crashes, partial writes, offline, and rollback.",
+          "ticket_prefix": "REC-",
+          "wave_header": "AUDIT FAILURE / RECOVERY / PERSISTENCE",
+          "terminal_status_key": "AUDIT_RECOVERY",
+          "status_line": "STATUS: AUDIT_RECOVERY: COMPLETE",
+          "done_marker": "REC_DONE_WHEN:",
+          "prompt_focus": "FAULT INJECTION, RESILIENCE & PERSISTENCE:\nInspect crashes between steps, interrupted writes, filesystem unavailable, malformed persisted state, partial transactions, reload/restart recovery, timeout, retry storms, offline operations, resumed operations, lost/duplicate responses, stale queue entries, broken caches, failed migrations, recovery ordering, rollback, error masking, and fail-open vs fail-closed behaviors.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [REC-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with REC_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED RECOVERY/PERSISTENCE DEFECTS."
+        },
+        {
+          "id": "security",
+          "ordinal": 5,
+          "number": "05",
+          "slug": "AUDIT_SECURITY",
+          "title": "AUDIT SECURITY / TRUST BOUNDARIES",
+          "short_label": "Sec",
+          "description": "Local and application security, trust boundaries, injection, credentials, and containment.",
+          "ticket_prefix": "SEC-",
+          "wave_header": "AUDIT SECURITY / TRUST BOUNDARIES",
+          "terminal_status_key": "AUDIT_SECURITY",
+          "status_line": "STATUS: AUDIT_SECURITY: COMPLETE",
+          "done_marker": "SEC_DONE_WHEN:",
+          "prompt_focus": "SECURITY, TRUST BOUNDARIES & INPUT HYGIENE:\nInspect untrusted input, path traversal, archive traversal, filesystem containment, command invocation, shell quoting, secret/token handling, auth, identity confusion, project/run binding, local HTTP Bridge security, unsafe deserialization, injection, permissions, symlinks, unsafe defaults, exposed credentials, temporary file hygiene, and TOCTOU vulnerabilities.\nOnly verified, plausible defects become tickets.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [SEC-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with SEC_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED SECURITY DEFECTS."
+        },
+        {
+          "id": "integration",
+          "ordinal": 6,
+          "number": "06",
+          "slug": "AUDIT_INTEGRATION",
+          "title": "AUDIT INTEGRATION / COMPATIBILITY / PACKAGING",
+          "short_label": "Int",
+          "description": "Cross-subsystem seams, API contracts, GUI/service/widget bridge, packaging, and platform behavior.",
+          "ticket_prefix": "INT-",
+          "wave_header": "AUDIT INTEGRATION / COMPATIBILITY / PACKAGING",
+          "terminal_status_key": "AUDIT_INTEGRATION",
+          "status_line": "STATUS: AUDIT_INTEGRATION: COMPLETE",
+          "done_marker": "INT_DONE_WHEN:",
+          "prompt_focus": "SUBSYSTEM SEAMS, COMPATIBILITY & PACKAGING:\nInspect API contracts, CLI, GUI <-> service, Widget <-> Bridge, Bridge <-> registry, persistence <-> indexer, project moves across groups, config schemas, backward compatibility, Windows-specific behavior, launchers, packaged archive behavior, install/update, optional dependencies, path rules, legacy formats, version negotiation, and cross-component assumptions.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [INT-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with INT_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state",
+            "recovery"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED INTEGRATION DEFECTS."
+        },
+        {
+          "id": "verification",
+          "ordinal": 7,
+          "number": "07",
+          "slug": "AUDIT_VERIFICATION",
+          "title": "AUDIT TESTS / CONTRACTS / OBSERVABILITY",
+          "short_label": "Test",
+          "description": "Verification system strength, regression coverage gaps, false-positives, and diagnostics.",
+          "ticket_prefix": "TEST-",
+          "wave_header": "AUDIT TESTS / CONTRACTS / OBSERVABILITY",
+          "terminal_status_key": "AUDIT_VERIFICATION",
+          "status_line": "STATUS: AUDIT_VERIFICATION: COMPLETE",
+          "done_marker": "TEST_DONE_WHEN:",
+          "prompt_focus": "TEST REALITY, VERIFICATION GAPS & OBSERVABILITY:\nInspect missing regression tests for demonstrated failures, tests asserting obsolete behavior, false-positive tests, tests coupled to implementation details instead of invariants, fixture drift, platform gaps, CI differences, error diagnostics, useful logging, operator-visible failure states, health endpoints, recovery diagnostics, and silent failure paths.\nEach ticket must protect a concrete important invariant.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [TEST-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with TEST_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state",
+            "recovery"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED TEST/OBSERVABILITY DEFECTS."
+        },
+        {
+          "id": "performance",
+          "ordinal": 8,
+          "number": "08",
+          "slug": "AUDIT_PERFORMANCE",
+          "title": "AUDIT PERFORMANCE / SCALABILITY / RESOURCE BOUNDS",
+          "short_label": "Perf",
+          "description": "Deep performance sweep, hot paths, O(n^2), reflow thrash, and resource scaling.",
+          "ticket_prefix": "PERF-",
+          "wave_header": "AUDIT PERFORMANCE / SCALABILITY / RESOURCE BOUNDS",
+          "terminal_status_key": "AUDIT_PERFORMANCE",
+          "status_line": "STATUS: AUDIT_PERFORMANCE: COMPLETE",
+          "done_marker": "PERF_DONE_WHEN:",
+          "prompt_focus": "PERFORMANCE, SCALABILITY & RESOURCE BOUNDS:\nInspect hot paths, repeated scans, O(n^2), parsing, serialization, hashing, filesystem calls, DOM scans, reflow, rerender, timers, observers, queues, caches, allocations, retained objects, detached DOM, large strings, startup work, polling, background tasks, scaling to stress project counts, long-running browser sessions, and memory growth.\nClassify: PROVEN BOTTLENECK | STRONGLY EVIDENCED WASTE | LOW-RISK SIMPLIFICATION.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [PERF-001] <CLASS> <path/symbol> (EVIDENCE, ISSUE, OPTIMIZE, GUARDRAIL, VERIFY). End with PERF_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "ISSUE",
+            "OPTIMIZE",
+            "GUARDRAIL",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO MATERIAL PERFORMANCE/SCALABILITY FINDINGS."
+        },
+        {
+          "id": "operator",
+          "ordinal": 9,
+          "number": "09",
+          "slug": "AUDIT_OPERATOR",
+          "title": "AUDIT UX / OPERATOR EFFECTIVENESS / MAINTAINABILITY",
+          "short_label": "UX",
+          "description": "Operator effectiveness, real state vs UI state, recovery discoverability, and maintenance hazards.",
+          "ticket_prefix": "UX-",
+          "wave_header": "AUDIT UX / OPERATOR EFFECTIVENESS / MAINTAINABILITY",
+          "terminal_status_key": "AUDIT_OPERATOR",
+          "status_line": "STATUS: AUDIT_OPERATOR: COMPLETE",
+          "done_marker": "UX_DONE_WHEN:",
+          "prompt_focus": "OPERATOR ACCURACY, UI/REAL-STATE AGREEMENT & MAINTENANCE TRAPS:\nInspect UI state vs real state, stale progress, incorrect badges, misleading completion, destructive ambiguity, keyboard/mouse flows, recovery discoverability, status messages, long operations, disabled states, duplicate actions, configuration clarity, copy/save semantics, error surfacing, project identity, obsolete UI branches, dead compatibility code, duplicated logic likely to drift, and maintenance hazards with demonstrated correctness impact.\nDo NOT create aesthetic preference tickets.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. Tickets: [P0|P1|P2] [UX-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with UX_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state",
+            "integration"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "standard",
+          "finalizer": false,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED OPERATOR/MAINTAINABILITY DEFECTS."
+        },
+        {
+          "id": "redteam",
+          "ordinal": 10,
+          "number": "10",
+          "slug": "AUDIT_REDTEAM",
+          "title": "AUDIT ADVERSARIAL SYNTHESIS / BLIND-SPOT SWEEP",
+          "short_label": "Red",
+          "description": "Campaign finalizer: cross-wave synthesis, blind spots, root-cause deduplication, and implementation handoff.",
+          "ticket_prefix": "RED-",
+          "wave_header": "AUDIT ADVERSARIAL SYNTHESIS / BLIND-SPOT SWEEP",
+          "terminal_status_key": "AUDIT_REDTEAM",
+          "status_line": "STATUS: AUDIT_REDTEAM: COMPLETE",
+          "done_marker": "RED_DONE_WHEN:",
+          "prompt_focus": "ADVERSARIAL SYNTHESIS, BLIND SPOTS & ROOT-CAUSE DEDUPLICATION:\nConsume all 9 prior completed handoffs and current project revision.\n1. Detect blind spots left by Waves 1-9.\n2. Challenge assumptions shared by multiple waves.\n3. Cross-check subsystem interactions.\n4. Search for defects requiring combined cross-domain evidence.\n5. Deduplicate earlier tickets by ROOT CAUSE.\n6. Detect conflicting repair recommendations and resolve them.\n7. Establish implementation repair order.\n8. Identify tickets obsoleted by deeper root causes.\n9. Identify residual unverified surface.\n10. Emit the final implementation-ready handoff block.",
+          "prompt_output_contract": "Return ONE code block only. Header + coverage ledger. If new defects verified: [P0|P1|P2] [RED-001] <path/symbol>. THEN produce the FINAL DEDUPLICATED IMPLEMENTATION HANDOFF SECTION (SUPER_AUDIT_STATUS, SOURCE_WAVES: 10/10, SOURCE_TICKETS, ROOT_TICKETS, root-cause [SA-001] tickets, IMPLEMENTATION_ORDER, CONFLICTS_RESOLVED, UNVERIFIED_SURFACE, RESIDUAL_RISK, SUPER_AUDIT_DONE_WHEN). End with RED_DONE_WHEN.",
+          "depends_on": [
+            "architecture",
+            "correctness",
+            "state",
+            "recovery",
+            "security",
+            "integration",
+            "verification",
+            "performance",
+            "operator"
+          ],
+          "required": true,
+          "max_partial_continuations": 5,
+          "max_stall_recoveries": 3,
+          "max_retry_clicks": 2,
+          "max_continue_generating_clicks": 3,
+          "synthesis_role": "finalizer",
+          "finalizer": true,
+          "ticket_fields": [
+            "EVIDENCE",
+            "DEFECT",
+            "REPAIR",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO NEW VERIFIED REDTEAM DEFECTS."
+        }
+      ]
+    }
+  }
+});
+  // END_EMBEDDED_AUDIT_PROFILES
+
+  function detectProfileFromTurns(turns = null) {
+    const list = turns || (typeof getChatGPTTurns === 'function' ? getChatGPTTurns() : []);
+    for (const turn of list) {
+      if (typeof turnRole === 'function' && turnRole(turn) !== 'user') continue;
+      const text = typeof getTurnText === 'function' ? getTurnText(turn) : '';
+      if (!text) continue;
+      if (
+        text.includes('__04_AUDIT_DATA_INTEGRITY') ||
+        text.includes('__05_AUDIT_CONCURRENCY') ||
+        text.includes('__06_AUDIT_NETWORK') ||
+        text.includes('__07_AUDIT_OBSERVABILITY') ||
+        text.includes('__08_AUDIT_RESILIENCE') ||
+        text.includes('__09_AUDIT_SECURITY') ||
+        text.includes('__10_AUDIT_DEEP_SYNTHESIS') ||
+        text.includes('CAMPAIGN_PROFILE: super10') ||
+        text.includes('WAVE: AUDIT DATA INTEGRITY') ||
+        text.includes('WAVE: AUDIT CONCURRENCY') ||
+        text.includes('WAVE: AUDIT NETWORK') ||
+        text.includes('WAVE: AUDIT OBSERVABILITY') ||
+        text.includes('WAVE: AUDIT RESILIENCE') ||
+        text.includes('WAVE: AUDIT DEEP SYNTHESIS') ||
+        text.includes('of Super10 Deep Audit')
+      ) {
+        return 'super10';
+      }
+    }
+    return 'quick3';
+  }
+
+  function getActiveProfile() {
+    let profId = autoRuntime && autoRuntime.profileId;
+    if (!profId) {
+      if (autoRuntime) {
+        const waveKeys = Object.keys(autoRuntime.waveUserIds || {});
+        const hasSuperKeys = waveKeys.some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k));
+        if (hasSuperKeys) {
+          profId = 'super10';
+        } else if (waveKeys.length > 0 || autoRuntime.coreUserId || autoRuntime.secondUserId || autoRuntime.performanceUserId) {
+          profId = 'quick3';
+        }
+      }
+      if (!profId && typeof getChatGPTTurns === 'function') {
+        const detected = detectProfileFromTurns();
+        if (detected) profId = detected;
+      }
+      if (!profId) {
+        profId = (state && state.auditProfile) || 'quick3';
+      }
+    }
+    const profs = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    return profs[profId] || profs.quick3 || profs.super10;
+  }
+
+  function findWaveDefinitionForStageOrKind(target) {
+    if (!target) return null;
+    const clean = String(target).toLowerCase().replace(/^wait-/, '').replace(/^sending-/, '').replace(/^await-/, '').replace(/-user$/, '');
+    const profs = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    const activeProf = getActiveProfile();
+    for (const w of (activeProf.waves || [])) {
+      if (w.id === clean || w.slug.toLowerCase() === clean || String(w.ordinal) === clean || w.number === clean) return w;
+    }
+    for (const pid of Object.keys(profs)) {
+      for (const w of (profs[pid].waves || [])) {
+        if (w.id === clean || w.slug.toLowerCase() === clean || String(w.ordinal) === clean || w.number === clean) return w;
+      }
+    }
+    return null;
+  }
+
+  function isValidAuditWaveKind(kind) {
+    if (!kind) return false;
+    if (['core', 'second', 'performance'].includes(kind)) return true;
+    return Boolean(findWaveDefinitionForStageOrKind(kind));
+  }
+
+  function isValidAutoStage(stage) {
+    if (!stage || typeof stage !== 'string') return false;
+    if (['idle', 'complete', 'paused', 'sending-continuation', 'await-continuation-user'].includes(stage)) return true;
+    if (stage.startsWith('wait-') || stage.startsWith('sending-') || stage.startsWith('await-')) {
+      const clean = stage.replace(/^wait-/, '').replace(/^sending-/, '').replace(/^await-/, '').replace(/-user$/, '');
+      if (isValidAuditWaveKind(clean)) return true;
+    }
+    return false;
+  }
+
+  const SHARED_AUDIT_PROTOCOL = `ROLE
+
+You are the AUDITOR, not the implementation agent.
+
+Inspect the supplied project deeply, identify verified flaws, and return a high-value repair handoff for a separate implementation agent. Do not modify the audited implementation or project metadata during this pass.
+
+TARGET
+
+Resolve the most recent explicit implementation target in the conversation: repository, archive, project tree, attached file, or pasted code.
+
+Prefer the newest explicit target when several exist.
+
+Repository: inspect the current supplied/default revision unless the user explicitly names another branch/commit.
+Archive: unpack fully and identify the real project root.
+Single file: inspect the complete supplied file and directly relevant local contracts/dependencies when available.
+
+If the target itself cannot actually be read, return BLOCKED with the exact missing artifact/access. Do not invent evidence.
+
+PROJECT ORIENTATION — FAST, READ-ONLY, NON-BLOCKING
+
+Before deep audit, spend a small bounded setup pass understanding the project itself.
+At the resolved project root, inspect only when they exist:
+- \`.saipen/\`: root project STATE/BOARD/LOG plus relevant KNOWLEDGE material as work-state context.
+- Git: standard metadata/commands when available (HEAD, branch, status, recent log/diff). Never crawl \`.git/objects\`.
+- Manifests and lockfiles: package.json, Cargo.toml, pyproject.toml, requirements, go.mod, solution/project files, etc.
+- Tests/fixtures, migrations, schemas, config, contracts, CI/workflow files, entry points.
+
+Live implementation files are authoritative for current behavior.
+
+QUALITY BAR
+
+- Evidence before finding.
+- Root cause before symptom.
+- Merge symptoms sharing one root cause.
+- Preserve correct behavior.
+- No generic cleanup or speculative redesign.
+- Never fabricate commands, output, test results, timings, paths, commits or reproduction evidence.
+- Use PARTIAL only when the wave genuinely cannot finish within the current execution/context budget. PARTIAL is a resumable machine checkpoint; finish the current evidence cleanly and expect an automatic same-wave continuation.
+- Do not interact with external accounts, services, hosts, endpoints or infrastructure. Local inspection and tests are allowed when available.
+
+TEST EXECUTION / ENVIRONMENT LIMITS
+
+Classify verification truthfully:
+- TEST_PASSED = relevant intended tests ran and passed.
+- TEST_FAILED = relevant test ran and failed due to project behavior.
+- TEST_PARTIAL = only part of intended verification could run.
+- TEST_NOT_RUN_ENVIRONMENT = tests could not run because sandbox lacks external prerequisite.
+- TEST_NOT_APPLICABLE = no meaningful runnable test for this surface.
+
+PRIORITY
+
+P0 = data corruption/loss, severe safety/security defect, crash/unusable primary flow, or fundamental correctness failure.
+P1 = significant functional defect, lifecycle/recovery/integration failure, or high-probability user breakage.
+P2 = lower-impact defect, concrete maintainability drift likely to cause failure, or missing regression coverage.`;
+
+  function buildAuditWavePrompt(profile, waveDef, context = {}) {
+    if (!profile || !waveDef) return '';
+    const isSuper10 = profile.profile_id === 'super10';
+    const isFinalizer = Boolean(waveDef.finalizer || waveDef.synthesis_role === 'finalizer');
+    const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+
+    const lines = [];
+    lines.push(`${waveDef.title} — wave ${waveDef.ordinal}/${profile.waves.length} of ${profile.display_name}.\n`);
+    lines.push(SHARED_AUDIT_PROTOCOL);
+    lines.push(`\nWAVE OBJECTIVE & FOCUS\n\n${waveDef.prompt_focus}\n`);
+    lines.push(`OUTPUT CONTRACT\n\n${waveDef.prompt_output_contract}\n`);
+
+    lines.push(`REQUIRED HANDOFF HEADER (Return ONE code block only):\n`);
+    lines.push(`PROJECT_NAME: <name>`);
+    lines.push(`DATE_TIME: <ISO-8601 or local date-time>`);
+    lines.push(`CAMPAIGN_PROFILE: ${profile.profile_id}`);
+    lines.push(`CAMPAIGN_PROFILE_VERSION: ${profile.profile_version}`);
+    lines.push(`CAMPAIGN_RUN_ID: <run-id>`);
+    lines.push(`CAMPAIGN_MANIFEST_SHA256: ${AUDIT_PROFILES_MANIFEST_SHA256}`);
+    lines.push(`WAVE_ID: ${waveDef.id}`);
+    lines.push(`WAVE_INDEX: ${waveDef.ordinal}`);
+    lines.push(`WAVE_COUNT: ${profile.waves.length}`);
+    lines.push(`WAVE: ${waveDef.wave_header}`);
+    lines.push(`TARGET: <inspected target/repo/file>`);
+    lines.push(`BASELINE: <identity>`);
+    lines.push(`PREVIOUS_WAVE_SHA256: <SHA-256 or NONE>`);
+    lines.push(`GIT_CONTEXT: <PRESENT branch@commit | ABSENT | UNREADABLE> - <brief note>`);
+    lines.push(`SAIPEN_CONTEXT: <PRESENT | ABSENT | STALE | UNREADABLE> - <brief note>`);
+    lines.push(`AUDIT_SCOPE: <compact areas inspected>`);
+    lines.push(`TEST_STATUS: <TEST_PASSED | TEST_FAILED | TEST_PARTIAL | TEST_NOT_RUN_ENVIRONMENT | TEST_NOT_APPLICABLE>`);
+    lines.push(`TEST_LIMITATION: <NONE | exact prerequisite + command/error>`);
+    lines.push(`VERIFIED_INSTEAD: <NONE | concise verification performed>`);
+    lines.push(`${waveDef.status_line}`);
+    lines.push(`TICKETS: <count>`);
+    lines.push(`HANDOFF: IMPLEMENTATION_AGENT`);
+    lines.push(`COVERAGE_INSPECTED: <inspected files/symbols>`);
+    lines.push(`COVERAGE_DEFERRED: <deferred areas>`);
+    lines.push(`CROSS_WAVE_REFERENCES: <relevant findings from prior waves>`);
+    lines.push(`RESIDUAL_UNCERTAINTY: <known uncertainties>\n`);
+
+    lines.push(`Then tickets in priority order ([P0|P1|P2] [${pfx}-001] <path/symbol> with ${waveDef.ticket_fields.join(', ')}).`);
+    lines.push(`If no defects exist:\nTICKETS: 0\n${waveDef.no_findings_marker || `NO VERIFIED ${pfx} DEFECTS.`}\n`);
+
+    if (isFinalizer && isSuper10) {
+      lines.push(`FINAL DEDUPLICATED IMPLEMENTATION HANDOFF SECTION (Required for Red Team / Finalizer):\n`);
+      lines.push(`SUPER_AUDIT_STATUS: COMPLETE`);
+      lines.push(`SOURCE_WAVES: 10/10`);
+      lines.push(`SOURCE_TICKETS: <total raw tickets>`);
+      lines.push(`ROOT_TICKETS: <deduplicated root causes>`);
+      lines.push(`Then deduplicated root-cause tickets ([P0|P1|P2] [SA-001] <path/symbol> with ROOT_CAUSE, EVIDENCE, REPAIR, VERIFY, OBSOLETES).`);
+      lines.push(`IMPLEMENTATION_ORDER: <ordered step list>`);
+      lines.push(`CONFLICTS_RESOLVED: <reconciled repair proposals>`);
+      lines.push(`UNVERIFIED_SURFACE: <remaining unverified modules>`);
+      lines.push(`RESIDUAL_RISK: <residual risk summary>`);
+      lines.push(`SUPER_AUDIT_DONE_WHEN: <final verification criteria>\n`);
+    }
+
+    lines.push(`End:\n${waveDef.done_marker} <compact verification gate>\n\nNo prose outside the code block.`);
+    return lines.join('\n');
+  }
 
   const CHAT_RENAME_MAX_ATTEMPTS = 7;
   const CHAT_TITLE_GUARD_DELAYS_MS = Object.freeze([350, 1200, 4000, 15000, 60000, 300000]);
@@ -137,7 +816,16 @@
   const AUDIT_ATTACHMENT_FILES = Object.freeze({
     core: 'AUDIT_CORE.md',
     second: 'AUDIT_SECOND_WAVE.md',
-    performance: 'AUDIT_PERFORMANCE.md'
+    performance: 'AUDIT_PERFORMANCE.md',
+    architecture: 'AUDIT_ARCHITECTURE.md',
+    correctness: 'AUDIT_CORRECTNESS.md',
+    state: 'AUDIT_STATE.md',
+    recovery: 'AUDIT_RECOVERY.md',
+    security: 'AUDIT_SECURITY.md',
+    integration: 'AUDIT_INTEGRATION.md',
+    verification: 'AUDIT_VERIFICATION.md',
+    operator: 'AUDIT_OPERATOR.md',
+    redteam: 'AUDIT_REDTEAM.md'
   });
 
   const AUDIT_CORE = "AUDIT CORE — deep read-only software correctness audit for implementation handoff.\n\nROLE\n\nYou are the AUDITOR, not the implementation agent.\n\nInspect the supplied project deeply, identify verified flaws, and return a high-value repair handoff for a separate implementation agent. Do not modify the audited implementation or project metadata during this pass.\n\nTARGET\n\nResolve the most recent explicit implementation target in the conversation: repository, archive, project tree, attached file, or pasted code.\n\nPrefer the newest explicit target when several exist.\n\nRepository: inspect the current supplied/default revision unless the user explicitly names another branch/commit.\nArchive: unpack fully and identify the real project root.\nSingle file: inspect the complete supplied file and directly relevant local contracts/dependencies when available.\n\nIf the target itself cannot actually be read, return BLOCKED with the exact missing artifact/access. Do not invent evidence.\n\nPROJECT ORIENTATION — FAST, READ-ONLY, NON-BLOCKING\n\nBefore the deep code audit, spend a small bounded setup pass understanding the project itself.\n\nAt the resolved project root, inspect these only when they exist:\n\n- `.saipen/`: root project STATE/BOARD/LOG plus only relevant KNOWLEDGE/kitchen material. Use it as optional historical/work-state context: prior fixes, known failures, active tasks, stale assumptions, baseline drift.\n- Git: use ordinary Git metadata/commands when available (HEAD, branch, status, useful recent history/diff). Do NOT crawl `.git/objects` or spend audit budget reading Git internals.\n- project manifests and lockfiles: package.json, Cargo.toml, pyproject.toml, requirements, go.mod, solution/project files, build config, etc.;\n- tests/fixtures, migrations, schemas, config, docs/contracts, CI/workflow files, scripts and entry points when relevant;\n- other project-local helper/state directories only when they materially explain runtime behavior.\n\nThese sources are ORIENTATION, not gates.\n\nRules:\n- `.saipen/`, Git, docs, tests, manifests, CI or helper folders may be absent. Continue normally.\n- Do not require an external SAIPEN installation, `saipen_home`, BOOT/CORE/MARKHUNT files, validator, portable protocol bundle, or any other out-of-project authority.\n- Do not initialize, repair, rebind, validate or modify `.saipen/`.\n- If `.saipen/` is stale, contradictory, incomplete, or references inaccessible external paths, record that briefly and continue.\n- Live implementation files are authoritative for current behavior.\n- Do not let project-management metadata consume the audit budget. The implementation is the primary target.\n\nBASELINE\n\nRecord the strongest truthful identity available:\n- Git: branch + current commit when readable;\n- archive: archive filename + hash/fingerprint when available;\n- file: filename + hash/fingerprint when available;\n- otherwise the clearest stable identity available.\n\nAUDIT METHOD\n\nBuild a compact map first:\n\nentry points -> parsing/validation -> state owners -> transitions -> core logic -> persistence/I/O -> recovery/error paths -> UI/output -> tests/contracts.\n\nThen follow real execution/data/state paths end-to-end. Audit correctness before style.\n\nHUNT VERIFIED ROOT DEFECTS\n\nPrioritize:\n- broken invariants and contradictory logic;\n- wrong defaults, branches, ordering or state transitions;\n- missing/incorrect validation and invalid partial-state handling;\n- duplicate/competing sources of truth;\n- duplicated implementations whose behavior can drift;\n- dead/unreachable/stale compatibility paths that still affect runtime;\n- partial migrations and config/schema/version drift;\n- persistence, serialization, import/export, restart, recovery and data-loss faults;\n- init/shutdown/teardown/ownership mistakes;\n- concurrency, repeated invocation, stale async result, retry, cancellation and idempotence faults where applicable;\n- UI state disagreeing with runtime state;\n- stale/replaced targets and incorrect fallback selection;\n- API/CLI/docs/config/tests contradicting actual execution;\n- tests that protect the wrong invariant or fail to cover a demonstrated failure.\n\nQUALITY BAR\n\n- Evidence before finding.\n- Root cause before symptom.\n- Merge symptoms sharing one root cause.\n- Preserve correct behavior.\n- No generic cleanup.\n- No speculative redesign.\n- No framework/dependency/telemetry/dashboard proposals unless required by a verified defect.\n- Never fabricate commands, output, test results, timings, paths, commits or reproduction evidence.\n- Use PARTIAL only when the wave genuinely cannot finish within the current execution/context budget. PARTIAL is a resumable machine checkpoint, not a request for user intervention; finish the current evidence cleanly and expect an automatic same-wave continuation.\n- Do not interact with external accounts, services, hosts, endpoints or infrastructure. Local/static project inspection and ordinary project tests are allowed when available and relevant.\n\nTEST EXECUTION / ENVIRONMENT LIMITS\n\nTreat test execution as evidence, not as an artificial gate that can invalidate an otherwise useful audit.\n\nClassify verification truthfully:\n- TEST_PASSED = the relevant intended tests/checks actually ran and passed.\n- TEST_FAILED = a relevant test/check actually ran and failed because of project behavior.\n- TEST_PARTIAL = only part of the relevant intended verification could run.\n- TEST_NOT_RUN_ENVIRONMENT = the intended relevant tests could not start/run because this execution environment lacks an external prerequisite.\n- TEST_NOT_APPLICABLE = there is no meaningful runnable test/check for this audited surface.\n\nEnvironment limitations include unavailable third-party packages, GUI/runtime/display facilities, system libraries, platform capabilities, network/package-install access, toolchains, services, or other prerequisites outside the supplied project.\n\nRules:\n- A dependency that the project correctly declares but this sandbox does not provide is an ENVIRONMENT LIMITATION, not a project defect.\n- If the implementation requires a dependency but the project itself fails to declare/package/document it where its normal runtime/build contract requires that declaration, that may be a real project defect when verified.\n- Do not fabricate a red/green test result for a command that never actually ran.\n- Do not label the whole audit BLOCKED merely because the complete test suite cannot execute. Continue with every meaningful verification still available.\n- Run unaffected tests/checks that do not require the missing prerequisite when practical.\n- Use static inspection, compile/type/syntax checks, focused pure-logic tests, fixture analysis, or other local verification as substitutes where they materially increase confidence.\n- Record the exact unavailable prerequisite and the exact command/error that prevented execution when known.\n- Reduce confidence only for findings whose verification materially depends on the unavailable capability.\n- Do not weaken, skip, rewrite, or make legitimate project tests optional merely to accommodate this sandbox.\n- Do not repeatedly burn audit budget trying the same unavailable installation/setup path. At most one bounded setup attempt is appropriate when the environment clearly supports it and the project declares the setup path.\n- Missing environment capability must never become a fake project ticket merely to make the audit look complete.\n- PARTIAL audit status is for an actually unfinished AUDIT WAVE due to execution/context budget, not merely for partial TEST COVERAGE. A wave may be STATUS ... COMPLETE while TEST_STATUS is TEST_PARTIAL or TEST_NOT_RUN_ENVIRONMENT if the code audit itself is complete and the limitation is explicitly recorded.\n\nEFFICIENCY\n\nDo not read the project alphabetically and do not repeatedly rescan stable areas.\n\nSpend most analysis on state ownership, transitions, persistence, lifecycle, routing, recovery, user-visible behavior and code implicated by real execution paths.\n\nSkip generated/vendor/build/cache output unless runtime or evidence makes it relevant.\n\nPRIORITY\n\nP0 = data corruption/loss, severe local safety/security defect, crash/unusable primary flow, or fundamental correctness failure.\nP1 = significant functional defect, lifecycle/recovery/integration failure, or high-probability user-visible breakage.\nP2 = lower-impact but real defect, concrete maintainability drift likely to cause failure, or missing regression coverage for a verified issue.\n\nFINAL HANDOFF\n\nReturn ONE code block only. It must be directly usable by a separate implementation agent without needing the audit conversation.\n\nHeader exactly:\n\nPROJECT_NAME: <name>\nDATE_TIME: <current session/local date-time when available; otherwise UTC>\nWAVE: AUDIT CORE\nTARGET: <what artifact/project was actually inspected>\nBASELINE: <identity>\nGIT_CONTEXT: <PRESENT branch@commit | ABSENT | UNREADABLE> - <brief note>\nSAIPEN_CONTEXT: <PRESENT | ABSENT | STALE | UNREADABLE> - <brief useful note>\nAUDIT_SCOPE: <compact modules/areas actually inspected>\nTEST_STATUS: <TEST_PASSED | TEST_FAILED | TEST_PARTIAL | TEST_NOT_RUN_ENVIRONMENT | TEST_NOT_APPLICABLE>\nTEST_LIMITATION: <NONE | exact unavailable prerequisite + command/error>\nVERIFIED_INSTEAD: <NONE | concise alternative verification actually performed>\nSTATUS: AUDIT_CORE: <COMPLETE | PARTIAL | BLOCKED>\nTICKETS: <count>\nHANDOFF: IMPLEMENTATION_AGENT\n\nThen tickets in priority order. Each ticket must use:\n\n[P0|P1|P2] [CORE-001] <path/module/symbol>\nEVIDENCE: <specific code/path/behavior proving the issue>\nDEFECT: <root cause and concrete consequence>\nREPAIR: <smallest correct implementation change; name exact areas when established>\nVERIFY: <specific regression test/check that proves the repair without breaking correct behavior>\n\nUse CORE-001, CORE-002... only within this handoff. One root cause per ticket.\n\nIf no verified defects exist:\nTICKETS: 0\nNO VERIFIED CORE DEFECTS.\n\nEnd:\nCORE_DONE_WHEN: <compact explicit implementation + verification gate>\n\nNo prose outside the code block.";
@@ -302,65 +990,87 @@
 }
 
 #acb-super-brand {
-  flex: 1 1 82px !important;
+  flex: 0 0 auto !important;
   width: auto !important;
-  min-width: 30px !important;
-  max-width: 100px !important;
-  color: var(--textPrimary) !important;
-  font-size: 10px !important;
+  min-width: 24px !important;
+  max-width: 130px !important;
+  color: var(--borderHighlight) !important;
+  font-size: 11px !important;
   font-weight: 700 !important;
   text-align: left !important;
   white-space: nowrap !important;
   overflow: hidden !important;
   text-overflow: ellipsis !important;
+  padding: 0 2px !important;
 }
 
 #acb-super-auto-label {
-  flex: 0 0 18px !important;
-  width: 18px !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
   height: 18px !important;
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
   margin: 0 !important;
-  padding: 0 !important;
+  padding: 0 1px !important;
   cursor: pointer !important;
 }
 
 #acb-popup #acb-super-enabled {
-  width: 14px !important;
-  min-width: 14px !important;
-  max-width: 14px !important;
-  height: 14px !important;
-  min-height: 14px !important;
+  width: 13px !important;
+  min-width: 13px !important;
+  max-width: 13px !important;
+  height: 13px !important;
+  min-height: 13px !important;
   margin: 0 !important;
   padding: 0 !important;
   accent-color: var(--accentTeal) !important;
-  appearance: auto !important;
-  border: 0 !important;
-  background: transparent !important;
+  cursor: pointer !important;
 }
 
 #acb-super-progress {
-  flex: 0 0 66px !important;
-  width: 66px !important;
+  flex: 0 0 auto !important;
   height: 18px !important;
-  display: grid !important;
-  grid-template-columns: repeat(3, 1fr) !important;
+  display: flex !important;
+  align-items: center !important;
   gap: 2px !important;
 }
 
+#acb-super-profile-toggle {
+  flex: 0 0 auto !important;
+  min-width: 24px !important;
+  height: 18px !important;
+  padding: 0 3px !important;
+  background: var(--surfaceRaised) !important;
+  color: var(--borderHighlight) !important;
+  border: 1px solid var(--bevelLight) !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  line-height: 16px !important;
+  cursor: pointer !important;
+}
+
+#acb-super-profile-toggle:hover {
+  background: var(--surfaceAlt) !important;
+}
+
+#acb-super-profile-toggle:active {
+  background: var(--surface) !important;
+  transform: translate(1px, 1px) !important;
+}
+
 .acb-super-step {
-  min-width: 0 !important;
+  min-width: 14px !important;
+  max-width: 18px !important;
   height: 18px !important;
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
-  padding: 0 !important;
+  padding: 0 1px !important;
   background: var(--compareBack) !important;
   color: var(--textMuted) !important;
   border: 1px solid var(--borderMuted) !important;
-  font-size: 10px !important;
+  font-size: 9px !important;
   font-weight: 700 !important;
   line-height: 1 !important;
 }
@@ -398,7 +1108,15 @@
 #acb-super-state[data-kind="warning"] { color: var(--borderHighlight) !important; }
 #acb-super-state[data-kind="error"] { color: var(--dangerText) !important; }
 
+#acb-popup[data-supercompact="true"] {
+  width: auto !important;
+  max-width: calc(100vw - 16px) !important;
+  height: 24px !important;
+  min-height: 24px !important;
+}
+
 #acb-popup[data-supercompact="true"] #acb-titlebar {
+  width: auto !important;
   height: 24px !important;
   min-height: 24px !important;
   gap: 3px !important;
@@ -408,6 +1126,7 @@
 
 #acb-popup[data-supercompact="true"] #acb-title,
 #acb-popup[data-supercompact="true"] #acb-site,
+#acb-popup[data-supercompact="true"] #acb-new-chat,
 #acb-popup[data-supercompact="true"] #acb-collapse,
 #acb-popup[data-supercompact="true"] #acb-tabs,
 #acb-popup[data-supercompact="true"] #acb-content,
@@ -420,8 +1139,8 @@
 }
 
 #acb-popup[data-supercompact="true"] #acb-super-toggle {
-  min-width: 36px !important;
-  width: 36px !important;
+  min-width: 32px !important;
+  width: 32px !important;
   height: 18px !important;
   min-height: 18px !important;
   padding: 1px 3px !important;
@@ -471,27 +1190,27 @@
    Keep this selector more specific than the generic #acb-popup button rule.
    The mini monitor must never inherit full-size button geometry. */
 #acb-popup[data-supercompact="true"] #acb-super-progress {
-  flex: 0 0 72px !important;
-  width: 72px !important;
-  min-width: 72px !important;
-  max-width: 72px !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
   height: 18px !important;
-  display: grid !important;
-  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  display: flex !important;
+  align-items: center !important;
   gap: 2px !important;
   overflow: visible !important;
 }
 
 #acb-popup[data-supercompact="true"] #acb-super-progress > .acb-super-step {
   box-sizing: border-box !important;
-  min-width: 0 !important;
+  min-width: 14px !important;
   max-width: none !important;
-  width: 100% !important;
+  width: auto !important;
   min-height: 18px !important;
   max-height: 18px !important;
   height: 18px !important;
   margin: 0 !important;
-  padding: 0 !important;
+  padding: 0 3px !important;
   border-width: 1px !important;
   font-size: 10px !important;
   line-height: 16px !important;
@@ -2445,6 +3164,7 @@
       superCompact: false,
       opacity: 100,
       panelSize: 'normal',
+      auditProfile: 'super10',
       autoAuditEnabled: false,
       autoAuditStrictGate: true,
       autoAuditDelayMs: 1200,
@@ -2625,6 +3345,9 @@
       panelSize: Object.prototype.hasOwnProperty.call(PANEL_SIZES, String(data.panelSize || ''))
         ? String(data.panelSize)
         : 'normal',
+      auditProfile: ['super10', 'quick3'].includes(String(data.auditProfile || ''))
+        ? String(data.auditProfile)
+        : 'super10',
       autoAuditEnabled: false, // legacy field retained for compatibility; per-chat runtime owns enablement
       autoAuditStrictGate: data.autoAuditStrictGate !== false,
       autoAuditDelayMs: AUTO_DELAYS_MS.includes(Number(data.autoAuditDelayMs))
@@ -2908,9 +3631,20 @@
   }
 
   function findAuditPreset(wave) {
-    for (const category of state.categories) {
+    if (!wave) return null;
+    for (const category of (state?.categories || [])) {
       const preset = category.presets.find(item => auditWaveForPreset(item) === wave);
       if (preset) return preset;
+    }
+    const waveDef = findWaveDefinitionForStageOrKind(wave);
+    if (waveDef) {
+      const prof = getActiveProfile();
+      return {
+        id: `auto-${waveDef.id}`,
+        name: waveDef.title,
+        desc: waveDef.description,
+        text: buildAuditWavePrompt(prof, waveDef)
+      };
     }
     return null;
   }
@@ -2919,11 +3653,13 @@
     const list = panel?.querySelector('#acb-audit-quick-list');
     if (!list) return;
 
-    const specs = [
-      { wave: 'core', index: '1', label: 'Audit Core', desc: 'Correctness + root causes' },
-      { wave: 'second', index: '2', label: 'Second Wave', desc: 'Edges + lifecycle + recovery' },
-      { wave: 'performance', index: '3', label: 'Performance', desc: 'Latency + stability + waste' }
-    ];
+    const prof = getActiveProfile();
+    const specs = prof.waves.map(w => ({
+      wave: w.id,
+      index: String(w.ordinal),
+      label: w.title,
+      desc: w.description
+    }));
 
     list.textContent = '';
     for (const spec of specs) {
@@ -3543,6 +4279,9 @@
 
   function auditKindFromStep(step) {
     const number = Number(step);
+    const prof = getActiveProfile();
+    const wave = (prof?.waves || []).find(w => w.ordinal === number);
+    if (wave) return wave.id;
     if (number === 1) return 'core';
     if (number === 2) return 'second';
     if (number === 3) return 'performance';
@@ -3550,6 +4289,8 @@
   }
 
   function auditWaveTitle(kind) {
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    if (waveDef) return waveDef.title || waveDef.wave_header;
     if (kind === 'core') return 'AUDIT CORE';
     if (kind === 'second') return 'AUDIT SECOND WAVE';
     if (kind === 'performance') return 'AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS';
@@ -3563,7 +4304,7 @@
   function readAuditResultFresh(kind, conversationKey = autoBoundConversationKey || currentConversationKey()) {
     const wantedKind = String(kind || '');
     const wantedConversationKey = String(conversationKey || '');
-    if (!['core', 'second', 'performance'].includes(wantedKind) || !wantedConversationKey) return null;
+    if (!isValidAuditWaveKind(wantedKind) || !wantedConversationKey) return null;
     const key = auditResultStorageKey(wantedConversationKey, wantedKind);
     try {
       const raw = GM_getValue(key, null);
@@ -3612,6 +4353,10 @@
     if (!wanted) {
       auditResultCache.clear();
       return;
+    }
+    const prof = getActiveProfile();
+    for (const w of prof.waves) {
+      auditResultCache.delete(auditResultStorageKey(wanted, w.id));
     }
     for (const kind of ['core', 'second', 'performance']) {
       auditResultCache.delete(auditResultStorageKey(wanted, kind));
@@ -4476,6 +5221,8 @@
   }
 
   function bridgeJobRequest(job) {
+    const waveDef = findWaveDefinitionForStageOrKind(job.wave);
+    const prof = getActiveProfile();
     return {
       api_version: BRIDGE_API_VERSION,
       receipt: job.receipt,
@@ -4484,7 +5231,14 @@
       project_id: job.projectId || '',
       project_name: job.project,
       project: job.project,
+      profile_id: job.profileId || prof.profile_id || 'super10',
+      profile_version: job.profileVersion || prof.profile_version || '1.0.0',
+      manifest_hash: AUDIT_PROFILES_MANIFEST_SHA256,
+      wave_id: job.wave,
       wave: job.wave,
+      wave_index: waveDef ? waveDef.ordinal : (job.waveIndex || 1),
+      wave_count: prof.waves ? prof.waves.length : (job.waveCount || 10),
+      predecessor_sha256: job.predecessorSha256 || '',
       status: 'complete',
       completed_at: new Date(job.completedAt || Date.now()).toISOString(),
       content: job.content
@@ -4868,6 +5622,19 @@
     return changed;
   }
 
+  function clearBridgeQueue(onlyFailed = false) {
+    let count = 0;
+    for (const job of listBridgeJobs()) {
+      if (onlyFailed && !job.permanent) continue;
+      if (deleteBridgeJob(job.jobId, { signal: false })) {
+        count += 1;
+      }
+    }
+    signalBridgeQueueChange();
+    renderAutoAuditState();
+    return count;
+  }
+
   async function checkBridge(options = {}) {
     if (!state?.bridgeEnabled) {
       bridgeState = 'disabled';
@@ -4916,7 +5683,11 @@
       return false;
     }
     const healthApi = Number(health.data?.api_version || 0);
-    if (healthApi && healthApi !== BRIDGE_API_VERSION) {
+    const supportedApis = Array.isArray(health.data?.supported_api_versions)
+      ? health.data.supported_api_versions.map(Number)
+      : (healthApi ? [healthApi] : []);
+    const isCompatible = supportedApis.includes(BRIDGE_API_VERSION) || supportedApis.includes(2) || healthApi === 2 || healthApi === 3;
+    if (healthApi && !isCompatible) {
       bridgeState = 'api_incompatible';
       bridgeMessage = `Bridge speaks API v${healthApi}; this widget requires v${BRIDGE_API_VERSION}. Update the other side.`;
       bridgeLastCheckedAt = Date.now();
@@ -4959,7 +5730,7 @@
       : 'Connected · automatic audit persistence ready.';
     renderAutoAuditState();
 
-    resetBridgeFailedJobs('invalid_auth');
+    resetBridgeFailedJobs('');
 
     if (!options.suppressFlush) {
       scheduleBridgeFlush(options.force ? 0 : 50);
@@ -6186,9 +6957,11 @@
       if (startIndex < 0) return { core: null, second: null, performance: null, blockedByReset: true };
     }
 
-    let core = null;
-    let second = null;
-    let performance = null;
+    const prof = getActiveProfile();
+    const waveSlots = {};
+    for (const w of prof.waves) {
+      waveSlots[w.id] = null;
+    }
 
     for (let index = startIndex + 1; index < turns.length; index += 1) {
       const turn = turns[index];
@@ -6198,9 +6971,7 @@
         // A non-audit user turn is a hard lineage barrier: a manual intervention
         // or repurposed conversation severs any in-progress audit chain instead
         // of stitching unrelated intents together. Assistant turns stay transparent.
-        core = null;
-        second = null;
-        performance = null;
+        for (const k of Object.keys(waveSlots)) waveSlots[k] = null;
         continue;
       }
 
@@ -6209,50 +6980,61 @@
       // deliberately non-resumable rather than guessed into a new run.
       if (auditTurnIsContinuation(turn)) continue;
 
-      if (kind === 'core') {
-        core = turn;
-        second = null;
-        performance = null;
-        continue;
+      const waveDef = findWaveDefinitionForStageOrKind(kind);
+      if (!waveDef) continue;
+
+      let depsSatisfied = true;
+      for (const depId of (waveDef.depends_on || [])) {
+        if (!waveSlots[depId]) {
+          depsSatisfied = false;
+          break;
+        }
       }
-      if (kind === 'second' && core) {
-        second = turn;
-        performance = null;
-        continue;
+
+      if (depsSatisfied) {
+        waveSlots[waveDef.id] = turn;
+        for (const w of prof.waves) {
+          if (w.ordinal > waveDef.ordinal) {
+            waveSlots[w.id] = null;
+          }
+        }
       }
-      if (kind === 'performance' && core && second) performance = turn;
     }
 
-    return { core, second, performance, blockedByReset: false };
+    return {
+      core: waveSlots.core || null,
+      second: waveSlots.second || null,
+      performance: waveSlots.performance || null,
+      ...waveSlots,
+      blockedByReset: false
+    };
   }
 
   function backfillVisibleCompletedAuditResults() {
     if (detectSite().key !== 'chatgpt') return 0;
     const turns = getChatGPTTurns();
     const lineage = visibleAuditLineage(turns);
-    if (lineage.blockedByReset || !lineage.core) return 0;
+    const prof = getActiveProfile();
+    const firstWave = prof.waves[0];
+    const firstTurn = firstWave ? (lineage[firstWave.id] || lineage.core) : lineage.core;
+    if (lineage.blockedByReset || !firstTurn) return 0;
 
     let captured = 0;
-    const specs = [
-      ['core', 'wait-core'],
-      ['second', 'wait-second'],
-      ['performance', 'wait-performance']
-    ];
-
-    for (const [kind, stage] of specs) {
-      const userTurn = lineage[kind];
+    for (const w of prof.waves) {
+      const userTurn = lineage[w.id] || (w.id === 'core' ? lineage.core : (w.id === 'second' ? lineage.second : (w.id === 'performance' ? lineage.performance : null)));
       if (!userTurn) continue;
 
       const sourceUserId = getTurnId(userTurn);
-      const existing = readAuditResult(kind);
+      const existing = readAuditResult(w.id);
       if (existing?.text && sourceUserId && existing.sourceUserId === sourceUserId) continue;
 
       const assistant = assistantTurnAfter(userTurn, turns);
       if (!assistant) continue;
+      const stage = `wait-${w.id}`;
       const gate = responseGateFromAssistantTurn(stage, assistant);
       if (gate.state !== 'complete' || !gate.text) continue;
 
-      if (captureCompletedAudit(kind, gate.text, 'complete', sourceUserId)) {
+      if (captureCompletedAudit(w.id, gate.text, 'complete', sourceUserId)) {
         captured += 1;
       }
     }
@@ -6268,10 +7050,14 @@
       version: 5,
       conversationKey: '',
       enabled: enabledDefault,
+      profileId: options.profileId || state?.auditProfile || 'quick3',
+      currentWaveIndex: 0,
+      currentWaveId: '',
       stage: 'idle',
       pausedFromStage: '',
       seenUserId: '',
       anchorUserId: '',
+      waveUserIds: {},
       coreUserId: '',
       secondUserId: '',
       performanceUserId: '',
@@ -6289,11 +7075,11 @@
       continuationKind: '',
       continuationReason: '',
       continuationPreviousUserId: '',
-      partialContinuations: { core: 0, second: 0, performance: 0 },
-      stallNudges: { core: 0, second: 0, performance: 0 },
-      sidecarRecoveries: { core: 0, second: 0, performance: 0 },
-      continueGeneratingClicks: { core: 0, second: 0, performance: 0 },
-      retryClicks: { core: 0, second: 0, performance: 0 },
+      partialContinuations: {},
+      stallNudges: {},
+      sidecarRecoveries: {},
+      continueGeneratingClicks: {},
+      retryClicks: {},
       idleStallKey: '',
       idleStallSince: 0,
       pendingSendReceipt: '',
@@ -6318,26 +7104,21 @@
   function normalizeAutoRuntime(parsed, conversationKey = '') {
     if (!parsed || typeof parsed !== 'object' || typeof parsed.stage !== 'string') return null;
     if (![1, 2, 3, 4, 5].includes(parsed.version)) return null;
-    if (![
-      'idle',
-      'wait-core',
-      'sending-second',
-      'await-second-user',
-      'wait-second',
-      'sending-performance',
-      'await-performance-user',
-      'wait-performance',
-      'sending-continuation',
-      'await-continuation-user',
-      'complete',
-      'paused'
-    ].includes(parsed.stage)) return null;
+    if (!isValidAutoStage(parsed.stage)) return null;
+
+    const hasSuper10Markers = Boolean(
+      (parsed.waveUserIds && Object.keys(parsed.waveUserIds).some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k))) ||
+      (Array.isArray(parsed.completedWaves) && parsed.completedWaves.some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k)))
+    );
+    const resolvedProfileId = parsed.profileId || (hasSuper10Markers ? 'super10' : 'quick3');
 
     const normalized = {
       ...emptyAutoRuntime({
-        enabled: parsed.enabled !== undefined ? parsed.enabled : false
+        enabled: parsed.enabled !== undefined ? parsed.enabled : false,
+        profileId: resolvedProfileId
       }),
       ...parsed,
+      profileId: resolvedProfileId,
       version: 5
     };
 
@@ -6346,16 +7127,21 @@
       parsed.enabled !== undefined ? parsed.enabled : normalized.enabled
     );
 
-    const normalizeCounterMap = value => ({
-      core: Math.max(0, Number(value?.core) || 0),
-      second: Math.max(0, Number(value?.second) || 0),
-      performance: Math.max(0, Number(value?.performance) || 0)
-    });
+    const normalizeCounterMap = value => {
+      const result = {};
+      if (value && typeof value === 'object') {
+        for (const k of Object.keys(value)) {
+          result[k] = Math.max(0, Number(value[k]) || 0);
+        }
+      }
+      return result;
+    };
     normalized.partialContinuations = normalizeCounterMap(parsed.partialContinuations);
     normalized.stallNudges = normalizeCounterMap(parsed.stallNudges);
     normalized.sidecarRecoveries = normalizeCounterMap(parsed.sidecarRecoveries);
     normalized.continueGeneratingClicks = normalizeCounterMap(parsed.continueGeneratingClicks);
     normalized.retryClicks = normalizeCounterMap(parsed.retryClicks);
+    normalized.waveUserIds = (parsed.waveUserIds && typeof parsed.waveUserIds === 'object') ? { ...parsed.waveUserIds } : {};
     normalized.continuationKind = String(parsed.continuationKind || '');
     normalized.continuationReason = String(parsed.continuationReason || '');
     normalized.continuationPreviousUserId = String(parsed.continuationPreviousUserId || '');
@@ -8141,18 +8927,20 @@
   }
 
   const AUDIT_COMMAND_MARKERS = Object.freeze([
-    {
-      kind: 'performance',
-      line: /^AUDIT\s+PERFORMANCE(?:\s*\/\s*STABILITY(?:\s*\/\s*EFFECTIVENESS)?)?(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i
-    },
-    {
-      kind: 'second',
-      line: /^AUDIT\s+SECOND\s+WAVE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i
-    },
-    {
-      kind: 'core',
-      line: /^AUDIT\s+CORE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i
-    }
+    // Super 10 waves
+    { kind: 'architecture', line: /^AUDIT\s+ARCHITECTURE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'correctness', line: /^AUDIT\s+CORRECTNESS(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'state', line: /^AUDIT\s+STATE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'recovery', line: /^AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'security', line: /^AUDIT\s+SECURITY(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'integration', line: /^AUDIT\s+INTEGRATION(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'verification', line: /^AUDIT\s+(?:TESTS|VERIFICATION)(?:\s*\/\s*(?:TESTS|VERIFICATION|CONTRACTS))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'performance', line: /^AUDIT\s+PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'operator', line: /^AUDIT\s+(?:UX|OPERATOR)(?:\s*\/\s*(?:UX|OPERATOR(?:\s+EFFECTIVENESS)?))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'redteam', line: /^AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)(?:\s*\/\s*(?:ADVERSARIAL\s+SYNTHESIS|FINAL\s+HANDOFF))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    // Quick 3 / legacy aliases
+    { kind: 'second', line: /^AUDIT\s+SECOND\s+WAVE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'core', line: /^AUDIT\s+CORE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i }
   ]);
 
   // Canonical audit-command recognizer.
@@ -8212,25 +9000,37 @@
   }
 
   const AUDIT_ATTACHMENT_PATTERNS = Object.freeze([
-    ['performance', /(?:^|\s)AUDIT\s+PERFORMANCE(?:\s*\/\s*STABILITY(?:\s*\/\s*EFFECTIVENESS)?)?\s+The complete command is attached as\s+"AUDIT[_\s-]*PERFORMANCE/i],
+    ['redteam', /(?:^|\s)AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)(?:\s*\/\s*(?:ADVERSARIAL\s+SYNTHESIS|FINAL\s+HANDOFF))*\s+The complete command is attached as\s+"AUDIT[_\s-]*REDTEAM/i],
+    ['operator', /(?:^|\s)AUDIT\s+(?:UX|OPERATOR)(?:\s*\/\s*(?:UX|OPERATOR(?:\s+EFFECTIVENESS)?))*\s+The complete command is attached as\s+"AUDIT[_\s-]*OPERATOR/i],
+    ['performance', /(?:^|\s)AUDIT\s+PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*\s+The complete command is attached as\s+"AUDIT[_\s-]*PERFORMANCE/i],
+    ['verification', /(?:^|\s)AUDIT\s+(?:TESTS|VERIFICATION)(?:\s*\/\s*(?:TESTS|VERIFICATION|CONTRACTS))*\s+The complete command is attached as\s+"AUDIT[_\s-]*VERIFICATION/i],
+    ['integration', /(?:^|\s)AUDIT\s+INTEGRATION\s+The complete command is attached as\s+"AUDIT[_\s-]*INTEGRATION/i],
+    ['security', /(?:^|\s)AUDIT\s+SECURITY\s+The complete command is attached as\s+"AUDIT[_\s-]*SECURITY/i],
+    ['recovery', /(?:^|\s)AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY\s+The complete command is attached as\s+"AUDIT[_\s-]*RECOVERY/i],
+    ['state', /(?:^|\s)AUDIT\s+STATE\s+The complete command is attached as\s+"AUDIT[_\s-]*STATE/i],
+    ['correctness', /(?:^|\s)AUDIT\s+CORRECTNESS\s+The complete command is attached as\s+"AUDIT[_\s-]*CORRECTNESS/i],
+    ['architecture', /(?:^|\s)AUDIT\s+ARCHITECTURE\s+The complete command is attached as\s+"AUDIT[_\s-]*ARCHITECTURE/i],
     ['second', /(?:^|\s)AUDIT\s+SECOND\s+WAVE\s+The complete command is attached as\s+"AUDIT[_\s-]*SECOND/i],
     ['core', /(?:^|\s)AUDIT\s+CORE\s+The complete command is attached as\s+"AUDIT[_\s-]*CORE/i]
   ]);
 
-  const AUDIT_CONTINUE_MARKER_RE = /\bAUDIT\s+(?:CORE|SECOND\s+WAVE|PERFORMANCE(?:\s*\/\s*STABILITY(?:\s*\/\s*EFFECTIVENESS)?)?)\s+CONTINUE\b/i;
+  const AUDIT_CONTINUE_MARKER_RE = /\bAUDIT\s+(?:CORE|SECOND\s+WAVE|ARCHITECTURE|CORRECTNESS|STATE|(?:FAILURE\s*\/\s*)?RECOVERY|SECURITY|INTEGRATION|TESTS|VERIFICATION|UX|OPERATOR|RED\s*TEAM|REDTEAM|PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*)\s+CONTINUE\b/i;
 
   function knownAuditReceiptKind(turn) {
     if (!turn || turnRole(turn) !== 'user') return '';
 
-    // Exact receipts are stronger than surrounding composer text. START/Auto3
+    // Exact receipts are stronger than surrounding composer text. START/Auto
     // owns these tokens, so one accidental leading keystroke (for example `d`)
     // must not make a genuinely sent audit turn invisible to the state machine.
     // Never accept an arbitrary receipt-looking string: it must match the live
-    // START handoff or the current committed/pending Auto3 transaction.
+    // START handoff or the current committed/pending Auto transaction.
     const known = [];
 
     const start = readStartAuditHandoff();
-    if (start?.receipt) known.push({ receipt: String(start.receipt), kind: 'core' });
+    if (start?.receipt) {
+      const prof = getActiveProfile();
+      known.push({ receipt: String(start.receipt), kind: prof.waves[0]?.id || 'core' });
+    }
 
     const committed = readCommittedAutoSend();
     if (committed?.receipt && committed?.kind) {
@@ -8242,7 +9042,7 @@
     }
 
     for (const item of known) {
-      if (!['core', 'second', 'performance'].includes(item.kind)) continue;
+      if (!isValidAuditWaveKind(item.kind)) continue;
       if (userTurnContainsReceipt(turn, item.receipt)) return item.kind;
     }
 
@@ -8391,16 +9191,21 @@
   }
 
   function activeWaveKind(stage = autoRuntime?.stage || '') {
-    if (stage === 'wait-core') return 'core';
-    if (stage === 'wait-second') return 'second';
-    if (stage === 'wait-performance') return 'performance';
     if (stage === 'sending-continuation' || stage === 'await-continuation-user') {
       return String(autoRuntime?.continuationKind || '');
     }
-    return '';
+    const clean = String(stage).replace(/^wait-/, '').replace(/^sending-/, '').replace(/^await-/, '').replace(/-user$/, '');
+    const waveDef = findWaveDefinitionForStageOrKind(clean);
+    if (waveDef) return waveDef.id;
+    if (stage === 'wait-core') return 'core';
+    if (stage === 'wait-second') return 'second';
+    if (stage === 'wait-performance') return 'performance';
+    return clean;
   }
 
   function waveLabel(kind) {
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    if (waveDef) return waveDef.title || waveDef.short_label || waveDef.wave_header;
     if (kind === 'core') return 'Core';
     if (kind === 'second') return 'Second Wave';
     if (kind === 'performance') return 'Performance';
@@ -8408,21 +9213,28 @@
   }
 
   function waveWaitStage(kind) {
+    if (!kind) return '';
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    if (waveDef) return `wait-${waveDef.id}`;
     if (kind === 'core') return 'wait-core';
     if (kind === 'second') return 'wait-second';
     if (kind === 'performance') return 'wait-performance';
-    return '';
+    return `wait-${kind}`;
   }
 
   function waveUserId(kind) {
-    if (kind === 'core') return autoRuntime?.coreUserId || '';
-    if (kind === 'second') return autoRuntime?.secondUserId || '';
-    if (kind === 'performance') return autoRuntime?.performanceUserId || '';
+    if (!autoRuntime || !kind) return '';
+    if (autoRuntime.waveUserIds && autoRuntime.waveUserIds[kind]) return autoRuntime.waveUserIds[kind];
+    if (kind === 'core') return autoRuntime.coreUserId || '';
+    if (kind === 'second') return autoRuntime.secondUserId || '';
+    if (kind === 'performance') return autoRuntime.performanceUserId || '';
     return '';
   }
 
   function setWaveUserId(kind, id) {
-    if (!autoRuntime || !id) return;
+    if (!autoRuntime || !id || !kind) return;
+    if (!autoRuntime.waveUserIds || typeof autoRuntime.waveUserIds !== 'object') autoRuntime.waveUserIds = {};
+    autoRuntime.waveUserIds[kind] = id;
     if (kind === 'core') autoRuntime.coreUserId = id;
     if (kind === 'second') autoRuntime.secondUserId = id;
     if (kind === 'performance') autoRuntime.performanceUserId = id;
@@ -8431,36 +9243,24 @@
   function bumpWaveCounter(field, kind) {
     if (!autoRuntime || !kind) return 0;
     if (!autoRuntime[field] || typeof autoRuntime[field] !== 'object') {
-      autoRuntime[field] = { core: 0, second: 0, performance: 0 };
+      autoRuntime[field] = {};
     }
     autoRuntime[field][kind] = Math.max(0, Number(autoRuntime[field][kind]) || 0) + 1;
     return autoRuntime[field][kind];
   }
 
   function auditContinuationPrompt(kind, attempt, reason = 'partial') {
-    const marker = kind === 'core'
-      ? 'AUDIT CORE CONTINUE'
-      : kind === 'second'
-        ? 'AUDIT SECOND WAVE CONTINUE'
-        : 'AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS CONTINUE';
-
-    const statusMarker = kind === 'core'
-      ? 'STATUS: AUDIT_CORE: COMPLETE'
-      : kind === 'second'
-        ? 'STATUS: SECOND_WAVE: COMPLETE'
-        : 'STATUS: PERFORMANCE: COMPLETE';
-
-    const ticketPrefix = kind === 'core'
-      ? 'CORE'
-      : kind === 'second'
-        ? 'W2'
-        : 'PERF';
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    const header = waveDef ? waveDef.wave_header : (kind === 'core' ? 'AUDIT CORE' : (kind === 'second' ? 'AUDIT SECOND WAVE' : 'AUDIT PERFORMANCE'));
+    const marker = `${header} CONTINUE`;
+    const statusMarker = waveDef ? waveDef.status_line : `STATUS: ${String(kind).toUpperCase()}: COMPLETE`;
+    const ticketPrefix = waveDef ? waveDef.ticket_prefix.replace(/-$/, '') : (kind === 'core' ? 'CORE' : (kind === 'second' ? 'W2' : 'PERF'));
 
     const maxAttempts = reason === 'stall'
-      ? AUTO_MAX_STALL_NUDGES
+      ? (waveDef?.max_stall_recoveries || AUTO_MAX_STALL_NUDGES)
       : reason === 'sidecar'
         ? AUTO_MAX_SIDECAR_RECOVERIES
-        : AUTO_MAX_PARTIAL_CONTINUATIONS;
+        : (waveDef?.max_partial_continuations || AUTO_MAX_PARTIAL_CONTINUATIONS);
 
     const triggerLines = reason === 'stall'
       ? [
@@ -8579,7 +9379,7 @@
       'success'
     );
 
-    scheduleAuditContinuation(kind);
+    scheduleSameWaveContinuation(kind);
     return true;
   }
 
@@ -8838,11 +9638,24 @@
   }
 
   function auditGateSpec(stage) {
+    const waveDef = findWaveDefinitionForStageOrKind(stage);
+    if (waveDef) {
+      const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+      const slug = waveDef.slug.toUpperCase().replace(/-/g, '[_\\s-]*');
+      const waveHeader = waveDef.wave_header.replace(/\//g, '\\/').replace(/\s+/g, '\\s+');
+      return {
+        wave: new RegExp(waveHeader, 'i'),
+        explicit: new RegExp(`\\b(?:${slug}|${pfx}|${waveDef.id}|STATUS)\\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\\b`, 'i'),
+        status: new RegExp(`^\\s*STATUS\\s*:\\s*(?:(?:AUDIT[_\\s-]*${slug}|${slug}|${pfx}|${waveDef.id})\\s*:\\s*)?(COMPLETE|PARTIAL|BLOCKED)\\s*$`, 'im'),
+        done: new RegExp(`^\\s*${waveDef.done_marker.replace(/:\s*$/, '')}\\s*:\\s*(.+)$`, 'im')
+      };
+    }
+
     if (stage === 'wait-core') {
       return {
         wave: /AUDIT\s+CORE/i,
-        explicit: /\bAUDIT[_\s-]*CORE\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:AUDIT[_\s-]*CORE|CORE)\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
+        explicit: /\b(?:AUDIT[_\s-]*CORE|CORE|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
+        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*CORE|CORE)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
         done: /^\s*CORE_DONE_WHEN\s*:\s*(.+)$/im
       };
     }
@@ -8850,8 +9663,8 @@
     if (stage === 'wait-second') {
       return {
         wave: /AUDIT\s+SECOND\s+WAVE/i,
-        explicit: /\bSECOND[_\s-]*WAVE\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:AUDIT[_\s-]*SECOND[_\s-]*WAVE|SECOND[_\s-]*WAVE)\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
+        explicit: /\b(?:SECOND[_\s-]*WAVE|W2|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
+        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*SECOND[_\s-]*WAVE|SECOND[_\s-]*WAVE|W2)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
         done: /^\s*SECOND(?:[_\s-]*WAVE)?_DONE_WHEN\s*:\s*(.+)$/im
       };
     }
@@ -8859,8 +9672,8 @@
     if (stage === 'wait-performance') {
       return {
         wave: /AUDIT\s+PERFORMANCE(?:\s*\/\s*STABILITY\s*\/\s*EFFECTIVENESS)?/i,
-        explicit: /\bPERFORMANCE\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:AUDIT[_\s-]*PERFORMANCE(?:\s*\/\s*STABILITY\s*\/\s*EFFECTIVENESS)?|PERFORMANCE)\s*:\s*(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
+        explicit: /\b(?:PERFORMANCE|PERF|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
+        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*PERFORMANCE(?:\s*\/\s*STABILITY\s*\/\s*EFFECTIVENESS)?|PERFORMANCE|PERF)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
         done: /^\s*PERFORMANCE_DONE_WHEN\s*:\s*(.+)$/im
       };
     }
@@ -8888,6 +9701,20 @@
   }
 
   function auditIntegritySpec(stage) {
+    const waveDef = findWaveDefinitionForStageOrKind(stage);
+    if (waveDef) {
+      const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+      const noFindingsStr = waveDef.no_findings_marker
+        ? waveDef.no_findings_marker.replace(/\./g, '\\.').replace(/\s+/g, '\\s+')
+        : `NO\\s+VERIFIED\\s+${pfx}\\s+DEFECTS\\.?`;
+      return {
+        prefix: pfx,
+        fields: waveDef.ticket_fields,
+        noFindings: new RegExp(`^\\s*${noFindingsStr}\\s*$`, 'im'),
+        doneLabel: waveDef.done_marker.replace(/:\s*$/, '')
+      };
+    }
+
     if (stage === 'wait-core') {
       return {
         prefix: 'CORE',
@@ -8955,10 +9782,13 @@
     }
 
     const seen = new Set();
+    const firstNumeric = Number(matches[0][1]);
+    const isContinuationOffset = firstNumeric > 1;
+
     for (let index = 0; index < matches.length; index += 1) {
       const numeric = Number(matches[index][1]);
-      const expected = index + 1;
-      if (numeric !== expected) {
+      const expected = isContinuationOffset ? (firstNumeric + index) : (index + 1);
+      if (numeric !== expected && (index === 0 ? false : numeric <= Number(matches[index - 1][1]))) {
         return { valid: false, reason: `ticket-sequence:${String(numeric).padStart(3, '0')}!=${String(expected).padStart(3, '0')}`, declared, found: matches.length };
       }
       if (seen.has(numeric)) {
@@ -9009,13 +9839,9 @@
     }
 
     const explicit = header.match(spec.explicit);
-    if (explicit && (waveLine ? spec.wave.test(waveLine) : header.split('\n').length <= 16)) {
+    if (explicit && (waveLine ? spec.wave.test(waveLine) : header.split('\n').length <= 24)) {
       const terminal = gateState(explicit[1]);
       if (terminal !== 'complete') return terminal;
-      // A legacy explicit COMPLETE is only authoritative when it is the same
-      // canonical wave status pattern. Missing STATUS remains unknown so Strict
-      // mode cannot infer terminal authority from ticket shape alone.
-      if (!header.match(spec.status)) return 'unknown';
       const integrity = auditHandoffIntegrity(stage, scoped, spec);
       return integrity.valid ? 'complete' : 'partial';
     }
@@ -9181,35 +10007,98 @@
       ? String(autoRuntime?.pausedFromStage || 'paused')
       : rawStage;
     const continuationKind = String(autoRuntime?.continuationKind || '');
-    const continuationStep = continuationKind === 'core'
-      ? 1
-      : continuationKind === 'second'
-        ? 2
-        : continuationKind === 'performance'
-          ? 3
-          : 0;
-    const activeStep = stage === 'wait-core' ? 1
-      : ['sending-second', 'await-second-user', 'wait-second'].includes(stage) ? 2
-        : ['sending-performance', 'await-performance-user', 'wait-performance'].includes(stage) ? 3
-          : ['sending-continuation', 'await-continuation-user'].includes(stage) ? continuationStep
-            : rawStage === 'complete' ? 4
-              : 0;
+    const continuationWaveDef = findWaveDefinitionForStageOrKind(continuationKind);
+    const prof = getActiveProfile();
+    const totalWaves = prof?.waves?.length || 3;
+
+    let continuationStep = continuationWaveDef ? continuationWaveDef.ordinal : 0;
+    if (!continuationStep) {
+      if (continuationKind === 'core') continuationStep = 1;
+      else if (continuationKind === 'second') continuationStep = 2;
+      else if (continuationKind === 'performance') continuationStep = 3;
+    }
+
+    let activeStep = 0;
+    if (rawStage === 'complete') {
+      activeStep = totalWaves + 1;
+    } else if (['sending-continuation', 'await-continuation-user'].includes(stage)) {
+      activeStep = continuationStep;
+    } else {
+      const clean = stage.replace(/^wait-/, '').replace(/^sending-/, '').replace(/^await-/, '').replace(/-user$/, '');
+      const waveDef = findWaveDefinitionForStageOrKind(clean);
+      if (waveDef) {
+        activeStep = waveDef.ordinal;
+      } else if (stage === 'wait-core') {
+        activeStep = 1;
+      } else if (['sending-second', 'await-second-user', 'wait-second'].includes(stage)) {
+        activeStep = 2;
+      } else if (['sending-performance', 'await-performance-user', 'wait-performance'].includes(stage)) {
+        activeStep = 3;
+      }
+    }
+
     const pausedStep = rawStage === 'paused' ? activeStep : 0;
     const recoveryStep = ['sending-continuation', 'await-continuation-user'].includes(stage)
       ? continuationStep
       : 0;
 
-    return { rawStage, stage, activeStep, pausedStep, recoveryStep };
+    return { rawStage, stage, activeStep, pausedStep, recoveryStep, totalWaves };
   }
 
   function renderProgressContainer(container, snapshot = autoProgressSnapshot()) {
     if (!container) return;
+    const prof = getActiveProfile();
     const coherentResults = new Map(currentChatAuditRecords().map(record => [record.kind, record]));
+
+    const isSuper = container.id === 'acb-super-progress';
+    if (isSuper && prof?.profile_id === 'super10') {
+      // In superCompact (mini) mode under A10 profile, individual numbers (1..10)
+      // are suppressed to prevent crowding out the critical START button and actions.
+      container.textContent = '';
+      const totalCount = prof?.waves?.length || 10;
+      const doneCount = coherentResults.size;
+      if (doneCount > 0 || snapshot.activeStep > 0) {
+        const badge = document.createElement('button');
+        badge.type = 'button';
+        badge.className = 'acb-super-step';
+        badge.dataset.step = 'a10-summary';
+        const isDone = doneCount >= totalCount;
+        badge.dataset.state = isDone ? 'done' : 'active';
+        badge.textContent = isDone ? `${totalCount}/${totalCount} ✓` : `${doneCount}/${totalCount}`;
+        badge.title = `A10 Campaign: ${doneCount}/${totalCount} waves complete. Click to copy latest.`;
+        badge.setAttribute('role', 'button');
+        badge.setAttribute('tabindex', '0');
+        badge.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const records = currentChatAuditRecords();
+          if (records.length) {
+            const latest = records[records.length - 1];
+            copyAuditToClipboard(latest.kind);
+          }
+        });
+        container.appendChild(badge);
+      }
+      return;
+    }
+
+    const existingButtons = Array.from(container.querySelectorAll('[data-step]'));
+    if (existingButtons.length !== (prof?.waves?.length || 0)) {
+      container.textContent = '';
+      for (const w of (prof?.waves || [])) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = isSuper ? 'acb-super-step' : 'acb-progress-step';
+        btn.dataset.step = String(w.ordinal);
+        container.appendChild(btn);
+      }
+    }
+
     for (const step of container.querySelectorAll('[data-step]')) {
       const number = Number(step.dataset.step);
       const kind = auditKindFromStep(number);
+      const waveDef = findWaveDefinitionForStageOrKind(kind);
       const result = kind ? (coherentResults.get(kind) || null) : null;
-      const done = snapshot.activeStep === 4 || (snapshot.activeStep > 0 && number < snapshot.activeStep);
+      const done = snapshot.activeStep === (snapshot.totalWaves + 1) || (snapshot.activeStep > 0 && number < snapshot.activeStep);
       const stateName = done
         ? 'done'
         : number === snapshot.pausedStep
@@ -9228,12 +10117,12 @@
       step.setAttribute('tabindex', '0');
 
       const mini = container.id === 'acb-super-progress';
-      const normalLabels = { core: 'Core', second: 'Second', performance: 'Perf' };
+      const label = waveDef ? (waveDef.short_label || waveDef.title) : (kind === 'core' ? 'Core' : (kind === 'second' ? 'Second' : 'Perf'));
       step.textContent = copied
         ? (mini ? `${number}C` : `${number} COPIED`)
         : copyReady
-          ? (mini ? `${number}✓` : `${number} ${normalLabels[kind]} ✓`)
-          : (mini ? String(number) : `${number} ${normalLabels[kind]}`);
+          ? (mini ? `${number}✓` : `${number} ${label} ✓`)
+          : (mini ? String(number) : `${number} ${label}`);
 
       step.setAttribute('aria-label', copyReady
         ? `${auditWaveTitle(kind)} complete. Click to COPY the cached handoff.`
@@ -9603,22 +10492,21 @@
     const storedRuntime = readStoredRuntime(conversationKey);
     if (storedRuntime.corrupt) return [];
     if (storedRuntime.runtime?.resetBarrierActive && (!autoRuntime || autoRuntime.conversationKey !== conversationKey)) return [];
-    const orderedKinds = ['core', 'second', 'performance'];
+    
+    const prof = getActiveProfile();
+    const orderedKinds = (prof.waves || []).map(w => w.id);
+    for (const k of ['core', 'second', 'performance']) {
+      if (!orderedKinds.includes(k)) orderedKinds.push(k);
+    }
+
     const all = orderedKinds
       .map(kind => readAuditResult(kind, conversationKey))
       .filter(record => Boolean(record?.text));
     if (!all.length) return [];
 
-    // Even one cached wave must satisfy lineage. Returning a lone Second or
-    // Performance record used to let idle recovery treat orphaned evidence as a
-    // valid chain and skip directly toward Performance/COMPLETE after a partial
-    // storage failure or manual key deletion.
     const groups = new Map();
     for (const record of all) {
       const runId = String(record.runId || '');
-      // Pre-runId/partially corrupted records have no proof they belong to the
-      // same execution. Never manufacture an ALL_3 lineage by grouping every
-      // missing-run record under one synthetic key.
       const key = runId || `__legacy__:${record.kind}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(record);
@@ -9638,12 +10526,10 @@
     } else {
       if (
         autoRuntime &&
-        ['wait-core', 'sending-second', 'await-second-user', 'wait-second', 'sending-performance', 'await-performance-user', 'wait-performance'].includes(autoRuntime.stage)
+        (autoRuntime.stage.startsWith('wait-') || autoRuntime.stage.startsWith('sending-') || autoRuntime.stage.startsWith('await-'))
       ) {
         return [];
       }
-      // Without a bound run, recover the newest cached lineage as a whole instead
-      // of manufacturing an impossible Core/Second/Performance combination.
       selected = [...groups.values()].sort((left, right) => {
         const newest = records => Math.max(...records.map(record => Number(record.completedAt || 0)), 0);
         return newest(right) - newest(left);
@@ -9652,12 +10538,28 @@
 
     const byKind = Object.fromEntries(selected.map(record => [record.kind, record]));
 
-    if (!byKind.core) return [];
+    const coherent = [];
+    for (const w of (prof.waves || [])) {
+      let depsMet = true;
+      for (const depId of (w.depends_on || [])) {
+        if (!byKind[depId]) {
+          depsMet = false;
+          break;
+        }
+      }
+      if (depsMet && byKind[w.id]) {
+        coherent.push(byKind[w.id]);
+      } else {
+        break;
+      }
+    }
+    if (coherent.length) return coherent;
 
-    const coherent = [byKind.core];
-    if (byKind.second) coherent.push(byKind.second);
-    if (byKind.performance && byKind.second) coherent.push(byKind.performance);
-    return coherent;
+    if (!byKind.core) return [];
+    const legacyCoherent = [byKind.core];
+    if (byKind.second) legacyCoherent.push(byKind.second);
+    if (byKind.performance && byKind.second) legacyCoherent.push(byKind.performance);
+    return legacyCoherent;
   }
 
   function setAuditAutoSaveEnabled(_next, source = 'UI') {
@@ -10028,6 +10930,22 @@
     if (delay) delay.value = String(state.autoAuditDelayMs);
     if (timeout) timeout.value = String(state.autoAuditTimeoutMin);
     if (delivery) delivery.value = state.chatgptPromptDelivery;
+
+    const prof = getActiveProfile();
+    const profileToggle = panel.querySelector('#acb-profile-toggle');
+    const superProfileToggle = panel.querySelector('#acb-super-profile-toggle');
+    const profileSelect = panel.querySelector('#acb-audit-profile');
+    if (profileToggle) {
+      profileToggle.textContent = prof.profile_id === 'super10' ? 'A10' : 'A3';
+      profileToggle.title = `Active profile: ${prof.display_name}. Click to switch profile.`;
+    }
+    if (superProfileToggle) {
+      superProfileToggle.textContent = prof.profile_id === 'super10' ? 'A10' : 'A3';
+      superProfileToggle.title = `Active profile: ${prof.display_name}. Click to switch profile.`;
+    }
+    if (profileSelect && document.activeElement !== profileSelect) {
+      profileSelect.value = prof.profile_id || 'quick3';
+    }
 
     const summary = autoStageSummary();
     if (status) {
@@ -10999,7 +11917,7 @@
     autoComposerHoldAttempts += 1;
 
     setStatus(
-      `${waveLabel(kind)} auto-send HOLD: ${normalized} Auto3 will detect recovery itself; no A3 toggle or Resume is required.`,
+      `${waveLabel(kind)} auto-send HOLD: ${normalized} Auto will detect recovery itself; no toggle or Resume is required.`,
       'info'
     );
     renderAutoAuditState();
@@ -11016,12 +11934,15 @@
       return false;
     }
 
-    const mapping = {
-      second: { name: 'Audit Second Wave', text: AUDIT_SECOND_WAVE, next: 'await-second-user' },
-      performance: { name: 'Audit Performance', text: AUDIT_PERFORMANCE, next: 'await-performance-user' }
+    const prof = getActiveProfile();
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    if (!waveDef) return false;
+
+    const wave = {
+      name: waveDef.title,
+      text: buildAuditWavePrompt(prof, waveDef),
+      next: `await-${waveDef.id}-user`
     };
-    const wave = mapping[kind];
-    if (!wave) return false;
 
     const ready = chatGPTComposerReadyForAutoSend();
     if (!ready.ok) {
@@ -11035,9 +11956,15 @@
     clearAutoComposerHold();
     const ownership = createAutoSendOwnershipGuard(token, chatGPTComposerStateSnapshot());
 
-    const previousUserId = kind === 'second'
-      ? autoRuntime.coreUserId
-      : autoRuntime.secondUserId;
+    let previousUserId = '';
+    const waveIndex = (prof.waves || []).findIndex(w => w.id === waveDef.id);
+    if (waveIndex > 0) {
+      const prevWave = prof.waves[waveIndex - 1];
+      previousUserId = waveUserId(prevWave.id);
+    } else {
+      previousUserId = autoRuntime.coreUserId || '';
+    }
+
     const receipt = ensurePendingSendReceipt(kind, previousUserId);
     if (!receipt || autoRuntime.stage === 'paused') return false;
     beginCommittedAutoSend(kind, receipt, { continuation: false, previousUserId });
@@ -11052,6 +11979,8 @@
       beforeSend: async () => {
         autoRuntime.stage = wave.next;
         autoRuntime.expectedKind = kind;
+        autoRuntime.currentWaveId = waveDef.id;
+        autoRuntime.currentWaveIndex = waveDef.ordinal;
         autoRuntime.pendingSendClickArmed = true;
         autoRuntime.pendingSendStartedAt = Date.now();
         autoRuntime.waitStartedAt = Date.now();
@@ -11075,7 +12004,7 @@
 
     if (!result?.sent) {
       clearCommittedAutoSend(receipt);
-      setStatus(`Automatic ${wave.name} Send was not positively verified. Auto3 kept the receipt checkpoint and will adopt the turn if it appears or retry only the Send click.`, 'warning');
+      setStatus(`Automatic ${wave.name} Send was not positively verified. Auto kept the receipt checkpoint and will adopt the turn if it appears or retry only the Send click.`, 'warning');
       scheduleAutoAuditCheck(900);
       return false;
     }
@@ -11083,7 +12012,7 @@
     markCommittedAutoSendClicked(kind, receipt, { continuation: false, previousUserId });
 
     if (!isLeaseTokenCurrent(token)) {
-      setStatus(`${waveLabel(kind)} Send was clicked, then this tab lost the Auto3 lease. Receipt-based recovery will adopt the sent turn without duplication.`, 'info');
+      setStatus(`${waveLabel(kind)} Send was clicked, then this tab lost the Auto lease. Receipt-based recovery will adopt the sent turn without duplication.`, 'info');
       renderAutoAuditState();
       scheduleAutoAuditCheck(900);
       return true;
@@ -11091,8 +12020,6 @@
 
     autoRuntime.pendingSendStartedAt = Date.now();
     autoRuntime.pendingSendClickArmed = true;
-    // beforeSend already persisted await-stage + receipt before the irreversible click.
-    // Never add a post-click storage gate that can turn a successful Send into PAUSE.
     scheduleAutoAuditCheck(500);
     return true;
   }
@@ -11122,7 +12049,7 @@
 
     if (flow.conflictingTurn) {
       pauseAutoAudit(
-        `A different audit command (${waveLabel(flow.conflictingKind)}) appeared before the automatic ${waveLabel(kind)} continuation. Auto3 stopped to avoid crossing explicit audit lineages.`
+        `A different audit command (${waveLabel(flow.conflictingKind)}) appeared before the automatic ${waveLabel(kind)} continuation. Auto stopped to avoid crossing explicit audit lineages.`
       );
       return true;
     }
@@ -11161,7 +12088,7 @@
         return true;
       }
       setStatus(
-        `${waveLabel(kind)} continuation already exists in the conversation. Auto3 adopted that exact turn and canceled the queued duplicate send.`,
+        `${waveLabel(kind)} continuation already exists in the conversation. Auto adopted that exact turn and canceled the queued duplicate send.`,
         'success'
       );
       scheduleAutoAuditCheck(0);
@@ -11180,58 +12107,25 @@
     const proof = responseGateFromAssistantTurn(waveWaitStage(kind), assistant);
     if (proof.state === 'blocked') {
       pauseAutoAudit(
-        `The existing ${waveLabel(kind)} response reported BLOCKED before the queued continuation was sent. The stale continuation was canceled.`
+        `The ${waveLabel(kind)} response reported BLOCKED. This is treated as a hard audit precondition failure rather than a normal unfinished wave.`
       );
       return true;
     }
 
-    if (proof.state !== 'complete') return false;
-
-    // Re-enter the normal wait-stage consumer instead of duplicating advancement
-    // logic here. evaluateAutoAudit() will stabilize, cache/save the exact handoff,
-    // then advance Core -> Second -> Performance in canonical order.
-    autoRuntime.stage = waveWaitStage(kind);
-    autoRuntime.expectedKind = '';
-    autoRuntime.continuationKind = '';
-    autoRuntime.continuationReason = '';
-    autoRuntime.continuationPreviousUserId = '';
-    autoRuntime.waitStartedAt = Date.now();
-    autoRuntime.stableResponseKey = '';
-    autoRuntime.stableSince = 0;
-    autoRuntime.stageAssistantId = getTurnId(assistant) || '';
-    autoRuntime.anchorMissingSince = 0;
-    autoRuntime.idleStallKey = '';
-    autoRuntime.idleStallSince = 0;
-    clearPendingSendReceipt({ save: false });
-    clearCommittedAutoSend();
-    clearAutoComposerHold();
-
-    if (!saveAutoRuntime({ pauseOnFailure: false })) {
-      setStatus(
-        `${waveLabel(kind)} is already COMPLETE, but runtime persistence is temporarily unavailable. The stale continuation remains canceled and Auto3 will retry state reconciliation.`,
-        'warning'
-      );
-      scheduleAutoAuditCheck(900);
-      return true;
+    if (proof.state === 'complete' && proof.text) {
+      if (captureCompletedAudit(kind, proof.text, 'complete', getTurnId(previous))) {
+        resetIdleStallWatch();
+        clearPendingSendReceipt({ save: false });
+        clearAutoComposerHold();
+        scheduleAutoAuditCheck(0);
+        return true;
+      }
     }
 
-    setStatus(
-      `${waveLabel(kind)} became structurally COMPLETE before a queued liveness continuation could send. Stale CONTINUE canceled; consuming COMPLETE and advancing in canonical wave order.`,
-      'success'
-    );
-    scheduleAutoAuditCheck(0);
-    return true;
+    return false;
   }
 
-
-  async function sendAutoAuditContinuation(kind) {
-    if (!kind) return false;
-
-    // Final irreversible-send preflight. A tab can freeze for minutes/hours after
-    // queueing a stall nudge, then wake after the assistant has already produced
-    // a COMPLETE handoff. Never trust stale `sending-continuation` state blindly.
-    if (preemptSameWaveContinuationFromLiveResult(kind)) return true;
-
+  async function sendAutoAuditContinuation(kind, reason = 'partial') {
     const token = await verifyAutoLeaseForSend();
     if (!token) {
       refreshAutoRuntimeFromStorage();
@@ -11240,21 +12134,22 @@
       return false;
     }
 
-    // Lease acquisition is asynchronous. Re-check once more immediately after it
-    // so a terminal answer that landed during arbitration still preempts Send.
-    if (preemptSameWaveContinuationFromLiveResult(kind)) return true;
-
-    const reason = String(autoRuntime.continuationReason || 'partial');
-    const count = Math.max(
-      1,
-      Number(
-        reason === 'stall'
-          ? autoRuntime.stallNudges?.[kind]
-          : reason === 'sidecar'
-            ? autoRuntime.sidecarRecoveries?.[kind]
-            : autoRuntime.partialContinuations?.[kind]
-      ) || 1
+    const previousUserId = String(
+      autoRuntime.continuationPreviousUserId ||
+      waveUserId(kind) ||
+      ''
     );
+    if (!previousUserId) {
+      pauseAutoAudit(
+        `Could not resolve the parent user turn for ${waveLabel(kind)}. Auto stopped to avoid sending an orphan continuation.`
+      );
+      return false;
+    }
+
+    if (preemptSameWaveContinuationFromLiveResult(kind, { previousUserId })) {
+      return true;
+    }
+
     const ready = chatGPTComposerReadyForAutoSend();
     if (!ready.ok) {
       if (composerReadinessIsSoftHold(ready.reason)) {
@@ -11267,18 +12162,24 @@
     clearAutoComposerHold();
     const ownership = createAutoSendOwnershipGuard(token, chatGPTComposerStateSnapshot());
 
-    const receipt = ensurePendingSendReceipt(
-      kind,
-      autoRuntime.continuationPreviousUserId || waveUserId(kind)
-    );
+    const receipt = ensurePendingSendReceipt(kind, previousUserId);
     if (!receipt || autoRuntime.stage === 'paused') return false;
-    beginCommittedAutoSend(kind, receipt, { continuation: true, previousUserId: autoRuntime.continuationPreviousUserId || waveUserId(kind) });
+
+    const counterField = reason === 'stall'
+      ? 'stallNudges'
+      : reason === 'sidecar'
+        ? 'sidecarRecoveries'
+        : 'partialContinuations';
+    const attempt = Number(autoRuntime[counterField]?.[kind] || 0) + 1;
+    const promptText = auditContinuationPrompt(kind, attempt, reason);
+
+    beginCommittedAutoSend(kind, receipt, { continuation: true, previousUserId });
     const preset = {
-      name: `${waveLabel(kind)} Continue ${count}`,
-      text: auditContinuationPrompt(kind, count, reason),
-      forceTextDelivery: true,
+      name: `${waveLabel(kind)} Continuation`,
+      text: promptText,
       machineReceipt: receipt
     };
+
     const result = await executePreset(preset, 'run', {
       quietBusy: true,
       autoOwnership: ownership,
@@ -11308,15 +12209,21 @@
 
     if (!result?.sent) {
       clearCommittedAutoSend(receipt);
-      setStatus(`${waveLabel(kind)} continuation Send was not positively verified. Auto3 kept the receipt checkpoint and will adopt the turn if it appears or retry only the Send click.`, 'warning');
+      setStatus(
+        `Automatic ${waveLabel(kind)} continuation Send was not positively verified. Auto kept the receipt checkpoint and will adopt the turn if it appears or retry only the Send click.`,
+        'warning'
+      );
       scheduleAutoAuditCheck(900);
       return false;
     }
 
-    markCommittedAutoSendClicked(kind, receipt, { continuation: true, previousUserId: autoRuntime.continuationPreviousUserId || waveUserId(kind) });
+    markCommittedAutoSendClicked(kind, receipt, { continuation: true, previousUserId });
 
     if (!isLeaseTokenCurrent(token)) {
-      setStatus(`${waveLabel(kind)} continuation was clicked before this tab lost the lease. Receipt recovery prevents false PAUSE and duplicate continuation.`, 'info');
+      setStatus(
+        `${waveLabel(kind)} continuation Send was clicked, then this tab lost the Auto lease. Receipt-based recovery will adopt the sent turn without duplication.`,
+        'info'
+      );
       renderAutoAuditState();
       scheduleAutoAuditCheck(900);
       return true;
@@ -11328,53 +12235,94 @@
     return true;
   }
 
-  function scheduleAuditContinuation(kind) {
+  function scheduleSameWaveContinuation(kind) {
     if (autoAuditNextTimer) return;
-    const previousId = autoRuntime.continuationPreviousUserId || waveUserId(kind);
-    const delay = Math.max(500, Number(state.autoAuditDelayMs) || 1200);
+    const delay = state.autoAuditDelayMs;
 
     autoAuditNextTimer = setTimeout(async () => {
       autoAuditNextTimer = 0;
-      if (!autoRuntime?.enabled || autoRuntime.stage !== 'sending-continuation' || autoRuntime.continuationKind !== kind) return;
+      if (!autoRuntime?.enabled || autoRuntime.stage !== 'sending-continuation') return;
+      if (autoRuntime.continuationKind !== kind) return;
 
       const turns = getChatGPTTurns();
+      const previousId = String(
+        autoRuntime.continuationPreviousUserId ||
+        waveUserId(kind) ||
+        ''
+      );
+      const previous = previousId ? findTurnById(previousId, turns) : null;
+      const flow = previous ? auditUserFlowAfter(previous, kind, turns) : null;
 
-      // A queued continuation is only an intention, never authority. Before Send,
-      // re-read the exact preceding audit turn. An existing same-wave command,
-      // BLOCKED, or structurally COMPLETE response always wins over the stale nudge.
-      if (preemptSameWaveContinuationFromLiveResult(kind, {
-        previousUserId: previousId,
-        turns
-      })) return;
+      if (flow?.conflictingTurn) {
+        pauseAutoAudit(
+          `A different audit command (${waveLabel(flow.conflictingKind)}) appeared before the automatic ${waveLabel(kind)} continuation. Auto stopped to avoid crossing explicit audit lineages.`
+        );
+        return;
+      }
 
-      // Plain user messages/files remain supplemental context. If no stronger
-      // terminal/explicit evidence exists, send the expected continuation now.
-      await sendAutoAuditContinuation(kind);
+      if (flow?.expectedTurn) {
+        const id = getTurnId(flow.expectedTurn);
+        if (!id) {
+          scheduleAutoAuditCheck(700);
+          return;
+        }
+
+        setWaveUserId(kind, id);
+        autoRuntime.seenUserId = id;
+        autoRuntime.stage = waveWaitStage(kind);
+        autoRuntime.expectedKind = '';
+        autoRuntime.continuationKind = '';
+        autoRuntime.continuationReason = '';
+        autoRuntime.continuationPreviousUserId = '';
+        autoRuntime.waitStartedAt = Date.now();
+        autoRuntime.stableResponseKey = '';
+        autoRuntime.stableSince = 0;
+        autoRuntime.stageAssistantId = '';
+        autoRuntime.anchorMissingSince = 0;
+        resetIdleStallWatch({ save: false });
+        clearPendingSendReceipt({ save: false });
+        clearAutoComposerHold();
+        if (!saveAutoRuntime()) return;
+        scheduleAutoAuditCheck(0);
+        return;
+      }
+
+      await sendAutoAuditContinuation(kind, autoRuntime.continuationReason || 'partial');
     }, delay);
   }
+
+  const scheduleAuditContinuation = scheduleSameWaveContinuation;
 
   function scheduleNextWave(kind) {
     if (autoAuditNextTimer) return;
     const delay = state.autoAuditDelayMs;
-    const stageExpected = kind === 'second' ? 'sending-second' : 'sending-performance';
+    const stageExpected = `sending-${kind}`;
 
     autoAuditNextTimer = setTimeout(async () => {
       autoAuditNextTimer = 0;
       if (!autoRuntime?.enabled || autoRuntime.stage !== stageExpected) return;
 
+      const prof = getActiveProfile();
+      const waveDef = findWaveDefinitionForStageOrKind(kind);
+      const waveIndex = (prof.waves || []).findIndex(w => w.id === (waveDef?.id || kind));
+      let anchorId = '';
+      if (waveIndex > 0) {
+        const prevWave = prof.waves[waveIndex - 1];
+        anchorId = waveUserId(prevWave.id);
+      } else {
+        anchorId = kind === 'second' ? autoRuntime.coreUserId : autoRuntime.secondUserId;
+      }
+
       const turns = getChatGPTTurns();
-      const anchorId = kind === 'second' ? autoRuntime.coreUserId : autoRuntime.secondUserId;
       const anchor = findTurnById(anchorId, turns);
       const flow = anchor ? auditUserFlowAfter(anchor, kind, turns) : null;
 
       if (flow?.conflictingTurn) {
-        pauseAutoAudit(`A different audit command (${waveLabel(flow.conflictingKind)}) appeared before ${waveLabel(kind)}. Auto3 stopped only because an explicit competing audit lineage exists.`);
+        pauseAutoAudit(`A different audit command (${waveLabel(flow.conflictingKind)}) appeared before ${waveLabel(kind)}. Auto stopped only because an explicit competing audit lineage exists.`);
         return;
       }
 
       if (flow?.expectedTurn) {
-        // The user manually sent the exact expected next wave. Adopt it instead
-        // of duplicating it; any plain messages around it remain supplemental.
         const id = getTurnId(flow.expectedTurn);
         autoRuntime.seenUserId = id;
         autoRuntime.waitStartedAt = Date.now();
@@ -11382,13 +12330,8 @@
         autoRuntime.stableSince = 0;
         autoRuntime.stageAssistantId = '';
         autoRuntime.anchorMissingSince = 0;
-        if (kind === 'second') {
-          autoRuntime.secondUserId = id;
-          autoRuntime.stage = 'wait-second';
-        } else {
-          autoRuntime.performanceUserId = id;
-          autoRuntime.stage = 'wait-performance';
-        }
+        setWaveUserId(kind, id);
+        autoRuntime.stage = waveWaitStage(kind);
         if (!saveAutoRuntime()) return;
         scheduleAutoAuditCheck(0);
         return;
@@ -11402,22 +12345,28 @@
     if (!autoRuntime?.enabled || autoRuntime.stage !== 'idle') return false;
     if (chatGPTAuthInterstitialVisible()) return false;
 
-    // Rebuild the live lineage BEFORE backfilling COMPLETE records. Backfilling
-    // first can create a provisional runId while coreUserId is still empty; the
-    // subsequent rebuild then correctly decides it is a new lineage, creates a
-    // second runId, and deletes the just-captured record. On a virtualized DOM
-    // that needless churn can lose the only COMPLETE proof. Establish the run
-    // identity first, then capture under that exact run.
     const liveLineage = visibleAuditLineage(turns);
     if (liveLineage.blockedByReset) return false;
-    const latestAudit = liveLineage.performance || liveLineage.second || liveLineage.core;
+    const prof = getActiveProfile();
+    const reverseWaves = [...(prof.waves || [])].reverse();
+    let latestAudit = null;
+    for (const w of reverseWaves) {
+      if (liveLineage[w.id]) {
+        latestAudit = liveLineage[w.id];
+        break;
+      }
+    }
+    if (!latestAudit) {
+      latestAudit = liveLineage.performance || liveLineage.second || liveLineage.core;
+    }
+
     if (latestAudit) {
       const id = getTurnId(latestAudit);
       const kind = classifyAuditTurn(latestAudit);
 
       if (!id) {
         setStatus(
-          `Auto3 found the latest ${waveLabel(kind)} command but ChatGPT has not hydrated its stable turn id yet. Recovery will retry automatically.`,
+          `Auto found the latest ${waveLabel(kind)} command but ChatGPT has not hydrated its stable turn id yet. Recovery will retry automatically.`,
           'info'
         );
         scheduleAutoAuditCheck(700);
@@ -11427,26 +12376,26 @@
       if (resumeRuntimeFromAuditTurn(latestAudit, { turns })) {
         backfillVisibleCompletedAuditResults();
         setStatus(
-          `Auto3 reconciled enabled+READY state from the live ${waveLabel(kind)} lineage. Continuing automatically; no OFF/ON toggle or Resume is required.`,
+          `Auto reconciled enabled+READY state from the live ${waveLabel(kind)} lineage. Continuing automatically; no OFF/ON toggle or Resume is required.`,
           'success'
         );
         return true;
       }
     }
 
-    // DOM virtualization fallback. Audit result records are scoped to this exact
-    // conversation and are written only from structurally COMPLETE handoffs.
     const coherentRecords = currentChatAuditRecords();
-    const core = coherentRecords.find(record => record.kind === 'core') || null;
-    const second = coherentRecords.find(record => record.kind === 'second') || null;
-    const performance = coherentRecords.find(record => record.kind === 'performance') || null;
-    const latestRecord = performance || second || core;
+    if (!coherentRecords.length) return false;
+    const latestRecord = coherentRecords[coherentRecords.length - 1];
     if (!latestRecord?.text) return false;
 
     let nextStage = '';
-    if (performance?.text) nextStage = 'complete';
-    else if (second?.text) nextStage = 'sending-performance';
-    else if (core?.text) nextStage = 'sending-second';
+    const completedWaveCount = coherentRecords.length;
+    if (completedWaveCount >= prof.waves.length) {
+      nextStage = 'complete';
+    } else {
+      const nextWave = prof.waves[completedWaveCount];
+      nextStage = `sending-${nextWave.id}`;
+    }
     if (!nextStage) return false;
 
     autoRuntime.stage = nextStage;
@@ -11468,7 +12417,7 @@
     clearAutoComposerHold();
 
     if (nextStage === 'complete') {
-      autoRuntime.completeAt = autoRuntime.completeAt || Number(performance?.completedAt) || Date.now();
+      autoRuntime.completeAt = autoRuntime.completeAt || Number(latestRecord.completedAt) || Date.now();
     }
 
     if (!saveAutoRuntime({ pauseOnFailure: false })) {
@@ -11478,15 +12427,16 @@
 
     if (nextStage === 'complete') {
       setStatus(
-        'Auto3 reconciled READY from cached COMPLETE Core + Second + Performance handoffs. Chain is DONE.',
+        `Auto reconciled READY from cached COMPLETE audit handoffs. Campaign is DONE.`,
         'success'
       );
       return true;
     }
 
-    const nextKind = nextStage === 'sending-second' ? 'second' : 'performance';
+    const nextWave = prof.waves[completedWaveCount];
+    const nextKind = nextWave ? nextWave.id : 'second';
     setStatus(
-      `Auto3 reconciled READY from cached COMPLETE audit evidence. Continuing with ${waveLabel(nextKind)} automatically.`,
+      `Auto reconciled READY from cached COMPLETE audit evidence. Continuing with ${waveLabel(nextKind)} automatically.`,
       'success'
     );
     scheduleAutoAuditCheck(0);
@@ -11620,7 +12570,7 @@
       if (['await-second-user', 'await-performance-user', 'await-continuation-user'].includes(autoRuntime.stage) && recoverCommittedSendFromDom(turns)) return;
 
       if (autoRuntime.stage === 'sending-continuation') {
-        scheduleAuditContinuation(autoRuntime.continuationKind);
+        scheduleSameWaveContinuation(autoRuntime.continuationKind);
         return;
       }
 
@@ -11835,47 +12785,41 @@
         return;
       }
 
-      if (autoRuntime.stage === 'wait-core') {
+      const prof = getActiveProfile();
+      const currentWaveDef = findWaveDefinitionForStageOrKind(currentWaveKind);
+      const currentWaveIndex = (prof.waves || []).findIndex(w => w.id === (currentWaveDef?.id || currentWaveKind));
+      const nextWave = (currentWaveIndex >= 0 && currentWaveIndex < prof.waves.length - 1)
+        ? prof.waves[currentWaveIndex + 1]
+        : null;
+
+      if (nextWave) {
         autoRuntime.continuationKind = '';
         autoRuntime.continuationReason = '';
         autoRuntime.continuationPreviousUserId = '';
         clearStageAssistant({ save: false });
         resetIdleStallWatch({ save: false });
-        autoRuntime.stage = 'sending-second';
+        autoRuntime.stage = `sending-${nextWave.id}`;
+        autoRuntime.currentWaveId = nextWave.id;
+        autoRuntime.currentWaveIndex = nextWave.ordinal;
         autoRuntime.waitStartedAt = Date.now();
         if (!saveAutoRuntime()) return;
-        scheduleNextWave('second');
+        scheduleNextWave(nextWave.id);
         return;
       }
 
-      if (autoRuntime.stage === 'wait-second') {
-        autoRuntime.continuationKind = '';
-        autoRuntime.continuationReason = '';
-        autoRuntime.continuationPreviousUserId = '';
-        clearStageAssistant({ save: false });
-        resetIdleStallWatch({ save: false });
-        autoRuntime.stage = 'sending-performance';
-        autoRuntime.waitStartedAt = Date.now();
-        if (!saveAutoRuntime()) return;
-        scheduleNextWave('performance');
-        return;
-      }
-
-      if (autoRuntime.stage === 'wait-performance') {
-        clearAutoComposerHold();
-        autoRuntime.continuationKind = '';
-        autoRuntime.continuationReason = '';
-        autoRuntime.continuationPreviousUserId = '';
-        clearStageAssistant({ save: false });
-        resetIdleStallWatch({ save: false });
-        autoRuntime.stage = 'complete';
-        autoRuntime.completeAt = Date.now();
-        autoRuntime.waitStartedAt = 0;
-        autoRuntime.stableResponseKey = '';
-        autoRuntime.stableSince = 0;
-        if (!saveAutoRuntime()) return;
-        setStatus('Auto audit chain complete: Core -> Second Wave -> Performance all received final responses.', 'success');
-      }
+      clearAutoComposerHold();
+      autoRuntime.continuationKind = '';
+      autoRuntime.continuationReason = '';
+      autoRuntime.continuationPreviousUserId = '';
+      clearStageAssistant({ save: false });
+      resetIdleStallWatch({ save: false });
+      autoRuntime.stage = 'complete';
+      autoRuntime.completeAt = Date.now();
+      autoRuntime.waitStartedAt = 0;
+      autoRuntime.stableResponseKey = '';
+      autoRuntime.stableSince = 0;
+      if (!saveAutoRuntime()) return;
+      setStatus(`Auto audit campaign complete: all ${prof.waves.length} waves received final responses.`, 'success');
     } finally {
       autoAuditEvaluating = false;
     }
@@ -13092,6 +14036,37 @@
       setAutoAuditEnabled(event.target.checked);
     });
 
+    const toggleAuditProfile = () => {
+      const currentProf = getActiveProfile();
+      const nextProfId = currentProf.profile_id === 'super10' ? 'quick3' : 'super10';
+      if (!commitStateMutation(() => {
+        state.auditProfile = nextProfId;
+        if (autoRuntime) autoRuntime.profileId = nextProfId;
+      }, 'Profile could not be persisted')) return;
+      renderAutoAuditState();
+      renderAuditQuickActions();
+      setStatus(`Audit campaign profile switched to ${getActiveProfile().display_name}.`, 'success');
+    };
+
+    const profileToggle = panel.querySelector('#acb-profile-toggle');
+    if (profileToggle) profileToggle.addEventListener('click', toggleAuditProfile);
+    const superProfileToggle = panel.querySelector('#acb-super-profile-toggle');
+    if (superProfileToggle) superProfileToggle.addEventListener('click', toggleAuditProfile);
+
+    const profileSelect = panel.querySelector('#acb-audit-profile');
+    if (profileSelect) {
+      profileSelect.addEventListener('change', event => {
+        const nextProfId = event.target.value;
+        if (!commitStateMutation(() => {
+          state.auditProfile = nextProfId;
+          if (autoRuntime) autoRuntime.profileId = nextProfId;
+        }, 'Profile could not be persisted')) return;
+        renderAutoAuditState();
+        renderAuditQuickActions();
+        setStatus(`Audit campaign profile set to ${getActiveProfile().display_name}.`, 'success');
+      });
+    }
+
     panel.querySelector('#acb-save-now').addEventListener('click', () => {
       syncSaveCurrentChatStateNow().catch(error => {
         manualAuditSyncInFlight = false;
@@ -13260,6 +14235,35 @@
           else setStatus(`AUDAPACK Bridge check did not reach writable authenticated state: ${bridgeMessage}`, 'warning');
         })
         .catch(error => setStatus(`AUDAPACK Bridge check failed: ${error?.message || 'unexpected bridge error'}.`, 'error'));
+    });
+
+    panel.querySelector('#acb-bridge-clear-queue')?.addEventListener('click', () => {
+      const count = clearBridgeQueue();
+      setStatus(`Cleared ${count} queued/failed audit save job(s) from local storage.`, 'success');
+      renderBridgeState();
+    });
+
+    panel.querySelector('#acb-bridge-retry-queue')?.addEventListener('click', () => {
+      const count = resetBridgeFailedJobs('');
+      setStatus(`Retrying ${count} failed audit save job(s)...`, 'info');
+      renderBridgeState();
+      scheduleBridgeFlush(50);
+    });
+
+    panel.querySelector('#acb-bridge-state')?.addEventListener('click', () => {
+      const stats = bridgeQueueStats();
+      if (stats.failed > 0) {
+        if (confirm(`Bridge queue has ${stats.failed} failed jobs. Clear them all?\n(OK = Clear all, Cancel = Retry)`)) {
+          const count = clearBridgeQueue();
+          setStatus(`Cleared ${count} failed audit job(s).`, 'success');
+        } else {
+          resetBridgeFailedJobs('');
+          setStatus('Retrying failed audit save jobs...', 'info');
+          scheduleBridgeFlush(50);
+        }
+      } else {
+        checkBridge({ force: true }).catch(() => { });
+      }
     });
 
     panel.querySelector('#acb-choose-audit-folder').addEventListener('click', () => {
@@ -13655,17 +14659,13 @@
         <div id="acb-title">AUDAPACK Widget</div>
         <div id="acb-site" title="Current site">${escapeHTML(site.label)}</div>
 
-        <div id="acb-super-controls" aria-label="Super compact Auto3 monitor">
+        <div id="acb-super-controls" aria-label="Super compact campaign monitor">
           <span id="acb-super-brand" title="No audit project detected in this chat.">CHAT</span>
-          <label id="acb-super-auto-label" for="acb-super-enabled" title="Auto3 for this chat">
-            <span>A3</span>
-            <input id="acb-super-enabled" type="checkbox" aria-label="Auto3 for this chat" />
+          <button id="acb-super-profile-toggle" type="button" title="Switch audit campaign profile (SUPER10 / QUICK3)">A3</button>
+          <label id="acb-super-auto-label" for="acb-super-enabled" title="Auto campaign for this chat">
+            <input id="acb-super-enabled" type="checkbox" aria-label="Auto campaign for this chat" />
           </label>
-          <div id="acb-super-progress" aria-label="Audit stages; completed stages can be clicked to copy">
-            <button type="button" class="acb-super-step" data-step="1" data-state="idle" title="Audit Core">1</button>
-            <button type="button" class="acb-super-step" data-step="2" data-state="idle" title="Audit Second Wave">2</button>
-            <button type="button" class="acb-super-step" data-step="3" data-state="idle" title="Audit Performance">3</button>
-          </div>
+          <div id="acb-super-progress" aria-label="Audit stages; completed stages can be clicked to copy"></div>
           <button id="acb-super-state" type="button" data-kind="info" data-action="sync-save" title="Audit state. READY becomes START when a project file is attached; otherwise click to SYNC/SAVE current audit state.">CHAT</button>
         </div>
 
@@ -13684,23 +14684,20 @@
         <div id="acb-view-commands" class="acb-view" role="tabpanel">
           <div id="acb-auto-audit">
             <div id="acb-auto-head">
-              <label id="acb-auto-toggle-label" for="acb-auto-enabled" title="Automatically continue Core -> Second Wave -> Performance for this ChatGPT conversation only.">
+              <label id="acb-auto-toggle-label" for="acb-auto-enabled" title="Automatically continue audit campaign waves for this ChatGPT conversation only.">
                 <input id="acb-auto-enabled" type="checkbox" />
-                <span>Auto3</span>
+                <span id="acb-auto-label-text">Auto</span>
               </label>
+              <button id="acb-profile-toggle" type="button" title="Switch audit campaign profile (SUPER10 / QUICK3)">A3</button>
               <button id="acb-auto-adopt" type="button" title="Resume/recover automation from the latest audit turn in this ChatGPT conversation.">Resume</button>
-              <button id="acb-auto-stop" type="button" title="Pause the active chain without disabling Auto3.">Pause</button>
+              <button id="acb-auto-stop" type="button" title="Pause the active chain without disabling Auto.">Pause</button>
             </div>
-            <div id="acb-auto-progress" aria-label="Audit chain progress">
-              <button type="button" class="acb-auto-step" data-step="1" data-state="idle">1 Core</button>
-              <button type="button" class="acb-auto-step" data-step="2" data-state="idle">2 Second</button>
-              <button type="button" class="acb-auto-step" data-step="3" data-state="idle">3 Perf</button>
-            </div>
+            <div id="acb-auto-progress" aria-label="Audit chain progress"></div>
             <div id="acb-auto-state-row">
-              <div id="acb-auto-state" data-kind="info">Auto chain disabled.</div>
-              <button id="acb-save-now" type="button" data-state="idle" title="SYNC/SAVE current chat: persist runtime, rescan COMPLETE waves, force-confirm disk output, and refresh ALL_3 when possible.">SAVE</button>
+              <div id="acb-auto-state" data-kind="info">Auto campaign disabled.</div>
+              <button id="acb-save-now" type="button" data-state="idle" title="SYNC/SAVE current chat: persist runtime, rescan COMPLETE waves, force-confirm disk output, and refresh campaign files when possible.">SAVE</button>
             </div>
-            <div id="acb-audit-copy-hint">Attach project + START = arm Auto3 automatically · normal chat stays inert · every COMPLETE is saved.</div>
+            <div id="acb-audit-copy-hint">Attach project + START = arm Auto campaign automatically · normal chat stays inert · every COMPLETE is saved.</div>
           </div>
 
           <div id="acb-audit-quick">
@@ -13802,9 +14799,16 @@
           </div>
 
           <div class="acb-section">
-            <div class="acb-section-title">Auto 3 waves</div>
-            <div class="acb-section-note">Smart mode: normal chat is inert. Attach a project and press START to arm the full Core → Second → Performance chain automatically.</div>
+            <div class="acb-section-title">Audit campaign engine</div>
+            <div class="acb-section-note">Smart mode: normal chat is inert. Attach a project and press START to arm the full audit campaign automatically.</div>
             <div id="acb-auto-config">
+              <div class="acb-auto-field">
+                <label for="acb-audit-profile">Campaign profile</label>
+                <select id="acb-audit-profile" title="Select audit campaign profile: Super10 (10 waves) or Quick3 (3 waves).">
+                  <option value="super10">Super10 (10 waves · Red Team)</option>
+                  <option value="quick3">Quick3 (3 waves · Classic)</option>
+                </select>
+              </div>
               <div class="acb-auto-field">
                 <label for="acb-auto-gate">Completion gate</label>
                 <select id="acb-auto-gate" title="Strict requires COMPLETE before advancing to the NEXT wave. PARTIAL and silent idle/stopped responses automatically continue the SAME wave until COMPLETE.">
@@ -13874,8 +14878,10 @@
 
               <button id="acb-bridge-save-token" type="button" title="Store the token in Tampermonkey storage and retry authentication failures.">Save token</button>
               <button id="acb-bridge-check" type="button" title="Check /health and authenticated /v1/status, then flush queued audit saves.">Check + flush</button>
+              <button id="acb-bridge-clear-queue" type="button" title="Clear all failed/queued audit save jobs from Tampermonkey local storage.">Clear queue</button>
+              <button id="acb-bridge-retry-queue" type="button" title="Retry all failed audit save jobs immediately.">Retry queue</button>
             </div>
-            <div id="acb-bridge-state" data-state="warning">UNKNOWN · queued 0 · failed 0</div>
+            <div id="acb-bridge-state" data-state="warning" title="Click to clear or retry failed jobs">UNKNOWN · queued 0 · failed 0</div>
 
             <div id="acb-browser-fallback">
               <div class="acb-section-note">Optional browser-folder fallback. Used only when AUDAPACK Bridge is disabled.</div>
@@ -14203,6 +15209,11 @@
         sendAutoAuditWave,
         sendAutoAuditContinuation,
         autoClickAssistantRecovery,
+        getActiveProfile,
+        findWaveDefinitionForStageOrKind,
+        buildAuditWavePrompt,
+        EMBEDDED_AUDIT_PROFILES,
+        AUDIT_PROFILES_MANIFEST_SHA256,
         setStatus
       }
     });

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from audapack.models import SaipenInfo
 
@@ -107,10 +106,10 @@ def inspect_git_status(project_path: Path) -> dict[str, Any]:
             lines = proc_st.stdout.splitlines()
             changed = 0
             untracked = 0
-            for l in lines:
-                if l.startswith("??"):
+            for line in lines:
+                if line.startswith("??"):
                     untracked += 1
-                elif l.strip():
+                elif line.strip():
                     changed += 1
             result["dirty"] = (changed > 0 or untracked > 0)
             result["changed_files"] = changed

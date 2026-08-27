@@ -12,7 +12,9 @@ Presentation-only in-memory model:
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -25,8 +27,10 @@ from PySide6.QtCore import (
     Signal,
 )
 
-from audapack.audits import calculate_temperature
+from audapack.audits import calculate_temperature, format_age_str
+from audapack.config import app_dir
 from audapack.models import AuditSnapshot, AuditTemperature, Project
+from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
 from audapack.services.audit_service import AuditService
 from audapack.services.project_service import ProjectService
 
@@ -52,6 +56,12 @@ class ProjectRoomModel(QAbstractItemModel):
         "pack_message": Qt.ItemDataRole.UserRole + 12,
         "completed_waves": Qt.ItemDataRole.UserRole + 13,
         "source_path": Qt.ItemDataRole.UserRole + 14,
+        "total_waves": Qt.ItemDataRole.UserRole + 15,
+        "campaign_complete": Qt.ItemDataRole.UserRole + 16,
+        "audit_age_str": Qt.ItemDataRole.UserRole + 17,
+        "archive_info": Qt.ItemDataRole.UserRole + 18,
+        "audit_profile_id": Qt.ItemDataRole.UserRole + 19,
+        "archive_sync_status": Qt.ItemDataRole.UserRole + 20,
     }
 
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None, parent: Optional[QObject] = None):
@@ -89,10 +99,8 @@ class ProjectRoomModel(QAbstractItemModel):
         # Explicit reload (user Refresh All) still preloads synchronously for immediate feedback.
         self._snapshots = {}
         if not initial:
-            # De-duplicate via direct project object to avoid extra registry lookup per item.
             for p in projects:
                 try:
-                    # Use indexer directly if available to skip registry id lookup.
                     if hasattr(self._audit_service, "indexer"):
                         snap = self._audit_service.indexer.scan_project(p)
                     else:
@@ -105,6 +113,17 @@ class ProjectRoomModel(QAbstractItemModel):
 
     def reload(self):
         self._reload(initial=False)
+
+    def project_at(self, group: str, slot: int) -> Optional[Project]:
+        """Returns Project located at (group, slot), or None if empty."""
+        return self._projects.get((group.upper(), slot))
+
+    def project_by_id(self, project_id: str) -> Optional[Project]:
+        """Finds Project by project ID."""
+        for p in self._projects.values():
+            if p and p.id == project_id:
+                return p
+        return None
 
     # ---------------------------------------------------------------- Targeted Mutation API
 
@@ -139,10 +158,8 @@ class ProjectRoomModel(QAbstractItemModel):
         src_g = src_group.upper()
         tgt_g = tgt_group.upper()
 
-        # Ensure target group exists in model
         self.ensure_group_exists(tgt_g)
 
-        # Update in-memory map
         if swapped_project:
             self._projects[(src_g, src_slot)] = swapped_project
         else:
@@ -150,7 +167,6 @@ class ProjectRoomModel(QAbstractItemModel):
 
         self._projects[(tgt_g, tgt_slot)] = project
 
-        # Targeted signal emissions
         src_idx = self.index_for_slot(src_g, src_slot)
         tgt_idx = self.index_for_slot(tgt_g, tgt_slot)
 
@@ -204,14 +220,25 @@ class ProjectRoomModel(QAbstractItemModel):
             new_age = max(0.0, (current_time - snap.audit_timestamp).total_seconds())
             new_temp = (
                 calculate_temperature(new_age, cfg)
-                if (snap.completed_waves > 0 or snap.all3_ready)
+                if (snap.completed_waves > 0 or snap.final_handoff_ready or snap.all3_ready)
                 else AuditTemperature.NONE
             )
             if new_temp != snap.temperature or int(new_age // 60) != int((snap.audit_age_seconds or 0) // 60):
-                # Update snapshot in memory
                 updated_snap = AuditSnapshot(
                     project_id=snap.project_id,
                     project_name=snap.project_name,
+                    audit_profile_id=snap.audit_profile_id,
+                    audit_profile_version=snap.audit_profile_version,
+                    completed_waves=snap.completed_waves,
+                    total_waves=snap.total_waves,
+                    campaign_complete=snap.campaign_complete,
+                    final_handoff_ready=snap.final_handoff_ready,
+                    final_handoff_sha256=snap.final_handoff_sha256,
+                    final_handoff_path=snap.final_handoff_path,
+                    all_path=snap.all_path,
+                    campaign_run_id=snap.campaign_run_id,
+                    wave_files=snap.wave_files,
+                    wave_statuses=snap.wave_statuses,
                     core_path=snap.core_path,
                     core_complete=snap.core_complete,
                     second_path=snap.second_path,
@@ -224,7 +251,6 @@ class ProjectRoomModel(QAbstractItemModel):
                     audit_timestamp=snap.audit_timestamp,
                     audit_age_seconds=new_age,
                     temperature=new_temp,
-                    completed_waves=snap.completed_waves,
                     total_tickets=snap.total_tickets,
                 )
                 self._snapshots[proj.id] = updated_snap
@@ -234,6 +260,11 @@ class ProjectRoomModel(QAbstractItemModel):
 
         for idx in changed_indexes:
             self.dataChanged.emit(idx, idx)
+
+    def group_count(self, group: str) -> int:
+        """Returns count of active projects in a group."""
+        g_upper = group.upper()
+        return sum(1 for (g, s), p in self._projects.items() if g == g_upper and p is not None)
 
     def ensure_group_exists(self, group: str) -> bool:
         """Dynamically inserts a new SIDE group into model hierarchy with beginInsertRows."""
@@ -248,13 +279,13 @@ class ProjectRoomModel(QAbstractItemModel):
 
     # ---------------------------------------------------------------- Qt Item Model API
 
-    def index(self, row: int, column: int, parent: QModelIndex = QModelIndex()) -> QModelIndex:
-        if not self.hasIndex(row, column, parent):
+    def index(self, row: int, column: int, parent: Optional[QModelIndex] = None) -> QModelIndex:
+        p = parent if parent is not None else QModelIndex()
+        if not self.hasIndex(row, column, p):
             return QModelIndex()
-        if not parent.isValid():
-            return self.createIndex(row, column, 0)  # 0 = group row
-        # slot row: internalId stores (parent_group_row + 1)
-        return self.createIndex(row, column, parent.row() + 1)
+        if not p.isValid():
+            return self.createIndex(row, column, 0)
+        return self.createIndex(row, column, p.row() + 1)
 
     def parent(self, index: QModelIndex) -> QModelIndex:
         if not index.isValid():
@@ -267,14 +298,15 @@ class ProjectRoomModel(QAbstractItemModel):
             return self.createIndex(parent_row, 0, 0)
         return QModelIndex()
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        if not parent.isValid():
+    def rowCount(self, parent: Optional[QModelIndex] = None) -> int:
+        p = parent if parent is not None else QModelIndex()
+        if not p.isValid():
             return len(self._groups)
-        if parent.internalId() == 0:
+        if p.internalId() == 0:
             return 6  # SLOTS_PER_GROUP (1..6)
         return 0
 
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def columnCount(self, parent: Optional[QModelIndex] = None) -> int:
         return 1
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
@@ -282,7 +314,6 @@ class ProjectRoomModel(QAbstractItemModel):
             return None
 
         if index.internalId() == 0:
-            # Group row
             if index.row() >= len(self._groups):
                 return None
             group = self._groups[index.row()]
@@ -294,7 +325,6 @@ class ProjectRoomModel(QAbstractItemModel):
                 return group
             return None
 
-        # Slot row
         group_idx = int(index.internalId()) - 1
         if group_idx >= len(self._groups):
             return None
@@ -327,16 +357,30 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["enabled"]:
             return bool(proj.enabled)
 
-        # Audit roles (fast in-memory read)
+        # Audit roles
         snap = self._snapshots.get(proj.id)
         if role == self.ROLES["audit_temperature"]:
             return getattr(snap, "temperature", AuditTemperature.NONE)
         if role == self.ROLES["audit_age_seconds"]:
             return getattr(snap, "audit_age_seconds", None)
         if role == self.ROLES["all_ready"]:
-            return bool(getattr(snap, "all3_ready", getattr(snap, "all_ready", False)))
+            return bool(getattr(snap, "final_handoff_ready", False) or getattr(snap, "all3_ready", False) or getattr(snap, "all_ready", False))
         if role == self.ROLES["completed_waves"]:
             return getattr(snap, "completed_waves", 0)
+        if role == self.ROLES["total_waves"]:
+            return getattr(snap, "total_waves", 3)
+        if role == self.ROLES["campaign_complete"]:
+            return bool(getattr(snap, "campaign_complete", False))
+        if role == self.ROLES["audit_age_str"]:
+            age_s = getattr(snap, "audit_age_seconds", None) if snap else None
+            return format_age_str(age_s)
+        if role == self.ROLES["archive_info"]:
+            return self.get_archive_info(proj)
+        if role == self.ROLES["audit_profile_id"]:
+            prof = getattr(snap, "audit_profile_id", "quick3") if snap else "quick3"
+            return "A10" if prof == "super10" else "A3"
+        if role == self.ROLES["archive_sync_status"]:
+            return self.get_archive_sync_status(proj, snap)
 
         # Pack state role
         if role == self.ROLES["pack_state"]:
@@ -348,65 +392,94 @@ class ProjectRoomModel(QAbstractItemModel):
 
         return None
 
+    def get_archive_info(self, proj: Project) -> tuple[bool, str, str, Optional[Path]]:
+        """Returns (exists, size_str, age_str, path)."""
+        if not proj or not proj.source_path:
+            return (False, "", "", None)
+        try:
+            out_dir = resolve_output_dir(proj.source_path, self._service.config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
+            arc = find_archive_for_project(proj, out_dir)
+            if arc and arc.exists():
+                st = arc.stat()
+                age_s = time.time() - st.st_mtime
+                return (True, human_mb(st.st_size), format_age_str(age_s), arc)
+        except Exception:
+            pass
+        return (False, "", "", None)
+
+    def get_archive_sync_status(self, proj: Project, snap: Optional[AuditSnapshot]) -> str:
+        """Returns 'SYNCED', 'OUTDATED', or 'NO_ARCHIVE'."""
+        if not proj or not proj.source_path:
+            return "NO_ARCHIVE"
+        arc_info = self.get_archive_info(proj)
+        arc_exists, _size, _age, arc_path = arc_info
+        if not arc_exists or not arc_path:
+            return "NO_ARCHIVE"
+        if not snap or not snap.audit_timestamp:
+            return "SYNCED"
+        try:
+            arc_mtime = arc_path.stat().st_mtime
+            audit_ts = snap.audit_timestamp.timestamp()
+            if audit_ts > arc_mtime + 60:
+                return "OUTDATED"
+        except Exception:
+            pass
+        return "SYNCED"
+
+    def supportedDropActions(self) -> Qt.DropAction:
+        return Qt.DropAction.MoveAction | Qt.DropAction.CopyAction
+
+    def supportedDragActions(self) -> Qt.DropAction:
+        return Qt.DropAction.MoveAction | Qt.DropAction.CopyAction
+
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
+            return Qt.ItemFlag.ItemIsDropEnabled
 
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
         if index.internalId() == 0:
-            # Group row: not draggable, can accept drop to assign to first available slot
             return base | Qt.ItemFlag.ItemIsDropEnabled
 
-        # Slot row
         group_idx = int(index.internalId()) - 1
-        if group_idx < len(self._groups):
-            group = self._groups[group_idx]
-            slot = index.row() + 1
-            proj = self._projects.get((group, slot))
-            if proj is not None:
-                # Occupied slot is both draggable and droppable (swap/replace)
-                return base | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
-            else:
-                # Empty slot is a drop target
-                return base | Qt.ItemFlag.ItemIsDropEnabled
+        group = self._groups[group_idx] if group_idx < len(self._groups) else ""
+        slot = index.row() + 1
+        proj = self._projects.get((group, slot))
 
-        return base
-
-    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return "Project Room"
-        return None
-
-    # ---------------------------------------------------------------- Drag & Drop Model API
+        if proj is not None:
+            return base | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
+        return base | Qt.ItemFlag.ItemIsDropEnabled
 
     def mimeTypes(self) -> list[str]:
-        return [MIME_TYPE_PROJECT]
+        return [MIME_TYPE_PROJECT, "text/uri-list"]
 
     def mimeData(self, indexes: list[QModelIndex]) -> QMimeData:
-        """Serializes selected project ID and source slot into MIME payload."""
         mime = QMimeData()
-        for idx in indexes:
-            if idx.isValid() and idx.internalId() != 0:
-                p_id = self.data(idx, self.ROLES["project_id"])
-                grp = self.data(idx, self.ROLES["group"])
-                slot = self.data(idx, self.ROLES["slot"])
-                if p_id:
-                    payload = {
-                        "project_id": p_id,
-                        "source_group": grp,
-                        "source_slot": slot,
-                    }
-                    data_bytes = json.dumps(payload).encode("utf-8")
-                    mime.setData(MIME_TYPE_PROJECT, QByteArray(data_bytes))
-                    return mime
+        if not indexes:
+            return mime
+        idx = indexes[0]
+        if not idx.isValid() or idx.internalId() == 0:
+            return mime
+
+        group_idx = int(idx.internalId()) - 1
+        if group_idx >= len(self._groups):
+            return mime
+        group = self._groups[group_idx]
+        slot = idx.row() + 1
+        proj = self._projects.get((group, slot))
+        if not proj:
+            return mime
+
+        payload = {
+            "project_id": proj.id,
+            "display_name": proj.display_name,
+            "source_group": group,
+            "source_slot": slot,
+        }
+        data = QByteArray(json.dumps(payload).encode("utf-8"))
+        mime.setData(MIME_TYPE_PROJECT, data)
+        mime.setText(proj.display_name)
         return mime
-
-    def supportedDragActions(self) -> Qt.DropAction:
-        return Qt.DropAction.MoveAction
-
-    def supportedDropActions(self) -> Qt.DropAction:
-        return Qt.DropAction.MoveAction
 
     def canDropMimeData(
         self,
@@ -416,10 +489,9 @@ class ProjectRoomModel(QAbstractItemModel):
         column: int,
         parent: QModelIndex,
     ) -> bool:
-        """Zero I/O validation of drag format and destination."""
-        if not data.hasFormat(MIME_TYPE_PROJECT):
-            return False
-        return True
+        if data.hasFormat(MIME_TYPE_PROJECT) or data.hasUrls():
+            return True
+        return False
 
     def dropMimeData(
         self,
@@ -429,49 +501,49 @@ class ProjectRoomModel(QAbstractItemModel):
         column: int,
         parent: QModelIndex,
     ) -> bool:
-        """Receives drop and emits project_dropped signal for async persistence handling."""
         if not data.hasFormat(MIME_TYPE_PROJECT):
             return False
 
         try:
-            raw = bytes(data.data(MIME_TYPE_PROJECT)).decode("utf-8")
-            payload = json.loads(raw)
-            project_id = payload.get("project_id")
-            src_group = payload.get("source_group")
-            src_slot = payload.get("source_slot")
+            payload = json.loads(bytes(data.data(MIME_TYPE_PROJECT)).decode("utf-8"))
         except Exception:
             return False
 
-        if not project_id or not parent.isValid():
+        proj_id = payload.get("project_id")
+        src_group = payload.get("source_group")
+        src_slot = payload.get("source_slot")
+
+        if not proj_id or not src_group or src_slot is None:
             return False
 
-        # Determine target group & slot
-        if parent.internalId() == 0:
-            # Dropped directly on a slot item (whose parent is a group row)
-            # Or dropped on a group row
+        if not parent.isValid():
+            target_group = src_group
+            target_slot = 1
+            for s in range(1, 7):
+                if (target_group, s) not in self._projects:
+                    target_slot = s
+                    break
+        elif parent.internalId() == 0:
+            target_group = self._groups[parent.row()]
             if row >= 0:
-                target_group = self._groups[parent.row()]
                 target_slot = row + 1
             else:
-                # Dropped on a slot index directly
-                target_group = self.data(parent, self.ROLES["group"])
-                target_slot = self.data(parent, self.ROLES["slot"]) or 1
+                target_slot = 1
+                for s in range(1, 7):
+                    if (target_group, s) not in self._projects:
+                        target_slot = s
+                        break
         else:
-            target_group = self.data(parent, self.ROLES["group"])
-            target_slot = self.data(parent, self.ROLES["slot"]) or 1
+            group_idx = int(parent.internalId()) - 1
+            if group_idx >= len(self._groups):
+                return False
+            target_group = self._groups[group_idx]
+            target_slot = parent.row() + 1
 
-        if not target_group or not target_slot:
+        target_slot = max(1, min(6, target_slot))
+
+        if target_group == src_group and target_slot == src_slot:
             return False
 
-        # Emit drop signal for controller / MainWindow to handle with optimistic mutation
-        self.project_dropped.emit(project_id, target_group, target_slot, src_group, src_slot)
+        self.project_dropped.emit(proj_id, target_group, target_slot, src_group, src_slot)
         return True
-
-    # ---------------------------------------------------------------- helpers
-
-    def project_at(self, group: str, slot: int) -> Optional[Project]:
-        return self._projects.get((group.upper(), slot))
-
-    def group_count(self, group: str) -> int:
-        g = group.upper()
-        return sum(1 for (grp, _s), p in self._projects.items() if grp == g and p is not None)

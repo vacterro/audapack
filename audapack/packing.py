@@ -20,7 +20,7 @@ from typing import Callable, Optional
 from audapack.config import (
     DEFAULT_OUTPUT_LAYOUT,
     OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
-    OUTPUT_LAYOUT_SINGLE_FOLDER,
+    OUTPUT_LAYOUT_GROUPED_BY_PRIORITY,
     PackingConfig,
     normalize_output_layout,
 )
@@ -371,6 +371,8 @@ def resolve_output_dir(
     source_path: str | Path,
     packing: PackingConfig,
     fallback: Path,
+    group: Optional[str] = None,
+    project: Optional[Project] = None,
 ) -> Path:
     """Return the directory where the archive for ``source_path`` should be written.
 
@@ -387,10 +389,8 @@ def resolve_output_dir(
       ``V:\\code\\_PY\\_FastPrompter.zip`` next to the folder. This is the
       user's "archive next to the project" layout.
 
-    Robustness: when the alongside layout is selected but the source has no
-    usable parent (e.g. a drive root like ``V:\\``), fall back to the
-    single_folder behaviour so packing still succeeds and the user sees a
-    clear log line about the fallback.
+    - ``grouped_by_priority``: the archive is written into group subfolders
+      (e.g. ``MAIN0/``, ``SIDE0/``) under the output root, separate from text audits.
     """
     layout = normalize_output_layout(getattr(packing, "output_layout", DEFAULT_OUTPUT_LAYOUT))
     if layout == OUTPUT_LAYOUT_ALONGSIDE_PROJECTS:
@@ -406,6 +406,20 @@ def resolve_output_dir(
             # edge case so the pack still succeeds.
             if str(parent) != str(sp):
                 return parent
+
+    if layout == OUTPUT_LAYOUT_GROUPED_BY_PRIORITY:
+        grp = (group or (project.priority_group if project else None) or "MAIN0").strip().upper()
+        out = (packing.output_dir or "").strip()
+        base = Path(out) if out else Path(fallback)
+        # Avoid dumping archives directly inside text audit wave folders if base matches audit root
+        try:
+            from audapack.config import DEFAULT_AUDIT_ROOT
+            if base.resolve() == Path(DEFAULT_AUDIT_ROOT).resolve():
+                base = base / "_ARCHIVES"
+        except Exception:
+            pass
+        return base / grp
+
     # single_folder (default + fallback)
     out = (packing.output_dir or "").strip()
     if out:
@@ -419,6 +433,7 @@ def pack_single(
     archive_stem: str,
     excludes: set[str],
     delete_old: bool = True,
+    include_timestamp: Optional[bool] = None,
     cancel_event: Optional[threading.Event] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -428,14 +443,12 @@ def pack_single(
     log = log_callback or (lambda msg: None)
     source = Path(source_path)
     stem = safe_archive_stem(archive_stem)
-    # Clean, exact name when old archives are auto-deleted (default): the
-    # archive is named exactly after the project, no timestamp garbage. Keep
-    # the timestamp only when history is preserved (delete_old=False).
-    if delete_old:
-        output_path = output_dir / f"{stem}.zip"
-    else:
-        run_stamp = datetime.now().strftime("%d-%m-%Y-T%H-%M-%S")
+    use_ts = include_timestamp if include_timestamp is not None else (not delete_old)
+    if use_ts:
+        run_stamp = datetime.now().strftime("%d.%m.%y-T%H-%M-%S")
         output_path = output_dir / f"{stem}_{run_stamp}.zip"
+    else:
+        output_path = output_dir / f"{stem}.zip"
 
     # W2-003: reject a self-referential topology. Packing into the source (or a
     # descendant of it) makes the operation consume its own staging/output area.
