@@ -5,6 +5,12 @@
 ## TODO
 
 ## DONE
+- [x] T-26 [HIGH] Add archive output layout switch in Settings: single_folder (current, uses packing.output_dir) vs alongside_projects (archive written to source_path.parent, sibling of the project folder, NOT inside it). Resolve per-project in PackingService + CLI pack paths. Settings Packing tab: combo box with both modes + clear labels; persist via PackingConfig.output_layout. Verify: alongside writes archive as sibling of project folder; single_folder unchanged. | owner: opencode | claim_time: 2026-08-27T04:43:00Z
+
+## BLOCKED
+- [ ] T-27 [HIGH] Real launcher "app doesn't open" persists in production: self-correct does not fire because _find_window_hwnd's prefix fallback accepts explorer.exe windows titled "_AUDAPACK" (the project folder shown in File Explorer's title bar), so is_already_running returns True and main() silently no-ops foregrounding the wrong window. Em-dash marker landed (b7984cb T-25) but the actual production failure is the Qt MainWindow not becoming WS_VISIBLE (the window object exists with the correct title but IsWindowVisible=False), so even with the marker fix the app does not appear. | verify: real pythonw AUDAPACK.pyw produces a visible AUDAPACK window (WS_VISIBLE) end-to-end, not an in-process probe | blocker: requires live Windows GUI verification (headless agent session cannot reliably reproduce the WS_VISIBLE failure mode or validate a Qt platform/Windows-shell fix); user pivoted to layout work; revisit after T-26. Unblock path: reproduce on a real desktop session with a Qt-aware debugger, or switch the Qt entry to a minimal platform-independent test harness that forces ShowWindow(SW_SHOWNORMAL) on the top-level.
+
+## DONE
 - [x] T-25 [HIGH] Fix launcher "app doesn't open": single-instance guard trusts the mutex blindly; a windowless/hung AUDAPACK.pyw holds Local\AUDAPACK_GUI_MUTEX, so every launch sees "already running", finds no window, silently exits. | verify: is_already_running() returns False after zombie cleared; windowless holder no longer bricks the launcher; fresh launcher opens a real window | owner: opencode | claim_time: 2026-08-27T00:15:00Z
 - [x] T-13 [LOW] Reconcile legacy raw-named canonical artifact paths with new fs-safe naming | verify: pytest regression proving fs-safe name resolution | owner: opencode | claim_time: 2026-08-27T00:23:56Z
 - [x] T-24 [HIGH] Wave N Qt production cutover / Tkinter removal / final UI parity | verify: Qt default launcher, full feature parity, release audit | owner: opencode | claim_time: 2026-08-27T00:18:11Z

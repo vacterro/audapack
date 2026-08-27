@@ -310,12 +310,46 @@ def cross_process_lock(path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
         yield
 
 
+# Output layout modes (CORE-009 / T-26):
+#   single_folder      -- every archive is written to PackingConfig.output_dir
+#                         (or the app runtime dir if empty). This is the legacy
+#                         single-folder behaviour.
+#   alongside_projects -- each archive is written as a SIBLING of its project
+#                         folder, i.e. to source_path.parent. The archive is
+#                         NOT placed inside the project (which would make it
+#                         a self-referential pack, W2-003). This keeps each
+#                         project's archive next to the project on disk.
+OUTPUT_LAYOUT_SINGLE_FOLDER = "single_folder"
+OUTPUT_LAYOUT_ALONGSIDE_PROJECTS = "alongside_projects"
+OUTPUT_LAYOUT_CHOICES = (
+    OUTPUT_LAYOUT_SINGLE_FOLDER,
+    OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
+)
+DEFAULT_OUTPUT_LAYOUT = OUTPUT_LAYOUT_SINGLE_FOLDER
+
+
+def normalize_output_layout(value: object) -> str:
+    """Coerce a persisted/imported output_layout value to a known enum member.
+
+    Unknown / missing / empty values fall back to the legacy single-folder
+    behaviour so an older config.json keeps working unchanged.
+    """
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in OUTPUT_LAYOUT_CHOICES:
+            return v
+    return DEFAULT_OUTPUT_LAYOUT
+
+
 @dataclass
 class PackingConfig:
     output_dir: str = ""
     delete_old: bool = True
     excludes: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDES))
     manifest_enabled: bool = True
+    # CORE-009: archive output layout. Legacy configs without this field are
+    # treated as single_folder (the old behaviour) so migration is a no-op.
+    output_layout: str = DEFAULT_OUTPUT_LAYOUT
 
 
 @dataclass
@@ -676,6 +710,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         delete_old=bool(packing_raw.get("delete_old", data.get("delete_old", True))),
         excludes=list(packing_raw.get("excludes", data.get("excludes", DEFAULT_EXCLUDES))),
         manifest_enabled=bool(packing_raw.get("manifest_enabled", data.get("manifest_enabled", True))),
+        output_layout=normalize_output_layout(packing_raw.get("output_layout", DEFAULT_OUTPUT_LAYOUT)),
     )
 
     audits_raw = data.get("audits", {})

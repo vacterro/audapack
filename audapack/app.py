@@ -17,7 +17,7 @@ from audapack.context_menu import (
     is_context_menu_installed,
     remove_context_menu,
 )
-from audapack.packing import pack_single
+from audapack.packing import pack_single, resolve_output_dir
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
 
@@ -39,7 +39,7 @@ def run_silent_pack_all() -> int:
         return 0
 
     excludes = set(config.packing.excludes)
-    output_dir = Path(config.packing.output_dir or str(app_dir()))
+    fallback = app_dir()
     all_success = True
 
     for p in enabled_projects:
@@ -62,6 +62,7 @@ def run_silent_pack_all() -> int:
                     "changed_files": saipen_info.git_changed_files,
                 }
 
+        output_dir = resolve_output_dir(p.source_path, config.packing, fallback=fallback)
         res = pack_single(
             source_path=p.source_path,
             output_dir=output_dir,
@@ -89,7 +90,7 @@ def run_pack_path(path_str: str) -> int:
     registry = ProjectRegistry(config)
     matching_project = registry.get_project_by_path(target)
     stem = matching_project.archive_name if matching_project else target.name
-    output_dir = Path(config.packing.output_dir or str(app_dir()))
+    output_dir = resolve_output_dir(target, config.packing, fallback=app_dir())
     excludes = set(config.packing.excludes)
 
     extra_meta = {}
@@ -142,7 +143,7 @@ def run_pack_project(project_id: str) -> int:
         print(f"Error: Source path does not exist: {source}", file=sys.stderr)
         return 1
 
-    output_dir = Path(config.packing.output_dir or str(app_dir()))
+    output_dir = resolve_output_dir(source, config.packing, fallback=app_dir())
     excludes = set(config.packing.excludes)
     stem = proj.archive_name or proj.display_name
 

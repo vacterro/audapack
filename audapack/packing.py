@@ -17,6 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from audapack.config import (
+    DEFAULT_OUTPUT_LAYOUT,
+    OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
+    OUTPUT_LAYOUT_SINGLE_FOLDER,
+    PackingConfig,
+    normalize_output_layout,
+)
 from audapack.models import PackResult, Project
 
 MANIFEST_FILENAME = "_AUDAPACK_MANIFEST.json"
@@ -358,6 +365,52 @@ def find_archive_for_project(project: "Project", output_dir: Path) -> Optional[P
         if latest:
             return latest
     return None
+
+
+def resolve_output_dir(
+    source_path: str | Path,
+    packing: PackingConfig,
+    fallback: Path,
+) -> Path:
+    """Return the directory where the archive for ``source_path`` should be written.
+
+    The directory is chosen by ``packing.output_layout``:
+
+    - ``single_folder`` (legacy): every archive goes to ``packing.output_dir``
+      if set, otherwise to ``fallback`` (the app runtime dir). All projects
+      share the same output directory.
+
+    - ``alongside_projects``: the archive is written as a SIBLING of the
+      project folder, i.e. to ``source_path.parent``. The archive is NEVER
+      written inside the project (W2-003 self-referential guard): a project
+      at ``V:\\code\\_PY\\_FastPrompter`` produces
+      ``V:\\code\\_PY\\_FastPrompter.zip`` next to the folder. This is the
+      user's "archive next to the project" layout.
+
+    Robustness: when the alongside layout is selected but the source has no
+    usable parent (e.g. a drive root like ``V:\\``), fall back to the
+    single_folder behaviour so packing still succeeds and the user sees a
+    clear log line about the fallback.
+    """
+    layout = normalize_output_layout(getattr(packing, "output_layout", DEFAULT_OUTPUT_LAYOUT))
+    if layout == OUTPUT_LAYOUT_ALONGSIDE_PROJECTS:
+        sp = Path(source_path)
+        try:
+            parent = sp.parent
+        except Exception:
+            parent = None
+        if parent is not None and str(parent) not in ("", ".", "/"):
+            # Reject the drive-root case ("V:\\" parent is "V:\\") because the
+            # archive would land at the drive root and the W2-003 self-pack
+            # guard would reject it anyway. Fall back to single_folder in that
+            # edge case so the pack still succeeds.
+            if str(parent) != str(sp):
+                return parent
+    # single_folder (default + fallback)
+    out = (packing.output_dir or "").strip()
+    if out:
+        return Path(out)
+    return Path(fallback)
 
 
 def pack_single(

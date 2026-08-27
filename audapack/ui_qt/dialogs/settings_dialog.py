@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -15,7 +16,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from audapack.config import save_config
+from audapack.config import (
+    OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
+    OUTPUT_LAYOUT_CHOICES,
+    OUTPUT_LAYOUT_SINGLE_FOLDER,
+    normalize_output_layout,
+    save_config,
+)
+
+# Human-readable labels for the output-layout combo. Keep the data value as
+# the canonical key (one of OUTPUT_LAYOUT_CHOICES) so the on-disk config is
+# stable across UI translations.
+_OUTPUT_LAYOUT_OPTIONS = (
+    (
+        OUTPUT_LAYOUT_SINGLE_FOLDER,
+        "Single folder (all archives in Output dir)",
+    ),
+    (
+        OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
+        "Alongside projects (archive as sibling of each project folder)",
+    ),
+)
 
 
 class SettingsDialog(QDialog):
@@ -58,6 +79,15 @@ class SettingsDialog(QDialog):
         f = QFormLayout(w)
         self.output_dir = QLineEdit(self._config.packing.output_dir)
         f.addRow("Output dir", self.output_dir)
+        # CORE-009: archive output layout switch (T-26).
+        self.output_layout = QComboBox()
+        current_layout = normalize_output_layout(self._config.packing.output_layout)
+        for value, label in _OUTPUT_LAYOUT_OPTIONS:
+            self.output_layout.addItem(label, userData=value)
+        idx = self.output_layout.findData(current_layout)
+        if idx >= 0:
+            self.output_layout.setCurrentIndex(idx)
+        f.addRow("Archive layout", self.output_layout)
         self.delete_old = QCheckBox()
         self.delete_old.setChecked(self._config.packing.delete_old)
         f.addRow("Delete old archives", self.delete_old)
@@ -101,6 +131,10 @@ class SettingsDialog(QDialog):
         c.ui.ui_language = self.ui_language.text().strip() or c.ui.ui_language
         c.ui.reply_language = self.reply_language.text().strip() or c.ui.reply_language
         c.packing.output_dir = self.output_dir.text().strip()
+        layout_value = self.output_layout.currentData()
+        if layout_value not in OUTPUT_LAYOUT_CHOICES:
+            layout_value = normalize_output_layout(layout_value)
+        c.packing.output_layout = layout_value
         c.packing.delete_old = self.delete_old.isChecked()
         c.packing.manifest_enabled = self.manifest.isChecked()
         c.audits.root = self.audit_root.text().strip()

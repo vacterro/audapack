@@ -7,7 +7,7 @@ from typing import Callable, Iterable, List, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
 from audapack.models import Project
-from audapack.packing import pack_single
+from audapack.packing import pack_single, resolve_output_dir
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
 
@@ -31,7 +31,7 @@ class PackingService:
             from audapack.models import PackResult
             return PackResult(project_id=project_id, name=project_id, source_path="", success=False, error_message="No source path")
 
-        output_dir = Path(self.config.packing.output_dir or str(app_dir()))
+        output_dir = resolve_output_dir(proj.source_path, self.config.packing, fallback=app_dir())
         excludes = set(self.config.packing.excludes)
         extra_meta = {}
         if self.config.packing.manifest_enabled and proj.source_path:
@@ -52,9 +52,9 @@ class PackingService:
         )
 
     def pack_path(self, path: str | Path, **kw):
-        output_dir = Path(self.config.packing.output_dir or str(app_dir()))
-        excludes = set(self.config.packing.excludes)
         target = Path(path).resolve()
+        output_dir = resolve_output_dir(target, self.config.packing, fallback=app_dir())
+        excludes = set(self.config.packing.excludes)
         stem = target.name
         return pack_single(source_path=target, output_dir=output_dir, archive_stem=stem, excludes=excludes, **kw)
 
