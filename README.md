@@ -60,29 +60,6 @@ The 24-slot interface organizes projects into a dense, high-contrast operational
 
 ---
 
-## 🏗️ Architecture & Data Flow
-
-```mermaid
-flowchart TD
-    subgraph Browser ["🌐 Browser (ChatGPT)"]
-        W[AUDAPACK Widget] -->|Auto3: Core -> Second -> Perf| A3[Auto3 Wave Pipeline]
-    end
-
-    subgraph Bridge ["🔌 Local Daemon (127.0.0.1:17843)"]
-        A3 -->|HTTP POST /v1/audits + Token| B[Bridge Server]
-        B -->|Atomic Staging & runId Check| Ingest[Audit Ingest Engine]
-        Ingest -->|3/3 Waves Complete| All3[Generate __00_AUDIT_ALL_3.md]
-    end
-
-    subgraph Desktop ["🖥️ AUDAPACK Cockpit"]
-        All3 -->|Signal Generation Bump| UI[Desktop GUI]
-        UI -->|1-Click Copy| Clip[Clipboard Handoff]
-        UI -->|Pack Action| Z[Atomic .zip Packager]
-    end
-```
-
----
-
 ## 🚀 Quick Start
 
 ### 1. Launch GUI
