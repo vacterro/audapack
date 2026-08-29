@@ -24,9 +24,7 @@
 ---
 
 <p align="center">
-  <img width="680" height="731" alt="2026-08-29_025418" src="https://github.com/user-attachments/assets/0aca43e8-a049-4b9e-ac4d-4ac4ce8f0519" />
-
-
+  <img width="640" height="540" alt="2026-08-30_025740" src="https://github.com/user-attachments/assets/dbaf0e39-c925-4baa-8edb-7e36d706fd02" />
 </p>
 
 ---
@@ -201,6 +199,11 @@ Detailed guides are available in [`docs/wiki/`](docs/wiki/):
 - **Zero Heavy Frameworks**: Core functionality runs on Python standard library without cloud dependencies or telemetry.
 
 ---
+
+<img width="640" height="540" alt="2026-08-30_025746" src="https://github.com/user-attachments/assets/e6b25b21-4816-483d-9b74-f61257af0392" />
+<img width="640" height="540" alt="2026-08-30_025749" src="https://github.com/user-attachments/assets/f02df212-ca4c-42c1-810b-4f2ea3c5bac3" />
+<img width="640" height="540" alt="2026-08-30_025756" src="https://github.com/user-attachments/assets/72644503-6ae4-42d2-9ff9-25c6a44cd6f7" />
+
 
 <p align="center">
   <b>AUDAPACK</b> — Built for speed, clarity, and reliability.
