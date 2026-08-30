@@ -11344,10 +11344,22 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     return true;
   }
 
-  async function recoverArmedStartSend(options = {}) {
+async function recoverArmedStartSend(options = {}) {
     if (auditStartInFlight || actionInFlight) {
       if (options.reschedule !== false) scheduleArmedStartRecovery(300);
       return false;
+    }
+    // W2: when a browser dispatch owns the lease, EVERY irreversible Send click
+    // must ACK START_PREPARED through the Bridge fence. A standalone recovery
+    // call that lacks the callback must inject one from the lease context.
+    if (browserWorkerLease?.dispatch_id && browserWorkerLease?.lease_id && typeof options.beforeIrreversibleSend !== 'function') {
+      options.beforeIrreversibleSend = async ({ receipt, campaignRunId }) => {
+        const ack = await browserWorkerTransition('START_PREPARED', {
+          campaign_run_id: String(campaignRunId || browserWorkerLease.campaign_run_id || ''),
+          start_receipt: String(receipt || browserWorkerLease.start_receipt || '')
+        });
+        return Boolean(ack.ok);
+      };
     }
     let handoff = readStartAuditHandoff();
     if (!handoff || !startHandoffIsPrepared(handoff)) return false;
@@ -16439,6 +16451,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
   let browserWorkerStopRequested = false;
   let browserWorkerLease = null;
   let browserWorkerCompletionTimer = 0;
+  let browserWorkerConsecutivePollFailures = 0;
   const BROWSER_WORKER_LEASE_SESSION_KEY = 'audapack_browser_worker_lease_v1';
 
   function persistBrowserWorkerLease() {
@@ -16667,41 +16680,106 @@ let browserWorkerBraveConfirmed = false;
     };
     persistBrowserWorkerLease();
 if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return false;
-    // /v1/browser/poll atomically claims QUEUED -> LEASED before returning the
-    // job. Re-acknowledging LEASED here is an illegal LEASED -> LEASED edge.
-    const artifact = await fetchArtifact(job);
-    if (!artifact.ok) {
-      const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
-      if (acknowledged.ok) {
-        browserWorkerLease = null;
-        persistBrowserWorkerLease();
+    // W3: state-aware resume. The persisted Bridge state decides the resume
+    // entry point -- never "start from zero" for every state.
+    const resumeState = String(job.state || 'LEASED').toUpperCase();
+    let artifact = null;
+    let injected = false;
+    let ready = null;
+
+    if (resumeState === 'ATTACHED') {
+      // W3.3: reuse the exact ZIP already present in the composer if possible;
+      // do not inject again. Refetch only when absent.
+      const present = chatGPTFindComposerAttachment && chatGPTFindComposerAttachment(expectedFilename);
+      if (present && !chatGPTAttachmentIsBusy(present)) {
+        ready = { ok: true, reason: 'exact-match', observedNames: [expectedFilename] };
+      } else {
+        artifact = await fetchArtifact(job);
+        if (!artifact.ok) {
+          const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+          if (acknowledged.ok) {
+            browserWorkerLease = null;
+            persistBrowserWorkerLease();
+          }
+          return false;
+        }
+        const input = uploadInput();
+        const root = composerRoot();
+        if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
+          const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
+          if (acknowledged.ok) {
+            browserWorkerLease = null;
+            persistBrowserWorkerLease();
+          }
+          return false;
+        }
+        injected = true;
       }
-      return false;
+    } else if (resumeState === 'ARTIFACT_FETCHED') {
+      // W3.2: bytes may be gone from JS memory after reload; refetch the same
+      // immutable artifact and continue. Do NOT regress to LEASED.
+      artifact = await fetchArtifact(job);
+      if (!artifact.ok) {
+        const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+        if (acknowledged.ok) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        return false;
+      }
+      const input = uploadInput();
+      const root = composerRoot();
+      if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
+        const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
+        if (acknowledged.ok) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        return false;
+      }
+      injected = true;
+    } else {
+      // LEASED (or fresh claim): full pipeline.
+      // /v1/browser/poll atomically claims QUEUED -> LEASED before returning the
+      // job. Re-acknowledging LEASED here is an illegal LEASED -> LEASED edge.
+      artifact = await fetchArtifact(job);
+      if (!artifact.ok) {
+        const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+        if (acknowledged.ok) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        return false;
+      }
+      if (!(await transition('ARTIFACT_FETCHED')).ok) return false;
+      const input = uploadInput();
+      const root = composerRoot();
+      if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
+        const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
+        if (acknowledged.ok) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        return false;
+      }
+      injected = true;
     }
-    if (!(await transition('ARTIFACT_FETCHED')).ok) return false;
-    const input = uploadInput();
-    const root = composerRoot();
-    if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
-      const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
-      if (acknowledged.ok) {
-        browserWorkerLease = null;
-        persistBrowserWorkerLease();
+    if (!ready) {
+      const fileName = artifact ? String(artifact.file.name || '') : expectedFilename;
+      ready = await waitForAttachment({
+        filename: fileName,
+        expectedSize: Number(job.archive_size || 0),
+        timeoutMs: 40000
+      });
+      if (!ready?.ok) {
+        const reason = String(ready?.reason || 'attachment-not-ready');
+        const acknowledged = await transition('RETRYABLE', { error: reason });
+        if (acknowledged.ok) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        return false;
       }
-      return false;
-    }
-    const ready = await waitForAttachment({
-      filename: String(artifact.file.name || ''),
-      expectedSize: Number(job.archive_size || 0),
-      timeoutMs: 40000
-    });
-    if (!ready?.ok) {
-      const reason = String(ready?.reason || 'attachment-not-ready');
-      const acknowledged = await transition('RETRYABLE', { error: reason });
-      if (acknowledged.ok) {
-        browserWorkerLease = null;
-        persistBrowserWorkerLease();
-      }
-      return false;
     }
     if (!(await transition('ATTACHED')).ok) return false;
     const started = await startAudit({
@@ -16760,7 +16838,11 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       }
       const snapshot = browserWorkerSnapshot();
       const result = await bridgeRequest('POST', '/v1/browser/poll', snapshot, { timeout: 25000 });
-      if (!result.ok) return false;
+      if (!result.ok) {
+        browserWorkerConsecutivePollFailures += 1;
+        return false;
+      }
+      browserWorkerConsecutivePollFailures = 0;
       if (browserWorkerLease && result.data?.owned_job?.dispatch_id === browserWorkerLease.dispatch_id &&
           result.data?.owned_job?.state === 'COMPLETE') {
         // Positive terminal acknowledgement from Bridge is the only point at
@@ -16770,11 +16852,18 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       }
       const owned = result.data?.owned_job;
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
-          ['LEASED', 'ARTIFACT_FETCHED', 'ATTACHED'].includes(String(owned.state || '')) &&
           !autoRuntime?.runId) {
-        // Same-tab reload before START: resume the leased attachment path,
-        // never ask the broker for a second job.
-        await browserWorkerConsume(owned);
+        const ownedState = String(owned.state || '');
+        if (ownedState === 'CANCELLED') {
+          // W5.2: terminal cancellation ACK — clear local lease and stop
+          // side effects. Only after this ACK may the worker re-poll as clean.
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        } else if (['LEASED', 'ARTIFACT_FETCHED', 'ATTACHED'].includes(ownedState)) {
+          // Same-tab reload before START: resume the leased attachment path,
+          // never ask the broker for a second job.
+          await browserWorkerConsume(owned);
+        }
       }
       if (result.data?.job && browserWorkerCanClaim()) await browserWorkerConsume(result.data.job);
       return true;
@@ -16783,11 +16872,19 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     }
   }
 
+  function browserWorkerPollBackoff() {
+    // W7: persistent immediate poll errors must never become a 300ms tight loop.
+    const failures = Math.max(0, Number(browserWorkerConsecutivePollFailures || 0));
+    if (failures <= 0) return 300;
+    const table = [1000, 2000, 5000, 15000, 30000];
+    return table[Math.min(failures - 1, table.length - 1)] || 30000;
+  }
+
   function scheduleBrowserWorkerPoll(delay = 25000) {
     if (browserWorkerStopRequested || browserWorkerPollTimer) return;
     browserWorkerPollTimer = setTimeout(() => {
       browserWorkerPollTimer = 0;
-      browserWorkerPollOnce().finally(() => scheduleBrowserWorkerPoll(300));
+      browserWorkerPollOnce().finally(() => scheduleBrowserWorkerPoll(browserWorkerPollBackoff()));
     }, Math.max(250, Number(delay) || 25000));
   }
 
@@ -16851,6 +16948,8 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         set autoRuntime(val) { autoRuntime = val; },
         get state() { return state; },
         set state(val) { state = val; },
+        get browserWorkerLease() { return browserWorkerLease; },
+        set browserWorkerLease(val) { browserWorkerLease = val; },
         get autoBoundConversationKey() { return autoBoundConversationKey; },
         get autoInstanceId() { return autoInstanceId; },
         classifyAuditMessage,
@@ -16911,6 +17010,8 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerTransition,
          startBrowserWorker,
          stopBrowserWorker,
+         persistBrowserWorkerLease,
+         restoreBrowserWorkerLease,
         auditHandoffIntegrity,
         concreteHandoffState,
         responseGate,

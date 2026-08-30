@@ -17,6 +17,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from audapack.inaudit import (
+    delete_inaudit_layer,
+    ensure_next_layer,
+    get_active_inaudit_path,
+    get_inaudit_selected,
+    inaudit_dir,
+    list_inaudit_layers,
+    set_inaudit_selected,
+    validate_inaudit_path,
+)
+from audapack.models import Project
+from audapack.ui_qt.theme.golden_default import GoldenDefault
+
+
 class _InauditLayerList(QListWidget):
     """QListWidget that forwards the Delete key to the owning widget."""
 
@@ -30,19 +44,6 @@ class _InauditLayerList(QListWidget):
             event.accept()
             return
         super().keyPressEvent(event)
-
-from audapack.inaudit import (
-    delete_inaudit_layer,
-    ensure_next_layer,
-    get_active_inaudit_path,
-    get_inaudit_selected,
-    inaudit_dir,
-    list_inaudit_layers,
-    set_inaudit_selected,
-    validate_inaudit_path,
-)
-from audapack.models import Project
-from audapack.ui_qt.theme.golden_default import GoldenDefault
 
 
 class InauditWidget(QWidget):

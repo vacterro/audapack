@@ -52,3 +52,33 @@ test('SRC-005 worker refuses Chrome and non-root ChatGPT pages', () => {
   assert.strictEqual(api.browserWorkerCanClaim(), false);
   assert.strictEqual(api.startBrowserWorker(), false);
 });
+
+test('W8: stop preserves active non-terminal lease for recovery', () => {
+  const { h, api } = setup();
+  h.location.pathname = '/';
+  h.navigator.brave = { isBrave: () => Promise.resolve(true) };
+  api.state.bridgeEnabled = true;
+  api.browserWorkerLease = {
+    dispatch_id: 'dsp-0123456789abcdef',
+    worker_id: String(api.browserWorkerSnapshot().worker_id),
+    lease_id: 'lease-1',
+    project_id: 'p1',
+    project_name: 'P1',
+    campaign_run_id: '',
+    start_receipt: ''
+  };
+  api.persistBrowserWorkerLease();
+  assert.strictEqual(api.stopBrowserWorker(), true);
+  // Active lease checkpoint must survive a plain stop.
+  assert.ok(api.browserWorkerLease, 'active lease must survive stop');
+  assert.strictEqual(api.browserWorkerLease.dispatch_id, 'dsp-0123456789abcdef');
+});
+
+test('W8: stop clears lease when no active dispatch', () => {
+  const { h, api } = setup();
+  h.location.pathname = '/';
+  api.browserWorkerLease = null;
+  api.persistBrowserWorkerLease();
+  assert.strictEqual(api.stopBrowserWorker(), true);
+  assert.strictEqual(api.browserWorkerLease, null);
+});

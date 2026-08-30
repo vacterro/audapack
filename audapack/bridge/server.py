@@ -389,6 +389,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "final_handoff_path": job.final_handoff_path,
                     "final_handoff_sha256": job.final_handoff_sha256,
                     "completed_at": job.completed_at,
+                    "retry_count": job.retry_count,
+                    "next_retry_at": job.next_retry_at,
+                    "last_error_code": job.last_error_code,
+                    "recovery_state": job.recovery_state,
                 } for job in jobs],
             })
         elif parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/artifact"):

@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
-from audapack.bridge.lifecycle import check_bridge_health, is_bridge_healthy, start_bridge_background, stop_bridge
+from audapack.bridge.lifecycle import check_bridge_health, start_bridge_background, stop_bridge
 from audapack.components.autostart import get_autostart_status, install_autostart, remove_autostart
 from audapack.config import AppConfig, load_config
 from audapack.packing import find_archive_for_project, resolve_output_dir

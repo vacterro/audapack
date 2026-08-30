@@ -38,6 +38,12 @@ from PySide6.QtWidgets import (
 
 from audapack.bridge.state import get_generation_file_path, get_generation_info
 from audapack.config import app_dir, save_config
+from audapack.inaudit import (
+    get_active_inaudit_path,
+    get_inaudit_selected,
+    list_inaudit_layers,
+    validate_inaudit_path,
+)
 from audapack.ingest import ingest_audit_text
 from audapack.instances import InstanceMonitor
 from audapack.models import Project
@@ -46,13 +52,6 @@ from audapack.services.audit_service import AuditService
 from audapack.services.bridge_service import BridgeService
 from audapack.services.packing_service import PackingService
 from audapack.services.project_service import ProjectService
-from audapack.inaudit import (
-    get_active_inaudit_path,
-    get_inaudit_selected,
-    list_inaudit_layers,
-    set_inaudit_selected,
-    validate_inaudit_path,
-)
 from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
 from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
@@ -1194,17 +1193,24 @@ QToolTip QLabel {
             self._tray_icon = None
 
     def _notify_dispatch_terminal(self, dispatch_id: str, state: str, project_name: str) -> None:
-        """W8: exactly-once native notification per dispatch terminal transition.
+        """Native notification only when THIS running UI observes a transition
+        from a non-terminal state to a terminal one.
 
-        COMPLETE -> success; BLOCKED/FAILED -> needs-attention. The same
-        dispatch_id/state pair is never re-bubbled on refresh/restart."""
+        W9.5: a process-local exactly-once map is not enough — on AUDAPACK
+        restart it is empty, so every historical terminal job would re-notify
+        (the "audit complete" toast parade). We therefore record the last seen
+        state per dispatch and only toast when the previous observation was
+        non-terminal and the current one is terminal. Jobs that were already
+        terminal before this window started stay silent.
+        """
         tray = getattr(self, "_tray_icon", None)
-        if tray is None:
+        terminal = {"COMPLETE", "BLOCKED", "FAILED", "CANCELLED"}
+        prev = self._notified_terminal.get(dispatch_id, "")
+        self._notified_terminal[dispatch_id] = state
+        if tray is None or state not in terminal:
             return
-        key = f"{dispatch_id}:{state}"
-        if self._notified_terminal.get(key):
+        if prev in terminal:
             return
-        self._notified_terminal[key] = state
         if state == "COMPLETE":
             tray.showMessage(
                 "AUDAPACK — audit complete",
@@ -1277,19 +1283,28 @@ QToolTip QLabel {
         self.task_runner.submit(key, _prepare, on_success=_done, on_error=_error)
 
     def _on_cancel_browser_audit(self, proj, dispatch):
-        try:
-            did = str(dispatch.get("dispatch_id") or "")
-            if not did:
-                self._flash_status("Cancel failed: no dispatch id", "#D66464")
-                return
-            response = self._bridge.cancel_browser_job(did)
+        """Async cancel via TaskRunner — Qt UI must never block on HTTP."""
+        did = str(dispatch.get("dispatch_id") or "")
+        if not did:
+            self._flash_status("Cancel failed: no dispatch id", "#D66464")
+            return
+        self._flash_status(f"Cancelling audit for {proj.display_name}...", "#D4A840")
+        key = f"dispatch-cancel:{did}"
+
+        def _cancel():
+            return self._bridge.cancel_browser_job(did)
+
+        def _on_cancelled(response):
             if response.get("ok"):
                 self._flash_status(f"Audit cancelled for {proj.display_name}", "#D4A840")
                 self.model.update_dispatch_snapshot(proj.id, None)
             else:
                 self._flash_status(f"Cancel failed: {response.get('error', 'Bridge error')}", "#D66464")
-        except Exception as exc:
-            self._flash_status(f"Cancel error: {exc}", "#D66464")
+
+        def _on_cancel_error(err):
+            self._flash_status(f"Cancel error: {err}", "#D66464")
+
+        self.task_runner.submit(key, _cancel, on_success=_on_cancelled, on_error=_on_cancel_error)
 
     def _on_pack(self):
         """Async background packing — GUI thread remains 100% interactive."""

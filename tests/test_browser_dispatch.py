@@ -13,6 +13,7 @@ from audapack.bridge.browser_dispatch import (
     JOB_ATTACHED,
     JOB_AUDITING,
     JOB_BLOCKED,
+    JOB_CANCELLED,
     JOB_COMPLETE,
     JOB_FINALIZING,
     JOB_QUEUED,
@@ -417,3 +418,92 @@ def test_status_exposes_clean_worker_count_and_classification(tmp_path):
     occ = [w for w in d.list_workers() if w.worker_id == "v3_occ"][0]
     assert occ.has_conversation_turns is True
     assert occ.clean_for_audit is False
+
+
+# W4.1: lease expiry after START must record recovery_state + preserve lineage.
+def test_post_start_expiry_records_recovery_state(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.lease_expires_at = time.time() - 1
+    d.expire_leases()
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_BLOCKED
+    assert job.recovery_state == JOB_AUDITING
+    assert job.campaign_run_id == "run"
+    assert job.start_receipt == "receipt"
+    assert job.assigned_worker_id == "w1"
+
+
+# W4.2: same-owner reconciliation works for expiry blocks, not just restart.
+def test_expiry_recovery_reconciles_same_owner(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.lease_expires_at = time.time() - 1
+    d.expire_leases()
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+    d.register_worker(worker("w1", state="AUDITING", dispatch_id=item.dispatch_id, lease_id=lease.lease_id, campaign_run_id="run", start_receipt="receipt"))
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+
+# W5.1/W5.2: cancel preserves owner identity; poll returns owned CANCELLED.
+def test_cancel_preserves_owner_identity_for_ack(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_ARTIFACT_FETCHED)
+    assert d.cancel_job(item.dispatch_id)
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_CANCELLED
+    assert job.cancel_owner_worker_id == "w1"
+    assert job.cancel_owner_lease_id == lease.lease_id
+    # original worker still "owns" the cancelled job for ACK purposes
+    owned = d.get_owned_job("w1")
+    assert owned is not None and owned.dispatch_id == item.dispatch_id and owned.state == JOB_CANCELLED
+    # wrong worker cannot finalize
+    with pytest.raises(DispatchError) as wrong:
+        d.finalize_cancel(item.dispatch_id, "w2", "nope")
+    assert wrong.value.code == "stale_owner"
+    # correct owner finalizes
+    d.finalize_cancel(item.dispatch_id, "w1", lease.lease_id)
+    assert d.get_owned_job("w1") is None
+
+
+# W6: post-start BLOCKED cannot be ordinary-cancelled.
+def test_post_start_blocked_rejects_ordinary_cancel(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_BLOCKED, {"error": "recovery"})
+    with pytest.raises(DispatchError) as exc:
+        d.cancel_job(item.dispatch_id)
+    assert exc.value.code == "post_start_blocked"
+
+
+# W6: pre-start BLOCKED (no start_receipt) is still cancellable.
+def test_pre_start_blocked_can_cancel(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_ARTIFACT_FETCHED)
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_ATTACHED)
+    assert d.cancel_job(item.dispatch_id)

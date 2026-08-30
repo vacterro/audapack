@@ -195,6 +195,8 @@ class DispatchJob:
     next_retry_at: float = 0.0
     last_error_code: str = ""
     updated_at: float = 0.0
+    cancel_owner_worker_id: str = ""
+    cancel_owner_lease_id: str = ""
 
 
 def new_dispatch_id() -> str:
@@ -399,7 +401,7 @@ class BrowserDispatcher:
                 if not (dispatch_id and lease_id):
                     raise DispatchError("invalid_lease", "dispatch_id and lease_id must be reported together")
                 job = self._jobs.get(dispatch_id)
-                if job and job.state == JOB_BLOCKED and job.error.startswith("Bridge restarted after START_PREPARED"):
+                if job and self._is_recovery_block(job):
                     self.reconcile_job(dispatch_id, wid, lease_id, payload)
                 else:
                     self.renew_lease(dispatch_id, wid, lease_id)
@@ -455,13 +457,22 @@ class BrowserDispatcher:
             job.updated_at = _now()
             return job
 
+    @staticmethod
+    def _is_recovery_block(job: DispatchJob) -> bool:
+        """True for any explicit post-start recovery block (restart or expiry)."""
+        if job.state != JOB_BLOCKED:
+            return False
+        if job.recovery_state in POST_START_STATES:
+            return True
+        return job.error.startswith("Bridge restarted after START_PREPARED") or job.error.startswith("worker lost after START_PREPARED")
+
     def reconcile_job(self, dispatch_id: str, worker_id: str, lease_id: str, payload: dict[str, Any]) -> DispatchJob:
         """Restore a restart-blocked post-START job for its same owner only."""
         with self._lock:
             job = self._jobs.get(dispatch_id)
             if job is None:
                 raise DispatchError("unknown_job", "dispatch_id is unknown")
-            if job.state != JOB_BLOCKED or not job.error.startswith("Bridge restarted after START_PREPARED"):
+            if not self._is_recovery_block(job):
                 return self.renew_lease(dispatch_id, worker_id, lease_id)
             if job.assigned_worker_id != worker_id or job.lease_id != lease_id:
                 raise DispatchError("stale_owner", "only the original worker may reconcile this dispatch")
@@ -541,12 +552,18 @@ class BrowserDispatcher:
             return self._jobs.get(dispatch_id)
 
     def get_owned_job(self, worker_id: str) -> Optional[DispatchJob]:
-        """Return the worker's current dispatch for heartbeat reconciliation."""
+        """Return the worker's current dispatch for heartbeat reconciliation.
+
+        W5.2: a CANCELLED dispatch still belongs to its original worker (via
+        cancel_owner_* identity) so the browser can receive the terminal
+        CANCELLED ACK and clear its local lease -- otherwise it would loop on
+        stale_owner forever."""
         with self._lock:
             jobs = [
                 job for job in self._jobs.values()
-                if job.assigned_worker_id == str(worker_id)
-                and job.state not in {JOB_CANCELLED}
+                if (job.assigned_worker_id == str(worker_id)
+                    or job.cancel_owner_worker_id == str(worker_id))
+                and job.state not in {JOB_COMPLETE, JOB_FAILED}
             ]
             return min(jobs, key=lambda item: item.created_at) if jobs else None
 
@@ -781,6 +798,7 @@ class BrowserDispatcher:
                     job.updated_at = now
                     requeued += 1
                 elif job.state in POST_START_STATES and now > job.lease_expires_at:
+                    job.recovery_state = job.state
                     job.state = JOB_BLOCKED
                     job.error = "worker lost after START_PREPARED; recovery required"
                     job.updated_at = now
@@ -862,6 +880,18 @@ class BrowserDispatcher:
             self._work_available.notify_all()
             return job
 
+    @staticmethod
+    def safe_prestart_cancel(job: DispatchJob) -> bool:
+        """True only when positive evidence exists that no irreversible START occurred."""
+        if job.state == JOB_BLOCKED:
+            if job.recovery_state in POST_START_STATES:
+                return False
+            if job.start_receipt:
+                return False
+            if job.campaign_run_id:
+                return False
+        return True
+
     def cancel_job(self, dispatch_id: str) -> bool:
         with self._lock:
             job = self._jobs.get(dispatch_id)
@@ -869,14 +899,52 @@ class BrowserDispatcher:
                 return False
             if job.state not in (JOB_QUEUED, JOB_BLOCKED, JOB_RETRYABLE, *PRE_START_STATES):
                 raise DispatchError("invalid_transition", "only pre-start/queued/blocked jobs can be cancelled")
+            # W6: a BLOCKED job that holds post-start lineage (start_receipt,
+            # campaign_run_id or a post-start recovery_state) is NOT disposable.
+            # Cancelling it would break active-project dedupe and allow a second
+            # Core. Ordinary cancel refuses; RECONCILE is the correct path.
+            if job.state == JOB_BLOCKED and not self.safe_prestart_cancel(job):
+                raise DispatchError(
+                    "post_start_blocked",
+                    "dispatch is BLOCKED after an irreversible start; RECONCILE, do not cancel",
+                )
+            # W5.1: preserve cancel owner identity so the original worker can
+            # prove ownership and receive a terminal CANCELLED ACK. Only the
+            # holder of the matching cancel_owner_lease_id may finalize.
+            job.cancel_owner_worker_id = job.assigned_worker_id
+            job.cancel_owner_lease_id = job.lease_id
             job.state = JOB_CANCELLED
-            job.assigned_worker_id = ""
-            job.lease_id = ""
-            job.lease_expires_at = 0.0
             job.updated_at = _now()
             self._generation_context = {"dispatch_id": dispatch_id, "project_id": job.project_id, "state": job.state}
             self._persist_jobs()
             return True
+
+    def finalize_cancel(self, dispatch_id: str, worker_id: str, lease_id: str) -> DispatchJob:
+        """Clear cancel-owner identity once the original worker observes CANCELLED.
+
+        A worker that polls with the recorded cancel_owner_* tokens may call
+        this to drop assigned_worker_id/lease_id; any other identity gets a
+        stale_owner refusal so the worker's local lease is provably terminal
+        before it touches local state.
+        """
+        with self._lock:
+            job = self._jobs.get(dispatch_id)
+            if job is None:
+                raise DispatchError("unknown_job", "dispatch_id is unknown")
+            if job.state != JOB_CANCELLED:
+                raise DispatchError("invalid_transition", "dispatch is not in CANCELLED state")
+            if (job.cancel_owner_worker_id and job.cancel_owner_worker_id != worker_id) or (
+                job.cancel_owner_lease_id and job.cancel_owner_lease_id != lease_id
+            ):
+                raise DispatchError("stale_owner", "only the original cancel owner may finalize this cancellation")
+            job.assigned_worker_id = ""
+            job.lease_id = ""
+            job.lease_expires_at = 0.0
+            job.cancel_owner_worker_id = ""
+            job.cancel_owner_lease_id = ""
+            job.updated_at = _now()
+            self._persist_jobs()
+            return job
 
     # ------------------------------------------------------------------ #
     # status
