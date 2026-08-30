@@ -25,7 +25,7 @@ test('W2-004: em/en/hyphen dash framing classifies', () => {
   assert.strictEqual(api.classifyAuditMessage('AUDIT CORE – full sweep'), 'core');
   assert.strictEqual(api.classifyAuditMessage('AUDIT CORE - full sweep'), 'core');
   assert.strictEqual(api.classifyAuditMessage('AUDIT SECOND WAVE - more'), 'second');
-  assert.strictEqual(api.classifyAuditMessage('AUDIT CORE—full sweep'), '');
+  assert.strictEqual(api.classifyAuditMessage('AUDIT CORE—full sweep'), 'core');
 });
 
 test('W2-004: marker must be first meaningful authored line', () => {
@@ -86,13 +86,13 @@ test('W2-004: bare attachment filename never classifies', () => {
   assert.strictEqual(api.classifyAuditTurn(turn), '');
 });
 
-test('W2-004: tile without expand control is ignored', () => {
+test('W2-004: canonical command label classifies even when ChatGPT omits expand control', () => {
   const { h, api } = setup();
   const turn = userTurn(h, 'u1');
   const group = h.el('div', { role: 'group', 'aria-label': 'AUDIT CORE — text' });
   turn.appendChild(group);
   addTurns(h, [turn]);
-  assert.strictEqual(api.classifyAuditTurn(turn), '');
+  assert.strictEqual(api.classifyAuditTurn(turn), 'core');
 });
 
 test('W2-004: turn text is the canonical source', () => {

@@ -1,10 +1,8 @@
 """Qt model tests — ProjectRoomModel hierarchy, no filesystem access inside data()."""
 
 import sys
-from pathlib import Path
 
-import pytest
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import Qt
 
 # Minimal QApplication: one per session, reuse across model tests.
 from PySide6.QtWidgets import QApplication
@@ -86,8 +84,9 @@ def test_parent_index():
 
 
 def test_no_filesystem_access_in_data():
-    from audapack.models import Project
     import os
+
+    from audapack.models import Project
     p = Project(id="fp", display_name="FastPrompter", source_path="", priority_group="MAIN0", slot=1)
     m, svc = _model_with([p])
     # Ensure data() never touches filesystem: mock would fail if called

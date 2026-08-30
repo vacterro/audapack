@@ -8,12 +8,13 @@ Verifies:
 """
 
 import time
+
 import pytest
 from PySide6.QtCore import QModelIndex
 
-from audapack.audits import AUDIT_COUNTERS, reset_audit_counters
+from audapack.audits import reset_audit_counters
 from audapack.config import AppConfig, AuditsConfig
-from audapack.models import AuditSnapshot, AuditTemperature, Project
+from audapack.models import Project
 from audapack.services.audit_service import AuditService
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.models.project_room_model import ProjectRoomModel
@@ -53,9 +54,7 @@ def build_scale_project_service(tmp_path, count: int) -> tuple[ProjectService, P
 
 @pytest.mark.parametrize("project_count", [24, 60, 120, 300])
 def test_scale_model_construction_and_targeted_moves(tmp_path, qapp, project_count):
-    start = time.perf_counter()
     service, model = build_scale_project_service(tmp_path, project_count)
-    elapsed_init = (time.perf_counter() - start) * 1000.0
 
     # Verification of initial load
     assert model.rowCount(QModelIndex()) >= 2
@@ -88,7 +87,6 @@ def test_100_sequential_moves_stress(tmp_path, qapp):
     service, model = build_scale_project_service(tmp_path, 24)
     initial_resets = model.model_reset_count
 
-    start = time.perf_counter()
     for i in range(100):
         pid = f"proj_{i % 24:03d}"
         p = service.get_project(pid)
@@ -98,7 +96,6 @@ def test_100_sequential_moves_stress(tmp_path, qapp):
         updated = service.get_project(pid)
         model.apply_project_move(res.old_group, res.old_slot, res.new_group, res.new_slot, updated)
 
-    elapsed_100_moves = (time.perf_counter() - start) * 1000.0
 
     # Invariants
     assert model.model_reset_count == initial_resets  # 0 model reset during 100 moves!
@@ -117,7 +114,6 @@ def test_100_audit_events_stress_and_coalescing(tmp_path, qapp):
     reset_audit_counters()
     completed_events = []
 
-    start = time.perf_counter()
     # Fire 100 rapid audit events alternating among 4 projects
     for i in range(100):
         target_pid = f"proj_{i % 4:03d}"
@@ -136,7 +132,6 @@ def test_100_audit_events_stress_and_coalescing(tmp_path, qapp):
         qapp.processEvents()
         time.sleep(0.01)
 
-    elapsed_100_events = (time.perf_counter() - start) * 1000.0
 
     # Invariants:
     # 1. 0 full model resets

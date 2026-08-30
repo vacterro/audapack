@@ -2,10 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-08-30
+
+### Fixed
+- Project Room tree: single click on a project slot only selects it; double click is now required to open the Instances manager. Previously a single click opened the manager unexpectedly.
+
 ## [0.1.2] - 2026-08-27
+
+### Added
+- Generic Quick3/Super10 audit campaign profiles with dynamic wave progression.
+- Qt project room with archive freshness, pack progress, drag-and-drop, and targeted updates.
+- Tampermonkey recovery, fresh-archive START flow, and terminal-state regression coverage.
 
 ### Fixed
 - T-13 fs-safe reconciliation: legacy raw-named artifact paths now resolve via sanitized name (sanitize_project_name) with pytest regression.
+- Audit ingest now rolls back wave, canonical, and live campaign files on write failure and reports persistence errors honestly.
+- Stale or hidden Continue generating controls no longer prevent acceptance of a structurally complete audit wave.
 
 ## [0.1.1] - 2026-08-27
 

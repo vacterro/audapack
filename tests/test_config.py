@@ -13,11 +13,11 @@ from audapack.config import (
     create_default_projects,
     legacy_token_acceptance_revoked,
     load_config,
-    migrate_legacy_data,
     redact_legacy_source_config,
     revoke_legacy_token_acceptance,
     safe_slug,
     save_config,
+    scoped_config_write,
 )
 
 
@@ -48,6 +48,40 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(len(loaded.projects), len(cfg.projects))
         self.assertEqual(loaded.packing.output_dir, str(self.base_dir / "out"))
         self.assertEqual(loaded.audits.root, str(self.base_dir / "audits"))
+
+    def test_compact_rows_setting_roundtrip(self):
+        cfg = AppConfig()
+        cfg.ui.compact_rows = True
+        self.assertTrue(save_config(cfg, self.base_dir))
+        self.assertTrue(load_config(self.base_dir).ui.compact_rows)
+
+    def test_scoped_config_write_preserves_concurrent_external_mutation(self):
+        """W2-007: a stale UI snapshot must never overwrite newer concurrent
+        project-registry mutations; scoped write reloads the latest under the
+        lock and applies only the owned fields."""
+        cfg = AppConfig()
+        cfg.projects = create_default_projects()
+        cfg.ui.ui_language = "en"
+        cfg.packing.output_dir = str(self.base_dir / "out")
+        self.assertTrue(save_config(cfg, self.base_dir))
+
+        # External writer transactionally adds a project (simulating Bridge/CLI).
+        from audapack.projects import ProjectRegistry
+        ext_cfg = load_config(self.base_dir)
+        reg = ProjectRegistry(ext_cfg, base_dir=self.base_dir, transactional=True)
+        reg.add_project("ExtProj", r"C:\ExtProj", priority_group="SIDE1")
+        on_disk = load_config(self.base_dir)
+        self.assertGreater(len(on_disk.projects), len(cfg.projects))
+
+        # A stale UI snapshot tries to persist ONLY its owned fields.
+        ok = scoped_config_write(
+            lambda latest: setattr(latest.ui, "ui_language", "ru"),
+            base_dir=self.base_dir,
+        )
+        self.assertTrue(ok)
+        merged = load_config(self.base_dir)
+        self.assertEqual(merged.ui.ui_language, "ru", "owned field must be applied")
+        self.assertEqual(len(merged.projects), len(on_disk.projects), "external project mutation must survive")
 
     def test_corrupted_config_fails_closed(self):
         c_file = self.base_dir / "audapack.json"

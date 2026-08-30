@@ -1,12 +1,15 @@
 """Unit tests for AUDAPACK packing engine."""
 
 import json
+import queue
 import shutil
 import tempfile
 import threading
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from audapack.models import PackResult
 from audapack.packing import (
@@ -15,6 +18,7 @@ from audapack.packing import (
     create_zip,
     delete_old_archives,
     find_latest_archive,
+    human_mb,
     pack_single,
     path_is_excluded,
     safe_archive_stem,
@@ -52,6 +56,13 @@ class TestPackingEngine(unittest.TestCase):
         self.assertEqual(safe_archive_stem("My:Project?*"), "My_Project__")
         self.assertEqual(safe_archive_stem("  Valid Name  "), "Valid Name")
         self.assertEqual(safe_archive_stem(""), "Archive")
+
+    def test_human_mb_uses_correct_unit_for_archive_size(self):
+        self.assertEqual(human_mb(0), "0 B")
+        self.assertEqual(human_mb(512), "512 B")
+        self.assertEqual(human_mb(1536), "1.5 KB")
+        self.assertEqual(human_mb(1024 * 1024), "1.0 MB")
+        self.assertEqual(human_mb(2 * 1024**3), "2.0 GB")
 
     def test_path_is_excluded(self):
         excludes = {"node_modules", "*.log", "__pycache__"}
@@ -286,6 +297,142 @@ class TestPackingEngine(unittest.TestCase):
             bool(re.match(pattern, res_ts.output_path.name)),
             f"Filename {res_ts.output_path.name} did not match pattern {pattern}",
         )
+
+    def test_concurrent_same_target_pack_preserves_successful_payload(self):
+        """CORE-001: a failing same-target pack must never restore its stale
+        predecessor over (or unlink) an archive written by another pack."""
+        import time as _time
+
+        # Seed a pre-existing OLD archive for the same stem.
+        old_zip = self.output_dir / "Same.zip"
+        with zipfile.ZipFile(old_zip, "w") as zf:
+            zf.writestr("old.txt", "OLD")
+
+        from audapack import packing as packing_mod
+
+        real_create_zip = packing_mod.create_zip
+        a_entered = threading.Event()
+        state = {"calls": 0}
+        state_lock = threading.Lock()
+        results = {}
+
+        def flaky_create_zip(*args, **kwargs):
+            with state_lock:
+                state["calls"] += 1
+                is_first = state["calls"] == 1
+            if is_first:
+                # Pack A: begin (backup done), then fail mid-creation.
+                a_entered.set()
+                _time.sleep(0.2)
+                raise RuntimeError("simulated pack failure (A)")
+            return real_create_zip(*args, **kwargs)
+
+        def pack_a():
+            results["a"] = pack_single(
+                source_path=self.source_dir,
+                output_dir=self.output_dir,
+                archive_stem="Same",
+                excludes=set(),
+                delete_old=True,
+                include_timestamp=False,
+            )
+
+        with patch.object(packing_mod, "create_zip", side_effect=flaky_create_zip):
+            ta = threading.Thread(target=pack_a)
+            ta.start()
+            self.assertTrue(a_entered.wait(timeout=5), "pack A never entered creation")
+            # Pack B runs concurrently against the same target.
+            results["b"] = pack_single(
+                source_path=self.source_dir,
+                output_dir=self.output_dir,
+                archive_stem="Same",
+                excludes=set(),
+                delete_old=True,
+                include_timestamp=False,
+            )
+            ta.join(timeout=30)
+
+        self.assertFalse(results["a"].success, "pack A must have failed")
+        self.assertTrue(results["b"].success, "pack B must have succeeded")
+        final = self.output_dir / "Same.zip"
+        self.assertTrue(final.exists(), "final archive missing")
+        with zipfile.ZipFile(final) as zf:
+            names = zf.namelist()
+        self.assertIn("file1.txt", names, "final archive must contain B's payload")
+        self.assertNotIn("old.txt", names, "A must not restore the stale predecessor over B")
+        self.assertEqual(verify_zip(final, len(names)), len(names), "final archive must be byte-valid")
+
+    def test_concurrent_timestamp_pack_unique_outputs_same_second(self):
+        """CORE-001: same-second concurrent timestamp packs must produce unique,
+        byte-valid archives (no silent overwrite/collision)."""
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def pack_stamped(idx: int):
+            barrier.wait()
+            results[idx] = pack_single(
+                source_path=self.source_dir,
+                output_dir=self.output_dir,
+                archive_stem="StampProj",
+                excludes=set(),
+                include_timestamp=True,
+                delete_old=False,
+            )
+
+        threads = [threading.Thread(target=pack_stamped, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        for i in range(2):
+            self.assertTrue(results[i].success, f"stamped pack {i} must succeed")
+        paths = {results[i].output_path for i in range(2)}
+        self.assertEqual(len(paths), 2, "two concurrent stamped packs must not collide")
+        for p in paths:
+            self.assertTrue(Path(p).exists(), f"missing {p}")
+            with zipfile.ZipFile(p) as zf:
+                n = zf.namelist()
+            self.assertEqual(verify_zip(Path(p), len(n)), len(n), f"{p} must be byte-valid")
+
+
+class TestTkFallbackPackingOptions(unittest.TestCase):
+    def test_worker_passes_independent_packing_options(self):
+        from audapack.ui import main_window
+
+        project = SimpleNamespace(
+            id="project",
+            display_name="Project",
+            source_path="source",
+            archive_name="Project",
+        )
+        for delete_old in (False, True):
+            for include_timestamp in (False, True):
+                window = main_window.MainWindow.__new__(main_window.MainWindow)
+                window.config = SimpleNamespace(
+                    packing=SimpleNamespace(
+                        excludes=[],
+                        output_dir="",
+                        manifest_enabled=False,
+                        delete_old=delete_old,
+                        include_timestamp=include_timestamp,
+                    )
+                )
+                window.cancel_event = threading.Event()
+                window.ui_queue = queue.Queue()
+                window.registry = Mock()
+                result = SimpleNamespace(
+                    success=False,
+                    output_path=None,
+                    files_added=0,
+                    archive_bytes=0,
+                    error_message="",
+                )
+                with patch.object(main_window, "pack_single", return_value=result) as pack_mock:
+                    window._pack_worker([project])
+
+                self.assertEqual(pack_mock.call_args.kwargs["delete_old"], delete_old)
+                self.assertEqual(pack_mock.call_args.kwargs["include_timestamp"], include_timestamp)
 
 
 if __name__ == "__main__":

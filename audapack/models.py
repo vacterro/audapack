@@ -53,6 +53,8 @@ class Project:
     last_copied_archive_path: str = ""
     last_copied_archive_at: str = ""
     ignored: bool = False
+    ignore_archive: bool = False
+    audit_copy_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,8 @@ class Project:
             "last_copied_archive_path": self.last_copied_archive_path,
             "last_copied_archive_at": self.last_copied_archive_at,
             "ignored": self.ignored,
+            "ignore_archive": self.ignore_archive,
+            "audit_copy_count": self.audit_copy_count,
         }
 
     @classmethod
@@ -91,6 +95,8 @@ class Project:
             last_copied_archive_path=str(data.get("last_copied_archive_path", "")).strip(),
             last_copied_archive_at=str(data.get("last_copied_archive_at", "")).strip(),
             ignored=bool(data.get("ignored", False)),
+            ignore_archive=bool(data.get("ignore_archive", False)),
+            audit_copy_count=int(data.get("audit_copy_count", 0) or 0),
         )
 
 

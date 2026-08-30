@@ -1,8 +1,10 @@
 """ProjectService — move/add/remove/resolve via targeted results."""
 
-import tempfile, pathlib, shutil
+import pathlib
+import shutil
+import tempfile
+
 from audapack.config import AppConfig, save_config
-from audapack.projects import ProjectRegistry
 from audapack.services.project_service import ProjectService
 
 
@@ -68,10 +70,9 @@ def test_occupied_count_counts_actual_projects():
 
 
 def test_add_project_uses_single_registry_transaction():
-    import shutil as _sh
     from unittest import mock
+
     from audapack import projects as projects_mod
-    from audapack.services import project_service as ps
 
     svc, base = _isolated_service()
     try:

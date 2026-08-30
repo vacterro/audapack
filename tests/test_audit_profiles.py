@@ -147,3 +147,45 @@ def test_widget_embedded_manifest_hash_matches_python():
         f"Widget embedded manifest hash ({widget_hash}) != Python canonical manifest hash ({python_hash}). "
         "Run 'python tools/sync_audit_profiles.py' to synchronize."
     )
+
+
+def test_bridge_parse_wave_matches_canonical_manifest_matrix():
+    """Verify that Python parse_wave accepts canonical COMPLETE handoffs across all profiles and waves."""
+    from audapack.bridge.storage import parse_wave
+
+    profiles = load_profiles(force_reload=True)
+    for prof_id, prof in profiles.items():
+        for wave_def in prof.waves:
+            pfx = wave_def.ticket_prefix.rstrip("-")
+            term_key = wave_def.terminal_status_key or wave_def.slug
+            done_marker = wave_def.done_marker
+
+            handoff_md = f"""
+PROJECT_NAME: AUDAPACK
+DATE_TIME: 2026-08-27T16:03:00+03:00
+CAMPAIGN_PROFILE: {prof_id}
+WAVE_ID: {wave_def.id}
+WAVE_INDEX: {wave_def.ordinal}
+WAVE_COUNT: {prof.wave_count}
+WAVE: {wave_def.wave_header}
+STATUS: {term_key}: COMPLETE
+TICKETS: 1
+HANDOFF: IMPLEMENTATION_AGENT
+
+[P1] [{pfx}-001] Sample defect title
+EVIDENCE: In codebase.
+DEFECT: Sample defect.
+REPAIR: Fix defect.
+OPTIMIZE: Optimize code.
+ISSUE: Issue description.
+GUARDRAIL: Guardrail.
+VERIFY: Run tests.
+
+{done_marker} All tickets verified.
+"""
+            valid, meta, err = parse_wave(handoff_md, wave_def.id, prof)
+            assert valid, f"parse_wave failed for {prof_id}/{wave_def.id}: {err}"
+            assert meta is not None
+            assert meta["status"] == f"{term_key}: COMPLETE"
+            assert meta["profile_id"] == prof_id
+            assert meta["wave_id"] == wave_def.id

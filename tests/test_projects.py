@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from audapack.config import AppConfig, create_default_projects, load_config, migrate_legacy_data, save_config
+from audapack.config import AppConfig, load_config, migrate_legacy_data, save_config
 from audapack.models import CANONICAL_GROUPS, SLOTS_PER_GROUP, Project
 from audapack.projects import ProjectRegistry
 
@@ -103,6 +103,74 @@ class TestProjectRegistry(unittest.TestCase):
         self.assertIn("FastPrompter", p_names)
         self.assertEqual(cfg.packing.output_dir, r"C:\Out")
 
+    def test_get_by_name_exact_wins_over_earlier_fuzzy_match(self):
+        """W2-004: exact display name must outrank a fuzzy/slug collision on an
+        earlier registry entry, regardless of ordering."""
+        self.config.projects = []
+        self.config.projects.append(Project(
+            id="foo_bar", display_name="Foo.Bar",
+            source_path=r"C:\FooBar", priority_group="SIDE1", slot=1,
+        ))
+        self.config.projects.append(Project(
+            id="foo_bar_1", display_name="Foo+Bar",
+            source_path=r"C:\FooPlusBar", priority_group="SIDE1", slot=2,
+        ))
+
+        # Exact display name `Foo+Bar` must resolve to its own project, not the
+        # earlier entry whose generated slug (`foo_bar`) happens to collide.
+        hit = self.registry.get_project_by_name("Foo+Bar")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.id, "foo_bar_1")
+        self.assertEqual(hit.display_name, "Foo+Bar")
+
+        # Same guarantee with reversed registry order.
+        self.config.projects.reverse()
+        hit2 = self.registry.get_project_by_name("Foo+Bar")
+        self.assertEqual(hit2.id, "foo_bar_1")
+
+    def test_get_by_name_exact_beats_slug_phase(self):
+        """W2-004: exact display_name wins even when a later project's slug
+        matches the query before an exact-name project appears in list order."""
+        self.config.projects = []
+        self.config.projects.append(Project(
+            id="mailer", display_name="Mailer",
+            source_path=r"C:\Mailer", priority_group="SIDE1", slot=1,
+        ))
+        self.config.projects.append(Project(
+            id="foo_bar_1", display_name="Foo+Bar",
+            source_path=r"C:\FooPlusBar", priority_group="SIDE1", slot=2,
+        ))
+        self.config.projects.append(Project(
+            id="foo_bar", display_name="Foo Bar",
+            source_path=r"C:\FooBar", priority_group="SIDE1", slot=3,
+        ))
+        # Query is the canonical id of the third project; the id phase must hit
+        # exactly it, never the second project's earlier fuzzy normalized name.
+        hit = self.registry.get_project_by_name("foo_bar")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.id, "foo_bar")
+
+    def test_get_by_name_ambiguous_alias_returns_none(self):
+        """W2-004: a non-exact alias matching multiple projects is ambiguous and
+        must fail explicitly (None) instead of selecting by array order."""
+        self.config.projects = []
+        # Distinct exact names, distinct ids, but identical normalized keys.
+        self.config.projects.append(Project(
+            id="alpha_1", display_name="Alpha One",
+            source_path=r"C:\A1", priority_group="SIDE1", slot=1,
+        ))
+        self.config.projects.append(Project(
+            id="alpha_1_b", display_name="Alpha-One",
+            source_path=r"C:\A1B", priority_group="SIDE1", slot=2,
+        ))
+        # "alpha_one": no exact display/audit name, no id match, normalized
+        # "alphaone" matches both projects -> ambiguous, must not resolve.
+        hit = self.registry.get_project_by_name("alpha_one")
+        self.assertIsNone(hit, "ambiguous alias must not resolve by array order")
+        # Exact display names still resolve to their own project.
+        self.assertEqual(self.registry.get_project_by_name("Alpha One").id, "alpha_1")
+        self.assertEqual(self.registry.get_project_by_name("Alpha-One").id, "alpha_1_b")
+
 
 class TestRegistryTransactions(unittest.TestCase):
     """WJ-004: cross-process registry mutation is atomic and never falsely succeeds."""
@@ -174,6 +242,7 @@ class TestRegistryTransactions(unittest.TestCase):
 
     def test_save_failure_never_reports_success(self):
         from unittest import mock
+
         from audapack import projects as projects_mod
 
         reg = self._fresh_registry()
@@ -213,6 +282,79 @@ class TestRegistryTransactions(unittest.TestCase):
         # Default is False
         p3 = Project.from_dict({"id": "test3", "display_name": "Test 3", "source_path": r"C:\Test3"})
         self.assertFalse(p3.ignored)
+
+    def test_clear_project_marks_is_atomic_and_preserves_enablement(self):
+        reg = self._fresh_registry()
+        first = reg.add_project("Marked One", r"C:\One", enabled=False)
+        second = reg.add_project("Marked Two", r"C:\Two", enabled=True)
+        reg.edit_project(
+            first.id,
+            lambda p: (
+                setattr(p, "ignored", True),
+                setattr(p, "ignore_archive", True),
+                setattr(p, "audit_copy_count", 4),
+            ),
+        )
+        reg.edit_project(second.id, lambda p: setattr(p, "ignored", True))
+
+        self.assertEqual(reg.clear_project_marks(), 2)
+        fresh = self._fresh_registry()
+        first_after = fresh.get_project_by_id(first.id)
+        second_after = fresh.get_project_by_id(second.id)
+        self.assertFalse(first_after.enabled)
+        self.assertFalse(first_after.ignored)
+        self.assertFalse(first_after.ignore_archive)
+        self.assertEqual(first_after.audit_copy_count, 0)
+        self.assertTrue(second_after.enabled)
+        self.assertFalse(second_after.ignored)
+        self.assertEqual(fresh.clear_project_marks(), 0)
+
+
+class TestSlotHealing(unittest.TestCase):
+    def test_out_of_range_slots_healed(self):
+        cfg = AppConfig()
+        cfg.projects = [
+            Project(id="a", display_name="A", source_path=r"C:\A", priority_group="MAIN0", slot=1),
+            Project(id="b", display_name="B", source_path=r"C:\B", priority_group="MAIN0", slot=2),
+            Project(id="c", display_name="C", source_path=r"C:\C", priority_group="MAIN0", slot=3),
+            Project(id="d", display_name="D", source_path=r"C:\D", priority_group="MAIN0", slot=4),
+            Project(id="e", display_name="E", source_path=r"C:\E", priority_group="MAIN0", slot=5),
+            Project(id="f", display_name="F", source_path=r"C:\F", priority_group="MAIN0", slot=6),
+            Project(id="ghost7", display_name="Ghost7", source_path=r"C:\Ghost7", priority_group="MAIN0", slot=7),
+            Project(id="ghost8", display_name="Ghost8", source_path=r"C:\Ghost8", priority_group="MAIN0", slot=8),
+        ]
+        changed = cfg.heal_project_slots()
+        self.assertTrue(changed)
+        for p in cfg.projects:
+            self.assertTrue(1 <= p.slot <= SLOTS_PER_GROUP, f"{p.display_name} still at slot {p.slot}")
+        occupied = [(p.priority_group.upper(), p.slot) for p in cfg.projects]
+        self.assertEqual(len(occupied), len(set(occupied)), "slots must be unique per group")
+        # Original 6 stay in MAIN0; overflow must land in a later group, never MAIN0 #7.
+        main0 = sorted(p.slot for p in cfg.projects if p.priority_group.upper() == "MAIN0")
+        self.assertEqual(main0, [1, 2, 3, 4, 5, 6])
+
+    def test_valid_slots_not_touched(self):
+        cfg = AppConfig()
+        cfg.projects = [
+            Project(id="a", display_name="A", source_path=r"C:\A", priority_group="MAIN0", slot=1),
+            Project(id="b", display_name="B", source_path=r"C:\B", priority_group="MAIN0", slot=2),
+        ]
+        self.assertFalse(cfg.heal_project_slots())
+        self.assertEqual(
+            [(p.display_name, p.slot) for p in cfg.projects],
+            [("A", 1), ("B", 2)],
+        )
+
+    def test_colliding_slots_healed(self):
+        cfg = AppConfig()
+        cfg.projects = [
+            Project(id="a", display_name="A", source_path=r"C:\A", priority_group="MAIN0", slot=1),
+            Project(id="b", display_name="B", source_path=r"C:\B", priority_group="MAIN0", slot=1),
+        ]
+        changed = cfg.heal_project_slots()
+        self.assertTrue(changed)
+        slots = sorted(p.slot for p in cfg.projects)
+        self.assertEqual(slots, [1, 2])
 
 
 if __name__ == "__main__":

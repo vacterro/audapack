@@ -147,3 +147,12 @@ def get_saipen_info(project_path: str | Path) -> SaipenInfo:
         git_changed_files=int(git_info.get("changed_files", 0)),
         git_untracked_files=int(git_info.get("untracked_files", 0)),
     )
+
+
+def saipen_gg_entrypoint(path_or_str: str | Path) -> dict[str, Any]:
+    """
+    Entrypoint resolver for 'saipen gg <path>'.
+    Discovers campaign root, reconstructs campaign state, and determines active wave and prerequisite artifacts.
+    """
+    from audapack.campaign import resolve_audit_campaign_entrypoint
+    return resolve_audit_campaign_entrypoint(path_or_str)

@@ -87,6 +87,79 @@ test('W2-007: continue via explicit aria-label', () => {
   assert.strictEqual(api.assistantNeedsContinuation(turn), true);
 });
 
+function coreHandoffBody(api, ticketCount = 2) {
+  const waveDef = api.findWaveDefinitionForStageOrKind('core');
+  const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+  const termKey = waveDef.terminal_status_key || waveDef.slug;
+  let body = `
+PROJECT_NAME: AUDAPACK
+CAMPAIGN_PROFILE: quick3
+WAVE_ID: core
+WAVE_INDEX: 1
+WAVE_COUNT: 3
+WAVE: ${waveDef.wave_header}
+STATUS: ${termKey}: COMPLETE
+TICKETS: ${ticketCount}
+HANDOFF: IMPLEMENTATION_AGENT
+`;
+  for (let i = 1; i <= ticketCount; i += 1) {
+    const numStr = String(i).padStart(3, '0');
+    body += `
+[P1] [${pfx}-${numStr}] Sample defect issue title
+EVIDENCE: Verified in codebase.
+DEFECT: Sample defect explanation.
+REPAIR: Proposed fix.
+VERIFY: Run tests.
+`;
+  }
+  body += `\n${waveDef.done_marker.replace(/:\s*$/, '')}: All tickets verified.\n`;
+  return body;
+}
+
+test('W2-007: stale hidden/disabled continue buttons are ignored as recovery chrome', () => {
+  const { h, api } = setup();
+  const turn = assistantTurn(h, 'a1', el => {
+    const hidden = h.el('button', { 'data-testid': 'continue-generating' });
+    hidden.hidden = true;
+    el.appendChild(hidden);
+    const disabled = h.el('button', { 'aria-label': 'Continue generating' });
+    disabled.disabled = true;
+    el.appendChild(disabled);
+  });
+  addTurns(h, [turn]);
+  assert.strictEqual(
+    api.findAssistantRecoveryControl(turn, 'continue'),
+    null,
+    'hidden/disabled continue buttons are stale chrome, not actionable recovery'
+  );
+  assert.strictEqual(api.assistantNeedsContinuation(turn), false);
+});
+
+test('W2-007: ready core wave is accepted despite a stale continue button', () => {
+  const { h, api } = setup();
+  api.autoRuntime.enabled = true;
+  api.autoRuntime.stage = 'wait-core';
+  const body = coreHandoffBody(api, 2);
+  const turn = assistantTurn(h, 'a1', el => {
+    const message = h.el('div', { 'data-message-author-role': 'assistant' });
+    const markdown = h.el('div', { class: 'markdown prose' });
+    markdown._text = body;
+    message.appendChild(markdown);
+    const stale = h.el('button', { 'data-testid': 'continue-generating' });
+    stale.hidden = true;
+    message.appendChild(stale);
+    el.appendChild(message);
+  });
+  addTurns(h, [turn]);
+
+  const first = api.completedAssistantCandidate(turn);
+  assert.strictEqual(first.complete, false, 'first evaluation arms the stabilization window');
+  api.autoRuntime.stableSince = Date.now() - 120000;
+  const second = api.completedAssistantCandidate(turn);
+  assert.strictEqual(second.complete, true, 'structurally complete core must be accepted despite stale continue button');
+  assert.strictEqual(second.gate, 'complete');
+});
+
 test('W2-007: recovery refuses to run without a verifiable lease', async () => {
   const { h, api } = setup();
   composerFixture(h);

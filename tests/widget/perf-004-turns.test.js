@@ -73,3 +73,29 @@ test('PERF-004: no turns outside the composer returns empty list', () => {
   const { h, api } = setup();
   assert.strictEqual(api.getChatGPTTurns().length, 0);
 });
+
+test('PERF-006: one nested message lookup per stable wrapper', () => {
+  const { h, api } = setup();
+  const main = mainEl(h);
+  const turns = [];
+  for (let i = 0; i < 100; i += 1) {
+    turns.push(wrapperTurn(h, `s${i}`, i % 2 ? 'assistant' : 'user', `msg ${i}`));
+  }
+  addTurns(h, turns);
+
+  h.counters.qsa = 0;
+  const found = api.getChatGPTTurns();
+  assert.strictEqual(found.length, 100);
+
+  // getChatGPTTurns runs ONE root querySelectorAll for stable wrappers, then
+  // each wrapper resolves its nested authored message with a single descendant
+  // lookup (not two: turnRole query + message query). Fallback scan does not
+  // trigger here because user turns are found.
+  const qsa = h.counters.qsa;
+  const perWrapper = qsa / 100;
+  assert.ok(
+    perWrapper <= 1.1,
+    `expected ~1 nested message lookup per stable wrapper, got ${perWrapper} (qsa=${qsa})`
+  );
+  assert.ok(perWrapper >= 1, `expected at least one lookup per wrapper, got ${perWrapper}`);
+});

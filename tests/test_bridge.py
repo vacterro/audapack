@@ -13,7 +13,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from audapack.bridge.server import AudapackBridgeHandler
-from audapack.bridge.state import get_bridge_state_dir, get_run_state
+from audapack.bridge.state import get_run_state
 from audapack.bridge.storage import (
     InvalidProjectPathError,
     ensure_contained,
@@ -21,7 +21,7 @@ from audapack.bridge.storage import (
     resolve_project_audit_dir,
     sanitize_project_name,
 )
-from audapack.config import AppConfig, BridgeConfig, AuditsConfig
+from audapack.config import AppConfig, save_config
 from audapack.models import Project
 
 
@@ -50,6 +50,8 @@ class TestAudapackBridge(unittest.TestCase):
             pass
 
         TestHandler.config = self.config
+        TestHandler.test_base_dir = self.temp_dir
+        save_config(self.config, base_dir=self.temp_dir)
         self.server = ThreadingHTTPServer((self.config.bridge.host, self.config.bridge.port), TestHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
@@ -379,10 +381,13 @@ PERFORMANCE_DONE_WHEN: benchmark passes"""
             "X-ACB-Token": self.config.bridge.token,
         }
 
-        for w_name, w_hdr, w_done, w_pfx in [
-            ("core", "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE", "CORE_DONE_WHEN: ok", "CORE-001"),
-            ("second", "WAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE", "SECOND_WAVE_DONE_WHEN: ok", "W2-001"),
-            ("performance", "WAVE: AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS\nSTATUS: PERFORMANCE: COMPLETE", "PERFORMANCE_DONE_WHEN: ok", "PERF-001"),
+        for w_name, w_hdr, w_done, w_pfx, w_fields in [
+            ("core", "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE", "CORE_DONE_WHEN: ok", "CORE-001",
+             "EVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v"),
+            ("second", "WAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE", "SECOND_WAVE_DONE_WHEN: ok", "W2-001",
+             "EVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v"),
+            ("performance", "WAVE: AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS\nSTATUS: PERFORMANCE: COMPLETE", "PERFORMANCE_DONE_WHEN: ok", "PERF-001",
+             "EVIDENCE: e\nISSUE: i\nOPTIMIZE: o\nGUARDRAIL: g\nVERIFY: v"),
         ]:
             p = {
                 "run_id": run_id,
@@ -391,7 +396,7 @@ PERFORMANCE_DONE_WHEN: benchmark passes"""
                 "status": "complete",
             "api_version": 2,
                 "receipt": f"rcpt_{w_name}",
-                "content": f"PROJECT_NAME: SAIPEN\n{w_hdr}\nTICKETS: 1\n[P1] [{w_pfx}] test.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\n{w_done}",
+                "content": f"PROJECT_NAME: SAIPEN\n{w_hdr}\nTICKETS: 1\n[P1] [{w_pfx}] test.py\n{w_fields}\n{w_done}",
             }
             req = urllib.request.Request(self._url("/v1/audits"), data=json.dumps(p).encode("utf-8"), headers=headers)
             with urllib.request.urlopen(req) as resp:
@@ -514,7 +519,7 @@ PERFORMANCE_DONE_WHEN: benchmark passes"""
         self.assertEqual(outside, [])
 
     def test_autostart_command_and_task_detection(self):
-        from audapack.components.autostart import get_canonical_autostart_command, get_autostart_status
+        from audapack.components.autostart import get_autostart_status, get_canonical_autostart_command
         cmd = get_canonical_autostart_command()
         self.assertIn("AUDAPACK.pyw", cmd)
         self.assertIn("--bridge", cmd)
@@ -648,6 +653,88 @@ PERFORMANCE_DONE_WHEN: benchmark passes"""
         # No physical write for the conflicted run.
         self.assertFalse(any(run_id in f.name for f in self.audit_root.rglob("*")))
 
+    def test_payload_project_name_vs_handoff_name_conflict_409_no_write(self):
+        """CORE-005: first-wave payload project and handoff PROJECT_NAME are two
+        explicit identities; a real conflict must be rejected with 409 before any
+        registration/file/state mutation — even without a project_id."""
+        headers = {
+            "Content-Type": "application/json",
+            "X-ACB-Token": self.config.bridge.token,
+        }
+        # Register ALPHA and BETA as existing projects.
+        for name in ("ALPHA", "BETA"):
+            req_reg = urllib.request.Request(
+                self._url("/v1/projects/resolve"),
+                data=json.dumps({"project_name": name}).encode("utf-8"),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req_reg) as resp:
+                json.loads(resp.read().decode("utf-8"))
+
+        run_id = f"test_run_name_conf_{secrets.token_hex(4)}"
+        payload = {
+            "run_id": run_id,
+            "project": "ALPHA",
+            # No project_id supplied.
+            "wave": "core",
+            "status": "complete",
+            "api_version": 2,
+            "receipt": "rcpt_name_conf_1",
+            "content": (
+                "PROJECT_NAME: BETA\nWAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\n"
+                "TICKETS: 1\n[P1] [CORE-001] x.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\n"
+                "CORE_DONE_WHEN: done"
+            ),
+        }
+        req = urllib.request.Request(self._url("/v1/audits"), data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 409)
+        body = json.loads(ctx.exception.read().decode("utf-8"))
+        self.assertEqual(body["error"]["code"], "project_identity_conflict")
+
+        # No physical write for the conflicted run, no BETA artifact.
+        self.assertFalse(any(run_id in f.name for f in self.audit_root.rglob("*")))
+        beta_audit_dir = self.audit_root / "MAIN0" / "BETA"
+        self.assertFalse(beta_audit_dir.exists(), "BETA must not receive the wave")
+
+    def test_payload_unknown_name_vs_handoff_existing_conflict_409(self):
+        """CORE-005: a payload that names nothing known must not let handoff
+        metadata silently reroute/register an existing project."""
+        headers = {
+            "Content-Type": "application/json",
+            "X-ACB-Token": self.config.bridge.token,
+        }
+        req_reg = urllib.request.Request(
+            self._url("/v1/projects/resolve"),
+            data=json.dumps({"project_name": "GAMMA"}).encode("utf-8"),
+            headers=headers,
+        )
+        with urllib.request.urlopen(req_reg) as resp:
+            json.loads(resp.read().decode("utf-8"))
+
+        run_id = f"test_run_unknown_{secrets.token_hex(4)}"
+        payload = {
+            "run_id": run_id,
+            "project": "NoSuchProject",
+            "wave": "core",
+            "status": "complete",
+            "api_version": 2,
+            "receipt": "rcpt_unknown_1",
+            "content": (
+                "PROJECT_NAME: GAMMA\nWAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\n"
+                "TICKETS: 1\n[P1] [CORE-001] x.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\n"
+                "CORE_DONE_WHEN: done"
+            ),
+        }
+        req = urllib.request.Request(self._url("/v1/audits"), data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 409)
+        body = json.loads(ctx.exception.read().decode("utf-8"))
+        self.assertEqual(body["error"]["code"], "project_identity_conflict")
+        self.assertFalse(any(run_id in f.name for f in self.audit_root.rglob("*")))
+
 
 class TestBridgeAuthHygiene(unittest.TestCase):
     """WJ-002: auth surface must be canonical and migration-scoped, never user-hard-coded."""
@@ -663,8 +750,8 @@ class TestBridgeAuthHygiene(unittest.TestCase):
 
     def test_legacy_candidates_env_based_and_revocable(self):
         import tempfile as _tempfile
-        from audapack.config import revoke_legacy_token_acceptance
         from unittest import mock
+
 
         handler = AudapackBridgeHandler.__new__(AudapackBridgeHandler)
         fake_local = _tempfile.mkdtemp()
@@ -740,19 +827,21 @@ class TestAuditPathContainment(unittest.TestCase):
             "Normal Project",
         ]
         resolved_root = self.audit_root.resolve()
-        for raw in hostile_and_valid_names:
-            with self.subTest(raw=raw):
-                target_dir, _resolved_name, _proj, _created = resolve_project_audit_dir(
-                    self._fresh_config(), raw
-                )
-                resolved_target = target_dir.resolve()
-                self.assertTrue(
-                    resolved_target.is_relative_to(resolved_root),
-                    f"{raw!r} resolved to {resolved_target}, outside {resolved_root}",
-                )
-        # No write escaped the root for any case.
-        outside = [p for p in Path(self.temp_dir).iterdir() if p != self.audit_root]
-        self.assertEqual(outside, [])
+        with tempfile.TemporaryDirectory() as base_tmp:
+            base_dir = Path(base_tmp)
+            for raw in hostile_and_valid_names:
+                with self.subTest(raw=raw):
+                    target_dir, _resolved_name, _proj, _created = resolve_project_audit_dir(
+                        self._fresh_config(), raw, base_dir=base_dir
+                    )
+                    resolved_target = target_dir.resolve()
+                    self.assertTrue(
+                        resolved_target.is_relative_to(resolved_root),
+                        f"{raw!r} resolved to {resolved_target}, outside {resolved_root}",
+                    )
+            # No write escaped the root for any case.
+            outside = [p for p in Path(self.temp_dir).iterdir() if p != self.audit_root]
+            self.assertEqual(outside, [])
 
     def test_ensure_contained_rejects_escape(self):
         inside = ensure_contained(self.audit_root / "MAIN0" / "Proj", self.audit_root)
@@ -802,12 +891,14 @@ class TestStrictWaveValidation(unittest.TestCase):
         )
         self.second_ok = (
             "PROJECT_NAME: X\nWAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE\n"
-            "TICKETS: 0\nSECOND_WAVE_DONE_WHEN: nothing to do"
+            "TICKETS: 0\nNO NEW VERIFIED SECOND-WAVE DEFECTS.\nSECOND_WAVE_DONE_WHEN: nothing to do"
         )
         self.perf_ok = (
             "PROJECT_NAME: X\nWAVE: AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS\n"
-            "STATUS: PERFORMANCE: COMPLETE\nTICKETS: 2\n[P2] [PERF-001] a.py\n[P3] [PERF-002] b.py\n"
-            "EVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nPERFORMANCE_DONE_WHEN: done"
+            "STATUS: PERFORMANCE: COMPLETE\nTICKETS: 2\n"
+            "[P2] [PERF-001] a.py\nEVIDENCE: e1\nISSUE: i1\nOPTIMIZE: o1\nGUARDRAIL: g1\nVERIFY: v1\n"
+            "[P3] [PERF-002] b.py\nEVIDENCE: e2\nISSUE: i2\nOPTIMIZE: o2\nGUARDRAIL: g2\nVERIFY: v2\n"
+            "PERFORMANCE_DONE_WHEN: done"
         )
 
     def _reject(self, content, wave, fragment):
@@ -854,10 +945,10 @@ class TestStrictWaveValidation(unittest.TestCase):
 
     def test_rejects_ticket_count_mismatch(self):
         broken = self.perf_ok.replace("[P3] [PERF-002] b.py\n", "").replace("TICKETS: 2", "TICKETS: 2 ")
-        # count says 2, unique PERF ids now 1
+        # count says 2, unique PERF id blocks now 1
         ok, _meta, err = self.parse(broken.rstrip(), "performance")
         self.assertFalse(ok)
-        self.assertIn("Expected 2 unique PERF- tickets", err)
+        self.assertIn("Expected 2 unique PERF- ticket blocks", err)
 
     def test_rejects_other_wave_tickets_as_core_evidence(self):
         foreign = (
@@ -865,7 +956,7 @@ class TestStrictWaveValidation(unittest.TestCase):
             "TICKETS: 1\n[P1] [W2-001] b.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\n"
             "CORE_DONE_WHEN: done"
         )
-        self._reject(foreign, "core", "Expected 1 unique CORE- tickets")
+        self._reject(foreign, "core", "Expected 1 unique CORE- ticket blocks")
 
     def test_zero_ticket_terminal_form_accepted(self):
         ok, meta, err = self.parse(self.second_ok, "second")
@@ -877,7 +968,7 @@ class TestRunIdentity(unittest.TestCase):
     """WJ-006: hashed run-state identity + immutable project_id binding."""
 
     def test_colliding_sanitized_run_ids_remain_independent(self):
-        from audapack.bridge.state import canonical_run_key, get_run_state, save_run_state
+        from audapack.bridge.state import canonical_run_key, save_run_state
         # Both truncate to the SAME legacy sanitized form ("r" x 64).
         run_a = "r" * 70 + "A"
         run_b = "r" * 70 + "B"
@@ -900,7 +991,7 @@ class TestRunIdentity(unittest.TestCase):
             shutil.rmtree(base, ignore_errors=True)
 
     def test_legacy_sanitized_state_file_migrates_forward(self):
-        from audapack.bridge.state import canonical_run_key, get_run_state
+        from audapack.bridge.state import canonical_run_key
         base = Path(tempfile.mkdtemp())
         try:
             runs = base / "runs"

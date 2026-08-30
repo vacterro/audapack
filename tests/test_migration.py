@@ -6,11 +6,9 @@ no real Scheduled Task is ever touched, plus live capability probes against a
 real in-process bridge server.
 """
 
-import json
 import secrets
 import threading
 import unittest
-import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -168,6 +166,9 @@ class TestCapabilityProbes(unittest.TestCase):
             pass
 
         TestHandler.config = self.config
+        TestHandler.test_base_dir = self.temp_dir
+        from audapack.config import save_config
+        save_config(self.config, base_dir=self.temp_dir)
         self.server = ThreadingHTTPServer((self.config.bridge.host, self.config.bridge.port), TestHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 

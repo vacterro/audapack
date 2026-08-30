@@ -2,23 +2,40 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import threading
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from audapack.config import cross_process_lock, get_state_dir
 
 _GLOBAL_STATE_LOCK = threading.Lock()
-_RUN_LOCKS: dict[str, threading.Lock] = {}
+# PERF-004: weak values so the in-process lock registry stays bounded by live
+# contention instead of leaking one entry per run ever seen. A lock is kept
+# alive while any caller holds a reference (run_transaction holds the returned
+# lock across the critical section), so an entry is only evicted once no
+# holder/waiters remain.
+_RUN_LOCKS: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
 
 
 class RunStatePersistenceError(RuntimeError):
     """Raised when durable run-state replacement fails (CORE-013)."""
+
+
+class RunStateCorruptionError(RuntimeError):
+    """Raised when an existing durable run-state file is corrupt/unreadable (W2-004).
+
+    Recovery must fail safely: an unreadable existing state is treated as
+    evidence that a run exists with unknown committed content, never as proof
+    that no run exists. Callers must not accept new wave writes against a
+    freshly synthesized empty state in that case.
+    """
 
 
 class GenerationPersistenceError(RuntimeError):
@@ -43,9 +60,39 @@ def get_run_lock(run_id: str) -> threading.Lock:
     """
     key = canonical_run_key(run_id)
     with _GLOBAL_STATE_LOCK:
-        if key not in _RUN_LOCKS:
-            _RUN_LOCKS[key] = threading.Lock()
-        return _RUN_LOCKS[key]
+        lock = _RUN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _RUN_LOCKS[key] = lock
+        return lock
+
+
+def get_run_transaction_lock_path(run_id: str, base_dir: Optional[Path] = None) -> Path:
+    """Deterministic cross-process lock file for one run's complete transaction.
+
+    Lives beside the run state so all Bridge processes sharing a state dir
+    coordinate on the same owner (W2-001).
+    """
+    return get_bridge_state_dir(base_dir) / "locks" / f"run_{canonical_run_key(run_id)}.lock"
+
+
+@contextlib.contextmanager
+def run_transaction(run_id: str, base_dir: Optional[Path] = None) -> Iterator[None]:
+    """Serializes one campaign's complete durable transaction across threads AND
+    processes.
+
+    W2-001: the in-process threading.Lock alone cannot coordinate two Bridge
+    daemons sharing the canonical runtime. This holds a cross-process file lock
+    keyed by canonical_run_key(run_id) for the same region previously protected
+    only by the in-process lock, then acquires the cheap thread lock inside so
+    overlapping same-process requests stay serialized without extra OS handles.
+    """
+    lock_file = get_run_transaction_lock_path(run_id, base_dir)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    thread_lock = get_run_lock(run_id)
+    with cross_process_lock(lock_file):
+        with thread_lock:
+            yield
 
 
 def get_bridge_state_dir(base_dir: Optional[Path] = None) -> Path:
@@ -78,13 +125,17 @@ def get_run_state(run_id: str, base_dir: Optional[Path] = None) -> dict[str, Any
                 legacy_state = json.loads(legacy_file.read_text(encoding="utf-8"))
                 save_run_state(run_id, legacy_state, base_dir)
                 return legacy_state
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RunStateCorruptionError(
+                    f"Legacy run state file {legacy_file} is unreadable/corrupt: {exc}"
+                ) from exc
     if state_file.exists():
         try:
             return json.loads(state_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RunStateCorruptionError(
+                f"Run state file {state_file} is corrupt or unreadable: {exc}"
+            ) from exc
     return {
         "schema_version": 2,
         "run_id": run_id,

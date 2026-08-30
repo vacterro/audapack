@@ -85,8 +85,9 @@ class TestForceShowNativeContract(unittest.TestCase):
         """If Windows started the window minimised (IsIconic=True), force a
         SW_RESTORE before the SW_SHOWNORMAL so the user gets a normal window
         rather than a minimised one."""
-        from audapack.ui_qt.app import _force_show_native
         import ctypes
+
+        from audapack.ui_qt.app import _force_show_native
         original_user32 = ctypes.windll.user32
         mock_user32 = MagicMock()
         mock_user32.IsIconic.return_value = True
@@ -116,7 +117,7 @@ class TestRunQtGuiInvokesForceShow(unittest.TestCase):
         # Patch QApplication, MainWindow, and the force helper so the test
         # does not need a real Qt event loop.
         with patch.object(qt_app_mod, "_force_show_native") as mock_force:
-            with patch("PySide6.QtCore.QTimer") as mock_timer:
+            with patch("PySide6.QtCore.QTimer"):
                 with patch("PySide6.QtWidgets.QApplication") as mock_qapp:
                     mock_app_instance = MagicMock()
                     mock_qapp.return_value = mock_app_instance

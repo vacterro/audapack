@@ -66,38 +66,51 @@ def install_context_menu(script_path: Optional[Path] = None) -> bool:
         import winreg
 
         cmd = get_launcher_command(script_path)
+        created: list[str] = []
 
         for base_key in [REG_KEY_DIRECTORY, REG_KEY_FILE]:
-            # Create shell key
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base_key) as key:
                 winreg.SetValueEx(key, "", 0, winreg.REG_SZ, CONTEXT_MENU_TITLE)
-
-            # Create command subkey
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base_key}\command") as cmd_key:
+            created.append(base_key)
+            command_key = rf"{base_key}\command"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, command_key) as cmd_key:
                 winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, cmd)
+            created.append(command_key)
 
         return True
     except Exception:
+        for key_path in reversed(created):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
+            except OSError:
+                pass
         return False
 
 
 def remove_context_menu() -> bool:
-    """Removes context menu entries from HKCU."""
+    """Removes context menu entries from HKCU.
+
+    W2-010: only a genuinely absent key is treated as idempotent success.
+    Permission/access failures on an existing key are recorded and reported as
+    failure so the UI never claims removal that did not happen.
+    """
     if os.name != "nt":
         return False
     try:
         import winreg
-
-        for base_key in [REG_KEY_DIRECTORY, REG_KEY_FILE]:
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, rf"{base_key}\command")
-            except OSError:
-                pass
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, base_key)
-            except OSError:
-                pass
-
-        return True
     except Exception:
         return False
+
+    errors: list[str] = []
+    for base_key in [REG_KEY_DIRECTORY, REG_KEY_FILE]:
+        for key_path in (rf"{base_key}\command", base_key):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_path)
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) == 2:
+                    continue
+                errors.append(f"{key_path}: {exc}")
+            except Exception as exc:
+                errors.append(f"{key_path}: {exc}")
+
+    return not errors

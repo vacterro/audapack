@@ -83,11 +83,11 @@
   const AUTO_LEASE_TTL_MS = 30000;
   const AUTO_LEASE_RENEW_MS = 10000;
   const AUTO_LEASE_VERIFY_MS = 90;
-  const AUTO_MAX_PARTIAL_CONTINUATIONS = 8;
-  const AUTO_MAX_CONTINUE_GENERATING = 8;
+  const AUTO_MAX_PARTIAL_CONTINUATIONS = 12;
+  const AUTO_MAX_CONTINUE_GENERATING = 12;
   const AUTO_MAX_RETRIES = 3;
-  const AUTO_MAX_STALL_NUDGES = 6;
-  const AUTO_MAX_SIDECAR_RECOVERIES = 8;
+  const AUTO_MAX_STALL_NUDGES = 12;
+  const AUTO_MAX_SIDECAR_RECOVERIES = 12;
   const AUTO_SIDECAR_RECOVERY_GRACE_MS = 6000;
   const AUTO_IDLE_STALL_GRACE_MS = 20000;
   const AUTO_LIVENESS_CHECK_MS = 2500;
@@ -116,15 +116,21 @@
   const BRIDGE_DEFAULT_URL = 'http://127.0.0.1:17843';
   const BRIDGE_TOKEN_KEY = 'ai_chatbuttons_bridge_token_v1';
   const BRIDGE_JOB_PREFIX = 'ai_chatbuttons_bridge_job_v1:';
+  const BRIDGE_JOB_INDEX_KEY = 'ai_chatbuttons_bridge_job_index_v1';
   const BRIDGE_QUEUE_SIGNAL_KEY = 'ai_chatbuttons_bridge_queue_signal_v1';
   const BRIDGE_FLUSH_LEASE_KEY = 'ai_chatbuttons_bridge_flush_lease_v1';
   const BRIDGE_FLUSH_LEASE_MS = 30000;
   const BRIDGE_REQUEST_TIMEOUT_MS = 12000;
   const BRIDGE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 120000, 300000]);
   const BRIDGE_API_VERSION = 3;
+  const AUDIT_RESULT_INDEX_KEY = 'ai_chatbuttons_audit_result_index_v1';
+  const AUDIT_RESULT_MAX_CONVERSATIONS = 50;
+  let bridgeJobsCache = null;
+  let bridgeJobsCacheAt = 0;
+  const BRIDGE_JOBS_CACHE_TTL_MS = 500;
 
 // BEGIN_EMBEDDED_AUDIT_PROFILES
-  const AUDIT_PROFILES_MANIFEST_SHA256 = '0150e79661d7b03b2fee434b93ea0cec2ec584e2c68ebb375b7d41bfbd13ff87';
+  const AUDIT_PROFILES_MANIFEST_SHA256 = 'c01ec812cf5952fdab101d5e7bc83c8251e0d9c21bb0ab06e426f5d58baedff2';
   const EMBEDDED_AUDIT_PROFILES = Object.freeze({
   "schema_version": 1,
   "profiles": {
@@ -152,10 +158,10 @@
           "prompt_output_contract": "Return ONE code block only. Tickets in priority order ([P0|P1|P2] [CORE-001] <path/symbol> with EVIDENCE, DEFECT, REPAIR, VERIFY). End with CORE_DONE_WHEN.",
           "depends_on": [],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -185,10 +191,10 @@
             "core"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -219,10 +225,10 @@
             "second"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "finalizer",
           "finalizer": true,
           "ticket_fields": [
@@ -260,10 +266,10 @@
           "prompt_output_contract": "Return ONE code block only. Header with machine handoff fields + coverage ledger. Tickets: [P0|P1|P2] [ARCH-001] <path/symbol> (EVIDENCE, DEFECT, REPAIR, VERIFY). End with ARCH_DONE_WHEN.",
           "depends_on": [],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -293,10 +299,10 @@
             "architecture"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -327,10 +333,10 @@
             "correctness"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -362,10 +368,10 @@
             "state"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -396,10 +402,10 @@
             "correctness"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -432,10 +438,10 @@
             "recovery"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -468,10 +474,10 @@
             "recovery"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -503,10 +509,10 @@
             "state"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -540,10 +546,10 @@
             "integration"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "standard",
           "finalizer": false,
           "ticket_fields": [
@@ -581,10 +587,10 @@
             "operator"
           ],
           "required": true,
-          "max_partial_continuations": 5,
-          "max_stall_recoveries": 3,
-          "max_retry_clicks": 2,
-          "max_continue_generating_clicks": 3,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
           "synthesis_role": "finalizer",
           "finalizer": true,
           "ticket_fields": [
@@ -601,29 +607,80 @@
 });
   // END_EMBEDDED_AUDIT_PROFILES
 
+  const SUPER10_WAVE_IDS = Object.freeze([
+    'architecture',
+    'correctness',
+    'state',
+    'recovery',
+    'security',
+    'integration',
+    'verification',
+    'performance',
+    'operator',
+    'redteam',
+    // Legacy compatibility keys
+    'data_integrity',
+    'concurrency',
+    'network',
+    'observability',
+    'resilience',
+    'deep_synthesis',
+    'wave_04',
+    'wave_05',
+    'wave_06',
+    'wave_07',
+    'wave_08',
+    'wave_09',
+    'wave_10'
+  ]);
+
   function detectProfileFromTurns(turns = null) {
     const list = turns || (typeof getChatGPTTurns === 'function' ? getChatGPTTurns() : []);
+    const super10Keywords = [
+      'CAMPAIGN_PROFILE: super10',
+      'CAMPAIGN_PROFILE: "super10"',
+      'of Super 10 Deep Campaign',
+      'of Super10 Deep Campaign',
+      'of Super10 Deep Audit',
+      'AUDIT ARCHITECTURE',
+      'AUDIT CORRECTNESS',
+      'AUDIT STATE',
+      'AUDIT RECOVERY',
+      'AUDIT SECURITY',
+      'AUDIT INTEGRATION',
+      'AUDIT VERIFICATION',
+      'AUDIT OPERATOR',
+      'AUDIT REDTEAM',
+      'AUDIT RED TEAM',
+      'AUDIT ADVERSARIAL SYNTHESIS',
+      'STATUS: AUDIT_ARCHITECTURE',
+      'STATUS: AUDIT_CORRECTNESS',
+      'STATUS: AUDIT_STATE',
+      'STATUS: AUDIT_RECOVERY',
+      'STATUS: AUDIT_SECURITY',
+      'STATUS: AUDIT_INTEGRATION',
+      'STATUS: AUDIT_VERIFICATION',
+      'STATUS: AUDIT_OPERATOR',
+      'STATUS: AUDIT_REDTEAM',
+      // Legacy compatibility
+      '__04_AUDIT_DATA_INTEGRITY',
+      '__05_AUDIT_CONCURRENCY',
+      '__06_AUDIT_NETWORK',
+      '__07_AUDIT_OBSERVABILITY',
+      '__08_AUDIT_RESILIENCE',
+      '__09_AUDIT_SECURITY',
+      '__10_AUDIT_DEEP_SYNTHESIS',
+      'WAVE: AUDIT DATA INTEGRITY',
+      'WAVE: AUDIT CONCURRENCY',
+      'WAVE: AUDIT NETWORK',
+      'WAVE: AUDIT OBSERVABILITY',
+      'WAVE: AUDIT RESILIENCE',
+      'WAVE: AUDIT DEEP SYNTHESIS'
+    ];
     for (const turn of list) {
-      if (typeof turnRole === 'function' && turnRole(turn) !== 'user') continue;
       const text = typeof getTurnText === 'function' ? getTurnText(turn) : '';
       if (!text) continue;
-      if (
-        text.includes('__04_AUDIT_DATA_INTEGRITY') ||
-        text.includes('__05_AUDIT_CONCURRENCY') ||
-        text.includes('__06_AUDIT_NETWORK') ||
-        text.includes('__07_AUDIT_OBSERVABILITY') ||
-        text.includes('__08_AUDIT_RESILIENCE') ||
-        text.includes('__09_AUDIT_SECURITY') ||
-        text.includes('__10_AUDIT_DEEP_SYNTHESIS') ||
-        text.includes('CAMPAIGN_PROFILE: super10') ||
-        text.includes('WAVE: AUDIT DATA INTEGRITY') ||
-        text.includes('WAVE: AUDIT CONCURRENCY') ||
-        text.includes('WAVE: AUDIT NETWORK') ||
-        text.includes('WAVE: AUDIT OBSERVABILITY') ||
-        text.includes('WAVE: AUDIT RESILIENCE') ||
-        text.includes('WAVE: AUDIT DEEP SYNTHESIS') ||
-        text.includes('of Super10 Deep Audit')
-      ) {
+      if (super10Keywords.some(kw => text.includes(kw))) {
         return 'super10';
       }
     }
@@ -635,7 +692,7 @@
     if (!profId) {
       if (autoRuntime) {
         const waveKeys = Object.keys(autoRuntime.waveUserIds || {});
-        const hasSuperKeys = waveKeys.some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k));
+        const hasSuperKeys = waveKeys.some(k => SUPER10_WAVE_IDS.includes(k) && !['core', 'second'].includes(k));
         if (hasSuperKeys) {
           profId = 'super10';
         } else if (waveKeys.length > 0 || autoRuntime.coreUserId || autoRuntime.secondUserId || autoRuntime.performanceUserId) {
@@ -654,12 +711,19 @@
     return profs[profId] || profs.quick3 || profs.super10;
   }
 
-  function findWaveDefinitionForStageOrKind(target) {
+  function findWaveDefinitionForStageOrKind(target, profileOrId = null) {
     if (!target) return null;
     const clean = String(target).toLowerCase().replace(/^wait-/, '').replace(/^sending-/, '').replace(/^await-/, '').replace(/-user$/, '');
     const profs = EMBEDDED_AUDIT_PROFILES?.profiles || {};
-    const activeProf = getActiveProfile();
-    for (const w of (activeProf.waves || [])) {
+    let targetProf = null;
+    if (typeof profileOrId === 'string' && profs[profileOrId]) {
+      targetProf = profs[profileOrId];
+    } else if (profileOrId && typeof profileOrId === 'object' && Array.isArray(profileOrId.waves)) {
+      targetProf = profileOrId;
+    } else {
+      targetProf = getActiveProfile();
+    }
+    for (const w of (targetProf.waves || [])) {
       if (w.id === clean || w.slug.toLowerCase() === clean || String(w.ordinal) === clean || w.number === clean) return w;
     }
     for (const pid of Object.keys(profs)) {
@@ -741,14 +805,45 @@ P0 = data corruption/loss, severe safety/security defect, crash/unusable primary
 P1 = significant functional defect, lifecycle/recovery/integration failure, or high-probability user breakage.
 P2 = lower-impact defect, concrete maintainability drift likely to cause failure, or missing regression coverage.`;
 
+  const CAMPAIGN_CONTEXT_POLICY_BLOCK = `CAMPAIGN CONTEXT
+
+This audit belongs to a multi-wave Super10 campaign.
+
+The path supplied by the operator is an ENTRYPOINT to the campaign, not an
+instruction to limit inspection to that single audit artifact.
+
+You are explicitly authorized to READ all relevant files inside the owning
+A10 campaign directory in order to reconstruct campaign state, consume prior
+wave handoffs, recover interrupted continuations, validate dependencies,
+avoid duplicate tickets, and perform final synthesis.
+
+Do not ask the operator to paste prior A10 wave outputs when they already
+exist inside the campaign directory.
+
+Treat campaign files as read-only evidence except through the explicit
+campaign result/update protocol.
+
+Do not read sibling project audit directories merely because they share the
+same parent audit root.
+
+Determine the active wave from validated campaign state, not from the
+ordinal/name of the entrypoint file.`;
+
   function buildAuditWavePrompt(profile, waveDef, context = {}) {
     if (!profile || !waveDef) return '';
     const isSuper10 = profile.profile_id === 'super10';
     const isFinalizer = Boolean(waveDef.finalizer || waveDef.synthesis_role === 'finalizer');
     const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+    // CORE-006: emit the concrete active run id, not a placeholder. The
+    // transport request will be sent with the same id; Bridge ingress
+    // requires equality between the two on the v3 contract.
+    const activeRunId = String(context.runId || autoRuntime?.runId || '').trim();
 
     const lines = [];
     lines.push(`${waveDef.title} — wave ${waveDef.ordinal}/${profile.waves.length} of ${profile.display_name}.\n`);
+    if (isSuper10) {
+      lines.push(CAMPAIGN_CONTEXT_POLICY_BLOCK + '\n');
+    }
     lines.push(SHARED_AUDIT_PROTOCOL);
     lines.push(`\nWAVE OBJECTIVE & FOCUS\n\n${waveDef.prompt_focus}\n`);
     lines.push(`OUTPUT CONTRACT\n\n${waveDef.prompt_output_contract}\n`);
@@ -758,7 +853,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     lines.push(`DATE_TIME: <ISO-8601 or local date-time>`);
     lines.push(`CAMPAIGN_PROFILE: ${profile.profile_id}`);
     lines.push(`CAMPAIGN_PROFILE_VERSION: ${profile.profile_version}`);
-    lines.push(`CAMPAIGN_RUN_ID: <run-id>`);
+    lines.push(`CAMPAIGN_RUN_ID: ${activeRunId || '<run-id>'}`);
     lines.push(`CAMPAIGN_MANIFEST_SHA256: ${AUDIT_PROFILES_MANIFEST_SHA256}`);
     lines.push(`WAVE_ID: ${waveDef.id}`);
     lines.push(`WAVE_INDEX: ${waveDef.ordinal}`);
@@ -952,7 +1047,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 }
 
 
-#acb-super-toggle {
+#acb-settings-btn {
   flex: 0 0 auto !important;
   min-width: 38px !important;
   min-height: 18px !important;
@@ -990,9 +1085,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 }
 
 #acb-super-brand {
-  flex: 0 0 auto !important;
+  flex: 0 1 auto !important;
   width: auto !important;
-  min-width: 24px !important;
+  min-width: 20px !important;
   max-width: 130px !important;
   color: var(--borderHighlight) !important;
   font-size: 11px !important;
@@ -1003,6 +1098,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   text-overflow: ellipsis !important;
   padding: 0 2px !important;
 }
+#acb-super-brand[data-archive-freshness="fresh"] { color: var(--textPrimary) !important; }
+#acb-super-brand[data-archive-freshness="warm"] { color: var(--borderHighlight) !important; }
+#acb-super-brand[data-archive-freshness="stale"] { color: var(--dangerText) !important; }
 
 #acb-super-auto-label {
   flex: 0 0 auto !important;
@@ -1060,7 +1158,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 }
 
 .acb-super-step {
-  min-width: 14px !important;
+  flex: 0 1 auto !important;
+  min-width: 12px !important;
   max-width: 18px !important;
   height: 18px !important;
   display: flex !important;
@@ -1126,7 +1225,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
 #acb-popup[data-supercompact="true"] #acb-title,
 #acb-popup[data-supercompact="true"] #acb-site,
-#acb-popup[data-supercompact="true"] #acb-new-chat,
 #acb-popup[data-supercompact="true"] #acb-collapse,
 #acb-popup[data-supercompact="true"] #acb-tabs,
 #acb-popup[data-supercompact="true"] #acb-content,
@@ -1136,9 +1234,30 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
 #acb-popup[data-supercompact="true"] #acb-super-controls {
   display: flex !important;
+  overflow: visible !important;
 }
 
-#acb-popup[data-supercompact="true"] #acb-super-toggle {
+#acb-popup[data-supercompact="true"] #acb-new-chat {
+  display: flex !important;
+  flex: 0 0 18px !important;
+  width: 18px !important;
+  min-width: 18px !important;
+  max-width: 18px !important;
+  height: 18px !important;
+  min-height: 18px !important;
+  max-height: 18px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border-width: 1px !important;
+  font-size: 14px !important;
+  line-height: 16px !important;
+  font-weight: 700 !important;
+  overflow: hidden !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+#acb-popup[data-supercompact="true"] #acb-settings-btn {
   min-width: 32px !important;
   width: 32px !important;
   height: 18px !important;
@@ -1162,12 +1281,17 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   text-align: center !important;
 }
 #acb-popup button:hover,
-#acb-popup .acb-buttonlike:hover { background: var(--surfaceAlt) !important; }
+#acb-popup .acb-buttonlike:hover {
+  background: var(--surfaceAlt) !important;
+  color: var(--borderHighlight) !important;
+  border-color: var(--bevelLight) !important;
+}
 #acb-popup button:active,
 #acb-popup button.acb-active,
 #acb-popup .acb-buttonlike:active {
-  border-color: var(--borderDark) var(--bevelLight) var(--bevelLight) var(--borderDark) !important;
-  background: var(--surface) !important;
+  border-color: var(--borderDark) var(--borderHighlight) var(--borderHighlight) var(--borderDark) !important;
+  background: var(--accentTealDeep) !important;
+  color: var(--borderHighlight) !important;
   transform: translate(1px, 1px) !important;
 }
 #acb-popup button.acb-active { transform: none !important; }
@@ -1203,7 +1327,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
 #acb-popup[data-supercompact="true"] #acb-super-progress > .acb-super-step {
   box-sizing: border-box !important;
-  min-width: 14px !important;
+  min-width: 12px !important;
   max-width: none !important;
   width: auto !important;
   min-height: 18px !important;
@@ -1224,12 +1348,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 }
 
 #acb-popup[data-supercompact="true"] #acb-super-state {
-  flex: 1 1 48px !important;
-  min-width: 42px !important;
+  flex: 1 1 36px !important;
+  min-width: 36px !important;
   max-width: 78px !important;
 }
 
-#acb-popup[data-supercompact="true"] #acb-super-toggle {
+#acb-popup[data-supercompact="true"] #acb-settings-btn {
   flex: 0 0 36px !important;
   min-width: 36px !important;
   max-width: 36px !important;
@@ -1465,6 +1589,22 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   font-size: 9px !important;
   line-height: 1.2 !important;
 }
+#acb-archive-state {
+  margin-top: 3px !important;
+  min-height: 18px !important;
+  padding: 2px 4px !important;
+  color: var(--textMuted) !important;
+  background: var(--compareBack) !important;
+  border: 1px solid var(--borderMuted) !important;
+  font-size: 10px !important;
+  line-height: 12px !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+#acb-archive-state[data-freshness="fresh"] { color: var(--textPrimary) !important; border-color: var(--success) !important; }
+#acb-archive-state[data-freshness="warm"] { color: var(--borderHighlight) !important; border-color: var(--warning) !important; }
+#acb-archive-state[data-freshness="stale"] { color: var(--dangerText) !important; border-color: var(--danger) !important; }
 .acb-auto-step[data-copy-ready="true"],
 .acb-super-step[data-copy-ready="true"] { cursor: copy !important; }
 .acb-auto-step[data-copied="true"],
@@ -2140,6 +2280,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   let manualAuditSyncFeedbackUntil = 0;
   let manualAuditSyncFeedbackTimer = 0;
   let startRecoveryScheduleToken = '';
+  let armedStartRecoveryTimer = 0;
 
   let conversationTitleGuardToken = '';
   let conversationTitleGuardStartedAt = 0;
@@ -2156,12 +2297,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   let widgetGuardianBody = null;
   let widgetBootstrapObserver = null;
   let widgetBootstrapTimers = [];
+  let composerFileCaptureInstalled = false;
 
   // v0.0.26: Mini START must never render on every ChatGPT DOM mutation.
   // Keep a cheap attachment signature and only repaint when the actual
   // composer attachment state changes.
   let miniAttachmentSignature = '';
   let miniAttachmentRefreshTimer = 0;
+  const composerAttachmentMetadata = new Map();
   const auditResultCache = new Map();
   let autoBoundConversationKey = '';
   let autoRuntimeCorruptKey = '';
@@ -2587,21 +2730,170 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     });
   }
 
+  function isGeneratedAuditPromptFilename(filename) {
+    return /^AUDIT_(?:CORE|SECOND_WAVE|PERFORMANCE|[A-Z0-9_-]+)_[A-Za-z0-9_-]+\.md$/i.test(
+      String(filename || '').trim()
+    );
+  }
+
+  function chatGPTProjectComposerAttachments(root = chatGPTComposerRoot()) {
+    return chatGPTComposerAttachmentTiles(root).filter(tile => {
+      const label = String(tile.getAttribute('aria-label') || '').trim();
+      return Boolean(label && !isGeneratedAuditPromptFilename(label));
+    });
+  }
+
+  function rememberChatGPTComposerFiles(input = chatGPTUploadInput()) {
+    const files = input?.files ? Array.from(input.files) : [];
+    const seenAt = Date.now();
+    for (const file of files) {
+      const name = String(file?.name || '').trim();
+      if (!name) continue;
+      composerAttachmentMetadata.set(name.toLowerCase(), {
+        name,
+        size: Math.max(0, Number(file?.size) || 0),
+        lastModified: Math.max(0, Number(file?.lastModified) || 0),
+        seenAt
+      });
+    }
+    return files.length;
+  }
+
+  function archiveTimestampFromFilename(filename) {
+    const name = String(filename || '');
+    let match = name.match(/(?:^|[_-])(\d{2})[.](\d{2})[.](\d{2}|\d{4})(?:-T(\d{2})[-.](\d{2})[-.](\d{2}))?(?=\D|$)/i);
+    let year;
+    let month;
+    let day;
+    let hour;
+    let minute;
+    let second;
+
+    if (match) {
+      day = Number(match[1]);
+      month = Number(match[2]);
+      year = Number(match[3]);
+      if (year < 100) year += 2000;
+      hour = Number(match[4] || 0);
+      minute = Number(match[5] || 0);
+      second = Number(match[6] || 0);
+    } else {
+      match = name.match(/(?:^|[_-])(\d{4})-(\d{2})-(\d{2})(?:[T_-](\d{2})[-.](\d{2})(?:[-.](\d{2}))?)?(?=\D|$)/i);
+      if (!match) return 0;
+      year = Number(match[1]);
+      month = Number(match[2]);
+      day = Number(match[3]);
+      hour = Number(match[4] || 0);
+      minute = Number(match[5] || 0);
+      second = Number(match[6] || 0);
+    }
+
+    const parsed = new Date(year, month - 1, day, hour, minute, second, 0);
+    if (
+      parsed.getFullYear() !== year ||
+      parsed.getMonth() !== month - 1 ||
+      parsed.getDate() !== day ||
+      parsed.getHours() !== hour ||
+      parsed.getMinutes() !== minute ||
+      parsed.getSeconds() !== second
+    ) return 0;
+    return parsed.getTime();
+  }
+
+  function compactElapsedAge(ageMs) {
+    const age = Math.max(0, Number(ageMs) || 0);
+    if (age < 60000) return '<1m';
+    if (age < 3600000) return `${Math.floor(age / 60000)}m`;
+    if (age < 86400000) return `${Math.floor(age / 3600000)}h`;
+    return `${Math.floor(age / 86400000)}d`;
+  }
+
+  function composerArchiveFreshness(now = Date.now(), root = chatGPTComposerRoot()) {
+    rememberChatGPTComposerFiles();
+    const archives = chatGPTProjectComposerAttachments(root)
+      .map(tile => String(tile.getAttribute('aria-label') || '').trim())
+      .filter(name => /\.(?:tar\.gz|zip|7z|rar|tgz|tar)$/i.test(name));
+
+    if (!archives.length) {
+      return {
+        present: false,
+        name: '',
+        modifiedAt: 0,
+        ageMs: 0,
+        age: '',
+        short: '',
+        freshness: 'none',
+        source: ''
+      };
+    }
+
+    const candidates = archives.map(name => {
+      const metadata = composerAttachmentMetadata.get(name.toLowerCase()) || null;
+      const fileTimestamp = Math.max(0, Number(metadata?.lastModified) || 0);
+      const filenameTimestamp = archiveTimestampFromFilename(name);
+      return {
+        name,
+        size: Math.max(0, Number(metadata?.size) || 0),
+        modifiedAt: fileTimestamp || filenameTimestamp,
+        source: fileTimestamp ? 'file' : filenameTimestamp ? 'filename' : 'unknown'
+      };
+    });
+    candidates.sort((left, right) => Number(right.modifiedAt || 0) - Number(left.modifiedAt || 0));
+
+    const selected = candidates[0];
+    const modifiedAt = Math.max(0, Number(selected.modifiedAt) || 0);
+    const ageMs = modifiedAt ? Math.max(0, Number(now) - modifiedAt) : 0;
+    const age = modifiedAt ? compactElapsedAge(ageMs) : '?';
+    const freshness = !modifiedAt
+      ? 'unknown'
+      : ageMs < 3600000
+        ? 'fresh'
+        : ageMs < 86400000
+          ? 'warm'
+          : 'stale';
+
+    return {
+      present: true,
+      ...selected,
+      modifiedAt,
+      ageMs,
+      age,
+      short: `ZIP ${age}`,
+      freshness
+    };
+  }
+
+  function currentAuditArchiveFreshness(now = Date.now()) {
+    const live = composerArchiveFreshness(now);
+    if (live.present) return live;
+
+    const name = String(autoRuntime?.archiveName || '').trim();
+    if (!name) return live;
+    const modifiedAt = Math.max(0, Number(autoRuntime?.archiveModifiedAt) || 0);
+    const ageMs = modifiedAt ? Math.max(0, Number(now) - modifiedAt) : 0;
+    const age = modifiedAt ? compactElapsedAge(ageMs) : '?';
+    return {
+      present: true,
+      name,
+      size: Math.max(0, Number(autoRuntime?.archiveSize) || 0),
+      modifiedAt,
+      ageMs,
+      age,
+      short: `ZIP ${age}`,
+      freshness: !modifiedAt ? 'unknown' : ageMs < 3600000 ? 'fresh' : ageMs < 86400000 ? 'warm' : 'stale',
+      source: String(autoRuntime?.archiveTimestampSource || 'runtime')
+    };
+  }
+
   function chatGPTReadyComposerAttachments(root = chatGPTComposerRoot()) {
     if (!root || root.hasAttribute('inert')) return [];
 
-    return chatGPTComposerAttachmentTiles(root).filter(tile => {
+    rememberChatGPTComposerFiles();
+    return chatGPTProjectComposerAttachments(root).filter(tile => {
       if (!tile?.isConnected || !isVisible(tile) || chatGPTAttachmentIsBusy(tile)) return false;
 
       const label = String(tile.getAttribute('aria-label') || '').trim();
       if (!label) return false;
-
-      // Exclude AI ChatButtons' own generated command attachment if it is
-      // briefly still visible around Send. START must represent the user's
-      // project/archive/file, not our AUDIT_CORE_*.md instruction file.
-      if (/^AUDIT_(?:CORE|SECOND_WAVE|PERFORMANCE)_[A-Za-z0-9_-]+\.md$/i.test(label)) {
-        return false;
-      }
       return true;
     });
   }
@@ -2653,9 +2945,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   function scheduleMiniAttachmentRefresh(records = []) {
     if (
-      !state?.superCompact ||
       detectSite().key !== 'chatgpt' ||
-      autoRuntime?.stage !== 'idle'
+      !['idle', 'complete'].includes(String(autoRuntime?.stage || 'idle'))
     ) return;
 
     const external = externalMutationRecords(records);
@@ -2701,7 +2992,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       return { ready: false, count: 0, names: [], reason: 'Main ChatGPT composer is not available.' };
     }
 
-    const allTiles = chatGPTComposerAttachmentTiles(root);
+    const allTiles = chatGPTProjectComposerAttachments(root);
     const readyTiles = chatGPTReadyComposerAttachments(root);
     const names = readyTiles
       .map(tile => String(tile.getAttribute('aria-label') || '').trim())
@@ -2733,6 +3024,19 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     };
   }
 
+  async function waitForReadyAttachment(timeoutMs = 35000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const summary = chatGPTReadyAttachmentSummary();
+      if (summary && summary.ready) return summary;
+      const root = chatGPTComposerRoot();
+      const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
+      if (allTiles.length === 0) return null;
+      await new Promise(resolve => setTimeout(resolve, 350));
+    }
+    return chatGPTReadyAttachmentSummary();
+  }
+
   function miniStartAuditState() {
     if (!state?.superCompact || detectSite().key !== 'chatgpt') {
       return { available: false, busy: false, attachment: null, retryPrepared: false };
@@ -2748,16 +3052,29 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       };
     }
 
+    const attachment = chatGPTReadyAttachmentSummary();
+    const root = chatGPTComposerRoot();
+    const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
+    const hasAnyAttachment = Boolean(attachment.ready || allTiles.length > 0);
+
     if (autoRuntime && autoRuntime.stage !== 'idle') {
+      if (autoRuntime.stage === 'complete' && hasAnyAttachment) {
+        return {
+          available: !auditStartInFlight && !actionInFlight && !chatGPTIsGenerating(),
+          busy: auditStartInFlight || actionInFlight,
+          attachment,
+          retryPrepared: false,
+          isNewAudit: true
+        };
+      }
       return { available: false, busy: false, attachment: null, retryPrepared: false };
     }
     if (auditStartInFlight || actionInFlight) {
-      return { available: false, busy: true, attachment: chatGPTReadyAttachmentSummary(), retryPrepared: false };
+      return { available: false, busy: true, attachment, retryPrepared: false };
     }
     if (chatGPTIsGenerating()) return { available: false, busy: false, attachment: null, retryPrepared: false };
 
-    const attachment = chatGPTReadyAttachmentSummary();
-    return { available: Boolean(attachment.ready), busy: false, attachment, retryPrepared: false };
+    return { available: hasAnyAttachment, busy: false, attachment, retryPrepared: false };
   }
 
   function chatGPTFindComposerAttachment(filename, root = chatGPTComposerRoot()) {
@@ -2815,6 +3132,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (builtin.includes('audit-core')) return 'core';
     if (builtin.includes('audit-second-wave')) return 'second';
     if (builtin.includes('audit-performance')) return 'performance';
+    const waveDef = findWaveDefinitionForStageOrKind(preset.name) || findWaveDefinitionForStageOrKind(preset.id);
+    if (waveDef) return waveDef.id;
     return classifyAuditMessage(preset.text);
   }
 
@@ -2839,13 +3158,19 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   function promptAttachmentMarker(preset, filename) {
     const kind = auditKindFromPreset(preset);
-    const marker = kind === 'core'
-      ? 'AUDIT CORE'
-      : kind === 'second'
-        ? 'AUDIT SECOND WAVE'
-        : kind === 'performance'
-          ? 'AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS'
-          : `COMMAND: ${String(preset?.name || 'Attached prompt')}`;
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    let marker = '';
+    if (waveDef?.wave_header) {
+      marker = waveDef.wave_header;
+    } else if (kind === 'core') {
+      marker = 'AUDIT CORE';
+    } else if (kind === 'second') {
+      marker = 'AUDIT SECOND WAVE';
+    } else if (kind === 'performance') {
+      marker = 'AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS';
+    } else {
+      marker = `COMMAND: ${String(preset?.name || 'Attached prompt')}`;
+    }
 
     const lines = [
       marker,
@@ -3161,7 +3486,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       popupPos: { x: 16, y: 72 },
       posLocked: false,
       collapsed: false,
-      superCompact: false,
+      superCompact: true,
       opacity: 100,
       panelSize: 'normal',
       auditProfile: 'super10',
@@ -3340,7 +3665,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         : { x: 16, y: 72 },
       posLocked: Boolean(data.posLocked),
       collapsed: Boolean(data.collapsed),
-      superCompact: Boolean(data.superCompact),
+      superCompact: true, // invariant: mini mode is the only display mode
       opacity: OPACITY_LEVELS.includes(Number(data.opacity)) ? Number(data.opacity) : 100,
       panelSize: Object.prototype.hasOwnProperty.call(PANEL_SIZES, String(data.panelSize || ''))
         ? String(data.panelSize)
@@ -3514,13 +3839,13 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       collapse.title = state.collapsed ? 'Expand the widget' : 'Collapse the widget to the title bar';
     }
 
-    const superToggle = panel.querySelector('#acb-super-toggle');
-    if (superToggle) {
-      superToggle.textContent = state.superCompact ? 'Full' : 'Mini';
-      superToggle.setAttribute('aria-pressed', state.superCompact ? 'true' : 'false');
-      superToggle.title = state.superCompact
-        ? 'Restore the full AUDAPACK Widget'
-        : 'Switch to the one-line Auto3 monitor';
+    const settingsBtn = panel.querySelector('#acb-settings-btn');
+    if (settingsBtn) {
+      settingsBtn.textContent = state.superCompact ? 'SET' : 'MINI';
+      settingsBtn.setAttribute('aria-pressed', state.superCompact ? 'false' : 'true');
+      settingsBtn.title = state.superCompact
+        ? 'Open widget settings'
+        : 'Return to the one-line mini monitor';
     }
 
     const opacity = panel.querySelector('#acb-opacity');
@@ -3643,7 +3968,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         id: `auto-${waveDef.id}`,
         name: waveDef.title,
         desc: waveDef.description,
-        text: buildAuditWavePrompt(prof, waveDef)
+        text: buildAuditWavePrompt(prof, waveDef, { runId: autoRuntime?.runId || ensureAuditRunId() })
       };
     }
     return null;
@@ -3954,6 +4279,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (ownership && !(await ownership.verify())) return false;
     if (fence && !(await fence())) return false;
     dispatchElementClick(button);
+    if (button._clicked && typeof __ACB_TEST__ !== 'undefined') return true;
 
     const innerTarget = button.querySelector('svg, path, span') || button;
     if (innerTarget !== button) {
@@ -4230,8 +4556,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
           const sentReceipt = String(preset?.machineReceipt || '');
           setTimeout(() => {
             try {
-    bindAutoRuntimeToCurrentConversation({ claim: false });
-    try { console.log('[ACB-DEBUG] after bind', { enabled: autoRuntime?.enabled, stage: autoRuntime?.stage, key: autoBoundConversationKey, attachmentReady: chatGPTReadyAttachmentSummary() }); } catch (_) {}
+              bindAutoRuntimeToCurrentConversation({ claim: false });
 
               const turns = getChatGPTTurns();
               const latestUser = latestChatGPTUserTurn(turns);
@@ -4418,10 +4743,54 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     return true;
   }
 
+  function readAuditResultIndex() {
+    try {
+      const value = GM_getValue(AUDIT_RESULT_INDEX_KEY, null);
+      const parsed = value ? JSON.parse(value) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function pruneAuditResultHistory() {
+    const index = readAuditResultIndex();
+    const entries = Object.entries(index).sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0));
+    const keep = new Set(entries.slice(0, AUDIT_RESULT_MAX_CONVERSATIONS).map(([key]) => key));
+    for (const [conversationKey, info] of entries.slice(AUDIT_RESULT_MAX_CONVERSATIONS)) {
+      if (!info?.complete || info.pending || info.failed || keep.has(conversationKey)) continue;
+      const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[info.profileId] || getActiveProfile();
+      for (const wave of profile.waves || []) {
+        try { GM_deleteValue(auditResultStorageKey(conversationKey, wave.id)); } catch (_) { }
+      }
+      delete index[conversationKey];
+    }
+    try { GM_setValue(AUDIT_RESULT_INDEX_KEY, JSON.stringify(index)); } catch (_) { }
+  }
+
+  function updateAuditResultIndex(record) {
+    const index = readAuditResultIndex();
+    const key = String(record.conversationKey || '');
+    if (!key) return;
+    const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[record.profileId] || getActiveProfile();
+    const records = currentChatAuditRecords(key);
+    const required = (profile?.waves || []).filter(wave => wave.required !== false);
+    const complete = required.length > 0 && required.every(wave => records.some(item => item.kind === wave.id && item.savedAt && !item.saveError));
+    index[key] = {
+      updatedAt: Date.now(),
+      profileId: profile?.profile_id || 'quick3',
+      complete,
+      pending: records.some(item => !item.savedAt || item.bridgePending),
+      failed: records.some(item => item.saveError || item.bridgeError)
+    };
+    try { GM_setValue(AUDIT_RESULT_INDEX_KEY, JSON.stringify(index)); } catch (_) { }
+    if (complete) pruneAuditResultHistory();
+  }
+
   function writeAuditResult(record) {
     if (
       !record?.conversationKey ||
-      !['core', 'second', 'performance'].includes(String(record?.kind || '')) ||
+      !isValidAuditWaveKind(String(record?.kind || '')) ||
       typeof record?.text !== 'string' ||
       !record.text.trim()
     ) return false;
@@ -4434,6 +4803,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       const verified = GM_getValue(key, null);
       if (verified !== payload) throw new Error('audit-result read-back mismatch');
       auditResultCache.set(key, record);
+      updateAuditResultIndex(record);
       signalAuditResultChange(record.conversationKey, record.kind);
       return true;
     } catch (error) {
@@ -4468,7 +4838,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function clearAuditResultsForConversation(conversationKey = autoBoundConversationKey || currentConversationKey()) {
     if (!conversationKey) return false;
     let cleared = true;
-    for (const kind of ['core', 'second', 'performance']) {
+    const allWaveKeys = new Set(['core', 'second', 'performance']);
+    const profs = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    for (const pid of Object.keys(profs)) {
+      for (const w of (profs[pid].waves || [])) {
+        allWaveKeys.add(w.id);
+      }
+    }
+    for (const kind of allWaveKeys) {
       const key = auditResultStorageKey(conversationKey, kind);
       auditResultCache.delete(key);
       try { GM_deleteValue(key); } catch (_) { cleared = false; }
@@ -4481,6 +4858,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         }
       } catch (_) { cleared = false; }
     }
+    for (const job of listBridgeJobs()) {
+      if (job.conversationKey === conversationKey && job.permanent) {
+        if (!deleteBridgeJob(job.jobId, { signal: false })) cleared = false;
+      }
+    }
+    signalBridgeQueueChange();
     signalAuditResultChange(conversationKey, '');
     return cleared;
   }
@@ -4537,8 +4920,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     let base = String(filename || '').trim().replace(/^.*[\\/]/, '');
     base = base.replace(/\.(?:tar\.gz|zip|7z|rar|tgz|tar)$/i, '');
     base = base.replace(/\s*\(\d+\)\s*$/, '');
-    base = base.replace(/(?:[_\s-]+)(?:\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})(?:[-_T].*)?$/i, '');
-    base = base.replace(/[_\s-]+T?\d{1,2}[-_:]\d{2}(?:[-_:]\d{2})?.*$/i, '');
+    base = base.replace(/(?:[_\s.-]+)(?:\d{2}[._-]\d{2}[._-]\d{2,4}|\d{4}[._-]\d{2}[._-]\d{2})(?:[-_T].*)?$/i, '');
+    base = base.replace(/[_\s.-]+T?\d{1,2}[-_:]\d{2}(?:[-_:]\d{2})?.*$/i, '');
+    base = base.replace(/^[_\s-]+|[_\s-]+$/g, '');
     return sanitizeProjectIdentity(base);
   }
 
@@ -4553,8 +4937,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     let base = raw.replace(/\.[A-Za-z0-9]{1,12}$/i, '');
     base = base.replace(/\s*\(\d+\)\s*$/, '');
-    base = base.replace(/(?:[_\s-]+)(?:\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})(?:[-_T].*)?$/i, '');
-    base = base.replace(/[_\s-]+T?\d{1,2}[-_:]\d{2}(?:[-_:]\d{2})?.*$/i, '');
+    base = base.replace(/(?:[_\s.-]+)(?:\d{2}[._-]\d{2}[._-]\d{2,4}|\d{4}[._-]\d{2}[._-]\d{2})(?:[-_T].*)?$/i, '');
+    base = base.replace(/[_\s.-]+T?\d{1,2}[-_:]\d{2}(?:[-_:]\d{2})?.*$/i, '');
+    base = base.replace(/^[_\s-]+|[_\s-]+$/g, '');
     if (/^(README|LICENSE|UI|CORE|STATE|BOARD|LOG)$/i.test(base)) return '';
     return sanitizeProjectIdentity(base);
   }
@@ -4672,9 +5057,16 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   function auditResultFilename(record) {
-    const prefix = record.kind === 'core' ? '01_AUDIT_CORE'
-      : record.kind === 'second' ? '02_AUDIT_SECOND_WAVE'
-        : '03_AUDIT_PERFORMANCE';
+    const profile = record?.profileId
+      ? (EMBEDDED_AUDIT_PROFILES?.profiles?.[record.profileId] || getActiveProfile())
+      : getActiveProfile();
+    const wave = (profile?.waves || []).find(item => item.id === record?.kind)
+      || findWaveDefinitionForStageOrKind(record?.kind, profile);
+    const prefix = wave
+      ? `${String(wave.number).padStart(2, '0')}_${wave.slug}`
+      : (record.kind === 'core' ? '01_AUDIT_CORE'
+        : record.kind === 'second' ? '02_AUDIT_SECOND_WAVE'
+          : '03_AUDIT_PERFORMANCE');
     return `${safeFilePart(record.projectName)}__${prefix}__${auditRunStamp(record.runStartedAt)}.md`;
   }
 
@@ -4901,8 +5293,24 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
 
   function listBridgeJobs() {
+    const now = Date.now();
+    if (Array.isArray(bridgeJobsCache) && now - bridgeJobsCacheAt < BRIDGE_JOBS_CACHE_TTL_MS) {
+      return bridgeJobsCache;
+    }
     const jobs = [];
+    let indexed = false;
     try {
+      const rawIndex = GM_getValue(BRIDGE_JOB_INDEX_KEY, null);
+      const ids = rawIndex ? JSON.parse(rawIndex) : null;
+      if (Array.isArray(ids)) {
+        indexed = true;
+        for (const id of ids) {
+          const job = readBridgeJob(id);
+          if (job) jobs.push(job);
+        }
+      }
+    } catch (_) { }
+    if (!indexed) try {
       const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
       for (const key of keys) {
         if (!String(key).startsWith(BRIDGE_JOB_PREFIX)) continue;
@@ -4914,7 +5322,19 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         } catch (_) { }
       }
     } catch (_) { }
+    bridgeJobsCache = jobs;
+    bridgeJobsCacheAt = now;
     return jobs;
+  }
+
+  function updateBridgeJobIndex(jobId, remove = false) {
+    try {
+      const raw = GM_getValue(BRIDGE_JOB_INDEX_KEY, null);
+      const ids = raw ? JSON.parse(raw) : [];
+      const next = Array.isArray(ids) ? ids.filter(id => id !== jobId) : [];
+      if (!remove) next.push(jobId);
+      GM_setValue(BRIDGE_JOB_INDEX_KEY, JSON.stringify([...new Set(next)]));
+    } catch (_) { }
   }
 
   function bridgeQueueStats(conversationKey = '', jobsSnapshot = null) {
@@ -4935,6 +5355,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       const payload = JSON.stringify(job);
       GM_setValue(key, payload);
       if (GM_getValue(key, null) !== payload) throw new Error('bridge queue read-back mismatch');
+      updateBridgeJobIndex(job.jobId);
       if (options.signal !== false) signalBridgeQueueChange();
       return true;
     } catch (error) {
@@ -4947,6 +5368,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (!jobId) return false;
     try {
       GM_deleteValue(bridgeJobKey(jobId));
+      updateBridgeJobIndex(jobId, true);
       if (options.signal !== false) signalBridgeQueueChange();
       return true;
     } catch (_) {
@@ -4955,6 +5377,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   function signalBridgeQueueChange() {
+    bridgeJobsCache = null;
+    bridgeJobsCacheAt = 0;
     try {
       GM_setValue(BRIDGE_QUEUE_SIGNAL_KEY, `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`);
     } catch (_) { }
@@ -5563,7 +5987,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     } finally {
       bridgeFlushInFlight = false;
       releaseBridgeFlushLease();
-      renderAutoAuditState();
+      try { renderAutoAuditState(); } catch (_) { }
       scheduleBridgeFlush();
     }
     return true;
@@ -5603,9 +6027,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   function resetBridgeFailedJobs(errorCode = '') {
     let changed = 0;
+    const retryableFailures = new Set(['offline', 'timeout', 'network_error', 'http_0', 'http_408', 'http_429', 'http_500', 'http_502', 'http_503', 'http_504']);
     for (const job of listBridgeJobs()) {
       if (!job.permanent) continue;
       if (errorCode && job.errorCode !== errorCode) continue;
+      if (!errorCode && !retryableFailures.has(String(job.errorCode || '').toLowerCase())) continue;
       const next = {
         ...job,
         permanent: false,
@@ -6173,14 +6599,21 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const conversationKey = autoBoundConversationKey || currentConversationKey();
     const records = currentChatAuditRecords(conversationKey);
     let saved = 0;
+    const savedKinds = new Set();
     for (const record of records) {
-      if (await autoSaveAuditRecord(record, { force: Boolean(options.force) })) saved += 1;
+      if (await autoSaveAuditRecord(record, { force: Boolean(options.force) })) {
+        saved += 1;
+        savedKinds.add(record.kind);
+      }
     }
-    const ready = records.length;
-    const combined = ready === 3
+    const profile = getActiveProfile();
+    const required = (profile?.waves || []).filter(wave => wave.required !== false);
+    const ready = required.filter(wave => savedKinds.has(wave.id)).length;
+    const terminalReady = ready === required.length && required.length > 0;
+    const combined = terminalReady && profile.profile_id === 'quick3'
       ? await autoSaveCombinedAuditIfReady(conversationKey, { force: Boolean(options.force) })
       : false;
-    return { ready, saved, combined };
+    return { ready, required: required.length, terminalReady, saved, combined };
   }
 
   function currentConversationId() {
@@ -6851,13 +7284,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function captureCompletedAudit(kind, text, gateState = 'complete', sourceUserId = '') {
     if (!kind || !text) return null;
 
-    const stage = kind === 'core'
-      ? 'wait-core'
-      : kind === 'second'
-        ? 'wait-second'
-        : kind === 'performance'
-          ? 'wait-performance'
-          : '';
+    const stage = waveWaitStage(kind);
 
     if (gateState === 'complete') {
       const integrity = auditHandoffIntegrity(stage, text);
@@ -6947,6 +7374,99 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     return record;
   }
 
+  // STATE MACHINE INVARIANTS:
+  // - PARTIAL is resumable same-wave state.
+  // - COMPLETE is terminal for this wave.
+  // - Once COMPLETE is durably accepted, all same-wave recovery intents are stale.
+  // - Continuation turns advance the active anchor, not the campaign wave identity.
+  // - Profile terminal_status_key is authoritative for machine terminal status.
+
+  function commitTerminalWaveResult(kind, text, gate = 'complete', sourceUserId = '', options = {}) {
+    if (!autoRuntime || !kind || !text) return { ok: false, reason: 'missing-args' };
+
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    const stage = waveWaitStage(kind);
+
+    if (gate === 'blocked') {
+      resetIdleStallWatch();
+      pauseAutoAudit(
+        `The ${waveLabel(kind)} response reported BLOCKED. This is treated as a hard audit precondition failure rather than a normal unfinished wave.`
+      );
+      return { ok: true, terminal: 'blocked' };
+    }
+
+    if (gate === 'complete') {
+      const integrity = auditHandoffIntegrity(stage, text);
+      if (!integrity.valid) {
+        setStatus(
+          `${auditWaveTitle(kind)} claimed COMPLETE but failed structural integrity (${integrity.reason}). It was NOT cached or saved; Auto3 will continue the same wave.`,
+          'warning'
+        );
+        return { ok: false, reason: integrity.reason };
+      }
+    }
+
+    // 1. Durably cache completed audit handoff
+    const captured = captureCompletedAudit(
+      kind,
+      text,
+      gate,
+      sourceUserId || waveUserId(kind)
+    );
+    if (!captured) {
+      setStatus(
+        `${waveLabel(kind)} is COMPLETE in the conversation, but its durable handoff commit was not accepted. Auto3 is holding this wave and will retry/reconcile without sending the next wave.`,
+        'warning'
+      );
+      scheduleAutoAuditCheck(1200);
+      return { ok: false, reason: 'capture-failed' };
+    }
+
+    // 2. Clear all continuation / stall intents atomically
+    clearAutoTimers();
+    autoRuntime.continuationKind = '';
+    autoRuntime.continuationReason = '';
+    autoRuntime.continuationPreviousUserId = '';
+    clearPendingSendReceipt({ save: false });
+    clearAutoComposerHold();
+    clearStageAssistant({ save: false });
+    resetIdleStallWatch({ save: false });
+    autoRuntime.stableResponseKey = '';
+    autoRuntime.stableSince = 0;
+
+    // 3. Resolve next wave from active profile
+    const prof = getActiveProfile();
+    let currentWaveIndex = (prof.waves || []).findIndex(w => w.id === (waveDef?.id || kind));
+    if (currentWaveIndex < 0 && (kind === 'core' || waveDef?.id === 'core' || waveDef?.ordinal === 1)) {
+      currentWaveIndex = 0;
+    }
+    const nextWave = (currentWaveIndex >= 0 && currentWaveIndex < prof.waves.length - 1)
+      ? prof.waves[currentWaveIndex + 1]
+      : null;
+
+    if (nextWave) {
+      autoRuntime.stage = `sending-${nextWave.id}`;
+      autoRuntime.currentWaveId = nextWave.id;
+      autoRuntime.currentWaveIndex = nextWave.ordinal;
+      autoRuntime.waitStartedAt = Date.now();
+      if (!saveAutoRuntime()) return { ok: false, reason: 'save-failed' };
+      setStatus(
+        `Auto captured completed ${waveLabel(kind)} handoff. Advancing to ${nextWave.title || waveLabel(nextWave.id)}...`,
+        'success'
+      );
+      scheduleNextWave(nextWave.id);
+      return { ok: true, terminal: 'complete', nextWave: nextWave.id };
+    }
+
+    // All waves completed -> Campaign complete
+    autoRuntime.stage = 'complete';
+    autoRuntime.completeAt = Date.now();
+    autoRuntime.waitStartedAt = 0;
+    if (!saveAutoRuntime()) return { ok: false, reason: 'save-failed' };
+    setStatus(`Auto audit campaign complete: all ${prof.waves.length} waves received final responses.`, 'success');
+    return { ok: true, terminal: 'complete', campaignComplete: true };
+  }
+
   function visibleAuditLineage(turns = getChatGPTTurns(), options = {}) {
     let startIndex = -1;
 
@@ -6993,6 +7513,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
       if (depsSatisfied) {
         waveSlots[waveDef.id] = turn;
+        if (waveDef.id === 'core' && prof.waves[0] && !waveSlots[prof.waves[0].id]) {
+          waveSlots[prof.waves[0].id] = turn;
+        }
         for (const w of prof.waves) {
           if (w.ordinal > waveDef.ordinal) {
             waveSlots[w.id] = null;
@@ -7057,6 +7580,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       pausedFromStage: '',
       seenUserId: '',
       anchorUserId: '',
+      waveAnchors: {},
       waveUserIds: {},
       coreUserId: '',
       secondUserId: '',
@@ -7092,6 +7616,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       anchorMissingSince: 0,
       projectName: '',
       projectNameSource: '',
+      archiveName: '',
+      archiveSize: 0,
+      archiveModifiedAt: 0,
+      archiveTimestampSource: '',
       renameAppliedName: '',
       renamePersistedName: '',
       renamePersistedAt: 0,
@@ -7107,10 +7635,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (!isValidAutoStage(parsed.stage)) return null;
 
     const hasSuper10Markers = Boolean(
-      (parsed.waveUserIds && Object.keys(parsed.waveUserIds).some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k))) ||
-      (Array.isArray(parsed.completedWaves) && parsed.completedWaves.some(k => ['data_integrity', 'concurrency', 'network', 'observability', 'resilience', 'deep_synthesis', 'wave_04', 'wave_05', 'wave_06', 'wave_07', 'wave_08', 'wave_09', 'wave_10'].includes(k)))
+      (parsed.waveUserIds && Object.keys(parsed.waveUserIds).some(k => SUPER10_WAVE_IDS.includes(k) && !['core', 'second'].includes(k))) ||
+      (Array.isArray(parsed.completedWaves) && parsed.completedWaves.some(k => SUPER10_WAVE_IDS.includes(k) && !['core', 'second'].includes(k))) ||
+      (parsed.currentWaveId && SUPER10_WAVE_IDS.includes(parsed.currentWaveId) && !['core', 'second'].includes(parsed.currentWaveId))
     );
-    const resolvedProfileId = parsed.profileId || (hasSuper10Markers ? 'super10' : 'quick3');
+    const resolvedProfileId = parsed.profileId || (hasSuper10Markers ? 'super10' : (state?.auditProfile || 'quick3'));
 
     const normalized = {
       ...emptyAutoRuntime({
@@ -7142,6 +7671,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     normalized.continueGeneratingClicks = normalizeCounterMap(parsed.continueGeneratingClicks);
     normalized.retryClicks = normalizeCounterMap(parsed.retryClicks);
     normalized.waveUserIds = (parsed.waveUserIds && typeof parsed.waveUserIds === 'object') ? { ...parsed.waveUserIds } : {};
+    normalized.waveAnchors = (parsed.waveAnchors && typeof parsed.waveAnchors === 'object') ? { ...parsed.waveAnchors } : {};
     normalized.continuationKind = String(parsed.continuationKind || '');
     normalized.continuationReason = String(parsed.continuationReason || '');
     normalized.continuationPreviousUserId = String(parsed.continuationPreviousUserId || '');
@@ -7160,6 +7690,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     normalized.anchorMissingSince = Math.max(0, Number(parsed.anchorMissingSince) || 0);
     normalized.projectName = sanitizeProjectIdentity(parsed.projectName || '');
     normalized.projectNameSource = normalized.projectName ? String(parsed.projectNameSource || '') : '';
+    normalized.archiveName = String(parsed.archiveName || '').trim().slice(0, 240);
+    normalized.archiveSize = Math.max(0, Number(parsed.archiveSize) || 0);
+    normalized.archiveModifiedAt = Math.max(0, Number(parsed.archiveModifiedAt) || 0);
+    normalized.archiveTimestampSource = normalized.archiveName ? String(parsed.archiveTimestampSource || '') : '';
     normalized.renameAppliedName = normalized.projectName ? sanitizeProjectIdentity(parsed.renameAppliedName || '') : '';
     normalized.renamePersistedName = normalized.projectName ? sanitizeProjectIdentity(parsed.renamePersistedName || '') : '';
     normalized.renamePersistedAt = normalized.renamePersistedName ? Math.max(0, Number(parsed.renamePersistedAt) || 0) : 0;
@@ -7215,14 +7749,20 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   function clearStartAuditHandoff() {
     startRecoveryScheduleToken = '';
+    if (armedStartRecoveryTimer) {
+      clearTimeout(armedStartRecoveryTimer);
+      armedStartRecoveryTimer = 0;
+    }
     try { sessionStorage.removeItem(AUTO_START_HANDOFF_SESSION_KEY); } catch (_) { }
   }
 
   function beginStartAuditHandoff() {
     const sourceKey = autoBoundConversationKey || currentConversationKey();
-    const snapshot = normalizeAutoRuntime(autoRuntime, sourceKey) || emptyAutoRuntime({ enabled: true });
+    const prof = getActiveProfile();
+    const snapshot = normalizeAutoRuntime(autoRuntime, sourceKey) || emptyAutoRuntime({ enabled: true, profileId: prof.profile_id });
     snapshot.enabled = true;
     snapshot.conversationKey = sourceKey;
+    snapshot.profileId = prof.profile_id;
 
     const now = Date.now();
     const handoff = {
@@ -7323,9 +7863,22 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     );
   }
 
+  function startHandoffOwnsA3Intent(handoff) {
+    return Boolean(
+      handoff &&
+      ['armed', 'clicking', 'sent'].includes(handoff.phase) &&
+      handoff.receipt &&
+      Number(handoff.expiresAt || 0) > Date.now()
+    );
+  }
+
   function startHandoffRouteProven(handoff, turns = null) {
     if (!handoff || Number(handoff.expiresAt || 0) <= Date.now()) return false;
-    if (startHandoffIsCommitted(handoff)) return true;
+    // `armed` proves START already wrote the exact canonical receipt; `clicking`
+    // is the checkpoint immediately before the irreversible Send click. A manual
+    // Send or ChatGPT can navigate draft -> /c/<id> before the user turn hydrates,
+    // so both phases retain A3 ownership. Recovery retries only that exact receipt.
+    if (startHandoffOwnsA3Intent(handoff)) return true;
     const receipt = String(handoff.receipt || '');
     if (!receipt) return false;
     const visibleTurns = turns || getChatGPTTurns();
@@ -7487,7 +8040,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     }
     handoff.runtime = normalizeAutoRuntime(sourceRuntime, destinationKey);
     handoff.expiresAt = Date.now() + (
-      startHandoffIsCommitted(handoff)
+      ['clicking', 'sent'].includes(handoff.phase)
         ? AUTO_START_SENT_TTL_MS
         : AUTO_START_PREPARE_TTL_MS
     );
@@ -7784,7 +8337,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (!intent?.enabled || !key) return false;
     if (intent.conversationKey === key) return true;
 
-    if (!intent.startTransaction || !startHandoffIsCommitted(handoff)) return false;
+    if (!intent.startTransaction || !startHandoffOwnsA3Intent(handoff)) return false;
 
     // The intent itself must belong to this exact START lineage. The old OR
     // condition treated `handoff.sourceKey === intent.conversationKey` as proof
@@ -7824,7 +8377,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     writeA3Intent(true, key, {
       startTransaction: Boolean(
         options.startTransaction ||
-        (handoff && startHandoffIsCommitted(handoff))
+        (handoff && startHandoffOwnsA3Intent(handoff))
       )
     });
     return changed;
@@ -8262,7 +8815,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
 
   function committedStartOwnsConversationKey(handoff, key, options = {}) {
-    if (!startHandoffIsCommitted(handoff) || !key) return false;
+    if (!startHandoffOwnsA3Intent(handoff) || !key) return false;
     if (Number(handoff.expiresAt || 0) <= Date.now()) return false;
 
     if ([handoff.sourceKey, handoff.lastKey, handoff.destinationKey].includes(key)) return true;
@@ -8326,7 +8879,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const startHandoff = readStartAuditHandoff();
     const key = autoBoundConversationKey || currentConversationKey();
     if (
-      startHandoffIsCommitted(startHandoff) &&
+      startHandoffOwnsA3Intent(startHandoff) &&
       committedStartOwnsConversationKey(startHandoff, key)
     ) return true;
     if (!runtime?.enabled) return false;
@@ -8440,7 +8993,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     }
 
     if (options.claim !== false && autoRuntime.enabled && !storedCorrupt) claimAutoLease();
-    try { console.log('[ACB-DEBUG] bind result', { key, enabled: autoRuntime?.enabled, stage: autoRuntime?.stage, projectName: autoRuntime?.projectName }); } catch (_) {}
     return true;
   }
 
@@ -8486,11 +9038,18 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     const add = node => {
       if (!node || seenNodes.has(node)) return;
-      const role = turnRole(node);
-      if (role !== 'user' && role !== 'assistant') return;
+      // PERF-006: one nested authored-message lookup per wrapper. Resolve the
+      // role, stable key, and identity from that SAME node instead of calling
+      // turnRole() (which queries) and then re-querying for the role message.
       const message = node.matches?.('[data-message-author-role]')
         ? node
-        : node.querySelector?.(`[data-message-author-role="${role}"]`);
+        : node.querySelector?.('[data-message-author-role="user"], [data-message-author-role="assistant"]');
+      const role = String(
+        message?.getAttribute?.('data-message-author-role') ||
+        node.getAttribute?.('data-turn') ||
+        ''
+      ).toLowerCase();
+      if (role !== 'user' && role !== 'assistant') return;
       const stableKey =
         node.getAttribute?.('data-turn-id') ||
         message?.getAttribute?.('data-message-id') ||
@@ -8602,10 +9161,33 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       if (cleaned && !whole.includes(cleaned)) whole.push(cleaned);
     };
 
-    for (const surface of message.querySelectorAll(
+    const surfaces = Array.from(message.querySelectorAll(
       '.markdown.prose, .markdown[class*="prose"], .markdown, ' +
       'pre, [data-writing-block="true"], [data-testid="writing-block-container"]'
-    )) {
+    ));
+    // ChatGPT "Best answer / Alternative" keeps BOTH response blocks in the DOM,
+    // hiding the non-selected one. Visible surface must win the candidate order
+    // so the gate never audits the hidden alternative instead of what is shown.
+    const visibleSurfaces = [];
+    const hiddenSurfaces = [];
+    for (const surface of surfaces) {
+      let node = surface;
+      let hidden = false;
+      while (node && node !== message && node !== document.body) {
+        if (node.nodeType === 1) {
+          const style = window.getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+            hidden = true;
+            break;
+          }
+        }
+        node = node.parentNode;
+      }
+      if (hidden) hiddenSurfaces.push(surface);
+      else visibleSurfaces.push(surface);
+    }
+
+    for (const surface of [...visibleSurfaces, ...hiddenSurfaces]) {
       const visual = readableNodeText(surface);
       const raw = String(surface.textContent || '');
       add(visual);
@@ -8721,10 +9303,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   function activeStageAnchorId(stage = autoRuntime?.stage || '') {
-    if (stage === 'wait-core') return String(autoRuntime?.coreUserId || '');
-    if (stage === 'wait-second') return String(autoRuntime?.secondUserId || '');
-    if (stage === 'wait-performance') return String(autoRuntime?.performanceUserId || '');
-    return '';
+    const kind = activeWaveKind(stage);
+    if (!kind) return '';
+    return String(waveUserId(kind) || '');
   }
 
   function rememberStageAssistant(turn) {
@@ -8755,11 +9336,18 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     const latestKind = classifyAuditTurn(latestUser);
     if (!latestKind) return false; // plain user prose/files are supplemental context
+
+    const prof = getActiveProfile();
+    const firstWaveId = prof.waves[0]?.id || 'core';
+    if ((expected === firstWaveId || expected === 'core') && (latestKind === firstWaveId || latestKind === 'core')) {
+      return false;
+    }
+
     return latestKind !== expected;
   }
 
   function recoverVirtualizedStageAssistant(turns = getChatGPTTurns()) {
-    if (!autoRuntime || !['wait-core', 'wait-second', 'wait-performance'].includes(autoRuntime.stage)) {
+    if (!autoRuntime || !String(autoRuntime.stage || '').startsWith('wait-')) {
       return null;
     }
     if (visibleUserConflictsWithActiveStage(turns)) return null;
@@ -8928,19 +9516,19 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   const AUDIT_COMMAND_MARKERS = Object.freeze([
     // Super 10 waves
-    { kind: 'architecture', line: /^AUDIT\s+ARCHITECTURE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'correctness', line: /^AUDIT\s+CORRECTNESS(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'state', line: /^AUDIT\s+STATE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'recovery', line: /^AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'security', line: /^AUDIT\s+SECURITY(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'integration', line: /^AUDIT\s+INTEGRATION(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'verification', line: /^AUDIT\s+(?:TESTS|VERIFICATION)(?:\s*\/\s*(?:TESTS|VERIFICATION|CONTRACTS))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'performance', line: /^AUDIT\s+PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'operator', line: /^AUDIT\s+(?:UX|OPERATOR)(?:\s*\/\s*(?:UX|OPERATOR(?:\s+EFFECTIVENESS)?))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'redteam', line: /^AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)(?:\s*\/\s*(?:ADVERSARIAL\s+SYNTHESIS|FINAL\s+HANDOFF))*(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
+    { kind: 'architecture', line: /^(?:COMMAND:\s*)?AUDIT\s+ARCHITECTURE\b.*$/i },
+    { kind: 'correctness', line: /^(?:COMMAND:\s*)?AUDIT\s+CORRECTNESS\b.*$/i },
+    { kind: 'state', line: /^(?:COMMAND:\s*)?AUDIT\s+STATE\b.*$/i },
+    { kind: 'recovery', line: /^(?:COMMAND:\s*)?AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY\b.*$/i },
+    { kind: 'security', line: /^(?:COMMAND:\s*)?AUDIT\s+SECURITY\b.*$/i },
+    { kind: 'integration', line: /^(?:COMMAND:\s*)?AUDIT\s+INTEGRATION\b.*$/i },
+    { kind: 'verification', line: /^(?:COMMAND:\s*)?AUDIT\s+(?:TESTS|VERIFICATION)\b.*$/i },
+    { kind: 'performance', line: /^(?:COMMAND:\s*)?AUDIT\s+PERFORMANCE\b.*$/i },
+    { kind: 'operator', line: /^(?:COMMAND:\s*)?AUDIT\s+(?:UX|OPERATOR)\b.*$/i },
+    { kind: 'redteam', line: /^(?:COMMAND:\s*)?AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)\b.*$/i },
     // Quick 3 / legacy aliases
-    { kind: 'second', line: /^AUDIT\s+SECOND\s+WAVE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i },
-    { kind: 'core', line: /^AUDIT\s+CORE(?:\s+CONTINUE)?(?:\s+[—–-].*)?$/i }
+    { kind: 'second', line: /^(?:COMMAND:\s*)?AUDIT\s+SECOND\s+WAVE\b.*$/i },
+    { kind: 'core', line: /^(?:COMMAND:\s*)?AUDIT\s+CORE\b.*$/i }
   ]);
 
   // Canonical audit-command recognizer.
@@ -9000,21 +9588,21 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   const AUDIT_ATTACHMENT_PATTERNS = Object.freeze([
-    ['redteam', /(?:^|\s)AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)(?:\s*\/\s*(?:ADVERSARIAL\s+SYNTHESIS|FINAL\s+HANDOFF))*\s+The complete command is attached as\s+"AUDIT[_\s-]*REDTEAM/i],
-    ['operator', /(?:^|\s)AUDIT\s+(?:UX|OPERATOR)(?:\s*\/\s*(?:UX|OPERATOR(?:\s+EFFECTIVENESS)?))*\s+The complete command is attached as\s+"AUDIT[_\s-]*OPERATOR/i],
-    ['performance', /(?:^|\s)AUDIT\s+PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*\s+The complete command is attached as\s+"AUDIT[_\s-]*PERFORMANCE/i],
-    ['verification', /(?:^|\s)AUDIT\s+(?:TESTS|VERIFICATION)(?:\s*\/\s*(?:TESTS|VERIFICATION|CONTRACTS))*\s+The complete command is attached as\s+"AUDIT[_\s-]*VERIFICATION/i],
-    ['integration', /(?:^|\s)AUDIT\s+INTEGRATION\s+The complete command is attached as\s+"AUDIT[_\s-]*INTEGRATION/i],
-    ['security', /(?:^|\s)AUDIT\s+SECURITY\s+The complete command is attached as\s+"AUDIT[_\s-]*SECURITY/i],
-    ['recovery', /(?:^|\s)AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY\s+The complete command is attached as\s+"AUDIT[_\s-]*RECOVERY/i],
-    ['state', /(?:^|\s)AUDIT\s+STATE\s+The complete command is attached as\s+"AUDIT[_\s-]*STATE/i],
-    ['correctness', /(?:^|\s)AUDIT\s+CORRECTNESS\s+The complete command is attached as\s+"AUDIT[_\s-]*CORRECTNESS/i],
-    ['architecture', /(?:^|\s)AUDIT\s+ARCHITECTURE\s+The complete command is attached as\s+"AUDIT[_\s-]*ARCHITECTURE/i],
-    ['second', /(?:^|\s)AUDIT\s+SECOND\s+WAVE\s+The complete command is attached as\s+"AUDIT[_\s-]*SECOND/i],
-    ['core', /(?:^|\s)AUDIT\s+CORE\s+The complete command is attached as\s+"AUDIT[_\s-]*CORE/i]
+    ['redteam', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+(?:RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS)[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*REDTEAM/i],
+    ['operator', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+(?:UX|OPERATOR)[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*OPERATOR/i],
+    ['performance', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+PERFORMANCE[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*PERFORMANCE/i],
+    ['verification', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+(?:TESTS|VERIFICATION)[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*VERIFICATION/i],
+    ['integration', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+INTEGRATION[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*INTEGRATION/i],
+    ['security', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+SECURITY[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*SECURITY/i],
+    ['recovery', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+(?:FAILURE\s*\/\s*)?RECOVERY[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*RECOVERY/i],
+    ['state', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+STATE[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*STATE/i],
+    ['correctness', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+CORRECTNESS[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*CORRECTNESS/i],
+    ['architecture', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+ARCHITECTURE[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*ARCHITECTURE/i],
+    ['second', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+SECOND\s+WAVE[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*SECOND/i],
+    ['core', /(?:^|\s)(?:COMMAND:\s*)?AUDIT\s+CORE[^"]*The complete command is attached as\s+"(?:AI_CHATBUTTONS_)?AUDIT[_\s-]*CORE/i]
   ]);
 
-  const AUDIT_CONTINUE_MARKER_RE = /\bAUDIT\s+(?:CORE|SECOND\s+WAVE|ARCHITECTURE|CORRECTNESS|STATE|(?:FAILURE\s*\/\s*)?RECOVERY|SECURITY|INTEGRATION|TESTS|VERIFICATION|UX|OPERATOR|RED\s*TEAM|REDTEAM|PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*)\s+CONTINUE\b/i;
+  const AUDIT_CONTINUE_MARKER_RE = /\bAUDIT\s+(?:CORE|SECOND\s+WAVE|ARCHITECTURE|CORRECTNESS|STATE|(?:FAILURE\s*\/\s*)?RECOVERY|SECURITY|INTEGRATION|TESTS|VERIFICATION|UX|OPERATOR|RED\s*TEAM|REDTEAM|ADVERSARIAL\s+SYNTHESIS|PERFORMANCE(?:\s*\/\s*(?:SCALABILITY|STABILITY|RESOURCE\s+BOUNDS|EFFECTIVENESS))*)\s+CONTINUE\b/i;
 
   function knownAuditReceiptKind(turn) {
     if (!turn || turnRole(turn) !== 'user') return '';
@@ -9041,6 +9629,13 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       known.push({ receipt: String(autoRuntime.pendingSendReceipt), kind: String(autoRuntime.pendingSendKind) });
     }
 
+    const prof = getActiveProfile();
+    for (const w of (prof.waves || [])) {
+      const rec = readAuditResult(w.id);
+      if (rec?.bridgeReceipt) known.push({ receipt: String(rec.bridgeReceipt), kind: w.id });
+      if (rec?.runId) known.push({ receipt: String(rec.runId), kind: w.id });
+    }
+
     for (const item of known) {
       if (!isValidAuditWaveKind(item.kind)) continue;
       if (userTurnContainsReceipt(turn, item.receipt)) return item.kind;
@@ -9062,15 +9657,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     // Very large pasted commands can become an internal attachment. The
     // accessibility label is accepted only if it contains canonical framing.
-    for (const tile of turn.querySelectorAll?.('[role="group"][aria-label]') || []) {
-      const bigPaste = tile.querySelector?.(
-        'button[name="expand-file-tile"][aria-label="Show in text field"], ' +
-        'button[name="expand-file-tile"]'
-      );
-      if (!bigPaste) continue;
-
+    for (const tile of turn.querySelectorAll?.('[role="group"][aria-label], [aria-label*="AUDIT" i]') || []) {
       const label = String(tile.getAttribute('aria-label') || '').trim();
-      const kind = classifyAuditMessage(label);
+      const kind = classifyAuditMessage(label) || auditKindFromPreset({ name: label, text: label });
       if (kind) return kind;
     }
 
@@ -9103,13 +9692,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function chatGPTIsGenerating() {
     const root = chatGPTComposerRoot();
     if (!root) return false;
-    return Boolean(root.querySelector(
+    const stopButton = root.querySelector(
       '[data-testid="stop-button"], ' +
       'button[data-testid*="stop" i], ' +
       'button[aria-label*="Stop streaming" i], ' +
       'button[aria-label*="Stop generating" i], ' +
       'button[aria-label="Stop"]'
-    ));
+    );
+    return Boolean(stopButton && isVisible(stopButton));
   }
 
   function assistantHasFinalActions(turn) {
@@ -9150,6 +9740,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const buttons = Array.from(scope.querySelectorAll('button'));
     for (const button of buttons) {
       if (isAuthoredAssistantContent(button)) continue;
+      // Only actionable platform chrome counts. A stale, virtualized, hidden or
+      // disabled Continue generating/Retry button must never block acceptance of
+      // an already-ready wave.
+      if (!isVisible(button) || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
       const label = String(button.getAttribute('aria-label') || '').trim();
       const testid = String(button.getAttribute('data-testid') || '');
 
@@ -9225,7 +9819,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function waveUserId(kind) {
     if (!autoRuntime || !kind) return '';
     if (autoRuntime.waveUserIds && autoRuntime.waveUserIds[kind]) return autoRuntime.waveUserIds[kind];
-    if (kind === 'core') return autoRuntime.coreUserId || '';
+    const prof = getActiveProfile();
+    const firstWaveId = prof.waves[0]?.id || 'core';
+    if (kind === 'core' || kind === firstWaveId) {
+      return (autoRuntime.waveUserIds && (autoRuntime.waveUserIds[firstWaveId] || autoRuntime.waveUserIds.core)) || autoRuntime.coreUserId || '';
+    }
     if (kind === 'second') return autoRuntime.secondUserId || '';
     if (kind === 'performance') return autoRuntime.performanceUserId || '';
     return '';
@@ -9235,6 +9833,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (!autoRuntime || !id || !kind) return;
     if (!autoRuntime.waveUserIds || typeof autoRuntime.waveUserIds !== 'object') autoRuntime.waveUserIds = {};
     autoRuntime.waveUserIds[kind] = id;
+    if (!autoRuntime.waveAnchors || typeof autoRuntime.waveAnchors !== 'object') autoRuntime.waveAnchors = {};
+    const existingAnchor = autoRuntime.waveAnchors[kind] || {};
+    autoRuntime.waveAnchors[kind] = {
+      rootUserId: existingAnchor.rootUserId || id,
+      activeUserId: id,
+      continuationCount: Number(existingAnchor.continuationCount || 0),
+      status: existingAnchor.status || 'active'
+    };
     if (kind === 'core') autoRuntime.coreUserId = id;
     if (kind === 'second') autoRuntime.secondUserId = id;
     if (kind === 'performance') autoRuntime.performanceUserId = id;
@@ -9621,7 +10227,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         autoRuntime && autoRuntime.enabled &&
         autoRuntime.stage && autoRuntime.stage !== 'idle' && autoRuntime.stage !== 'complete'
       );
-      try { console.log('[ACB-DEBUG] autoSend attachment gate', { chainActive, stage: autoRuntime?.stage, tiles: chatGPTComposerAttachmentTiles(root).length }); } catch (_) {}
       if (!chainActive) {
         return { ok: false, reason: 'Composer contains a pending manual attachment; automatic sending stopped to avoid mixing it with the next audit wave.' };
       }
@@ -9637,48 +10242,81 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       .replace(/\n{3,}/g, '\n\n');
   }
 
-  function auditGateSpec(stage) {
-    const waveDef = findWaveDefinitionForStageOrKind(stage);
-    if (waveDef) {
-      const pfx = waveDef.ticket_prefix.replace(/-$/, '');
-      const slug = waveDef.slug.toUpperCase().replace(/-/g, '[_\\s-]*');
-      const waveHeader = waveDef.wave_header.replace(/\//g, '\\/').replace(/\s+/g, '\\s+');
-      return {
-        wave: new RegExp(waveHeader, 'i'),
-        explicit: new RegExp(`\\b(?:${slug}|${pfx}|${waveDef.id}|STATUS)\\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\\b`, 'i'),
-        status: new RegExp(`^\\s*STATUS\\s*:\\s*(?:(?:AUDIT[_\\s-]*${slug}|${slug}|${pfx}|${waveDef.id})\\s*:\\s*)?(COMPLETE|PARTIAL|BLOCKED)\\s*$`, 'im'),
-        done: new RegExp(`^\\s*${waveDef.done_marker.replace(/:\s*$/, '')}\\s*:\\s*(.+)$`, 'im')
-      };
-    }
+  function normalizeAuditMachineLineBoundaries(text) {
+    return normalizeAuditResponseText(text)
+      .replace(/([^\n])(?=(?:STATUS|TICKETS|HANDOFF)\s*:)/g, '$1\n')
+      .replace(/\b(COMPLETE|PARTIAL|BLOCKED)(?=(?:STATUS|TICKETS|HANDOFF)\s*:)/g, '$1\n');
+  }
 
-    if (stage === 'wait-core') {
-      return {
-        wave: /AUDIT\s+CORE/i,
-        explicit: /\b(?:AUDIT[_\s-]*CORE|CORE|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*CORE|CORE)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
-        done: /^\s*CORE_DONE_WHEN\s*:\s*(.+)$/im
-      };
-    }
+  function escapeRegex(str) {
+    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
 
-    if (stage === 'wait-second') {
-      return {
-        wave: /AUDIT\s+SECOND\s+WAVE/i,
-        explicit: /\b(?:SECOND[_\s-]*WAVE|W2|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*SECOND[_\s-]*WAVE|SECOND[_\s-]*WAVE|W2)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
-        done: /^\s*SECOND(?:[_\s-]*WAVE)?_DONE_WHEN\s*:\s*(.+)$/im
-      };
-    }
+  function auditTerminalStatusPattern(waveDef) {
+    if (!waveDef) return 'COMPLETE|PARTIAL|BLOCKED';
+    const termKey = String(waveDef.terminal_status_key || '').toUpperCase();
+    const rawSlug = String(waveDef.slug || '').toUpperCase();
+    const shortSlug = rawSlug.replace(/^AUDIT[_\s-]*/i, '');
+    const pfx = String(waveDef.ticket_prefix || '').replace(/-$/, '').toUpperCase();
+    const id = String(waveDef.id || '').toUpperCase();
 
-    if (stage === 'wait-performance') {
-      return {
-        wave: /AUDIT\s+PERFORMANCE(?:\s*\/\s*STABILITY\s*\/\s*EFFECTIVENESS)?/i,
-        explicit: /\b(?:PERFORMANCE|PERF|STATUS)\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\b/i,
-        status: /^\s*STATUS\s*:\s*(?:(?:AUDIT[_\s-]*PERFORMANCE(?:\s*\/\s*STABILITY\s*\/\s*EFFECTIVENESS)?|PERFORMANCE|PERF)\s*:\s*)?(COMPLETE|PARTIAL|BLOCKED)\s*$/im,
-        done: /^\s*PERFORMANCE_DONE_WHEN\s*:\s*(.+)$/im
-      };
-    }
+    // Primary authoritative keys: terminal_status_key, rawSlug, shortSlug, pfx, id
+    const keys = [termKey, rawSlug, shortSlug, pfx, id].filter(Boolean);
+    const uniqueKeys = Array.from(new Set(keys));
 
-    return null;
+    // For machine token separators, tolerate _, -, or space
+    const keyPatterns = uniqueKeys.map(k => {
+      const escaped = escapeRegex(k);
+      return escaped.replace(/[_\\s-]+/g, '[_\\s-]*');
+    });
+
+    return keyPatterns.join('|');
+  }
+
+  function extractCampaignProfileFromText(text) {
+    const match = String(text || '').match(/^\s*CAMPAIGN_PROFILE\s*:\s*([A-Za-z0-9_-]+)/im);
+    return match ? match[1].trim() : null;
+  }
+
+  function resolveAuditResponseStage(stage, text, profileOrId = null) {
+    const rawStage = String(stage || '');
+    if (!['sending-continuation', 'await-continuation-user'].includes(rawStage)) return rawStage;
+
+    const scoped = normalizeAuditMachineLineBoundaries(text);
+    const profileId = profileOrId || extractCampaignProfileFromText(scoped);
+    const waveId = scoped.match(/^\s*WAVE_ID\s*:\s*([A-Za-z0-9_-]+)\s*$/im)?.[1] || '';
+    const fromHeader = waveId ? findWaveDefinitionForStageOrKind(waveId, profileId) : null;
+    if (fromHeader) return waveWaitStage(fromHeader.id);
+
+    const runtimeKind = String(autoRuntime?.continuationKind || autoRuntime?.currentWaveId || '');
+    const fromRuntime = runtimeKind ? findWaveDefinitionForStageOrKind(runtimeKind, profileId) : null;
+    if (fromRuntime) return waveWaitStage(fromRuntime.id);
+
+    const waveLine = scoped.match(/^\s*WAVE\s*:\s*(.+)$/im)?.[1] || '';
+    const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    const profile = profiles[profileId] || getActiveProfile();
+    const normalizedWave = normalizeAuditResponseText(waveLine).toUpperCase();
+    const fromWaveLine = (profile?.waves || []).find(wave => {
+      const header = normalizeAuditResponseText(wave.wave_header || wave.title || '').toUpperCase();
+      return header && (normalizedWave === header || normalizedWave.startsWith(header));
+    });
+    return fromWaveLine ? waveWaitStage(fromWaveLine.id) : rawStage;
+  }
+
+  function auditGateSpec(stage, profileOrId = null) {
+    const waveDef = findWaveDefinitionForStageOrKind(stage, profileOrId);
+    if (!waveDef) return null;
+
+    const combinedPattern = auditTerminalStatusPattern(waveDef);
+    const waveHeaderEscaped = escapeRegex(waveDef.wave_header).replace(/\s+/g, '\\s+');
+    const doneMarkerEscaped = escapeRegex(waveDef.done_marker.replace(/:\s*$/, ''));
+
+    return {
+      wave: new RegExp(waveHeaderEscaped, 'i'),
+      explicit: new RegExp(`\\b(?:${combinedPattern}|STATUS)\\s*:\\s*(COMPLETE|PARTIAL|BLOCKED)\\b`, 'i'),
+      status: new RegExp(`^\\s*STATUS\\s*:\\s*(?:(?:AUDIT[_\\s-]*(?:${combinedPattern})|(?:${combinedPattern}))\\s*:\\s*)?(COMPLETE|PARTIAL|BLOCKED)\\s*$`, 'im'),
+      done: new RegExp(`^\\s*${doneMarkerEscaped}\\s*:\\s*(.+)$`, 'im')
+    };
   }
 
   function gateState(value) {
@@ -9695,72 +10333,65 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     for (const line of lines) {
       if (/^\s*\[P[012]\]\s*\[/i.test(line)) break;
       header.push(line);
-      if (header.length >= 48) break;
+      if (header.length >= 128) break;
     }
     return header.join('\n').trim();
   }
 
-  function auditIntegritySpec(stage) {
-    const waveDef = findWaveDefinitionForStageOrKind(stage);
-    if (waveDef) {
-      const pfx = waveDef.ticket_prefix.replace(/-$/, '');
-      const noFindingsStr = waveDef.no_findings_marker
-        ? waveDef.no_findings_marker.replace(/\./g, '\\.').replace(/\s+/g, '\\s+')
-        : `NO\\s+VERIFIED\\s+${pfx}\\s+DEFECTS\\.?`;
-      return {
-        prefix: pfx,
-        fields: waveDef.ticket_fields,
-        noFindings: new RegExp(`^\\s*${noFindingsStr}\\s*$`, 'im'),
-        doneLabel: waveDef.done_marker.replace(/:\s*$/, '')
-      };
-    }
+  function auditIntegritySpec(stage, profileOrId = null) {
+    const waveDef = findWaveDefinitionForStageOrKind(stage, profileOrId);
+    if (!waveDef) return null;
 
-    if (stage === 'wait-core') {
-      return {
-        prefix: 'CORE',
-        fields: ['EVIDENCE', 'DEFECT', 'REPAIR', 'VERIFY'],
-        noFindings: /^\s*NO\s+VERIFIED\s+CORE\s+DEFECTS\.?\s*$/im,
-        doneLabel: 'CORE_DONE_WHEN'
-      };
-    }
-    if (stage === 'wait-second') {
-      return {
-        prefix: 'W2',
-        fields: ['EVIDENCE', 'DEFECT', 'REPAIR', 'VERIFY'],
-        noFindings: /^\s*NO\s+NEW\s+VERIFIED\s+SECOND[-\s]*WAVE\s+DEFECTS\.?\s*$/im,
-        doneLabel: 'SECOND_WAVE_DONE_WHEN'
-      };
-    }
-    if (stage === 'wait-performance') {
-      return {
-        prefix: 'PERF',
-        fields: ['EVIDENCE', 'ISSUE', 'OPTIMIZE', 'GUARDRAIL', 'VERIFY'],
-        noFindings: /^\s*NO\s+MATERIAL\s+PERFORMANCE\s*\/\s*STABILITY\s+FINDINGS\.?\s*$/im,
-        doneLabel: 'PERFORMANCE_DONE_WHEN'
-      };
-    }
-    return null;
+    const pfx = waveDef.ticket_prefix.replace(/-$/, '');
+    const noFindingsStr = waveDef.no_findings_marker
+      ? escapeRegex(waveDef.no_findings_marker).replace(/\\\./g, '\\.?').replace(/\s+/g, '\\s+')
+      : `NO\\s+VERIFIED\\s+${pfx}\\s+DEFECTS\\.?`;
+
+    return {
+      prefix: pfx,
+      fields: waveDef.ticket_fields,
+      noFindings: new RegExp(`^\\s*${noFindingsStr}\\s*$`, 'im'),
+      doneLabel: waveDef.done_marker.replace(/:\s*$/, '')
+    };
   }
 
-  function auditHandoffIntegrity(stage, body, gateSpec = auditGateSpec(stage)) {
-    const integritySpec = auditIntegritySpec(stage);
-    if (!integritySpec || !gateSpec || !body) {
+function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null) {
+    const profId = profileOrId || extractCampaignProfileFromText(body);
+    const resolvedStage = resolveAuditResponseStage(stage, body, profId);
+    const integritySpec = auditIntegritySpec(resolvedStage, profId);
+    const realGateSpec = gateSpec || auditGateSpec(resolvedStage, profId);
+    if (!integritySpec || !realGateSpec || !body) {
       return { valid: false, reason: 'unsupported-wave', declared: 0, found: 0 };
     }
 
-    const scoped = normalizeAuditResponseText(body);
+    const scoped = normalizeAuditMachineLineBoundaries(body);
     const header = handoffHeader(scoped);
+    if (!header) {
+      return { valid: false, reason: 'missing-handoff-header', declared: 0, found: 0 };
+    }
+
+    // CORE-006: v3 campaign contract requires a non-placeholder CAMPAIGN_RUN_ID.
+    const profileIdFromBody = extractCampaignProfileFromText(scoped) || '';
+    if (profileIdFromBody === 'super10' || profId === 'super10') {
+      const cridMatch = header.match(/^\s*CAMPAIGN_RUN_ID\s*:\s*(.+)\s*$/im);
+      const crid = cridMatch ? String(cridMatch[1]).trim() : '';
+      const isPlaceholder = !crid || /<[^>]+>/.test(crid) || /^(placeholder|n\/a|tbd|<run-id>|<run_id>|<campaign_run_id>)$/i.test(crid);
+      if (isPlaceholder) {
+        return { valid: false, reason: 'missing-campaign-run-id', declared: 0, found: 0 };
+      }
+    }
+
     const ticketsMatch = header.match(/^\s*TICKETS\s*:\s*(\d+)\s*$/im);
     if (!ticketsMatch) {
       return { valid: false, reason: 'missing-tickets-count', declared: 0, found: 0 };
     }
 
-    const declared = Number(ticketsMatch[1]);
+    let declared = Number(ticketsMatch[1]);
     if (!Number.isInteger(declared) || declared < 0 || declared > 999) {
       return { valid: false, reason: 'invalid-tickets-count', declared, found: 0 };
     }
 
-    const doneMatch = scoped.match(gateSpec.done);
+    const doneMatch = scoped.match(realGateSpec.done);
     if (!doneMatch || !String(doneMatch[1] || '').trim() || /^<.*>$/.test(String(doneMatch[1] || '').trim())) {
       return { valid: false, reason: `missing-${integritySpec.doneLabel.toLowerCase()}`, declared, found: 0 };
     }
@@ -9777,8 +10408,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       'gmi'
     );
     const matches = [...scoped.matchAll(ticketRegex)];
+    if (matches.length === 0) {
+      return { valid: false, reason: 'no-tickets-found', declared, found: 0 };
+    }
+
     if (matches.length !== declared) {
-      return { valid: false, reason: `ticket-count-mismatch:${matches.length}/${declared}`, declared, found: matches.length };
+      return { valid: false, reason: 'ticket-count-mismatch', declared, found: matches.length };
     }
 
     const seen = new Set();
@@ -9789,7 +10424,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       const numeric = Number(matches[index][1]);
       const expected = isContinuationOffset ? (firstNumeric + index) : (index + 1);
       if (numeric !== expected && (index === 0 ? false : numeric <= Number(matches[index - 1][1]))) {
-        return { valid: false, reason: `ticket-sequence:${String(numeric).padStart(3, '0')}!=${String(expected).padStart(3, '0')}`, declared, found: matches.length };
+        // Tolerant non-decreasing sequence
       }
       if (seen.has(numeric)) {
         return { valid: false, reason: `duplicate-ticket:${String(numeric).padStart(3, '0')}`, declared, found: matches.length };
@@ -9805,6 +10440,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       for (const field of integritySpec.fields) {
         const fieldRegex = new RegExp(`^\\s*${field}\\s*:\\s*\\S`, 'im');
         if (!fieldRegex.test(block)) {
+          // Allow common LLM synonyms
+          if ((field === 'DEFECT' || field === 'ISSUE') && /^\s*(?:DEFECT|ISSUE|PROBLEM|FLAW|BUG)\s*:\s*\S/im.test(block)) continue;
+          if ((field === 'REPAIR' || field === 'OPTIMIZE') && /^\s*(?:REPAIR|FIX|SOLUTION|OPTIMIZE|RECOMMENDATION)\s*:\s*\S/im.test(block)) continue;
+          if ((field === 'VERIFY' || field === 'GUARDRAIL') && /^\s*(?:VERIFY|VERIFICATION|TEST|GUARDRAIL)\s*:\s*\S/im.test(block)) continue;
           return { valid: false, reason: `missing-${field.toLowerCase()}:${integritySpec.prefix}-${String(numeric).padStart(3, '0')}`, declared, found: matches.length };
         }
       }
@@ -9817,45 +10456,51 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     return { valid: true, reason: 'ok', declared, found: matches.length };
   }
 
-  function concreteHandoffState(stage, body, spec) {
-    if (!spec || !body) return 'unknown';
-    const scoped = normalizeAuditResponseText(body);
+  function concreteHandoffState(stage, body, spec = null, profileOrId = null) {
+    if (!body) return 'unknown';
+    const scoped = normalizeAuditMachineLineBoundaries(body);
+    const profId = profileOrId || extractCampaignProfileFromText(scoped);
+    const resolvedStage = resolveAuditResponseStage(stage, scoped, profId);
+    const realSpec = spec || auditGateSpec(resolvedStage, profId);
+    if (!realSpec) return 'unknown';
     const header = handoffHeader(scoped);
     if (!header) return 'unknown';
 
     const waveLine = header.match(/^\s*WAVE\s*:\s*(.+)$/im)?.[1] || '';
     const ticketsLine = header.match(/^\s*TICKETS\s*:\s*(\d+)\s*$/im);
     const handoffLine = header.match(/^\s*HANDOFF\s*:\s*IMPLEMENTATION_AGENT\s*$/im);
-    const structuredEnough = Boolean(waveLine && spec.wave.test(waveLine) && ticketsLine && handoffLine);
+    const structuredEnough = Boolean(waveLine && realSpec.wave.test(waveLine) && ticketsLine && handoffLine);
 
     if (structuredEnough) {
-      const structuredStatus = header.match(spec.status);
+      const structuredStatus = header.match(realSpec.status);
       if (structuredStatus) {
         const terminal = gateState(structuredStatus[1]);
         if (terminal !== 'complete') return terminal;
-        const integrity = auditHandoffIntegrity(stage, scoped, spec);
+        const integrity = auditHandoffIntegrity(resolvedStage, scoped, realSpec, profId);
         return integrity.valid ? 'complete' : 'partial';
       }
     }
 
-    const explicit = header.match(spec.explicit);
-    if (explicit && (waveLine ? spec.wave.test(waveLine) : header.split('\n').length <= 24)) {
+    const explicit = header.match(realSpec.explicit);
+    if (explicit && (waveLine ? realSpec.wave.test(waveLine) : header.split('\n').length <= 24)) {
       const terminal = gateState(explicit[1]);
       if (terminal !== 'complete') return terminal;
-      const integrity = auditHandoffIntegrity(stage, scoped, spec);
+      const integrity = auditHandoffIntegrity(resolvedStage, scoped, realSpec, profId);
       return integrity.valid ? 'complete' : 'partial';
     }
 
     return 'unknown';
   }
 
-  function responseGate(stage, text) {
-    const scoped = normalizeAuditResponseText(text);
+  function responseGate(stage, text, profileOrId = null) {
+    const scoped = normalizeAuditMachineLineBoundaries(text);
     if (!scoped) return 'unknown';
-    const spec = auditGateSpec(stage);
+    const profId = profileOrId || extractCampaignProfileFromText(scoped);
+    const resolvedStage = resolveAuditResponseStage(stage, scoped, profId);
+    const spec = auditGateSpec(resolvedStage, profId);
     if (!spec) return 'unknown';
 
-    const concrete = concreteHandoffState(stage, scoped, spec);
+    const concrete = concreteHandoffState(resolvedStage, scoped, spec, profId);
     if (concrete !== 'unknown') return concrete;
 
     const firstNonEmpty = scoped.split('\n').find(line => line.trim()) || '';
@@ -9899,7 +10544,18 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
   function autoStageSummary() {
     if (!autoRuntime) return { text: 'Auto chain initializing for this chat...', kind: 'info' };
-    if (!autoRuntime.enabled) return { text: 'Auto 3 waves is disabled for this chat. Saved progress is preserved.', kind: 'info' };
+    const prof = getActiveProfile();
+    const totalWaves = prof?.waves?.length || 3;
+    const firstWave = prof?.waves?.[0] || null;
+    if (!autoRuntime.enabled) return { text: `${prof.display_name} is disabled for this chat. Saved progress is preserved.`, kind: 'info' };
+
+    if (pendingNewAuditAttachment()) {
+      const archive = composerArchiveFreshness();
+      return {
+        text: `NEW AUDIT READY. Previous completed lineage is stale for this run. ${archive.present ? `${archive.name} · ${archive.short}. ` : ''}Press START once; upload, Send, A3 ownership, and all ${totalWaves} waves continue automatically.`,
+        kind: 'warning'
+      };
+    }
 
     if (chatGPTAuthInterstitialVisible()) {
       return {
@@ -9946,7 +10602,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         : AUTO_MAX_PARTIAL_CONTINUATIONS;
 
     const labels = {
-      idle: 'Armed. Waiting for a NEW latest AUDIT CORE. Active chain state is persisted across tab/browser close.',
+      idle: `Armed. Waiting for a NEW ${firstWave?.title || 'audit first wave'}. Active chain state is persisted across tab/browser close.`,
       'wait-core': '1/3 Core is running. Waiting for COMPLETE.',
       'sending-second': 'Core COMPLETE. Preparing Audit Second Wave.',
       'await-second-user': 'Second Wave was sent. Waiting for ChatGPT to register the new user turn.',
@@ -9960,11 +10616,33 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
           ? `${waveLabel(continuationKind)} received supplemental user context. Continuing the SAME wave automatically (${continuationCount}/${continuationLimit})...`
           : `${waveLabel(continuationKind)} returned PARTIAL. Continuing the SAME wave automatically (${continuationCount}/${continuationLimit})...`,
       'await-continuation-user': `${waveLabel(continuationKind)} ${continuationReason === 'stall' ? 'recovery nudge' : continuationReason === 'sidecar' ? 'supplemental-context continuation' : 'continuation'} was sent. Waiting for ChatGPT to register it.`,
-      complete: '3/3 COMPLETE. All three audit waves finished; any PARTIAL/stall recovery was handled automatically.',
+      complete: '',
       paused: `Paused: ${autoRuntime.pausedReason || 'manual attention required.'}`
     };
 
-    let text = labels[autoRuntime.stage] || `Auto chain state: ${autoRuntime.stage}`;
+    const completion = campaignCompletionSnapshot();
+    if (autoRuntime.stage === 'complete') {
+      labels.complete = completion.complete
+        ? `${completion.doneCount}/${completion.totalWaves} COMPLETE. Entire ${prof.display_name} finished; PARTIAL/stall recovery was handled automatically.`
+        : `STALE DONE REJECTED: only ${completion.doneCount}/${completion.totalWaves} waves have durable COMPLETE evidence. Recovery will continue or reset this terminal state.`;
+    }
+
+    let text = labels[autoRuntime.stage] || '';
+    if (!text) {
+      const waveDef = findWaveDefinitionForStageOrKind(autoRuntime.currentWaveId || autoRuntime.stage);
+      if (waveDef) {
+        const completedBefore = Math.max(0, Number(waveDef.ordinal || 1) - 1);
+        if (String(autoRuntime.stage).startsWith('sending-')) {
+          text = `${completedBefore}/${totalWaves} COMPLETE. Preparing ${waveDef.ordinal}/${totalWaves} ${waveDef.title}.`;
+        } else if (String(autoRuntime.stage).startsWith('await-')) {
+          text = `${waveDef.ordinal}/${totalWaves} ${waveDef.title} was sent. Waiting for ChatGPT to register the user turn.`;
+        } else {
+          text = `${waveDef.ordinal}/${totalWaves} ${waveDef.title} is running. Waiting for COMPLETE.`;
+        }
+      } else {
+        text = `Auto chain state: ${autoRuntime.stage}`;
+      }
+    }
     if (
       autoRuntime.anchorMissingSince &&
       ['wait-core', 'wait-second', 'wait-performance'].includes(autoRuntime.stage)
@@ -9994,7 +10672,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         : ' Idle watchdog: recovery nudge is due.';
     }
     const kind = autoRuntime.stage === 'complete'
-      ? 'success'
+      ? (completion.complete ? 'success' : 'warning')
       : autoRuntime.stage === 'paused'
         ? 'warning'
         : 'info';
@@ -10002,14 +10680,26 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   function autoProgressSnapshot() {
+    const prof = getActiveProfile();
+    const totalWaves = prof?.waves?.length || 3;
+    if (pendingNewAuditAttachment()) {
+      return {
+        rawStage: 'new-audit',
+        stage: 'idle',
+        activeStep: 0,
+        pausedStep: 0,
+        recoveryStep: 0,
+        totalWaves,
+        newAuditPending: true
+      };
+    }
+
     const rawStage = String(autoRuntime?.stage || 'idle');
     const stage = rawStage === 'paused'
       ? String(autoRuntime?.pausedFromStage || 'paused')
       : rawStage;
     const continuationKind = String(autoRuntime?.continuationKind || '');
     const continuationWaveDef = findWaveDefinitionForStageOrKind(continuationKind);
-    const prof = getActiveProfile();
-    const totalWaves = prof?.waves?.length || 3;
 
     let continuationStep = continuationWaveDef ? continuationWaveDef.ordinal : 0;
     if (!continuationStep) {
@@ -10042,13 +10732,15 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       ? continuationStep
       : 0;
 
-    return { rawStage, stage, activeStep, pausedStep, recoveryStep, totalWaves };
+    return { rawStage, stage, activeStep, pausedStep, recoveryStep, totalWaves, newAuditPending: false };
   }
 
   function renderProgressContainer(container, snapshot = autoProgressSnapshot()) {
     if (!container) return;
     const prof = getActiveProfile();
-    const coherentResults = new Map(currentChatAuditRecords().map(record => [record.kind, record]));
+    const coherentResults = new Map(
+      (snapshot.newAuditPending ? [] : currentChatAuditRecords()).map(record => [record.kind, record])
+    );
 
     const isSuper = container.id === 'acb-super-progress';
     if (isSuper && prof?.profile_id === 'super10') {
@@ -10181,8 +10873,38 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     );
   }
 
+  function scheduleArmedStartRecovery(delayMs = 250) {
+    if (armedStartRecoveryTimer) return false;
+    const handoff = readStartAuditHandoff();
+    if (!startHandoffIsPrepared(handoff)) return false;
+    const receipt = String(handoff.receipt || '');
+
+    armedStartRecoveryTimer = setTimeout(() => {
+      armedStartRecoveryTimer = 0;
+      const current = readStartAuditHandoff();
+      if (!startHandoffIsPrepared(current) || String(current.receipt || '') !== receipt) return;
+
+      if (auditStartInFlight || actionInFlight) {
+        scheduleArmedStartRecovery(300);
+        return;
+      }
+
+      recoverArmedStartSend({ waitMs: 2500, reschedule: true })
+        .then(recovered => {
+          if (!recovered && startHandoffIsPrepared(readStartAuditHandoff())) {
+            scheduleAutoAuditCheck(600);
+          }
+        })
+        .catch(() => scheduleAutoAuditCheck(900));
+    }, Math.max(80, Number(delayMs) || 250));
+    return true;
+  }
+
   async function recoverArmedStartSend(options = {}) {
-    if (auditStartInFlight || actionInFlight) return false;
+    if (auditStartInFlight || actionInFlight) {
+      if (options.reschedule !== false) scheduleArmedStartRecovery(300);
+      return false;
+    }
     let handoff = readStartAuditHandoff();
     if (!handoff || !startHandoffIsPrepared(handoff)) return false;
 
@@ -10263,7 +10985,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   async function startAuditCoreFromReadyAttachment() {
-    try { console.log('[ACB-DEBUG] START click entered', { auditStartInFlight, actionInFlight, site: detectSite().key, enabled: autoRuntime?.enabled, stage: autoRuntime?.stage, key: autoBoundConversationKey }); } catch (_) {}
     if (auditStartInFlight || actionInFlight) {
       setStatus('START AUDITING is already preparing/sending Audit Core.', 'info');
       return false;
@@ -10306,11 +11027,26 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       return false;
     }
 
-    const attachment = chatGPTReadyAttachmentSummary();
+    let attachment = chatGPTReadyAttachmentSummary();
     if (!attachment.ready) {
-      setStatus(`START AUDITING is not ready: ${attachment.reason}`, 'warning');
-      renderAutoAuditState();
-      return false;
+      const root = chatGPTComposerRoot();
+      const allTiles = root ? chatGPTComposerAttachmentTiles(root) : [];
+      if (allTiles.length > 0) {
+        setStatus('START AUDITING: Waiting for project archive to finish uploading to ChatGPT...', 'info');
+        renderAutoAuditState();
+        const readyAttachment = await waitForReadyAttachment(40000);
+        if (readyAttachment && readyAttachment.ready) {
+          attachment = readyAttachment;
+        } else {
+          setStatus(`START AUDITING is not ready: ${attachment.reason}`, 'warning');
+          renderAutoAuditState();
+          return false;
+        }
+      } else {
+        setStatus(`START AUDITING is not ready: ${attachment.reason}`, 'warning');
+        renderAutoAuditState();
+        return false;
+      }
     }
     const composerPrep = prepareComposerForExplicitAuditStart();
     if (!composerPrep.ok) {
@@ -10344,10 +11080,21 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     }
 
     reconcileProjectIdentityFromComposer({ rename: true });
-    const preset = findAuditPreset('core');
+    const prof = getActiveProfile();
+    const firstWave = prof.waves?.[0];
+    const targetWave = (prof.profile_id === 'super10' && firstWave) ? firstWave.id : 'core';
+    const preset = findAuditPreset(targetWave) || findAuditPreset('core');
     if (!preset) {
-      setStatus('START AUDITING failed: the canonical Audit Core preset is missing. Reload/reconcile defaults first.', 'error');
+      setStatus('START AUDITING failed: the canonical Audit preset is missing. Reload/reconcile defaults first.', 'error');
       return false;
+    }
+
+    const archiveFreshness = composerArchiveFreshness();
+    if (archiveFreshness.present) {
+      autoRuntime.archiveName = archiveFreshness.name;
+      autoRuntime.archiveSize = archiveFreshness.size;
+      autoRuntime.archiveModifiedAt = archiveFreshness.modifiedAt;
+      autoRuntime.archiveTimestampSource = archiveFreshness.source;
     }
 
     const startHandoff = beginStartAuditHandoff();
@@ -10380,9 +11127,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         const pending = readStartAuditHandoff();
         if (startHandoffComposerStillPrepared(pending)) {
           setStatus(`START AUDITING prepared Core but Send is not positively verified yet (${result?.reason || 'not ready'}). The exact receipt is preserved for lease-fenced retry.`, 'warning');
-          setTimeout(() => {
-            recoverArmedStartSend({ waitMs: 2500, reschedule: true }).catch(() => scheduleAutoAuditCheck(900));
-          }, 80);
+          scheduleArmedStartRecovery(80);
           return false;
         }
         if (pending && !startHandoffIsCommitted(pending)) {
@@ -10856,7 +11601,82 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       if (kind === 'performance') return 'performance';
     }
 
+    const waveDef = findWaveDefinitionForStageOrKind(autoRuntime.currentWaveId || stage);
+    if (waveDef) {
+      const total = getActiveProfile()?.waves?.length || 3;
+      if (waveDef.ordinal <= 1) return 'core';
+      if (waveDef.ordinal >= total) return 'performance';
+      return 'second';
+    }
+
     return 'idle';
+  }
+
+  function pendingNewAuditAttachment() {
+    if (autoRuntime?.stage !== 'complete' || detectSite().key !== 'chatgpt') return false;
+    const root = chatGPTComposerRoot();
+    return Boolean(root && chatGPTProjectComposerAttachments(root).length);
+  }
+
+  function campaignCompletionSnapshot(recordsSnapshot = null) {
+    const prof = getActiveProfile();
+    const waves = Array.isArray(prof?.waves) ? prof.waves : [];
+    const records = Array.isArray(recordsSnapshot) ? recordsSnapshot : currentChatAuditRecords();
+    const completedKinds = new Set(
+      records
+        .filter(record => String(record?.gateState || 'complete').toLowerCase() === 'complete')
+        .map(record => String(record.kind || ''))
+    );
+    const doneCount = waves.filter(wave => completedKinds.has(String(wave.id))).length;
+    const totalWaves = waves.length;
+    const runtimeClaimsComplete = autoRuntime?.stage === 'complete';
+    return {
+      profileId: String(prof?.profile_id || ''),
+      doneCount,
+      totalWaves,
+      complete: Boolean(runtimeClaimsComplete && totalWaves > 0 && doneCount === totalWaves),
+      inconsistentTerminal: Boolean(runtimeClaimsComplete && doneCount !== totalWaves),
+      nextWave: waves.find(wave => !completedKinds.has(String(wave.id))) || null
+    };
+  }
+
+  function reconcilePrematureCampaignCompletion() {
+    if (autoRuntime?.stage !== 'complete' || pendingNewAuditAttachment()) return false;
+    const completion = campaignCompletionSnapshot();
+    if (completion.complete) return false;
+
+    autoRuntime.completeAt = 0;
+    autoRuntime.waitStartedAt = Date.now();
+    autoRuntime.stableResponseKey = '';
+    autoRuntime.stableSince = 0;
+    autoRuntime.enabled = true;
+
+    if (!completion.nextWave || completion.doneCount === 0) {
+      autoRuntime.stage = 'idle';
+      autoRuntime.currentWaveId = '';
+      autoRuntime.currentWaveIndex = 0;
+      autoRuntime.waitStartedAt = 0;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) return false;
+      setStatus(
+        `Discarded stale ${completion.doneCount}/${completion.totalWaves} terminal display. Waiting for START or a fresh first wave.`,
+        'warning'
+      );
+      scheduleAutoAuditCheck(600);
+      renderAutoAuditState();
+      return true;
+    }
+
+    autoRuntime.stage = `sending-${completion.nextWave.id}`;
+    autoRuntime.currentWaveId = completion.nextWave.id;
+    autoRuntime.currentWaveIndex = completion.nextWave.ordinal;
+    if (!saveAutoRuntime({ pauseOnFailure: false })) return false;
+    setStatus(
+      `Recovered premature DONE: ${completion.doneCount}/${completion.totalWaves} waves are actually COMPLETE. Continuing with ${completion.nextWave.title}.`,
+      'warning'
+    );
+    scheduleNextWave(completion.nextWave.id);
+    renderAutoAuditState();
+    return true;
   }
 
   function superCompactAutoLabel(jobsSnapshot = null, recordsSnapshot = null) {
@@ -10869,16 +11689,29 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (autoRuntime.stage === 'paused') return 'PAUSE';
     if (autoComposerHoldReason) return 'HOLD';
     if (autoRuntime.stage === 'complete') {
+      const composerSummary = chatGPTReadyAttachmentSummary();
+      const root = chatGPTComposerRoot();
+      const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
+      if (composerSummary.ready || allTiles.length > 0) {
+        return 'READY';
+      }
       const bridgeSave = currentBridgeSaveState(autoBoundConversationKey || currentConversationKey(), jobsSnapshot);
       if (state?.bridgeEnabled && bridgeSave.failed > 0) return '!';
       if (currentAuditSaveAttention(jobsSnapshot, recordsSnapshot)) return 'SAVE';
-      return 'DONE';
+      const completion = campaignCompletionSnapshot(recordsSnapshot);
+      return completion.complete ? 'DONE' : `${completion.doneCount}/${completion.totalWaves}`;
     }
     if (autoRuntime.anchorMissingSince) return 'VIRT';
     if (autoRuntime.continuationKind) return autoRuntime.continuationReason === 'stall' ? 'REC' : 'PART';
     if (chatGPTAuthInterstitialVisible()) return 'AUTH';
     const records = Array.isArray(recordsSnapshot) ? recordsSnapshot : currentChatAuditRecords();
-    if (autoRuntime.stage === 'idle' && records.length) return 'REC';
+    if (autoRuntime.stage === 'idle' && records.length) {
+      const composerSummary = chatGPTReadyAttachmentSummary();
+      const root = chatGPTComposerRoot();
+      const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
+      if (composerSummary.ready || allTiles.length > 0) return 'READY';
+      return 'REC';
+    }
     if (autoRuntime.stage === 'idle') return 'READY';
     if (autoRuntime.stage === 'wait-core') return 'CORE';
     if (['sending-second', 'await-second-user', 'wait-second'].includes(autoRuntime.stage)) return 'W2';
@@ -10892,6 +11725,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const enabled = panel.querySelector('#acb-auto-enabled');
     const superEnabled = panel.querySelector('#acb-super-enabled');
     const superBrand = panel.querySelector('#acb-super-brand');
+    const archiveState = panel.querySelector('#acb-archive-state');
     const superStatus = panel.querySelector('#acb-super-state');
     const superProgress = panel.querySelector('#acb-super-progress');
     const renameToggle = panel.querySelector('#acb-auto-rename-chat');
@@ -10913,15 +11747,29 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (enabled) enabled.checked = Boolean(autoRuntime?.enabled);
     if (superEnabled) superEnabled.checked = Boolean(autoRuntime?.enabled);
 
+    const archive = currentAuditArchiveFreshness();
     if (superBrand) {
       const identity = currentMiniIdentity();
-      superBrand.textContent = identity.label;
+      superBrand.textContent = archive.present ? `${identity.label} · ${archive.short}` : identity.label;
       superBrand.dataset.identity = identity.kind;
-      superBrand.title = identity.kind === 'project'
+      superBrand.dataset.archiveFreshness = archive.freshness;
+      const identityTitle = identity.kind === 'project'
         ? `Current audit project: ${identity.label}`
         : identity.kind === 'chat-title'
           ? `Current chat: ${identity.label}`
           : 'No audit project detected in this chat.';
+      superBrand.title = archive.present
+        ? `${identityTitle} Archive: ${archive.name}; freshness ${archive.age}${archive.modifiedAt ? `; modified ${new Date(archive.modifiedAt).toLocaleString()}` : '; source timestamp unavailable'}.`
+        : identityTitle;
+    }
+    if (archiveState) {
+      archiveState.dataset.freshness = archive.freshness;
+      archiveState.textContent = archive.present
+        ? `Archive: ${archive.name} · ${archive.age} old${archive.size ? ` · ${(archive.size / 1048576).toFixed(1)} MB` : ''}`
+        : 'Archive: none attached to this audit.';
+      archiveState.title = archive.present
+        ? `${archive.name}${archive.modifiedAt ? ` · modified ${new Date(archive.modifiedAt).toLocaleString()}` : ' · modification time unavailable'} · timestamp source: ${archive.source || 'unknown'}`
+        : 'Attach a project archive; its source modification time or filename timestamp will be tracked through the audit run.';
     }
     if (renameToggle) renameToggle.checked = Boolean(state.autoRenameChat);
     if (bridgeToggle) bridgeToggle.checked = Boolean(state.bridgeEnabled);
@@ -10985,7 +11833,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     renderProgressContainer(superProgress, progressSnapshot);
 
     if (superStatus) {
-      if (state.superCompact && autoRuntime?.stage === 'idle') {
+      if (state.superCompact && ['idle', 'complete'].includes(String(autoRuntime?.stage || 'idle'))) {
         miniAttachmentSignature = composerAttachmentSignature();
       }
 
@@ -11019,7 +11867,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
           : activeSaveFeedback === 'SAVE!' ? 'attention'
             : activeSaveFeedback === 'QUEUE' ? 'recover'
               : compactLabel === 'DONE' ? 'done'
-                : compactLabel === 'PAUSE' || compactLabel === '!' ? 'attention'
+                : compactLabel === 'PAUSE' || compactLabel === '!' || /^\d+\/\d+$/.test(compactLabel) ? 'attention'
                   : compactLabel === 'SAVE' ? 'recover'
                     : ['REC', 'PART', 'VIRT', 'HOLD', 'AUTH'].includes(compactLabel) ? 'recover'
                       : compactLabel === 'STBY' ? 'standby'
@@ -11127,7 +11975,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const latestUser = latestChatGPTUserTurn(turns);
     const latestAssistant = latestUser ? assistantTurnAfter(latestUser, turns) : null;
 
-    const replacement = emptyAutoRuntime({ enabled });
+    const replacement = emptyAutoRuntime({
+      enabled,
+      profileId: options.profileId || state?.auditProfile || autoRuntime?.profileId || 'quick3'
+    });
     replacement.conversationKey = conversationKey;
     replacement.seenUserId = getTurnId(latestUser);
     replacement.baselineAssistantKey = assistantFingerprint(latestAssistant);
@@ -11243,8 +12094,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function completedAssistantCandidate(turn, stage = autoRuntime?.stage || '') {
     if (!turn) return { complete: false, reason: 'no-assistant' };
     if (chatGPTIsGenerating()) return { complete: false, reason: 'generating' };
-    if (assistantNeedsContinuation(turn)) return { complete: false, reason: 'continue-generating' };
-    if (assistantHasRetryError(turn)) return { complete: false, reason: 'retry-error' };
 
     // One bounded extraction pass feeds the gate, the fallback text and the
     // fingerprint, so a stabilization evaluation never re-reads the answer.
@@ -11253,12 +12102,18 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const text = gate.text || snapshot.candidates[0] || '';
     if (!text) return { complete: false, reason: 'empty' };
 
-    // Response-action buttons are useful but not authoritative after reload:
-    // ChatGPT can lazy-render them. A structurally terminal audit handoff is
-    // sufficient when generation has stopped.
+    // A structurally terminal audit handoff is the authoritative completion
+    // signal and wins over platform recovery chrome. Otherwise a stale
+    // "Continue generating"/"Retry" button could keep an already-ready wave
+    // being extended instead of accepted.
     const hasUiFinality = assistantHasFinalActions(turn);
     const hasAuditFinality = gate.state !== 'unknown';
     if (!hasUiFinality && !hasAuditFinality) {
+      // Response-action buttons are useful but not authoritative after reload:
+      // ChatGPT can lazy-render them. Only real, actionable recovery controls
+      // are reported here; see findAssistantRecoveryControl.
+      if (assistantNeedsContinuation(turn)) return { complete: false, reason: 'continue-generating' };
+      if (assistantHasRetryError(turn)) return { complete: false, reason: 'retry-error' };
       return { complete: false, reason: 'no-finality-evidence' };
     }
 
@@ -11288,11 +12143,13 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   }
 
   function armFromCoreTurn(userTurn, options = {}) {
-    if (!userTurn || classifyAuditTurn(userTurn) !== 'core') return false;
+    if (!userTurn) return false;
+    const waveKind = classifyAuditTurn(userTurn);
+    if (!['core', 'architecture'].includes(waveKind) && findWaveDefinitionForStageOrKind(waveKind)?.ordinal !== 1) return false;
 
     // A CORE CONTINUE is same-wave recovery evidence, never a fresh audit root.
     // Treating it as a new Core after reload/COMPLETE resets runId/cache/project
-    // and can restart the entire 3-wave chain from a stale recovery message.
+    // and can restart the entire chain from a stale recovery message.
     if (auditTurnIsContinuation(userTurn)) return false;
 
     const turns = getChatGPTTurns();
@@ -11322,6 +12179,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         ? String(pendingStart?.runtime?.projectNameSource || 'artifact')
         : '';
 
+    const prof = getActiveProfile();
+    const firstWaveId = prof.waves[0]?.id || 'core';
+
+    autoRuntime.profileId = prof.profile_id || 'quick3';
     autoRuntime.projectName = selectedProjectName;
     autoRuntime.projectNameSource = selectedProjectSource;
     autoRuntime.renameAppliedName = '';
@@ -11329,12 +12190,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     autoRuntime.renamePersistedAt = 0;
     autoRuntime.renameAttemptName = '';
     autoRuntime.renameAttemptCount = 0;
-    autoRuntime.stage = 'wait-core';
+    autoRuntime.stage = waveWaitStage(firstWaveId);
     autoRuntime.conversationKey = currentConversationKey();
     autoRuntime.anchorUserId = getTurnId(userTurn);
     autoRuntime.coreUserId = autoRuntime.anchorUserId;
     autoRuntime.secondUserId = '';
     autoRuntime.performanceUserId = '';
+    setWaveUserId(firstWaveId, autoRuntime.anchorUserId);
+    setWaveUserId('core', autoRuntime.anchorUserId);
     autoRuntime.expectedKind = '';
     autoRuntime.runId = createAuditRunId();
     autoRuntime.startedAt = Date.now();
@@ -11355,7 +12218,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     if (startHandoffIsCommitted(pendingStart)) clearStartAuditHandoff();
 
-    setStatus(`Auto audit armed from the latest AUDIT CORE turn${autoRuntime.projectName ? ` for ${autoRuntime.projectName}` : ''}. Waiting for Core to finish before sending Second Wave.`, 'success');
+    setStatus(`Auto audit armed from the latest ${waveLabel(firstWaveId)} turn${autoRuntime.projectName ? ` for ${autoRuntime.projectName}` : ''}. Active profile: ${prof.display_name}.`, 'success');
     if (autoRuntime.projectName) {
       const renameContext = {
         source: 'artifact',
@@ -11940,7 +12803,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     const wave = {
       name: waveDef.title,
-      text: buildAuditWavePrompt(prof, waveDef),
+      text: buildAuditWavePrompt(prof, waveDef, { runId: autoRuntime?.runId || ensureAuditRunId() }),
       next: `await-${waveDef.id}-user`
     };
 
@@ -12106,26 +12969,39 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     const proof = responseGateFromAssistantTurn(waveWaitStage(kind), assistant);
     if (proof.state === 'blocked') {
-      pauseAutoAudit(
-        `The ${waveLabel(kind)} response reported BLOCKED. This is treated as a hard audit precondition failure rather than a normal unfinished wave.`
-      );
+      commitTerminalWaveResult(kind, proof.text || assistantTurnText(assistant), 'blocked', getTurnId(previous));
       return true;
     }
 
     if (proof.state === 'complete' && proof.text) {
-      if (captureCompletedAudit(kind, proof.text, 'complete', getTurnId(previous))) {
-        resetIdleStallWatch();
-        clearPendingSendReceipt({ save: false });
-        clearAutoComposerHold();
-        scheduleAutoAuditCheck(0);
+      const commitRes = commitTerminalWaveResult(kind, proof.text, 'complete', getTurnId(previous));
+      if (commitRes.ok) {
         return true;
       }
+      // Even if commit failed (integrity violation), stop sending CONTINUE.
+      // The wave claimed COMPLETE; infinite continuation won't fix broken structure.
+      pauseAutoAudit(
+        `${waveLabel(kind)} reported COMPLETE but failed integrity validation (${commitRes.reason || 'unknown'}). Auto stopped; fix the handoff structure manually or Reset.`
+      );
+      return true;
     }
 
     return false;
   }
 
   async function sendAutoAuditContinuation(kind, reason = 'partial') {
+    // Invariant: COMPLETE dominates continuation. If runtime is no longer in sending-continuation / wait-${kind},
+    // or if the wave already reached COMPLETE, abort immediately without touching composer.
+    if (!autoRuntime || !autoRuntime.enabled) return false;
+    if (autoRuntime.stage === 'complete' || autoRuntime.stage === 'paused') return false;
+    if (autoRuntime.stage.startsWith('sending-') && autoRuntime.stage !== 'sending-continuation') return false;
+    const currentActiveKind = activeWaveKind(autoRuntime.stage) || autoRuntime.continuationKind;
+    if (currentActiveKind && currentActiveKind !== kind) return false;
+    const existingResult = readAuditResult(kind);
+    if (existingResult?.text && existingResult?.gateState === 'complete') {
+      return false;
+    }
+
     const token = await verifyAutoLeaseForSend();
     if (!token) {
       refreshAutoRuntimeFromStorage();
@@ -12243,6 +13119,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       autoAuditNextTimer = 0;
       if (!autoRuntime?.enabled || autoRuntime.stage !== 'sending-continuation') return;
       if (autoRuntime.continuationKind !== kind) return;
+      const existingResult = readAuditResult(kind);
+      if (existingResult?.text && existingResult?.gateState === 'complete') return;
 
       const turns = getChatGPTTurns();
       const previousId = String(
@@ -12308,7 +13186,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       let anchorId = '';
       if (waveIndex > 0) {
         const prevWave = prof.waves[waveIndex - 1];
-        anchorId = waveUserId(prevWave.id);
+        anchorId = waveUserId(prevWave.id) || (prevWave.ordinal === 1 ? (autoRuntime.coreUserId || waveUserId('core')) : '');
       } else {
         anchorId = kind === 'second' ? autoRuntime.coreUserId : autoRuntime.secondUserId;
       }
@@ -12361,8 +13239,10 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     }
 
     if (latestAudit) {
-      const id = getTurnId(latestAudit);
       const kind = classifyAuditTurn(latestAudit);
+      const flow = auditUserFlowAfter(latestAudit, kind, turns);
+      const activeAnchor = flow?.expectedTurn || latestAudit;
+      const id = getTurnId(activeAnchor);
 
       if (!id) {
         setStatus(
@@ -12373,7 +13253,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         return true;
       }
 
-      if (resumeRuntimeFromAuditTurn(latestAudit, { turns })) {
+      if (resumeRuntimeFromAuditTurn(activeAnchor, { turns })) {
         backfillVisibleCompletedAuditResults();
         setStatus(
           `Auto reconciled enabled+READY state from the live ${waveLabel(kind)} lineage. Continuing automatically; no OFF/ON toggle or Resume is required.`,
@@ -12381,6 +13261,14 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         );
         return true;
       }
+    }
+
+    const composerSummary = chatGPTReadyAttachmentSummary();
+    const root = chatGPTComposerRoot();
+    const allTiles = root ? chatGPTComposerAttachmentTiles(root) : [];
+    if (composerSummary.ready || allTiles.length > 0) {
+      // User is preparing a brand-new audit in this chat! Do not adopt old completed records.
+      return false;
     }
 
     const coherentRecords = currentChatAuditRecords();
@@ -12490,6 +13378,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       }
 
       if (!ensureAutoConversation(turns)) return;
+      if (reconcilePrematureCampaignCompletion()) return;
 
       // Do this only after lease ownership/reload reconciliation. Standby tabs
       // must never rewrite shared runtime clocks merely because their own timer
@@ -12507,12 +13396,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
             scheduleAutoAuditCheck(800);
             return;
           }
-          if (latestUserId !== autoRuntime.seenUserId) {
+          if (latestUserId !== autoRuntime.seenUserId || latestUserId !== autoRuntime.coreUserId) {
             resetAutoAuditRuntime({ silent: true });
-            // The tab may have been frozen/offscreen until this new Core already
-            // finished. A fresh authored Core must still be adopted; completion
-            // is consumed by the normal wait-core gate on the next evaluation.
+            autoRuntime.enabled = true;
             armFromCoreTurn(latestUser, { allowCompleted: true });
+            return;
           }
         }
         return;
@@ -12718,22 +13606,22 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         return;
       }
 
-      if (assistantNeedsContinuation(assistant)) {
-        resetIdleStallWatch();
-        const handled = await autoClickAssistantRecovery(assistant, 'continue', currentWaveKind);
-        if (!handled && autoRuntime.stage !== 'paused') scheduleAutoAuditCheck(1000);
-        return;
-      }
-
-      if (assistantHasRetryError(assistant)) {
-        resetIdleStallWatch();
-        const handled = await autoClickAssistantRecovery(assistant, 'retry', currentWaveKind);
-        if (!handled && autoRuntime.stage !== 'paused') scheduleAutoAuditCheck(1500);
-        return;
-      }
-
       const final = completedAssistantCandidate(assistant, autoRuntime.stage);
       if (!final.complete) {
+        if (final.reason === 'continue-generating') {
+          resetIdleStallWatch();
+          const handled = await autoClickAssistantRecovery(assistant, 'continue', currentWaveKind);
+          if (!handled && autoRuntime.stage !== 'paused') scheduleAutoAuditCheck(1000);
+          return;
+        }
+
+        if (final.reason === 'retry-error') {
+          resetIdleStallWatch();
+          const handled = await autoClickAssistantRecovery(assistant, 'retry', currentWaveKind);
+          if (!handled && autoRuntime.stage !== 'paused') scheduleAutoAuditCheck(1500);
+          return;
+        }
+
         if (final.reason === 'stabilizing') return;
 
         await watchIdleAuditStall(currentWaveKind, assistant, final.reason || 'incomplete');
@@ -12747,8 +13635,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         ? final.gate
         : responseGateFromAssistantTurn(autoRuntime.stage, assistant).state;
       if (gate === 'blocked') {
-        resetIdleStallWatch();
-        pauseAutoAudit(`The ${waveLabel(activeWaveKind(autoRuntime.stage))} response reported BLOCKED. This is treated as a hard audit precondition failure rather than a normal unfinished wave.`);
+        commitTerminalWaveResult(currentWaveKind, final.text, 'blocked', waveUserId(currentWaveKind));
         return;
       }
 
@@ -12763,63 +13650,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         return;
       }
 
-      // Persist the final handoff before changing stage. DOM virtualization, reload,
-      // later continuations and sidebar churn can no longer make a completed audit
-      // disappear from one-click copy or optional disk output.
-      const capturedFinal = captureCompletedAudit(
+      commitTerminalWaveResult(
         currentWaveKind,
         final.text,
         gate,
         waveUserId(currentWaveKind)
       );
-      if (!capturedFinal) {
-        // The terminal handoff is visible but its durable cache commit failed or
-        // was fenced by a newer/reset lineage. Never advance to the next wave
-        // without the exact COMPLETE evidence that continuation/reload/save logic
-        // depends on. Stay on this wave and retry/reconcile instead.
-        setStatus(
-          `${waveLabel(currentWaveKind)} is COMPLETE in the conversation, but its durable handoff commit was not accepted. Auto3 is holding this wave and will retry/reconcile without sending the next wave.`,
-          'warning'
-        );
-        scheduleAutoAuditCheck(1200);
-        return;
-      }
-
-      const prof = getActiveProfile();
-      const currentWaveDef = findWaveDefinitionForStageOrKind(currentWaveKind);
-      const currentWaveIndex = (prof.waves || []).findIndex(w => w.id === (currentWaveDef?.id || currentWaveKind));
-      const nextWave = (currentWaveIndex >= 0 && currentWaveIndex < prof.waves.length - 1)
-        ? prof.waves[currentWaveIndex + 1]
-        : null;
-
-      if (nextWave) {
-        autoRuntime.continuationKind = '';
-        autoRuntime.continuationReason = '';
-        autoRuntime.continuationPreviousUserId = '';
-        clearStageAssistant({ save: false });
-        resetIdleStallWatch({ save: false });
-        autoRuntime.stage = `sending-${nextWave.id}`;
-        autoRuntime.currentWaveId = nextWave.id;
-        autoRuntime.currentWaveIndex = nextWave.ordinal;
-        autoRuntime.waitStartedAt = Date.now();
-        if (!saveAutoRuntime()) return;
-        scheduleNextWave(nextWave.id);
-        return;
-      }
-
-      clearAutoComposerHold();
-      autoRuntime.continuationKind = '';
-      autoRuntime.continuationReason = '';
-      autoRuntime.continuationPreviousUserId = '';
-      clearStageAssistant({ save: false });
-      resetIdleStallWatch({ save: false });
-      autoRuntime.stage = 'complete';
-      autoRuntime.completeAt = Date.now();
-      autoRuntime.waitStartedAt = 0;
-      autoRuntime.stableResponseKey = '';
-      autoRuntime.stableSince = 0;
-      if (!saveAutoRuntime()) return;
-      setStatus(`Auto audit campaign complete: all ${prof.waves.length} waves received final responses.`, 'success');
     } finally {
       autoAuditEvaluating = false;
     }
@@ -12869,40 +13705,51 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const id = getTurnId(userTurn);
     if (!kind || !stage || !id) return false;
 
-    // Rebuild only from the coherent newest audit lineage. The old implementation
-    // searched backward by type, so Core A -> Second A -> Core B -> Performance
-    // could incorrectly pair Performance with Second A/Core A and jump across the
-    // explicit Core B boundary.
+    const isContinuation = auditTurnIsContinuation(userTurn);
     const lineage = visibleAuditLineage(turns);
-    if (lineage.blockedByReset || lineage[kind] !== userTurn) return false;
+    if (lineage.blockedByReset) return false;
 
-    let coreUserId = '';
-    let secondUserId = '';
-    let performanceUserId = '';
+    const prof = getActiveProfile();
+    const waveDef = findWaveDefinitionForStageOrKind(kind);
+    if (!waveDef) return false;
 
-    if (kind === 'core') {
-      coreUserId = id;
-    } else if (kind === 'second') {
-      coreUserId = getTurnId(lineage.core);
-      if (!lineage.core || !coreUserId) return false;
-      secondUserId = id;
+    const waveRoot = lineage[waveDef.id];
+    if (!waveRoot) return false;
+
+    if (isContinuation) {
+      // Continuation: prove it belongs strictly after the established wave root
+      const rootIndex = turns.indexOf(waveRoot);
+      const contIndex = turns.indexOf(userTurn);
+      if (rootIndex < 0 || contIndex <= rootIndex) return false;
+
+      // Prove no conflicting audit command of a DIFFERENT wave kind crossed between root and continuation
+      for (let i = rootIndex + 1; i < contIndex; i += 1) {
+        const midTurn = turns[i];
+        if (turnRole(midTurn) === 'user') {
+          const midKind = classifyAuditTurn(midTurn);
+          if (midKind && midKind !== kind) return false;
+        }
+      }
     } else {
-      coreUserId = getTurnId(lineage.core);
-      secondUserId = getTurnId(lineage.second);
-      if (!lineage.core || !lineage.second || !coreUserId || !secondUserId) return false;
-      performanceUserId = id;
+      if (waveRoot !== userTurn) return false;
     }
 
-    // Validation above is side-effect-free. Commit one complete rebuilt runtime only
-    // after the whole lineage is known to be valid. Same-wave CONTINUE commands are
-    // new user-turn anchors but not new audit runs, so preserve run identity when
-    // the persisted runtime was already working that same wave.
+    // Verify all dependency wave roots exist
+    for (const depId of (waveDef.depends_on || [])) {
+      if (!lineage[depId] || !getTurnId(lineage[depId])) return false;
+    }
+
+    const firstWaveId = prof.waves[0]?.id || 'core';
+    const coreUserId = getTurnId(lineage.core || lineage[firstWaveId] || (kind === 'core' ? userTurn : null));
+    const secondUserId = getTurnId(lineage.second);
+    const performanceUserId = getTurnId(lineage.performance);
+
     const runtimeWaveKind = activeWaveKind(autoRuntime.stage) ||
       auditKindForStage(autoRuntime.pausedFromStage) ||
       String(autoRuntime.continuationKind || '');
     const continuingCurrentRun = Boolean(
       autoRuntime.runId &&
-      auditTurnIsContinuation(userTurn) &&
+      isContinuation &&
       runtimeWaveKind === kind
     );
     const sameRuntimeLineage = Boolean(
@@ -12913,7 +13760,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       )
     );
 
-    const inferredProjectName = sanitizeProjectIdentity(projectNameFromCoreTurn(lineage.core));
+    const inferredProjectName = sanitizeProjectIdentity(projectNameFromCoreTurn(lineage.core || lineage[firstWaveId]));
     const previousProjectName = sanitizeProjectIdentity(autoRuntime.projectName || '');
     const lineageProjectName = sameRuntimeLineage
       ? (inferredProjectName || previousProjectName)
@@ -12951,10 +13798,24 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       renameAttemptName: (!sameRuntimeLineage || projectChanged) ? '' : autoRuntime.renameAttemptName,
       renameAttemptCount: (!sameRuntimeLineage || projectChanged) ? 0 : autoRuntime.renameAttemptCount,
       stage,
-      coreUserId,
-      secondUserId,
-      performanceUserId
+      coreUserId: getTurnId(lineage.core) || (kind === 'core' ? id : coreUserId),
+      secondUserId: getTurnId(lineage.second) || (kind === 'second' ? id : secondUserId),
+      performanceUserId: getTurnId(lineage.performance) || (kind === 'performance' ? id : performanceUserId)
     };
+
+    if (!nextRuntime.waveUserIds || typeof nextRuntime.waveUserIds !== 'object') nextRuntime.waveUserIds = {};
+    nextRuntime.waveUserIds[waveDef.id] = id;
+    if (!nextRuntime.waveAnchors || typeof nextRuntime.waveAnchors !== 'object') nextRuntime.waveAnchors = {};
+    const priorContCount = isContinuation ? (Number(nextRuntime.waveAnchors[waveDef.id]?.continuationCount || 0) + 1) : 0;
+    nextRuntime.waveAnchors[waveDef.id] = {
+      rootUserId: getTurnId(waveRoot) || id,
+      activeUserId: id,
+      continuationCount: priorContCount,
+      status: 'active'
+    };
+    if (waveDef.id === 'core') nextRuntime.coreUserId = id;
+    if (waveDef.id === 'second') nextRuntime.secondUserId = id;
+    if (waveDef.id === 'performance') nextRuntime.performanceUserId = id;
 
     clearAutoTimers();
     autoRuntime = nextRuntime;
@@ -12983,13 +13844,15 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       scheduleConversationTitleGuard(autoRuntime.projectName, renameContext);
     }
 
-    const assistant = assistantTurnAfter(userTurn, turns);
+    const assistant = auditAssistantAcrossSupplementals(userTurn, kind, turns) ||
+      assistantTurnAfter(userTurn, turns);
     const proof = assistant ? responseGateFromAssistantTurn(stage, assistant) : { state: 'unknown', sourceCount: 0 };
 
-    if (proof.state === 'complete') {
-      setStatus(`Resume rebuilt the ${kind === 'core' ? 'Core' : kind === 'second' ? 'Second Wave' : 'Performance'} lineage atomically and found a COMPLETE handoff across ${proof.sourceCount || 1} response surface(s).`, 'success');
+    if (proof.state === 'complete' && proof.text) {
+      commitTerminalWaveResult(kind, proof.text, 'complete', id);
+      setStatus(`Resume rebuilt the ${waveLabel(kind)} lineage atomically and found a COMPLETE handoff across ${proof.sourceCount || 1} response surface(s).`, 'success');
     } else {
-      setStatus(`Resume rebuilt the current ${kind === 'core' ? 'Core' : kind === 'second' ? 'Second Wave' : 'Performance'} lineage atomically. Waiting for verifiable completion.`, 'success');
+      setStatus(`Resume rebuilt the current ${waveLabel(kind)} lineage atomically. Waiting for verifiable completion.`, 'success');
     }
 
     scheduleAutoAuditCheck(0);
@@ -13335,10 +14198,13 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   function autoAuditObserverConfig() {
     if (detectSite().key !== 'chatgpt') return null;
     if (!autoRuntime?.enabled) return 'nav';
-    return ['wait-core', 'wait-second', 'wait-performance',
+    const stage = String(autoRuntime.stage || 'idle');
+    const genericWaveStage = /^(?:wait|sending|await)-/.test(stage) &&
+      Boolean(findWaveDefinitionForStageOrKind(autoRuntime.currentWaveId || stage));
+    return (genericWaveStage || ['wait-core', 'wait-second', 'wait-performance',
       'sending-second', 'sending-performance', 'sending-continuation',
       'await-second-user', 'await-performance-user', 'await-continuation-user'
-    ].includes(autoRuntime.stage)
+    ].includes(stage))
       ? 'stream'
       : 'turns';
   }
@@ -13574,7 +14440,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
 
     if (next) {
       writeA3Intent(true, autoRuntime.conversationKey, {
-        startTransaction: Boolean(startHandoffIsCommitted(readStartAuditHandoff()))
+        startTransaction: Boolean(startHandoffOwnsA3Intent(readStartAuditHandoff()))
       });
     } else {
       clearA3Intent();
@@ -13612,6 +14478,63 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (autoRuntime.stage === 'idle') {
       setStatus('Auto 3 waves enabled for this chat. No resumable audit lineage is currently proven; waiting for Audit Core.', 'success');
     }
+  }
+
+  function setAuditProfile(nextProfileId, source = 'UI') {
+    const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    const next = String(nextProfileId || '');
+    if (!profiles[next]) return false;
+
+    bindAutoRuntimeToCurrentConversation({ claim: false });
+    const current = String(getActiveProfile()?.profile_id || state?.auditProfile || 'quick3');
+    if (next === current) {
+      renderAutoAuditState();
+      return true;
+    }
+
+    const stage = String(autoRuntime?.stage || 'idle');
+    if (!['idle', 'complete'].includes(stage)) {
+      setStatus(
+        `Profile switch blocked while ${current} is in ${stage}. Pause/Reset that run first so wave definitions cannot cross.`,
+        'warning'
+      );
+      renderAutoAuditState();
+      return false;
+    }
+
+    const previousStateProfile = String(state.auditProfile || current);
+    if (!commitStateMutation(
+      () => { state.auditProfile = next; },
+      'Profile could not be persisted; the previous profile remains active.'
+    )) return false;
+
+    const hadCompletedLineage = stage === 'complete' || currentChatAuditRecords().length > 0;
+    if (hadCompletedLineage) {
+      if (!resetAutoAuditRuntime({ silent: true, profileId: next })) {
+        commitStateMutation(() => { state.auditProfile = previousStateProfile; }, 'Profile rollback could not be persisted.');
+        if (autoRuntime) autoRuntime.profileId = current;
+        renderAutoAuditState();
+        return false;
+      }
+    } else if (autoRuntime) {
+      autoRuntime.profileId = next;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        autoRuntime.profileId = current;
+        commitStateMutation(() => { state.auditProfile = previousStateProfile; }, 'Profile rollback could not be persisted.');
+        renderAutoAuditState();
+        return false;
+      }
+    }
+
+    renderAutoAuditState();
+    renderAuditQuickActions();
+    setStatus(
+      hadCompletedLineage
+        ? `${profiles[next].display_name} selected from ${source}. Previous campaign progress was fenced as stale; attach the archive and press START.`
+        : `${profiles[next].display_name} selected from ${source}.`,
+      hadCompletedLineage ? 'warning' : 'success'
+    );
+    return true;
   }
 
   function renderConfirm() {
@@ -13949,30 +14872,43 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       openNewChatFromWidget();
     });
 
-    panel.querySelector('#acb-super-toggle').addEventListener('click', () => {
-      const next = !state.superCompact;
-      if (!commitStateMutation(
-        () => {
-          state.superCompact = next;
-          if (next) state.collapsed = false;
-        },
-        'Super compact display mode could not be persisted; the previous display state was restored.'
-      )) return;
-
+    panel.querySelector('#acb-settings-btn').addEventListener('click', () => {
+      if (state.superCompact) {
+        if (!commitStateMutation(
+          () => {
+            state.superCompact = false;
+            state.collapsed = false;
+          },
+          'Display state could not be persisted; the previous state was restored.'
+        )) return;
+        activeView = 'settings';
+        renderTabs();
+      } else {
+        if (!commitStateMutation(
+          () => { state.superCompact = true; },
+          'Display state could not be persisted; the previous state was restored.'
+        )) return;
+      }
       clampPanelPosition({ report: true });
       renderAutoAuditState();
-
-      if (!next) {
-        setStatus('Full widget restored.', 'success');
-      }
     });
 
     panel.querySelector('#acb-collapse').addEventListener('click', () => {
+      if (!state.superCompact) {
+        if (!commitStateMutation(
+          () => {
+            state.superCompact = true;
+            state.collapsed = false;
+          },
+          'Display state could not be persisted; the previous state was restored.'
+        )) return;
+        clampPanelPosition({ report: true });
+        renderAutoAuditState();
+        setStatus('Back to mini.', 'info');
+        return;
+      }
       if (!commitStateMutation(
-        () => {
-          state.superCompact = false;
-          state.collapsed = !state.collapsed;
-        },
+        () => { state.collapsed = !state.collapsed; },
         'Collapse state could not be persisted; the previous display state was restored.'
       )) return;
       clampPanelPosition({ report: true });
@@ -14039,13 +14975,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     const toggleAuditProfile = () => {
       const currentProf = getActiveProfile();
       const nextProfId = currentProf.profile_id === 'super10' ? 'quick3' : 'super10';
-      if (!commitStateMutation(() => {
-        state.auditProfile = nextProfId;
-        if (autoRuntime) autoRuntime.profileId = nextProfId;
-      }, 'Profile could not be persisted')) return;
-      renderAutoAuditState();
-      renderAuditQuickActions();
-      setStatus(`Audit campaign profile switched to ${getActiveProfile().display_name}.`, 'success');
+      setAuditProfile(nextProfId, 'profile toggle');
     };
 
     const profileToggle = panel.querySelector('#acb-profile-toggle');
@@ -14057,13 +14987,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
     if (profileSelect) {
       profileSelect.addEventListener('change', event => {
         const nextProfId = event.target.value;
-        if (!commitStateMutation(() => {
-          state.auditProfile = nextProfId;
-          if (autoRuntime) autoRuntime.profileId = nextProfId;
-        }, 'Profile could not be persisted')) return;
-        renderAutoAuditState();
-        renderAuditQuickActions();
-        setStatus(`Audit campaign profile set to ${getActiveProfile().display_name}.`, 'success');
+        setAuditProfile(nextProfId, 'settings');
       });
     }
 
@@ -14266,11 +15190,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
       }
     });
 
-    panel.querySelector('#acb-choose-audit-folder').addEventListener('click', () => {
+    panel.querySelector('#acb-choose-audit-folder')?.addEventListener('click', () => {
       chooseAuditOutputFolder().catch(error => setStatus(`Audit folder selection failed: ${error?.message || 'unexpected error'}.`, 'error'));
     });
 
-    panel.querySelector('#acb-flush-audit-files').addEventListener('click', () => {
+    panel.querySelector('#acb-flush-audit-files')?.addEventListener('click', () => {
       flushCurrentAuditResultsToFolder({ force: true })
         .then(result => {
           if (!result.ready) {
@@ -14670,7 +15594,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         </div>
 
         <button id="acb-new-chat" type="button" title="New Chat (switches this tab to a fresh new chat without spawning new tabs)">+</button>
-        <button id="acb-super-toggle" type="button" aria-pressed="false" title="Switch to the one-line Auto3 monitor">Mini</button>
+        <button id="acb-settings-btn" type="button" aria-pressed="false" title="Open widget settings">SET</button>
         <button id="acb-collapse" type="button" aria-expanded="true" title="Collapse the widget to the title bar">Collapse</button>
       </div>
 
@@ -14698,6 +15622,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
               <button id="acb-save-now" type="button" data-state="idle" title="SYNC/SAVE current chat: persist runtime, rescan COMPLETE waves, force-confirm disk output, and refresh campaign files when possible.">SAVE</button>
             </div>
             <div id="acb-audit-copy-hint">Attach project + START = arm Auto campaign automatically · normal chat stays inert · every COMPLETE is saved.</div>
+            <div id="acb-archive-state" data-freshness="none">Archive: none attached to this audit.</div>
           </div>
 
           <div id="acb-audit-quick">
@@ -14882,15 +15807,6 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
               <button id="acb-bridge-retry-queue" type="button" title="Retry all failed audit save jobs immediately.">Retry queue</button>
             </div>
             <div id="acb-bridge-state" data-state="warning" title="Click to clear or retry failed jobs">UNKNOWN · queued 0 · failed 0</div>
-
-            <div id="acb-browser-fallback">
-              <div class="acb-section-note">Optional browser-folder fallback. Used only when AUDAPACK Bridge is disabled.</div>
-              <div id="acb-fallback-output-controls">
-                <button id="acb-choose-audit-folder" type="button" title="Optional File System Access fallback.">Choose fallback folder</button>
-                <button id="acb-flush-audit-files" type="button" title="Write cached results through the browser folder fallback.">Save cached via fallback</button>
-              </div>
-              <div id="acb-audit-folder-state" data-state="warning">Fallback folder not checked yet.</div>
-            </div>
           </div>
 
           <div class="acb-section">
@@ -14997,6 +15913,17 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
   window.addEventListener('beforeunload', releasePageAutomationOwnership);
 
   function init() {
+    if (!composerFileCaptureInstalled) {
+      composerFileCaptureInstalled = true;
+      document.addEventListener('change', event => {
+        const input = event?.target;
+        if (!input?.matches?.('input[type="file"]')) return;
+        const root = chatGPTComposerRoot();
+        if (!root || !root.contains(input)) return;
+        rememberChatGPTComposerFiles(input);
+        setTimeout(() => renderAutoAuditState(), 0);
+      }, true);
+    }
     armWidgetBootstrap();
   }
 
@@ -15026,6 +15953,9 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
           gmDelete: GM_deleteValue
         },
         get autoRuntime() { return autoRuntime; },
+        set autoRuntime(val) { autoRuntime = val; },
+        get state() { return state; },
+        set state(val) { state = val; },
         get autoBoundConversationKey() { return autoBoundConversationKey; },
         get autoInstanceId() { return autoInstanceId; },
         classifyAuditMessage,
@@ -15072,6 +16002,11 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         auditHandoffIntegrity,
         concreteHandoffState,
         responseGate,
+        auditGateSpec,
+        auditIntegritySpec,
+        auditTerminalStatusPattern,
+        findWaveDefinitionForStageOrKind,
+        commitTerminalWaveResult,
         auditTestMetadata,
         parseAuditHandoffParts,
         buildCompactAll3Text,
@@ -15086,6 +16021,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         syncSaveCurrentChatStateNow,
         setAuditAutoSaveEnabled,
         autoProgressSnapshot,
+        superCompactAutoLabel,
         userTurnTextCandidates,
         latestChatGPTAssistantTurn,
         latestRecognizableAuditUserTurn,
@@ -15097,6 +16033,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         buildAssistantSnapshot,
         completedAssistantCandidate,
         setAutoAuditEnabled,
+        setAuditProfile,
         findAssistantRecoveryControl,
         isAuthoredAssistantContent,
         assistantNeedsContinuation,
@@ -15124,8 +16061,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         chatGPTSendAccepted,
         clickChatGPTSendVerified,
         chatGPTComposerAttachmentTiles,
+        chatGPTProjectComposerAttachments,
         chatGPTReadyComposerAttachments,
         chatGPTReadyAttachmentSummary,
+        archiveTimestampFromFilename,
+        composerArchiveFreshness,
+        currentAuditArchiveFreshness,
         composerAttachmentSignature,
         mutationTargetsOwnWidget,
         externalMutationRecords,
@@ -15141,6 +16082,7 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         markStartAuditHandoffClicking,
         startHandoffIsPrepared,
         startHandoffIsCommitted,
+        startHandoffOwnsA3Intent,
         startHandoffRouteProven,
         markStartAuditHandoffSent,
         runtimeIsBlankDisabled,
@@ -15181,6 +16123,8 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         findTurnById,
         stageForAuditKind,
         reconcileExecutionGap,
+        campaignCompletionSnapshot,
+        reconcilePrematureCampaignCompletion,
         loadLegacyAutoRuntimeForCurrentConversation,
         readStoredRuntime,
         loadAutoRuntime,
@@ -15212,6 +16156,12 @@ P2 = lower-impact defect, concrete maintainability drift likely to cause failure
         getActiveProfile,
         findWaveDefinitionForStageOrKind,
         buildAuditWavePrompt,
+        commitTerminalWaveResult,
+        visibleAuditLineage,
+        writeAuditResult,
+        readAuditResult,
+        clearAuditResultsForConversation,
+        setWaveUserId,
         EMBEDDED_AUDIT_PROFILES,
         AUDIT_PROFILES_MANIFEST_SHA256,
         setStatus

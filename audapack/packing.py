@@ -7,6 +7,7 @@ Zip64 support, and optional manifest generation.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,8 @@ from audapack.config import (
     OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
     OUTPUT_LAYOUT_GROUPED_BY_PRIORITY,
     PackingConfig,
+    cross_process_lock,
+    get_state_dir,
     normalize_output_layout,
 )
 from audapack.models import PackResult, Project
@@ -52,19 +55,15 @@ class PackingCancelled(Exception):
     pass
 
 
-# Per-(output_dir, stem) locks so concurrent same-target retention cannot delete
-# each other's archives (CORE-005).
-_RETENTION_LOCKS: dict[str, threading.Lock] = {}
-_RETENTION_LOCKS_GUARD = threading.Lock()
-
-
-def _retention_lock(key: str) -> threading.Lock:
-    with _RETENTION_LOCKS_GUARD:
-        lock = _RETENTION_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _RETENTION_LOCKS[key] = lock
-        return lock
+# CORE-001: full-transaction cross-process locks keyed by (output_dir, stem).
+# Replaces the previous retention-only in-process lock so a failing pack can
+# never delete or restore over output produced by another successful concurrent
+# transaction. The lock file lives under the canonical state directory so all
+# processes sharing the runtime coordinate on the same primitive.
+def _pack_transaction_lock_path(output_dir: Path, stem: str) -> Path:
+    key = f"{Path(output_dir).resolve()}|{safe_archive_stem(stem)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return get_state_dir() / "pack_locks" / f"pack_{digest}.lock"
 
 
 def safe_archive_stem(name: str) -> str:
@@ -74,29 +73,73 @@ def safe_archive_stem(name: str) -> str:
     return name or "Archive"
 
 
+# Timestamped-history form: {stem}_DD.MM.YY-THH-MM-SS.zip or legacy DD-MM-YYYY variant
+# Anchored so a sibling project named "{stem}_Bar" can never match "{stem}".
+_ARCHIVE_HISTORY_RE = re.compile(r"^\d{2}[.\-]\d{2}[.\-]\d{2,4}-T\d{2}-\d{2}-\d{2}(?:-\d{6})?(?:-\d+)?\.zip$")
+
+
+def archive_belongs_to_stem(filename: str, stem: str) -> bool:
+    """True when ``filename`` is a canonical archive for ``stem``.
+
+    Accepts the clean ``{stem}.zip`` and the anchored timestamped history form
+    ``{stem}_DD.MM.YY-THH-MM-SS.zip``. A name like ``Foo_Bar_27.08.26-T00-00-00.zip``
+    does NOT belong to ``Foo`` — prefix sharing must never cross project boundaries.
+    """
+    safe_stem = safe_archive_stem(stem)
+    if not safe_stem:
+        return False
+    name = filename
+    if name == f"{safe_stem}.zip":
+        return True
+    if name.startswith(f"{safe_stem}_"):
+        return bool(_ARCHIVE_HISTORY_RE.match(name[len(safe_stem) + 1:]))
+    return False
+
+
 def human_mb(value: int) -> str:
-    return f"{value / (1024 * 1024):.1f} MB"
+    """Format a byte count with the largest useful binary unit.
+
+    Keep the historical function name because it is used by the UI and pack
+    status paths, but do not force sub-megabyte archives to display as 0.0 MB.
+    """
+    size = max(0, int(value))
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    unit_index = 0
+    while amount >= 1024 and unit_index < len(units) - 1:
+        amount /= 1024
+        unit_index += 1
+
+    if unit_index == 0:
+        return f"{size} B"
+    return f"{amount:.1f} {units[unit_index]}"
+
+
+def _build_exclusion_matcher(patterns: set[str]):
+    lowered = frozenset(pat.lower() for pat in patterns)
+    exact = {pat for pat in lowered if not any(char in pat for char in "*?[")}
+    globs = tuple(re.compile(fnmatch.translate(pat)) for pat in lowered if pat not in exact)
+
+    def matches(path: Path | str) -> bool:
+        p = path if isinstance(path, Path) else Path(path)
+        parts = tuple(part.lower() for part in p.parts)
+        for part in (p.name.lower(), *parts):
+            if part in exact or any(pattern.fullmatch(part) for pattern in globs):
+                return True
+        return False
+
+    return matches
+
+
+def _path_is_excluded_normalized(path: Path | str, lowered: set[str]) -> bool:
+    if callable(lowered):
+        return bool(lowered(path))
+    return _build_exclusion_matcher(lowered)(path)
 
 
 def path_is_excluded(path: Path | str, patterns: set[str]) -> bool:
-    # Perf: lower patterns once per invocation instead of per-file*patterns (400 files * 40 patterns = 16k lowers).
-    p = path if isinstance(path, Path) else Path(path)
-    name = p.name.lower()
-    lowered = {pat.lower() for pat in patterns}
-    if name in lowered:
-        return True
-    for pat in lowered:
-        if fnmatch.fnmatchcase(name, pat):
-            return True
-    # Check path parts for directory excludes (__pycache__, .git etc.)
-    parts = [part.lower() for part in p.parts]
-    for part_lower in parts:
-        if part_lower in lowered:
-            return True
-        for pat in lowered:
-            if fnmatch.fnmatchcase(part_lower, pat):
-                return True
-    return False
+    """Checks path using case-insensitive exact and fnmatch exclusions."""
+    return _path_is_excluded_normalized(path, {pat.lower() for pat in patterns})
 
 
 def generate_manifest_data(
@@ -152,6 +195,7 @@ def create_zip(
 
     # Enforce mandatory excludes regardless of user config.
     excludes = set(excludes) | MANDATORY_EXCLUDES
+    normalized_excludes = _build_exclusion_matcher(excludes)
 
     log = log_callback or (lambda msg: None)
     prog = progress_callback or (lambda added, b_written, cur_path: None)
@@ -199,7 +243,7 @@ def create_zip(
                     dirs[:] = [
                         d for d in dirs
                         if not (Path(root) / d).is_symlink()
-                        and not path_is_excluded(Path(root) / d, excludes)
+                        and not _path_is_excluded_normalized(Path(root) / d, normalized_excludes)
                     ]
 
                     for filename in files:
@@ -213,7 +257,7 @@ def create_zip(
                             skipped += 1
                             log(f"! symlink skipped (link target excluded): {file_path}")
                             continue
-                        if path_is_excluded(file_path, excludes):
+                        if _path_is_excluded_normalized(file_path, normalized_excludes):
                             continue
 
                         try:
@@ -303,7 +347,7 @@ def delete_old_archives(output_dir: Path, stem: str, current_zip: Path, log_cb: 
             p for p in output_dir.iterdir()
             if p.is_file()
             and p.suffix.lower() == ".zip"
-            and (p.name == f"{stem}.zip" or p.name.startswith(f"{stem}_"))
+            and archive_belongs_to_stem(p.name, stem)
         )
         for old in old_candidates:
             if old.resolve() == current_zip.resolve():
@@ -320,50 +364,49 @@ def delete_old_archives(output_dir: Path, stem: str, current_zip: Path, log_cb: 
     return removed, remove_errors
 
 
-def find_latest_archive(output_dir: Path, stem: str) -> Optional[Path]:
-    """Returns the most recently modified ZIP archive for ``stem``.
+_ARCHIVE_DIRECTORY_INDEX: dict[str, tuple[int, int, list[tuple[float, str]]]] = {}
 
-    Matches the clean ``{stem}.zip`` form and the legacy ``{stem}_*.zip``
-    timestamped form (mirrors ``pack_single`` behaviour). Returns ``None`` if no
-    archive exists or the output directory is missing.
-    """
+
+def _archive_directory_index(output_dir: Path) -> list[tuple[float, str]]:
     if not output_dir or not output_dir.exists() or not output_dir.is_dir():
-        return None
-    safe_stem = safe_archive_stem(stem)
-    candidates: list[tuple[float, str]] = []
-    clean_name = f"{safe_stem}.zip"
-    prefix_name = f"{safe_stem}_"
+        return []
     try:
+        stat = output_dir.stat()
+        key = str(output_dir.resolve())
+        signature = (stat.st_mtime_ns, stat.st_size)
+        cached = _ARCHIVE_DIRECTORY_INDEX.get(key)
+        if cached and cached[:2] == signature:
+            return cached[2]
+        candidates: list[tuple[float, str]] = []
         with os.scandir(output_dir) as it:
             for entry in it:
                 if entry.is_file() and entry.name.lower().endswith(".zip"):
-                    name = entry.name
-                    if name == clean_name or name.startswith(prefix_name):
-                        candidates.append((entry.stat().st_mtime, entry.path))
+                    candidates.append((entry.stat().st_mtime, entry.path))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _ARCHIVE_DIRECTORY_INDEX[key] = (signature[0], signature[1], candidates)
+        return candidates
     except OSError:
-        return None
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return Path(candidates[0][1])
+        return []
+
+
+def find_latest_archive(output_dir: Path, stem: str) -> Optional[Path]:
+    """Returns most recently modified ZIP archive for ``stem``."""
+    safe_stem = safe_archive_stem(stem)
+    for _mtime, path in _archive_directory_index(output_dir):
+        if archive_belongs_to_stem(Path(path).name, safe_stem):
+            return Path(path)
+    return None
 
 
 def find_archive_for_project(project: "Project", output_dir: Path) -> Optional[Path]:
-    """Resolve the latest archive for a registered project (by archive_name / display_name / id)."""
-    candidates = [
-        project.archive_name,
-        project.display_name,
-        project.id,
-    ]
-    seen: set[str] = set()
-    for stem in candidates:
-        s = safe_archive_stem(stem or "")
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        latest = find_latest_archive(output_dir, s)
-        if latest:
-            return latest
+    """Resolve latest archive for registered project using one directory index."""
+    stems = {safe_archive_stem(stem or "") for stem in (
+        project.archive_name, project.display_name, project.id
+    )}
+    stems.discard("")
+    for _mtime, path in _archive_directory_index(output_dir):
+        if any(archive_belongs_to_stem(Path(path).name, stem) for stem in stems):
+            return Path(path)
     return None
 
 
@@ -447,6 +490,10 @@ def pack_single(
     if use_ts:
         run_stamp = datetime.now().strftime("%d.%m.%y-T%H-%M-%S")
         output_path = output_dir / f"{stem}_{run_stamp}.zip"
+        suffix = 1
+        while output_path.exists():
+            output_path = output_dir / f"{stem}_{run_stamp}-{suffix}.zip"
+            suffix += 1
     else:
         output_path = output_dir / f"{stem}.zip"
 
@@ -473,112 +520,143 @@ def pack_single(
             error_message=f"Source does not exist: {source}",
         )
 
-    # W2-001: back up any existing complete archive before overwriting so a
-    # partial/failed run can never destroy the last good backup. The diagnostic
-    # name uses a dot (not underscore) after the stem so retention globbing
-    # (`{stem}_*`) never touches it.
-    backup_path = None
-    if delete_old and output_path.exists():
-        backup_path = output_path.with_name(f"{stem}.bak.{uuid.uuid4().hex}.zip")
-        try:
-            output_path.replace(backup_path)
-        except OSError:
-            backup_path = None
-
+    # CORE-001: serialize the entire same-target transaction (filename
+    # selection, backup, archive creation + atomic replace, verification,
+    # retention, backup cleanup, and rollback) under a cross-process lock
+    # keyed by the resolved output directory + output stem. Reusing the
+    # existing cross-process locking primitive ensures all processes sharing
+    # this state dir coordinate on the same owner, and rollback ownership
+    # stays local to the transaction so a failure can never unlink or
+    # restore over output produced by another successful transaction.
+    tx_lock_path = _pack_transaction_lock_path(output_dir, stem)
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        added, raw_bytes, skipped, walk_errors = create_zip(
-            source,
-            output_path,
-            excludes,
-            cancel_event=cancel_event,
-            log_callback=log,
-            progress_callback=progress_callback,
-            manifest_meta=manifest_meta,
-        )
-        entries = verify_zip(output_path, added)
-        size_bytes = output_path.stat().st_size
+        with cross_process_lock(tx_lock_path):
+            # Re-evaluate timestamp collision under the lock so two packs
+            # inside the same second never pick the same numeric suffix
+            # loop and overwrite each other.
+            if use_ts:
+                suffix = 1
+                while output_path.exists():
+                    output_path = output_dir / f"{stem}_{run_stamp}-{suffix}.zip"
+                    suffix += 1
 
-        # W2-001: a partial archive (skipped files or traversal errors) must not
-        # be reported as a complete, successful pack, and must never delete the
-        # previous good archive.
-        partial = skipped > 0 or walk_errors > 0
-        if partial:
-            diag = output_path.with_name(f"{stem}.PARTIAL.{uuid.uuid4().hex}.zip")
-            try:
-                output_path.replace(diag)
-            except OSError:
-                pass
-            if backup_path and backup_path.exists():
+            # W2-001: back up any existing complete archive before overwriting so a
+            # partial/failed run can never destroy the last good backup. The diagnostic
+            # name uses a dot (not underscore) after the stem so retention globbing
+            # (`{stem}_*`) never touches it.
+            backup_path = None
+            if delete_old and output_path.exists():
+                backup_path = output_path.with_name(f"{stem}.bak.{uuid.uuid4().hex}.zip")
                 try:
-                    backup_path.replace(output_path)  # restore previous good
+                    output_path.replace(backup_path)
                 except OSError:
-                    pass
-            return PackResult(
-                project_id=stem,
-                name=stem,
-                source_path=str(source),
-                output_path=diag if diag.exists() else output_path,
-                success=False,
-                error_message=(
-                    f"Partial archive: {skipped} file(s) skipped, {walk_errors} walk error(s). "
-                    f"Previous complete archive preserved."
-                ),
-                files_added=entries,
-                raw_bytes=raw_bytes,
-                archive_bytes=size_bytes,
-                skipped_files=skipped,
-                walk_errors=walk_errors,
-            )
+                    backup_path = None
 
-        if delete_old:
-            # CORE-005: serialize retention for the same target so concurrent
-            # packs cannot delete each other's freshly written archives.
-            retention_key = f"{Path(output_dir).resolve()}:{stem}"
-            with _retention_lock(retention_key):
-                delete_old_archives(output_dir, stem, output_path, log)
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                added, raw_bytes, skipped, walk_errors = create_zip(
+                    source,
+                    output_path,
+                    excludes,
+                    cancel_event=cancel_event,
+                    log_callback=log,
+                    progress_callback=progress_callback,
+                    manifest_meta=manifest_meta,
+                )
+                entries = verify_zip(output_path, added)
+                size_bytes = output_path.stat().st_size
 
-        if backup_path and backup_path.exists():
-            try:
-                backup_path.unlink()
-            except OSError:
-                pass
+                # W2-001: a partial archive (skipped files or traversal errors) must not
+                # be reported as a complete, successful pack, and must never delete the
+                # previous good archive.
+                partial = skipped > 0 or walk_errors > 0
+                if partial:
+                    diag = output_path.with_name(f"{stem}.PARTIAL.{uuid.uuid4().hex}.zip")
+                    try:
+                        output_path.replace(diag)
+                    except OSError:
+                        pass
+                    if backup_path and backup_path.exists():
+                        try:
+                            backup_path.replace(output_path)  # restore previous good
+                        except OSError:
+                            pass
+                    return PackResult(
+                        project_id=stem,
+                        name=stem,
+                        source_path=str(source),
+                        output_path=diag if diag.exists() else output_path,
+                        success=False,
+                        error_message=(
+                            f"Partial archive: {skipped} file(s) skipped, {walk_errors} walk error(s). "
+                            f"Previous complete archive preserved."
+                        ),
+                        files_added=entries,
+                        raw_bytes=raw_bytes,
+                        archive_bytes=size_bytes,
+                        skipped_files=skipped,
+                        walk_errors=walk_errors,
+                    )
 
-        log(f"OK {output_path.name}: {entries} files, {human_mb(raw_bytes)} -> {human_mb(size_bytes)}")
-        return PackResult(
-            project_id=stem,
-            name=stem,
-            source_path=str(source),
-            output_path=output_path,
-            success=True,
-            files_added=entries,
-            raw_bytes=raw_bytes,
-            archive_bytes=size_bytes,
-            skipped_files=skipped,
-            walk_errors=walk_errors,
-        )
-    except Exception as exc:
-        # Restore previous good archive on failure (do not leave a broken/empty file).
-        if backup_path and backup_path.exists() and not output_path.exists():
-            try:
-                backup_path.replace(output_path)
-            except OSError:
-                pass
-        elif backup_path and backup_path.exists():
-            try:
-                backup_path.unlink()
-            except OSError:
-                pass
-        if output_path.exists():
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-        log(f"FAIL {stem}: {exc}")
+                if delete_old:
+                    delete_old_archives(output_dir, stem, output_path, log)
+
+                if backup_path and backup_path.exists():
+                    try:
+                        backup_path.unlink()
+                    except OSError:
+                        pass
+
+                log(f"OK {output_path.name}: {entries} files, {human_mb(raw_bytes)} -> {human_mb(size_bytes)}")
+                return PackResult(
+                    project_id=stem,
+                    name=stem,
+                    source_path=str(source),
+                    output_path=output_path,
+                    success=True,
+                    files_added=entries,
+                    raw_bytes=raw_bytes,
+                    archive_bytes=size_bytes,
+                    skipped_files=skipped,
+                    walk_errors=walk_errors,
+                )
+            except Exception as exc:
+                # Restore previous good archive on failure. The failed new output must
+                # be removed FIRST; the backup is the only recovery authority and must
+                # never be unlinked just because a failed replacement exists.
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        pass
+                if backup_path and backup_path.exists():
+                    try:
+                        backup_path.replace(output_path)
+                    except OSError:
+                        # Preserve the backup under its diagnostic name; never destroy it.
+                        log(f"WARN {stem}: could not restore backup {backup_path.name}: {exc}")
+                        return PackResult(
+                            project_id=stem,
+                            name=stem,
+                            source_path=str(source),
+                            output_path=backup_path if backup_path.exists() else None,
+                            success=False,
+                            error_message=f"{exc} (previous archive preserved as {backup_path.name})",
+                        )
+                log(f"FAIL {stem}: {exc}")
+                return PackResult(
+                    project_id=stem,
+                    name=stem,
+                    source_path=str(source),
+                    success=False,
+                    error_message=str(exc),
+                )
+    except TimeoutError:
+        log(f"FAIL {stem}: pack transaction lock busy: {tx_lock_path}")
         return PackResult(
             project_id=stem,
             name=stem,
             source_path=str(source),
             success=False,
-            error_message=str(exc),
+            error_message=f"Pack transaction for '{stem}' is already in progress; retry shortly",
         )

@@ -79,9 +79,17 @@ class ComponentManager:
         return stop_bridge(self.config)
 
     def restart_bridge(self) -> tuple[bool, str]:
-        stop_bridge(self.config)
+        """W2-009: verify a real stop/start transition. Never report success
+        when the old Bridge was not stopped or the new one did not come up."""
+        stopped, stop_msg = stop_bridge(self.config)
+        if not stopped:
+            return False, f"Restart aborted: {stop_msg}"
         ok = start_bridge_background(self.config)
-        return ok, "AUDAPACK Bridge restarted." if ok else "Failed to restart AUDAPACK Bridge."
+        if not ok:
+            return False, "Failed to restart AUDAPACK Bridge."
+        if not is_bridge_healthy(self.config.bridge.host, self.config.bridge.port, timeout=2.0):
+            return False, "AUDAPACK Bridge did not become healthy after restart."
+        return True, "AUDAPACK Bridge restarted."
 
     def install_autostart(self) -> tuple[bool, str]:
         return install_autostart()
@@ -104,8 +112,9 @@ class ComponentManager:
             import webbrowser
             url = f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js"
             try:
-                webbrowser.open(url)
-                return True, f"Opened {url} in browser."
+                opened = webbrowser.open(url)
+                if opened:
+                    return True, f"Opened {url} in browser."
             except Exception:
                 pass
         ok = open_widget_installation()

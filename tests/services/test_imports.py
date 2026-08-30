@@ -1,6 +1,7 @@
 """Services: no GUI framework imports."""
 
-import ast, pathlib
+import ast
+import pathlib
 
 
 def _imports_of(path: pathlib.Path):
@@ -31,8 +32,8 @@ def test_core_imports_without_tkinter():
     # service modules themselves do not pull Tkinter at import time.
     for mod in ("audapack.services.project_service", "audapack.services.audit_service", "audapack.services.packing_service", "audapack.services.bridge_service"):
         assert mod not in sys.modules or True
-    from audapack.services.project_service import ProjectService
     from audapack.services.audit_service import AuditService
-    from audapack.services.packing_service import PackingService
     from audapack.services.bridge_service import BridgeService
+    from audapack.services.packing_service import PackingService
+    from audapack.services.project_service import ProjectService
     assert ProjectService and AuditService and PackingService and BridgeService

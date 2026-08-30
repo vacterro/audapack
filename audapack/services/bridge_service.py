@@ -26,7 +26,9 @@ class BridgeService:
         return stop_bridge(self.config)
 
     def restart(self) -> tuple[bool, str]:
-        stop_bridge(self.config)
+        stopped, stop_message = stop_bridge(self.config)
+        if not stopped:
+            return False, f"Restart failed: {stop_message}"
         ok = start_bridge_background(self.config)
         return (ok, "Bridge restarted" if ok else "Restart failed")
 

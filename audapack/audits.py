@@ -17,12 +17,32 @@ from audapack.bridge.storage import (
     sanitize_project_name,
 )
 from audapack.campaign import (
+    STATUS_CAMPAIGN_COMPLETE,
     CampaignProfile,
     get_default_profile,
     load_profiles,
 )
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import AuditSnapshot, AuditTemperature, Project
+
+
+def _load_live_campaign_index(audit_dir: Optional[Path]) -> Optional[dict]:
+    """Read the live campaign.json written by save_live_campaign_index if present.
+
+    Returns the parsed payload or None when absent / unreadable. CORE-002 treats
+    this file as the authority for current-run identity, completion count, and
+    final handoff status when a Bridge or direct-ingest run is active.
+    """
+    if not audit_dir:
+        return None
+    cj = audit_dir / "campaign.json"
+    if not cj.exists() or not cj.is_file():
+        return None
+    try:
+        import json as _json
+        return _json.loads(cj.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 _RE_GEN_AT = re.compile(r"^GENERATED_AT:\s*(.+)$", re.MULTILINE)
 _RE_DATE_TIME = re.compile(r"^DATE_TIME:\s*(.+)$", re.MULTILINE)
@@ -137,6 +157,17 @@ def format_age_str(age_seconds: Optional[float]) -> str:
     if days < 7:
         return f"{days}d {rem_hours}h" if rem_hours > 0 else f"{days}d"
     return f"{days}d"
+
+
+def format_created_str(timestamp: Optional[float], with_year: bool = False) -> str:
+    """Short creation date string for a file timestamp (zip/archive)."""
+    if not timestamp:
+        return ""
+    from datetime import datetime
+    dt = datetime.fromtimestamp(timestamp)
+    if with_year:
+        return dt.strftime("%d.%m.%y %H:%M")
+    return dt.strftime("%d.%m %H:%M")
 
 
 def calculate_temperature(age_seconds: Optional[float], cfg: AuditsConfig) -> AuditTemperature:
@@ -398,6 +429,16 @@ class AuditIndexer:
         profile_id = "super10" if has_super10_markers else "quick3"
         profile = self._profiles.get(profile_id) or get_default_profile()
 
+        # CORE-002: load live campaign index as authority when present.
+        live = _load_live_campaign_index(audit_dir)
+        authoritative_run: Optional[str] = None
+        if live and live.get("campaign_run_id"):
+            authoritative_run = live["campaign_run_id"]
+            idx_profile = live.get("campaign_profile", "")
+            if idx_profile and idx_profile in self._profiles:
+                profile_id = idx_profile
+                profile = self._profiles[profile_id]
+
         wave_files: dict[str, Path] = {}
         wave_statuses: dict[str, bool] = {}
         wave_texts: dict[str, str] = {}
@@ -426,20 +467,42 @@ class AuditIndexer:
                     wave_files[w.id] = f_path
 
         total_tickets = 0
-        campaign_run_id = ""
+        campaign_run_id = authoritative_run or ""
 
-        # Validate each wave file for active profile
+        # PERF-003: parse each wave text exactly once per scan. The previous
+        # implementation called parse_wave (via is_wave_complete) and then
+        # immediately re-parsed the same text for metadata. Cache the single
+        # parse result in a per-scan map and derive completeness, meta, and
+        # identity checks from it. is_wave_complete is preserved as a public
+        # compatibility helper for external callers.
+        parse_cache: dict[str, tuple[bool, Optional[dict], str]] = {}
+
         for w in profile.waves:
             wf = wave_files.get(w.id)
             if wf and wf.exists():
                 try:
                     text = wf.read_text(encoding="utf-8")
                     AUDIT_COUNTERS["files_read"] += 1
-                    ok = is_wave_complete(text, w.id, profile)
+                    ok_v, meta, perr = parse_wave(text, w.id, profile)
+                    parse_cache[w.id] = (ok_v, meta, perr)
+                    ok = ok_v
                     wave_statuses[w.id] = ok
                     if ok:
+                        # CORE-002: a wave file belonging to a different indexed
+                        # run must never be counted as a member of the current
+                        # run. Legacy wave files lacking run metadata are only
+                        # trusted when no live index pins an authoritative run.
+                        if meta and meta.get("campaign_run_id"):
+                            if authoritative_run and meta["campaign_run_id"] != authoritative_run:
+                                wave_statuses[w.id] = False
+                                ok = False
+                        elif authoritative_run:
+                            # No run header on the wave but a live index pins a
+                            # concrete run: refuse to attribute it (old-run file).
+                            wave_statuses[w.id] = False
+                            ok = False
+                    if ok:
                         wave_texts[w.id] = text
-                        _, meta, _ = parse_wave(text, w.id, profile)
                         if meta:
                             total_tickets += int(meta.get("tickets", 0))
                             if not campaign_run_id and meta.get("campaign_run_id"):
@@ -449,16 +512,53 @@ class AuditIndexer:
                             timestamps.append(ts)
                 except Exception:
                     wave_statuses[w.id] = False
+                    parse_cache[w.id] = (False, None, "exception")
             else:
                 wave_statuses[w.id] = False
 
         completed_count = sum(1 for ok in wave_statuses.values() if ok)
         campaign_complete = (completed_count == profile.wave_count and profile.wave_count > 0)
 
+        # CORE-002: when a live campaign.json is present, the indexed run and its
+        # recorded status/completion are the authority — not loose file counts
+        # from canonical names left behind by an earlier run.
+        if authoritative_run and live:
+            completed_count = int(live.get("completed_count", 0) or 0)
+            idx_status = live.get("campaign_status", "")
+            idx_completed_waves = [w for w in live.get("completed_waves", []) or []]
+            campaign_complete = idx_status == STATUS_CAMPAIGN_COMPLETE and len(idx_completed_waves) >= profile.wave_count
+
         final_ready = False
         final_sha256 = ""
 
-        if profile_id == "quick3":
+        # CORE-002: when a live index pins an authoritative run, derive final
+        # readiness from the index status and the recorded final handoff path.
+        # Skip auto-synthesis (Bridge owns finalization).
+        if authoritative_run and live:
+            idx_status = live.get("campaign_status", "")
+            final_rel = live.get("final_handoff", "")
+            if idx_status == STATUS_CAMPAIGN_COMPLETE and final_rel:
+                final_fp = audit_dir / final_rel
+                if final_fp.exists():
+                    try:
+                        f_text = final_fp.read_text(encoding="utf-8")
+                        AUDIT_COUNTERS["files_read"] += 1
+                        final_ready = True
+                        final_sha256 = hashlib.sha256(f_text.encode("utf-8")).hexdigest()
+                        ts = extract_audit_metadata_timestamp(f_text)
+                        if ts:
+                            timestamps.insert(0, ts)
+                        else:
+                            timestamps.append(datetime.fromtimestamp(final_fp.stat().st_mtime))
+                    except Exception:
+                        pass
+            # Resolve final_file/all_file for the snapshot from the index.
+            if final_rel:
+                final_file = audit_dir / final_rel
+            all3_file = final_file if profile_id == "quick3" else all3_file
+            all_file = final_file if profile_id != "quick3" else all_file
+
+        if profile_id == "quick3" and not authoritative_run:
             if all3_file and all3_file.exists():
                 try:
                     a_text = all3_file.read_text(encoding="utf-8")
@@ -481,8 +581,12 @@ class AuditIndexer:
                 try:
                     parsed_d = {}
                     for w in profile.waves:
-                        _, meta, _ = parse_wave(wave_texts.get(w.id, ""), w.id, profile)
-                        parsed_d[w.id] = meta or {}
+                        cached = parse_cache.get(w.id)
+                        if cached and cached[0] and cached[1]:
+                            parsed_d[w.id] = cached[1]
+                        else:
+                            _, meta, _ = parse_wave(wave_texts.get(w.id, ""), w.id, profile)
+                            parsed_d[w.id] = meta or {}
                     all3_target = audit_dir / f"{audit_dir.name}__00_AUDIT_ALL_3.md"
                     all3_c = generate_canonical_all3(audit_dir.name, campaign_run_id or f"synthesized_{int(current_time.timestamp())}", parsed_d)
                     atomic_write(all3_target, all3_c)
@@ -497,8 +601,8 @@ class AuditIndexer:
             final_file = all3_file
             all_file = all3_file
 
-        else:
-            # SUPER10 / N-wave
+        elif not authoritative_run:
+            # SUPER10 / N-wave (legacy/manual synthesis only when no live index)
             if final_file and final_file.exists():
                 try:
                     f_text = final_file.read_text(encoding="utf-8")
@@ -538,8 +642,12 @@ class AuditIndexer:
                 try:
                     parsed_d = {}
                     for w in profile.waves:
-                        _, meta, _ = parse_wave(wave_texts.get(w.id, ""), w.id, profile)
-                        parsed_d[w.id] = meta or {}
+                        cached = parse_cache.get(w.id)
+                        if cached and cached[0] and cached[1]:
+                            parsed_d[w.id] = cached[1]
+                        else:
+                            _, meta, _ = parse_wave(wave_texts.get(w.id, ""), w.id, profile)
+                            parsed_d[w.id] = meta or {}
                     synth_map = generate_canonical_campaign(
                         profile,
                         campaign_run_id or f"synthesized_{int(current_time.timestamp())}",

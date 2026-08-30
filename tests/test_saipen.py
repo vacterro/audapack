@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from audapack.saipen import detect_saipen_root, get_saipen_info, read_saipen_summary
+from audapack.saipen import get_saipen_info
 
 
 class TestSaipenAwareness(unittest.TestCase):

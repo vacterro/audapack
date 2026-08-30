@@ -60,6 +60,37 @@ def _force_show_native(hwnd: int) -> bool:
         return False
 
 
+def _build_app_icon():
+    """Builds a multi-size application icon from the shipped resources.
+
+    A single large PNG as the only icon source intermittently renders blank
+    in the Windows taskbar/title bar (the shell picks one size and scales
+    badly, or the lazy PNG load fails under a cold icon cache). Registering
+    exact-size variants (16/32/48/256) via QIcon.addFile gives every Windows
+    surface a native-resolution bitmap and makes the icon deterministic.
+    Returns None when no icon resource exists (app_dir layout drifted).
+    """
+    from pathlib import Path
+
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QIcon
+
+    from audapack.config import app_dir
+
+    res = Path(app_dir()) / "resources"
+    icon = QIcon()
+    for name, size in (
+        ("app_icon_16.png", 16),
+        ("app_icon_32.png", 32),
+        ("app_icon.ico", 48),
+        ("app_icon.png", 256),
+    ):
+        p = res / name
+        if p.exists():
+            icon.addFile(str(p), QSize(size, size))
+    return icon if not icon.isNull() else None
+
+
 def run_qt_gui(service=None) -> int:
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import QApplication
@@ -80,13 +111,12 @@ def run_qt_gui(service=None) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("AUDAPACK")
 
-    # Set main orange application icon
-    from PySide6.QtGui import QFont, QIcon
+    # Set main orange application icon (multi-size, deterministic rendering)
+    from PySide6.QtGui import QFont
 
-    from audapack.config import app_dir
-    icon_path = app_dir() / "resources" / "app_icon.png"
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
+    app_icon = _build_app_icon()
+    if app_icon is not None:
+        app.setWindowIcon(app_icon)
 
     # UI.md Iron Law 1: Verdana, non-antialiased everywhere, !important.
     app_font = QFont("Verdana", 9)
@@ -94,6 +124,10 @@ def run_qt_gui(service=None) -> int:
     app.setFont(app_font)
 
     window = MainWindow(service)
+    # Explicit window-level icon: taskbar/title-bar rendering on Windows
+    # intermittently misses the inherited QApplication icon.
+    if app_icon is not None:
+        window.setWindowIcon(app_icon)
     # Ensure the window is not stuck in a minimised/maximised pre-state and
     # is a normal top-level. QMainWindow is, but be explicit.
     window.setWindowState(window.windowState() & ~(Qt.WindowMinimized | Qt.WindowMaximized | Qt.WindowFullScreen))

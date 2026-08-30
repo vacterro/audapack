@@ -40,7 +40,7 @@ class TestComponents(unittest.TestCase):
             self.assertTrue(Path(b["exe"]).exists())
 
     def test_preferred_browser_config(self):
-        from audapack.config import UIConfig, AppConfig, load_config
+        from audapack.config import AppConfig, UIConfig
         cfg = AppConfig(ui=UIConfig(preferred_browser="C:\\fake\\browser.exe"))
         d = cfg.to_dict()
         self.assertEqual(d["ui"]["preferred_browser"], "C:\\fake\\browser.exe")

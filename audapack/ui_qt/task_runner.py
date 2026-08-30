@@ -82,6 +82,7 @@ class TaskRunner(QObject):
         self._dirty: dict[str, tuple[Callable[[], Any], Optional[Callable[[Any], None]], Optional[Callable[[Exception], None]]]] = {}
         # key -> callbacks for current running task
         self._callbacks: dict[str, tuple[Optional[Callable[[Any], None]], Optional[Callable[[Exception], None]]]] = {}
+        self._generation_counter = 0
         self._generations: dict[str, int] = {}
 
         self._signals = _TaskSignals()
@@ -100,7 +101,8 @@ class TaskRunner(QObject):
     ) -> int:
         """Submits a task, cancelling / superseding any existing generation for that key."""
         with self._lock:
-            gen = self._generations.get(key, 0) + 1
+            self._generation_counter += 1
+            gen = self._generation_counter
             self._generations[key] = gen
             self._running[key] = gen
             self._callbacks[key] = (on_success, on_error)
@@ -123,7 +125,8 @@ class TaskRunner(QObject):
                 # Mark dirty for subsequent run
                 self._dirty[key] = (fn, on_success, on_error)
                 return self._running[key]
-            gen = self._generations.get(key, 0) + 1
+            self._generation_counter += 1
+            gen = self._generation_counter
             self._generations[key] = gen
             self._running[key] = gen
             self._callbacks[key] = (on_success, on_error)
@@ -145,6 +148,8 @@ class TaskRunner(QObject):
                 self._running.pop(result.key, None)
                 if result.key in self._dirty:
                     re_run = self._dirty.pop(result.key)
+                else:
+                    self._generations.pop(result.key, None)
 
         if is_latest:
             if result.success:
@@ -170,3 +175,4 @@ class TaskRunner(QObject):
             self._running.clear()
             self._dirty.clear()
             self._callbacks.clear()
+            self._generations.clear()

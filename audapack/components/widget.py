@@ -234,6 +234,22 @@ def read_bundled_widget_metadata() -> dict[str, str]:
     return meta
 
 
+BRAVE_KEEPALIVE_FLAGS = [
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=TabDiscarding",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+
+
+def _is_brave_exe(exe_path: str) -> bool:
+    """Returns True if the executable path points to a Brave-based browser."""
+    lower = Path(exe_path).stem.lower()
+    return "brave" in lower
+
+
 def open_widget_in_browser(browser_exe: Optional[str] = None, use_bridge: bool = False) -> bool:
     """Open the widget for Tampermonkey installation in a chosen browser.
 
@@ -262,14 +278,18 @@ def open_widget_in_browser(browser_exe: Optional[str] = None, use_bridge: bool =
 
     if browser_exe:
         try:
-            subprocess.Popen([browser_exe, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            args = [browser_exe]
+            if _is_brave_exe(browser_exe):
+                args.extend(BRAVE_KEEPALIVE_FLAGS)
+            args.append(target)
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception:
             return False
 
     try:
-        webbrowser.open(target)
-        return True
+        opened = webbrowser.open(target)
+        return bool(opened)
     except Exception:
         return False
 

@@ -42,6 +42,13 @@ TRANSLATIONS_RU: dict[str, str] = {
     "header.archive": "АРХИВ",
     "header.menu": "···",
 
+    # Archive freshness / pack progress (Qt delegate)
+    "archive.fresh.tag": "  [✓]",
+    "archive.stale.tag": "  [·]",
+    "archive.old.tag": "  [!]",
+    "archive.source_newer.tag": "  [SRC▲]",
+    "pack.progress_fmt": "[УПАК {pct}% {files}ф {size}]",
+
     # Project row - checkbox / slot
     "row.missing_path": "[НЕТ ПУТИ]",
     "row.dirty_fmt": "[ГРЯЗНО {n}]",
@@ -201,6 +208,13 @@ TRANSLATIONS_EN: dict[str, str] = {
     "header.pack": "PACK",
     "header.archive": "ARCHIVE",
     "header.menu": "···",
+
+    # Archive freshness / pack progress (Qt delegate)
+    "archive.fresh.tag": "  [fresh]",
+    "archive.stale.tag": "  [stale]",
+    "archive.old.tag": "  [old]",
+    "archive.source_newer.tag": "  [SRC▲]",
+    "pack.progress_fmt": "[PACK {pct}% {files}f {size}]",
 
     # Project row - checkbox / slot
     "row.missing_path": "[MISSING PATH]",

@@ -152,21 +152,15 @@ class ProjectRegistry:
         self._id_index = {p.id.lower(): p for p in self.config.projects}
 
     def get_project_by_name(self, name: str) -> Optional[Project]:
-        """Matches project by display name, audit name, slug or normalized identity."""
-        if not name:
-            return None
-        target_raw = name.strip().lower()
-        target_norm = normalize_project_key(name)
-        target_slug = safe_slug(name)
+        """Matches project by display name, audit name, slug or normalized identity.
 
-        for p in self.config.projects:
-            p_display = p.display_name.strip().lower()
-            p_audit = (p.audit_project_name or "").strip().lower()
-            if p_display == target_raw or p_audit == target_raw or p.id.lower() == target_slug:
-                return p
-            if normalize_project_key(p.display_name) == target_norm or normalize_project_key(p.audit_project_name) == target_norm:
-                return p
-        return None
+        W2-004: resolution in global phases, not per-record mixed precedence.
+        Exact display_name/audit_project_name across the whole registry first;
+        then exact id (slug) match; only then normalized/punctuation aliases.
+        A non-exact alias that matches multiple projects returns None
+        (ambiguous) rather than silently selecting the first array entry.
+        """
+        return self._find_in(self.config, name)
 
     def get_project_by_path(self, path: str | Path) -> Optional[Project]:
         target = Path(path).resolve()
@@ -259,19 +253,42 @@ class ProjectRegistry:
 
     @staticmethod
     def _find_in(cfg: AppConfig, name: str) -> Optional[Project]:
-        """Alias/normalized identity match against an explicit snapshot."""
+        """Global-phase alias/normalized identity match against an explicit snapshot.
+
+        W2-004:
+          1. exact display_name across the whole snapshot
+          2. exact audit_project_name across the whole snapshot
+          3. exact id across the whole snapshot (caller-supplied slug/canonical id)
+          4. normalized/punctuation alias; ambiguous (multi-match) returns None
+        Per-record mixed precedence is replaced with global phases so an exact
+        match on a later project always wins over a fuzzy match on an earlier
+        one, and a non-exact alias that matches more than one project is
+        rejected as ambiguous.
+        """
         if not name:
             return None
         target_raw = name.strip().lower()
-        target_norm = normalize_project_key(name)
         target_slug = safe_slug(name)
+
         for p in cfg.projects:
-            p_display = p.display_name.strip().lower()
-            p_audit = (p.audit_project_name or "").strip().lower()
-            if p_display == target_raw or p_audit == target_raw or p.id.lower() == target_slug:
+            if p.display_name and p.display_name.strip().lower() == target_raw:
                 return p
+        for p in cfg.projects:
+            if (p.audit_project_name or "").strip().lower() == target_raw:
+                return p
+        for p in cfg.projects:
+            if p.id and p.id.lower() == target_slug:
+                return p
+
+        target_norm = normalize_project_key(name)
+        if not target_norm:
+            return None
+        alias_hits: list[Project] = []
+        for p in cfg.projects:
             if normalize_project_key(p.display_name) == target_norm or normalize_project_key(p.audit_project_name) == target_norm:
-                return p
+                alias_hits.append(p)
+        if len(alias_hits) == 1:
+            return alias_hits[0]
         return None
 
     @staticmethod
@@ -437,6 +454,20 @@ class ProjectRegistry:
                 return False
             editor(proj)
             return True
+
+    def clear_project_marks(self) -> int:
+        """Atomically clear user workflow marks without changing enablement."""
+        with self._mutate_latest() as tx:
+            changed = 0
+            for project in tx.cfg.projects:
+                if project.ignored or project.ignore_archive or project.audit_copy_count:
+                    project.ignored = False
+                    project.ignore_archive = False
+                    project.audit_copy_count = 0
+                    changed += 1
+            if not changed:
+                tx.skip = True
+            return changed
 
     def sync_from_audit_root(self, audit_root: Path) -> int:
         """

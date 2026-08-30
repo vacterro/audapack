@@ -9,6 +9,36 @@ from typing import Optional
 from audapack.config import get_state_dir
 
 
+class GuardEstablishmentError(RuntimeError):
+    """Raised when the single-instance guard cannot be reliably established.
+
+    W2-007: a failed guard must not fail open (permit a second instance).
+    The launcher must surface the error rather than silently starting.
+    """
+
+
+# The em-dash "—" is the MainWindow's distinctive marker. Bare "AUDAPACK"
+# matches too many unrelated windows (the IDE itself, file explorer breadcrumbs,
+# Explorer windows titled with the project folder name), so a title is ONLY
+# identified as the application by these distinctive production markers — never
+# by an arbitrary "AUDAPACK" substring.
+AUDAPACK_WINDOW_MARKERS = (
+    "audapack \u2014 project room",  # MainWindow
+    "audapack settings",  # Settings dialog
+)
+
+
+def is_audapack_window_title(title: str) -> bool:
+    """Pure title classifier: True only for distinctive AUDAPACK app windows.
+
+    Extracted so tests exercise the exact production predicate. A generic
+    "AUDAPACK" substring (Explorer folder windows, IDE breadcrumbs, editors
+    open on the project) must return False — that is the whole point.
+    """
+    title_lower = str(title or "").lower()
+    return any(marker in title_lower for marker in AUDAPACK_WINDOW_MARKERS)
+
+
 class SingleInstance:
     """Enforces a single running instance of AUDAPACK per user session.
 
@@ -19,6 +49,7 @@ class SingleInstance:
     def __init__(self, name: str = "AUDAPACK_GUI"):
         self.name = name
         self._mutex = None
+        self._recovery_mutex = None
         self._file_handle = None
         self._is_already_running = False
 
@@ -50,23 +81,16 @@ class SingleInstance:
 
             # The em-dash "—" is the MainWindow's distinctive marker. Bare
             # "AUDAPACK" matches too many unrelated windows (the IDE itself,
-            # file explorer breadcrumbs, etc.) so we treat it as a hint, not
-            # as identification.
-            app_markers = (
-                "audapack \u2014 project room",  # MainWindow
-                "audapack settings",  # Settings dialog
-            )
+            # file explorer breadcrumbs, Explorer windows showing the project
+            # folder) so a title is never identified by the bare substring.
+            app_markers = AUDAPACK_WINDOW_MARKERS
 
             def _matches(title_lower: str) -> bool:
                 if any(m in title_lower for m in app_markers):
                     return True
-                # Caller-supplied prefix still works (kept for backwards compat
-                # and explicit override), but exclude obvious IDE/editor noise.
-                if title_prefix and title_prefix.lower() in title_lower:
-                    if not any(
-                        noise in title_lower for noise in (" | ", " - ", "—", "opencode", "code -", "visual studio")
-                    ):
-                        return True
+                # No generic prefix fallback: `_AUDAPACK` Explorer / IDE titles
+                # must not be mistaken for the application window. The caller
+                # prefix parameter is retained for signature compatibility only.
                 return False
 
             def foreach_window(hwnd, lParam):
@@ -94,6 +118,10 @@ class SingleInstance:
                 ERROR_ALREADY_EXISTS = 183
                 mutex_name = f"Local\\{self.name}_MUTEX"
                 self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+                if not self._mutex:
+                    raise GuardEstablishmentError(
+                        f"CreateMutexW for '{mutex_name}' returned a null handle"
+                    )
                 last_error = ctypes.windll.kernel32.GetLastError()
                 if last_error == ERROR_ALREADY_EXISTS:
                     # Mutex is held by someone. Before treating this as "another AUDAPACK
@@ -107,19 +135,41 @@ class SingleInstance:
                     # handle and report False so a new instance can open.
                     hwnd = self._find_window_hwnd("AUDAPACK")
                     if hwnd is None:
+                        primary = self._mutex
                         try:
-                            ctypes.windll.kernel32.CloseHandle(self._mutex)
-                        except Exception:
-                            pass
+                            ctypes.windll.kernel32.CloseHandle(primary)
+                        except Exception as exc:
+                            raise GuardEstablishmentError(
+                                f"Could not release stale primary mutex handle: {exc}"
+                            ) from exc
                         self._mutex = None
+                        recovery_name = f"Local\\{self.name}_RECOVERY_MUTEX"
+                        recovery = ctypes.windll.kernel32.CreateMutexW(None, False, recovery_name)
+                        if not recovery:
+                            raise GuardEstablishmentError(
+                                f"CreateMutexW for recovery guard '{recovery_name}' returned a null handle"
+                            )
+                        recovery_error = ctypes.windll.kernel32.GetLastError()
+                        if recovery_error == ERROR_ALREADY_EXISTS:
+                            ctypes.windll.kernel32.CloseHandle(recovery)
+                            raise GuardEstablishmentError(
+                                "Another launcher is already recovering a windowless instance"
+                            )
+                        self._recovery_mutex = recovery
+                        self._mutex = recovery
+                        atexit.register(self.release)
                         self._is_already_running = False
                         return False
                     self._is_already_running = True
                     return True
                 atexit.register(self.release)
                 return False
-            except Exception:
-                return False
+            except GuardEstablishmentError:
+                raise
+            except Exception as exc:
+                raise GuardEstablishmentError(
+                    f"Single-instance guard establishment failed on Win32: {exc}"
+                ) from exc
         else:
             lock_file = get_state_dir() / f"{self.name.lower()}.lock"
             try:
@@ -140,6 +190,7 @@ class SingleInstance:
 
                 ctypes.windll.kernel32.CloseHandle(self._mutex)
                 self._mutex = None
+                self._recovery_mutex = None
             except Exception:
                 pass
         elif self._file_handle:

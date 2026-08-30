@@ -19,7 +19,6 @@ from audapack.config import (
     AppConfig,
     app_dir,
     load_config,
-    save_config,
 )
 from audapack.models import (
     SLOTS_PER_GROUP,
@@ -175,9 +174,15 @@ class MainWindow:
 
     def _on_close(self):
         try:
-            latest = load_config()
-            latest.ui.window_size = [self.root.winfo_width(), self.root.winfo_height()]
-            save_config(latest)
+            from audapack.config import scoped_config_write
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            scoped_config_write(lambda cfg: (
+                setattr(cfg.ui, "window_size", [w, h]),
+                setattr(cfg.ui, "window_pos", [x, y]),
+            ))
         except Exception:
             pass
         self.root.destroy()
@@ -434,13 +439,18 @@ class MainWindow:
     def _on_language_button(self, lang_code: str):
         """Handle a click on the RU/EN switcher."""
         applied = i18n_set_language(lang_code)
-        latest = load_config()
-        if applied == latest.ui.ui_language:
+        if not applied:
             return
-        latest.ui.ui_language = applied
-        self.config = latest
-        save_config(latest)
-        # set_language already fired _on_language_changed via reload callback.
+        try:
+            from audapack.config import scoped_config_write
+            ok = scoped_config_write(lambda cfg: setattr(cfg.ui, "ui_language", applied))
+            if not ok:
+                messagebox.showerror("Save Error", "Could not persist language preference.", parent=self.root)
+                return
+            latest = load_config()
+            self.config = latest
+        except Exception as exc:
+            messagebox.showerror("Save Error", f"Language save failed: {exc}", parent=self.root)
 
     def _on_language_changed(self, new_lang: str):
         """Called by i18n when the active language changes. Retranslates in place."""
@@ -827,6 +837,7 @@ class MainWindow:
                 archive_stem=p.archive_name or p.display_name,
                 excludes=excludes,
                 delete_old=self.config.packing.delete_old,
+                include_timestamp=getattr(self.config.packing, 'include_timestamp', True),
                 cancel_event=self.cancel_event,
                 progress_callback=lambda a, b, cur: self.ui_queue.put(("progress", a, b, cur)),
                 manifest_meta={"project_name": p.display_name, "extra_meta": extra_meta} if self.config.packing.manifest_enabled else None,

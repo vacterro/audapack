@@ -1,12 +1,11 @@
 """Unit tests for AUDAPACK CLI entry points and arguments."""
 
 import io
-import sys
 import unittest
 from unittest.mock import patch
 
 from audapack import __version__
-from audapack.app import main, print_status
+from audapack.app import main
 
 
 class TestAppCLI(unittest.TestCase):
@@ -21,6 +20,7 @@ class TestAppCLI(unittest.TestCase):
 
     def test_gui_startup_instantiation(self):
         import tkinter as tk
+
         from audapack.ui.main_window import MainWindow
 
         try:

@@ -18,19 +18,31 @@ from typing import Callable, Optional
 from urllib.parse import urlparse
 
 from audapack import __version__
-from audapack.bridge.lifecycle import remove_pid, write_pid
-from audapack.bridge.state import get_run_lock, get_run_state, save_run_state
+from audapack.bridge.lifecycle import INSTANCE_NONCE, remove_pid, write_pid
+from audapack.bridge.state import (
+    GenerationPersistenceError,
+    RunStateCorruptionError,
+    RunStatePersistenceError,
+    get_run_state,
+    run_transaction,
+    save_run_state,
+)
 from audapack.bridge.storage import (
     InvalidProjectPathError,
     atomic_write,
+    capture_file_snapshots,
     generate_canonical_campaign,
     parse_wave,
     resolve_project_audit_dir,
+    restore_file_snapshots,
 )
 from audapack.campaign import (
+    STATUS_CAMPAIGN_COMPLETE,
+    STATUS_CAMPAIGN_READY_FOR_WAVE,
     get_canonical_manifest_hash,
     get_profile,
     load_profiles,
+    save_live_campaign_index,
 )
 from audapack.components.widget import get_bundled_widget_path
 from audapack.config import AppConfig, legacy_token_acceptance_revoked, load_config, normalize_bridge_host
@@ -49,6 +61,54 @@ _ON_AUDIT_WRITTEN: Optional[Callable[[str, str], None]] = None
 def set_audit_written_callback(cb: Optional[Callable[[str, str], None]]):
     global _ON_AUDIT_WRITTEN
     _ON_AUDIT_WRITTEN = cb
+
+
+def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, state, resolved_name):
+    """Synthesizes and durably writes the canonical campaign final artifacts.
+
+    Raises on any write failure so the caller can roll back. History side is
+    written before the canonical latest so a partial failure never leaves the
+    authoritative file mutated without durable state agreeing.
+    """
+    if prof.profile_id == "quick3":
+        all3_content = synth_result.get("all3", "")
+        all3_latest = target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
+        all3_hist = history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md"
+        atomic_write(all3_hist, all3_content)
+        atomic_write(all3_latest, all3_content)
+        state["all3_complete"] = True
+        state["all3_path"] = str(all3_latest)
+    else:
+        super_all = synth_result.get("super_all", "")
+        super_final = synth_result.get("super_final", "")
+        super_index = synth_result.get("super_index", "")
+        all_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md"
+        final_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md"
+        index_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json"
+        all_hist = history_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL__{dt_str}.md"
+        final_hist = history_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL__{dt_str}.md"
+        index_hist = history_dir / "manifest.json"
+        atomic_write(all_hist, super_all)
+        atomic_write(all_latest, super_all)
+        atomic_write(final_hist, super_final)
+        atomic_write(final_latest, super_final)
+        atomic_write(index_hist, super_index)
+        atomic_write(index_latest, super_index)
+        state["campaign_complete"] = True
+        state["final_handoff_path"] = str(final_latest)
+        state["canonical_campaign_path"] = str(all_latest)
+
+
+def _get_final_handoff_path(prof, state) -> Optional[Path]:
+    if prof.profile_id == "quick3":
+        return Path(state["all3_path"]) if state.get("all3_path") else None
+    return Path(state["final_handoff_path"]) if state.get("final_handoff_path") else None
+
+
+def _get_canonical_path(prof, state) -> Optional[Path]:
+    if prof.profile_id == "quick3":
+        return Path(state["all3_path"]) if state.get("all3_path") else None
+    return Path(state["canonical_campaign_path"]) if state.get("canonical_campaign_path") else None
 
 
 class AudapackBridgeHandler(BaseHTTPRequestHandler):
@@ -85,18 +145,20 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
+    # W2-001: explicit base directory for test isolation. When set on the
+    # handler (or its subclass), registry and run-state operations use this
+    # directory instead of the canonical %LOCALAPPDATA% path. Production
+    # callers must NEVER set this; the port number must NOT be used as a
+    # proxy for test isolation.
+    test_base_dir: Optional[Path] = None
+
     def get_custom_base_dir(self) -> Optional[Path]:
-        if self.config and self.config.bridge.port != 17843:
-            try:
-                return Path(self.config.audits.root).parent
-            except Exception:
-                pass
-        return None
+        return self.test_base_dir
 
     def get_live_config(self) -> AppConfig:
+        if self.test_base_dir:
+            return self.config
         try:
-            if self.config and (self.config.bridge.port != 17843 or not Path(self.config.audits.root).exists()):
-                return self.config
             cfg = load_config()
             if cfg and cfg.audits and cfg.audits.root:
                 return cfg
@@ -184,6 +246,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "profiles": list(profs.keys()),
                 "manifest_hash": get_canonical_manifest_hash(),
                 "instance_id": f"audapack_{os.getpid()}",
+                "instance_nonce": INSTANCE_NONCE,
                 "registry_revision": len(live_cfg.projects),
             })
         elif parsed.path == "/widget.user.js":
@@ -285,13 +348,36 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
 
-    def handle_project_resolve(self):
+    def _read_json_body(self) -> Optional[dict]:
+        raw_length = self.headers.get("Content-Length")
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            data = json.loads(body) if body else {}
+            length = int(raw_length) if raw_length is not None else 0
+        except (TypeError, ValueError):
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "Content-Length must be a non-negative integer", "retriable": False}})
+            return None
+        if length < 0:
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "Content-Length must be non-negative", "retriable": False}})
+            return None
+        max_bytes = int(getattr(self.config.bridge, "max_request_bytes", 10 * 1024 * 1024))
+        if length > max_bytes:
+            self.send_json(413, {"ok": False, "error": {"code": "payload_too_large", "retriable": False}})
+            return None
+        try:
+            self.connection.settimeout(5.0)
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError("request body ended before Content-Length")
+            data = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(data, dict):
+                raise ValueError("JSON body must be an object")
+            return data
         except Exception:
             self.send_json(400, {"ok": False, "error": {"code": "invalid_json", "retriable": False}})
+            return None
+
+    def handle_project_resolve(self):
+        data = self._read_json_body()
+        if data is None:
             return
 
         raw_name = str(data.get("project_name") or data.get("name") or data.get("project_id") or "").strip()
@@ -309,7 +395,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         if was_created:
             from audapack.bridge.state import increment_audit_generation
-            increment_audit_generation(proj.display_name, "registered")
+            increment_audit_generation(proj.display_name, "registered", project_id=proj.id)
             if _ON_AUDIT_WRITTEN:
                 try:
                     _ON_AUDIT_WRITTEN(proj.display_name, "registered")
@@ -334,22 +420,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self.send_json(415, {"ok": False, "error": {"code": "unsupported_media_type", "retriable": False}})
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "retriable": False}})
-            return
-
-        max_bytes = self.config.bridge.max_request_bytes
-        if length > max_bytes:
-            self.send_json(413, {"ok": False, "error": {"code": "payload_too_large", "retriable": False}})
-            return
-
-        try:
-            body = self.rfile.read(length).decode("utf-8")
-            data = json.loads(body)
-        except Exception:
-            self.send_json(400, {"ok": False, "error": {"code": "invalid_json", "retriable": False}})
+        data = self._read_json_body()
+        if data is None:
             return
 
         # API version contract: support 2 and 3
@@ -469,6 +541,106 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # CORE-006: enforce equality between transport run_id and content
+        # CAMPAIGN_RUN_ID for v3 contracts. Placeholder/missing values are
+        # rejected so the durable run identity is provably bound to the
+        # delivered artifact. v2 is allowed the historical relaxation.
+        if client_api >= 3:
+            crid_raw = (wave_meta or {}).get("campaign_run_id", "")
+            crid = (crid_raw or "").strip()
+            is_placeholder = (not crid) or ("<" in crid and ">" in crid) or crid.lower() in {
+                "<run-id>", "<run_id>", "<campaign_run_id>", "placeholder", "n/a", "tbd",
+            }
+            if is_placeholder:
+                self.send_json(400, {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_run_id",
+                        "message": "v3 contract requires a non-placeholder CAMPAIGN_RUN_ID header",
+                        "retriable": False,
+                    }
+                })
+                return
+            if crid != run_id:
+                self.send_json(400, {
+                    "ok": False,
+                    "error": {
+                        "code": "run_id_mismatch",
+                        "message": f"Payload run_id '{run_id}' does not match content CAMPAIGN_RUN_ID '{crid}'",
+                        "retriable": False,
+                    }
+                })
+                return
+
+        # CORE-005: two explicit project identities (transport payload vs parsed
+        # handoff PROJECT_NAME) must be reconciled before any registration, file,
+        # or state mutation. Aliases that resolve to the same canonical project
+        # are accepted; a genuine conflict is a hard, non-retriable 409.
+        requested_project = project
+        handoff_project = (wave_meta or {}).get("project_name") or ""
+        if handoff_project and handoff_project.strip().lower() != requested_project.strip().lower():
+            check_registry = ProjectRegistry(live_cfg, base_dir=self.get_custom_base_dir(), transactional=True)
+
+            def _resolve_canonical(pid: Optional[str], name: str):
+                if pid:
+                    p = check_registry.get_project_by_id(pid)
+                    if p:
+                        return p
+                if name:
+                    p = check_registry.get_project_by_name(name)
+                    if p:
+                        return p
+                return None
+
+            p_req = _resolve_canonical(project_id, requested_project)
+            p_hand = _resolve_canonical(None, handoff_project)
+            if p_req and p_hand and p_req.id != p_hand.id:
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "project_identity_conflict",
+                        "message": (
+                            f"Payload project '{requested_project}' resolves to '{p_req.id}' "
+                            f"but handoff PROJECT_NAME '{handoff_project}' resolves to '{p_hand.id}'"
+                        ),
+                        "retriable": False,
+                    }
+                })
+                return
+            if p_hand and not p_req:
+                # Payload names nothing known but the handoff resolves to an existing
+                # project: refusing prevents handoff metadata from silently stealing
+                # routing/registration for a project the transport did not address.
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "project_identity_conflict",
+                        "message": (
+                            f"Payload project '{requested_project}' is unknown but handoff "
+                            f"PROJECT_NAME '{handoff_project}' resolves to '{p_hand.id}'; refusing reroute"
+                        ),
+                        "retriable": False,
+                    }
+                })
+                return
+            if not p_req and not p_hand:
+                # Two different unknown names: ambiguous auto-registration.
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "project_identity_conflict",
+                        "message": (
+                            f"Payload project '{requested_project}' and handoff PROJECT_NAME "
+                            f"'{handoff_project}' identify different unknown projects; refusing ambiguous registration"
+                        ),
+                        "retriable": False,
+                    }
+                })
+                return
+            # Both resolve to the same canonical project (or payload resolves and
+            # handoff is a harmless formatting alias): accept the canonical name.
+            project = handoff_project
+
         if wave_meta and wave_meta.get("project_name"):
             project = wave_meta["project_name"]
 
@@ -500,23 +672,20 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     }
                 })
                 return
-            if target_proj is None and name_proj is None:
-                try:
-                    name_proj, _created = live_registry.resolve_or_register_project(project)
-                except RegistrySaveError as exc:
-                    self.send_json(503, {
-                        "ok": False,
-                        "error": {"code": "configuration_error", "message": str(exc), "retriable": True}
-                    })
-                    return
             if target_proj is None and name_proj is not None:
                 target_proj = name_proj
             if target_proj is not None:
                 project = target_proj.audit_project_name or target_proj.display_name
 
-        run_lock = get_run_lock(run_id)
-        with run_lock:
-            state = get_run_state(run_id)
+        with run_transaction(run_id):
+            try:
+                state = get_run_state(run_id)
+            except RunStateCorruptionError as exc:
+                self.send_json(503, {
+                    "ok": False,
+                    "error": {"code": "run_state_corrupt", "message": str(exc), "retriable": True}
+                })
+                return
             existing_project = state.get("project")
 
             # Validate immutable run -> project_id binding
@@ -536,6 +705,22 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                         })
                         return
 
+            if bound_pid:
+                bound_project = live_registry.get_project_by_id(bound_pid)
+                bound_names = {
+                    str(getattr(bound_project, "display_name", "")).strip().lower(),
+                    str(getattr(bound_project, "audit_project_name", "")).strip().lower(),
+                }
+                if project and project.strip().lower() not in bound_names:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "project_identity_conflict",
+                            "message": f"Run {run_id} is bound to project_id '{bound_pid}', cannot accept '{project}'",
+                            "retriable": False,
+                        }
+                    })
+                    return
             if target_proj is not None and bound_pid and target_proj.id != bound_pid:
                 self.send_json(409, {
                     "ok": False,
@@ -574,6 +759,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            run_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
+            dt_str = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
             wave_state = state.get("waves", {}).get(wave_def.id, {})
 
             # Receipt idempotency check
@@ -585,7 +772,111 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     if wave_state.get("history_path"):
                         files_written.append(str(wave_state["history_path"]))
                     is_ready = state.get("campaign_complete", False) or state.get("all3_complete", False)
+                    generation_pending = bool(state.get("generation_pending", False))
+                    if generation_pending:
+                        try:
+                            from audapack.bridge.state import increment_audit_generation
+                            increment_audit_generation(project, wave_def.id, project_id=state.get("project_id") or None)
+                            state["generation_pending"] = False
+                            save_run_state(run_id, state)
+                            generation_pending = False
+                        except GenerationPersistenceError:
+                            pass
                     completed_count = len([w for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")])
+                    # CORE-002: a same-receipt retry must repair incomplete
+                    # finalization (crash/partial write) instead of contradicting
+                    # the first response.
+                    all_waves_complete = all(
+                        w.id in state.get("waves", {}) and state["waves"][w.id].get("complete")
+                        for w in prof.waves if w.required
+                    )
+                    if not is_ready and all_waves_complete:
+                        try:
+                            target_dir, resolved_name, proj, _created = resolve_project_audit_dir(
+                                live_cfg, project, project_id, base_dir=self.get_custom_base_dir()
+                            )
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            parsed_dict = {
+                                w.id: state["waves"][w.id].get("meta", {})
+                                for w in prof.waves if w.id in state.get("waves", {})
+                            }
+                            history_dir = Path(state["history_dir"]) if state.get("history_dir") else None
+                            if history_dir is None or not history_dir.exists():
+                                history_dir = target_dir / "_history" / f"{dt_str}_{run_hash}"
+                                history_dir.mkdir(parents=True, exist_ok=True)
+                                state["history_dir"] = str(history_dir)
+                            # CORE-004: route duplicate finalization repair through
+                            # the same transactional commit gate as normal delivery.
+                            # Snapshot affected artifacts/index, require the live
+                            # campaign-index write to succeed before persisting
+                            # ready/completion, and on failure restore the exact
+                            # prior artifact/index bytes and return retriable 503.
+                            snap_targets = [target_dir / "campaign.json"]
+                            if prof.profile_id == "quick3":
+                                snap_targets.append(target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md")
+                            else:
+                                snap_targets.extend([
+                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md",
+                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md",
+                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
+                                ])
+                            snapshots, snap_err = capture_file_snapshots(snap_targets)
+                            if snap_err:
+                                self.send_json(503, {
+                                    "ok": False,
+                                    "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
+                                })
+                                return
+                            try:
+                                synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                                _write_final_artifacts(prof, synth_result, target_dir, history_dir,
+                                                       dt_str, state, resolved_name)
+                                save_live_campaign_index(
+                                    campaign_root=target_dir, profile=prof, run_id=run_id,
+                                    project_name=resolved_name,
+                                    parsed_waves={
+                                        wid: {
+                                            "wave_id": wid,
+                                            "status": "COMPLETE",
+                                            "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                                            "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
+                                            "sha256": w_info.get("sha256", ""),
+                                            "completed_at": w_info.get("completed_at", dt_str),
+                                        }
+                                        for wid, w_info in state.get("waves", {}).items()
+                                    },
+                                    completed_waves=[w.id for w in prof.waves],
+                                    active_wave_id=None,
+                                    status=STATUS_CAMPAIGN_COMPLETE,
+                                    final_handoff_path=_get_final_handoff_path(prof, state),
+                                )
+                            except Exception as exc:
+                                restore_file_snapshots(snapshots)
+                                self.send_json(503, {
+                                    "ok": False,
+                                    "error": {"code": "campaign_index_failed", "message": str(exc), "retriable": True}
+                                })
+                                return
+                            # Persist ready/completion only after the index commit
+                            # succeeded; a failure above already rolled back.
+                            try:
+                                save_run_state(run_id, state)
+                            except RunStatePersistenceError as exc:
+                                restore_file_snapshots(snapshots)
+                                self.send_json(503, {
+                                    "ok": False,
+                                    "error": {"code": "campaign_index_failed", "message": str(exc), "retriable": True}
+                                })
+                                return
+                            is_ready = True
+                            from audapack.bridge.state import increment_audit_generation
+                            increment_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
+                        except Exception as exc:
+                            self.send_json(503, {
+                                "ok": False,
+                                "error": {"code": "finalization_failed", "message": str(exc), "retriable": True}
+                            })
+                            return
                     self.send_json(200, {
                         "ok": True,
                         "duplicate": True,
@@ -612,6 +903,19 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                         }
                     })
                     return
+
+            # A completed wave is immutable within its run. Replacement would
+            # require descendant invalidation/replay; reject it instead.
+            if wave_state.get("complete"):
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "completed_wave_immutable",
+                        "message": f"Wave '{wave_def.id}' is already complete in run {run_id}; start a fresh run for replacement",
+                        "retriable": False,
+                    }
+                })
+                return
 
             # Order / dependency validation
             existing_waves = state.get("waves", {})
@@ -659,13 +963,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             w_no = wave_def.number
             w_slug = wave_def.slug
 
-            # 1. Latest canonical wave file
             latest_filename = f"{resolved_name}__{w_no}_{w_slug}.md"
             latest_path = target_dir / latest_filename
-
-            # 2. History wave file in unified single-run history folder
             run_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
             dt_str = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
             if state.get("history_dir") and Path(state["history_dir"]).exists():
                 history_dir = Path(state["history_dir"])
             else:
@@ -676,10 +978,37 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             history_filename = f"{resolved_name}__{w_no}_{w_slug}__{dt_str}.md"
             history_path = history_dir / history_filename
 
+            # CORE-003: snapshot all canonical artifact paths before any write
+            # so ANY failure below can restore the exact previous state.
+            snapshot_paths = [latest_path, history_path, target_dir / "campaign.json"]
+            if prof.profile_id == "quick3":
+                snapshot_paths.extend([
+                    target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md",
+                    history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md",
+                ])
+            else:
+                snapshot_paths.extend([
+                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md",
+                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md",
+                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
+                    history_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL__{dt_str}.md",
+                    history_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL__{dt_str}.md",
+                    history_dir / "manifest.json",
+                ])
+            snapshots, snap_err = capture_file_snapshots(snapshot_paths)
+            if snap_err:
+                self.send_json(500, {
+                    "ok": False,
+                    "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
+                })
+                return
+
+            # Write history first, then canonical latest (CORE-003).
             try:
-                atomic_write(latest_path, content)
                 atomic_write(history_path, content)
+                atomic_write(latest_path, content)
             except Exception as exc:
+                restore_file_snapshots(snapshots)
                 self.send_json(500, {
                     "ok": False,
                     "error": {"code": "atomic_write_failed", "message": str(exc), "retriable": True}
@@ -699,67 +1028,104 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "meta": wave_meta,
             }
 
-            # Check if all required waves are complete
             all_waves = state["waves"]
             required_waves = [w for w in prof.waves if w.required]
             campaign_ready = all(w.id in all_waves and all_waves[w.id].get("complete") for w in required_waves)
 
             final_handoff_path: Optional[Path] = None
             canonical_campaign_path: Optional[Path] = None
+            finalization_ok = False
 
             if campaign_ready:
                 parsed_dict = {
                     w.id: all_waves[w.id].get("meta", {}) for w in prof.waves if w.id in all_waves
                 }
-                synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                try:
+                    synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                    _write_final_artifacts(prof, synth_result, target_dir, history_dir,
+                                           dt_str, state, resolved_name)
+                    final_handoff_path = _get_final_handoff_path(prof, state)
+                    canonical_campaign_path = _get_canonical_path(prof, state)
+                    finalization_ok = True
+                except Exception as exc:
+                    restore_file_snapshots(snapshots)
+                    self.send_json(503, {
+                        "ok": False,
+                        "error": {"code": "finalization_failed", "message": str(exc), "retriable": True}
+                    })
+                    return
 
-                if prof.profile_id == "quick3":
-                    all3_content = synth_result.get("all3", "")
-                    all3_latest = target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
-                    all3_hist = history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md"
-                    try:
-                        atomic_write(all3_latest, all3_content)
-                        atomic_write(all3_hist, all3_content)
-                        state["all3_complete"] = True
-                        state["all3_path"] = str(all3_latest)
-                        canonical_campaign_path = all3_latest
-                        final_handoff_path = all3_latest
-                    except Exception as exc:
-                        logger.error(f"Failed to write ALL_3: {exc}")
-                else:
-                    # SUPER10 / N-wave outputs
-                    super_all = synth_result.get("super_all", "")
-                    super_final = synth_result.get("super_final", "")
-                    super_index = synth_result.get("super_index", "")
+            # Live campaign index — only writes COMPLETE when finalization
+            # succeeded (CORE-002). On failure roll back and return retriable.
+            completed_waves_list = [w.id for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")]
+            next_w = prof.get_next_wave(wave_def.id)
+            active_wid = None if campaign_ready else (next_w.id if next_w else None)
+            c_status = STATUS_CAMPAIGN_COMPLETE if (campaign_ready and finalization_ok) else STATUS_CAMPAIGN_READY_FOR_WAVE
 
-                    all_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md"
-                    final_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md"
-                    index_latest = target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json"
+            parsed_waves_dict = {
+                wid: {
+                    "wave_id": wid,
+                    "status": "COMPLETE" if w_info.get("complete") else "IDLE",
+                    "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                    "file": Path(w_info.get("latest_path", "")) if w_info.get("latest_path") else None,
+                    "sha256": w_info.get("sha256", ""),
+                    "completed_at": w_info.get("completed_at", dt_str),
+                }
+                for wid, w_info in all_waves.items()
+            }
+            try:
+                save_live_campaign_index(
+                    campaign_root=target_dir,
+                    profile=prof,
+                    run_id=run_id,
+                    project_name=resolved_name,
+                    parsed_waves=parsed_waves_dict,
+                    completed_waves=completed_waves_list,
+                    active_wave_id=active_wid,
+                    status=c_status,
+                    final_handoff_path=final_handoff_path,
+                )
+            except Exception as ex:
+                if finalization_ok:
+                    restore_file_snapshots(snapshots)
+                self.send_json(503, {
+                    "ok": False,
+                    "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
+                })
+                return
 
-                    all_hist = history_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL__{dt_str}.md"
-                    final_hist = history_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL__{dt_str}.md"
-                    index_hist = history_dir / "manifest.json"
-
-                    try:
-                        atomic_write(all_latest, super_all)
-                        atomic_write(all_hist, super_all)
-                        atomic_write(final_latest, super_final)
-                        atomic_write(final_hist, super_final)
-                        atomic_write(index_latest, super_index)
-                        atomic_write(index_hist, super_index)
-
-                        state["campaign_complete"] = True
-                        state["final_handoff_path"] = str(final_latest)
-                        state["canonical_campaign_path"] = str(all_latest)
-                        final_handoff_path = final_latest
-                        canonical_campaign_path = all_latest
-                    except Exception as exc:
-                        logger.error(f"Failed to write campaign synthesis files: {exc}")
-
-            save_run_state(run_id, state)
+            # W2-002: persist the pending-publication marker as part of the primary
+            # durable state commit BEFORE publishing generation, so recovery intent
+            # survives a crash and duplicate retries can repair a missed publication.
+            state["generation_pending"] = True
+            try:
+                save_run_state(run_id, state)
+            except RunStatePersistenceError as exc:
+                restore_file_snapshots(snapshots)
+                self.send_json(500, {
+                    "ok": False,
+                    "error": {"code": "run_state_persistence_failed", "message": str(exc), "retriable": True}
+                })
+                return
 
             from audapack.bridge.state import increment_audit_generation
-            increment_audit_generation(resolved_name, wave_def.id)
+            generation_pending = True
+            try:
+                # W2-003: pass the resolved canonical project id so consumers can
+                # refresh the exact project instead of falling back to name lookup.
+                increment_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
+                generation_pending = False
+                state["generation_pending"] = False
+                try:
+                    save_run_state(run_id, state)
+                except RunStatePersistenceError:
+                    # Publication succeeded but clearing the marker failed: keep
+                    # the marker so a duplicate retry repairs the clear (W2-002).
+                    state["generation_pending"] = True
+                    generation_pending = True
+            except GenerationPersistenceError:
+                # Marker already durable; duplicate retries repair publication.
+                generation_pending = True
 
             if _ON_AUDIT_WRITTEN:
                 try:
@@ -768,7 +1134,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     pass
 
             files_written = [str(latest_path), str(history_path)]
-            if campaign_ready:
+            if campaign_ready and finalization_ok:
                 if final_handoff_path:
                     files_written.append(str(final_handoff_path))
                 if canonical_campaign_path and str(canonical_campaign_path) != str(final_handoff_path):
@@ -792,12 +1158,13 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "wave_count": prof.wave_count,
                 "completed_waves": completed_count,
                 "total_waves": prof.wave_count,
-                "campaign_ready": campaign_ready,
-                "all3_ready": campaign_ready if prof.profile_id == "quick3" else state.get("all3_complete", False),
+                "campaign_ready": campaign_ready and finalization_ok,
+                "all3_ready": campaign_ready and finalization_ok if prof.profile_id == "quick3" else state.get("all3_complete", False),
                 "files": files_written,
                 "history_dir": str(history_dir),
                 "final_handoff_path": str(final_handoff_path) if final_handoff_path else "",
                 "canonical_campaign_path": str(canonical_campaign_path) if canonical_campaign_path else "",
+                "generation_pending": generation_pending,
             })
 
 
@@ -819,11 +1186,19 @@ def run_bridge_server(config: AppConfig) -> int:
 
     write_pid()
     print(f"AUDAPACK Bridge listening on http://{host}:{port}")
+    # W2-011: prune expired history on startup (best-effort, non-blocking).
+    try:
+        from audapack.bridge.storage import prune_audit_history
+        removed = prune_audit_history(config)
+        if removed:
+            logger.info(f"Pruned {removed} expired history run(s) from audit root")
+    except Exception:
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        remove_pid()
+        remove_pid(expected_pid=os.getpid(), expected_nonce=INSTANCE_NONCE)
     return 0

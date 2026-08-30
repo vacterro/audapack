@@ -4,19 +4,18 @@ import hashlib
 import shutil
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from audapack.audits import (
     AuditIndexer,
     calculate_temperature,
-    extract_audit_metadata_timestamp,
     format_age_str,
     is_all3_ready,
     is_wave_complete,
 )
 from audapack.config import AppConfig, AuditsConfig
-from audapack.models import AuditSnapshot, AuditTemperature, Project
+from audapack.models import AuditTemperature, Project
 
 SAMPLE_CORE = """# FastPrompter — Audit Core
 PROJECT_NAME: FastPrompter
@@ -219,6 +218,167 @@ class TestAuditEngine(unittest.TestCase):
         self.assertTrue(snapshot2.all3_ready)
         self.assertNotEqual(snapshot2.all3_sha256, project.last_copied_audit_hash)
         # New hash proves copy state is invalidated / NEW
+
+    def test_scan_project_live_index_authority_over_stale_waves(self):
+        """CORE-002: an old run's canonical wave/final files must never be
+        counted as members of a new run. campaign.json is the authority."""
+        import json
+
+        proj_dir = self.audit_root / "MAIN0" / "StaleRun"
+        proj_dir.mkdir(parents=True)
+
+        # Old run A: three waves + ALL_3 all carry run A identity.
+        core_a = SAMPLE_CORE + "\nCAMPAIGN_RUN_ID: run-A\n"
+        second_a = SAMPLE_SECOND + "\nCAMPAIGN_RUN_ID: run-A\n"
+        perf_a = SAMPLE_PERF + "\nCAMPAIGN_RUN_ID: run-A\n"
+        all3_a = SAMPLE_ALL_3 + "\nCAMPAIGN_RUN_ID: run-A\n"
+        (proj_dir / "StaleRun__01_AUDIT_CORE.md").write_text(core_a, encoding="utf-8")
+        (proj_dir / "StaleRun__02_AUDIT_SECOND_WAVE.md").write_text(second_a, encoding="utf-8")
+        (proj_dir / "StaleRun__03_AUDIT_PERFORMANCE.md").write_text(perf_a, encoding="utf-8")
+        (proj_dir / "StaleRun__00_AUDIT_ALL_3.md").write_text(all3_a, encoding="utf-8")
+        index_a = {
+            "schema_version": 1,
+            "campaign_run_id": "run-A",
+            "campaign_profile": "quick3",
+            "campaign_status": "CAMPAIGN_COMPLETE",
+            "completed_count": 3,
+            "completed_waves": ["core", "second", "performance"],
+            "wave_count": 3,
+            "final_handoff": "StaleRun__00_AUDIT_ALL_3.md",
+        }
+        (proj_dir / "campaign.json").write_text(json.dumps(index_a), encoding="utf-8")
+
+        project = Project(
+            id="stalrun",
+            display_name="StaleRun",
+            source_path=r"C:\StaleRun",
+            priority_group="MAIN0",
+            slot=1,
+            audit_project_name="StaleRun",
+        )
+        now = datetime(2026, 8, 29, 6, 0, 0)
+        snap_a = self.indexer.scan_project(project, now=now)
+        self.assertEqual(snap_a.completed_waves, 3)
+        self.assertTrue(snap_a.campaign_complete)
+        self.assertTrue(snap_a.final_handoff_ready)
+
+        # New run B: only Core posted. campaign.json records 1/3 ready-for-wave.
+        core_b = SAMPLE_CORE + "\nCAMPAIGN_RUN_ID: run-B\n"
+        (proj_dir / "StaleRun__01_AUDIT_CORE.md").write_text(core_b, encoding="utf-8")
+        index_b = {
+            "schema_version": 1,
+            "campaign_run_id": "run-B",
+            "campaign_profile": "quick3",
+            "campaign_status": "CAMPAIGN_READY_FOR_WAVE",
+            "completed_count": 1,
+            "completed_waves": ["core"],
+            "wave_count": 3,
+            "final_handoff": "",
+        }
+        (proj_dir / "campaign.json").write_text(json.dumps(index_b), encoding="utf-8")
+
+        snap_b = self.indexer.scan_project(project, now=now)
+        # Old run-A waves and ALL_3 remain on disk but must NOT count for run B.
+        self.assertEqual(snap_b.completed_waves, 1, "new run must report 1/3")
+        self.assertFalse(snap_b.campaign_complete, "new run must not be complete")
+        self.assertFalse(snap_b.final_handoff_ready, "old ALL_3 must not be final")
+        self.assertNotEqual(snap_b.campaign_run_id, "run-A")
+
+    def test_scan_project_parses_each_wave_exactly_once(self):
+        """PERF-003: a single uncached scan of a complete Quick3 must invoke
+        parse_wave exactly 3 times (one per wave) regardless of synthesis."""
+        from unittest.mock import patch
+
+        from audapack import audits as audits_mod
+
+        proj_dir = self.audit_root / "MAIN0" / "OncePerScan"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "OncePerScan__01_AUDIT_CORE.md").write_text(SAMPLE_CORE, encoding="utf-8")
+        (proj_dir / "OncePerScan__02_AUDIT_SECOND_WAVE.md").write_text(SAMPLE_SECOND, encoding="utf-8")
+        (proj_dir / "OncePerScan__03_AUDIT_PERFORMANCE.md").write_text(SAMPLE_PERF, encoding="utf-8")
+        (proj_dir / "OncePerScan__00_AUDIT_ALL_3.md").write_text(SAMPLE_ALL_3, encoding="utf-8")
+
+        project = Project(
+            id="onceperscan",
+            display_name="OncePerScan",
+            source_path=r"C:\OncePerScan",
+            priority_group="MAIN0",
+            slot=1,
+            audit_project_name="OncePerScan",
+        )
+        now = datetime(2026, 8, 29, 7, 0, 0)
+        with patch.object(audits_mod, "parse_wave", wraps=audits_mod.parse_wave) as spy:
+            snap = self.indexer.scan_project(project, now=now)
+        # Three waves parsed once each = 3 calls. No extra synthesis reparse.
+        self.assertEqual(spy.call_count, 3, f"expected 3 parse_wave calls, got {spy.call_count}")
+        self.assertEqual(snap.completed_waves, 3)
+
+    def test_live_campaign_index_authority_over_stale_canonical_files(self):
+        """CORE-002: old run wave files at canonical names must not be counted
+        as members of a new run; the live campaign.json is the authority."""
+        import json
+        proj_dir = self.audit_root / "MAIN0" / "Scorecard"
+        proj_dir.mkdir(parents=True)
+
+        # Old run A: complete 3 waves + ALL_3 + campaign.json
+        core_a = SAMPLE_CORE + "\nCAMPAIGN_RUN_ID: old-run-a\n"
+        second_a = SAMPLE_SECOND + "\nCAMPAIGN_RUN_ID: old-run-a\n"
+        perf_a = SAMPLE_PERF + "\nCAMPAIGN_RUN_ID: old-run-a\n"
+        all3_a = SAMPLE_ALL_3 + "\nCAMPAIGN_RUN_ID: old-run-a\n"
+        (proj_dir / "Scorecard__01_AUDIT_CORE.md").write_text(core_a, encoding="utf-8")
+        (proj_dir / "Scorecard__02_AUDIT_SECOND_WAVE.md").write_text(second_a, encoding="utf-8")
+        (proj_dir / "Scorecard__03_AUDIT_PERFORMANCE.md").write_text(perf_a, encoding="utf-8")
+        (proj_dir / "Scorecard__00_AUDIT_ALL_3.md").write_text(all3_a, encoding="utf-8")
+        old_index = {
+            "schema_version": 1, "campaign_run_id": "old-run-a",
+            "campaign_profile": "quick3", "campaign_status": "CAMPAIGN_COMPLETE",
+            "completed_count": 3, "completed_waves": ["core", "second", "performance"],
+            "final_handoff": "Scorecard__00_AUDIT_ALL_3.md",
+            "wave_count": 3, "project_name": "Scorecard",
+        }
+        (proj_dir / "campaign.json").write_text(json.dumps(old_index), encoding="utf-8")
+
+        project = Project(
+            id="scorecard", display_name="Scorecard",
+            source_path=r"C:\Scorecard", priority_group="MAIN0", slot=1,
+            audit_project_name="Scorecard",
+        )
+        now = datetime(2026, 8, 29, 1, 0, 0)
+
+        # Precondition: old run shows 3/3 complete.
+        snap_old = self.indexer.scan_project(project, now=now)
+        self.assertEqual(snap_old.completed_waves, 3)
+        self.assertTrue(snap_old.campaign_complete)
+        self.assertTrue(snap_old.final_handoff_ready)
+
+        # New run B: only Core posted, campaign.json says 1/3.
+        core_b = SAMPLE_CORE + "\nCAMPAIGN_RUN_ID: new-run-b\n"
+        (proj_dir / "Scorecard__01_AUDIT_CORE.md").write_text(core_b, encoding="utf-8")
+        new_index = {
+            "schema_version": 1, "campaign_run_id": "new-run-b",
+            "campaign_profile": "quick3", "campaign_status": "CAMPAIGN_READY_FOR_WAVE",
+            "completed_count": 1, "completed_waves": ["core"],
+            "final_handoff": "",
+            "wave_count": 3, "project_name": "Scorecard",
+        }
+        (proj_dir / "campaign.json").write_text(json.dumps(new_index), encoding="utf-8")
+
+        snap_new = self.indexer.scan_project(project, now=now)
+        self.assertEqual(snap_new.completed_waves, 1, "new run must report 1/3, not 3")
+        self.assertFalse(snap_new.campaign_complete, "new run must not be complete")
+        self.assertFalse(snap_new.final_handoff_ready, "old ALL_3 must not be preferred")
+        # The old ALL_3 still exists on disk; verify it's not exposed.
+        if snap_new.final_handoff_path:
+            self.assertNotIn("run-a", str(snap_new.final_handoff_path), "old final handoff must not be preferred")
+        # After completing the new run, final_handoff_ready becomes true.
+        new_index["campaign_status"] = "CAMPAIGN_COMPLETE"
+        new_index["completed_count"] = 3
+        new_index["completed_waves"] = ["core", "second", "performance"]
+        new_index["final_handoff"] = "Scorecard__00_AUDIT_ALL_3.md"
+        (proj_dir / "campaign.json").write_text(json.dumps(new_index), encoding="utf-8")
+        snap_final = self.indexer.scan_project(project, now=now)
+        self.assertTrue(snap_final.campaign_complete)
+        self.assertTrue(snap_final.final_handoff_ready)
 
 
 if __name__ == "__main__":

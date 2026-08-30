@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 from audapack import __app_name__, __version__
 from audapack.audits import AuditIndexer
-from audapack.config import app_dir, load_config
+from audapack.config import app_dir, get_logs_dir, load_config
 from audapack.context_menu import (
     install_context_menu,
     is_context_menu_installed,
@@ -21,14 +23,19 @@ from audapack.saipen import get_saipen_info
 
 
 def run_silent_pack_all() -> int:
-    """Packs all enabled projects in silent mode with rotating/appended log."""
+    """Packs all enabled projects in silent mode with bounded runtime logging."""
     config = load_config()
     registry = ProjectRegistry(config)
-    log_file = app_dir() / "pack_all_audit_silent.log"
+    log_file = get_logs_dir() / "pack_all_audit_silent.log"
+    logger = logging.getLogger("audapack.silent_pack")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = RotatingFileHandler(log_file, maxBytes=1_048_576, backupCount=3, encoding="utf-8")
+    logger.addHandler(handler)
 
     def log(msg: str):
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"{msg}\n")
+        logger.info(msg)
 
     log(f"--- {__app_name__} v{__version__} SILENT RUN START ---")
     enabled_projects = [p for p in registry.projects if p.enabled]
@@ -200,7 +207,9 @@ def print_status() -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=f"{__app_name__} — Project archive packager & audit room.")
+    parser = argparse.ArgumentParser(
+        description=f"{__app_name__} — Windows cockpit for verified ZIP packaging and multi-wave AI audit handoff."
+    )
     parser.add_argument("--pack", metavar="PATH", help="Pack specified directory or file into archive")
     parser.add_argument("--pack-project", metavar="ID", help="Pack project by ID")
     parser.add_argument("--silent", action="store_true", help="Pack all enabled projects silently without UI")
@@ -297,9 +306,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_bridge_server(config)
 
     # Launch GUI (enforce single instance)
-    from audapack.single_instance import SingleInstance
+    from audapack.single_instance import GuardEstablishmentError, SingleInstance
     single = SingleInstance("AUDAPACK_GUI")
-    if single.is_already_running():
+    try:
+        already_running = single.is_already_running()
+    except GuardEstablishmentError as exc:
+        print(f"AUDAPACK: single-instance guard failed, refusing to start: {exc}", file=sys.stderr)
+        return 1
+    if already_running:
         if not single.activate_existing_window("AUDAPACK"):
             # Mutex reported held but no window was found -- zombie holder.
             # Do NOT silently no-op (that bricks the launcher). Open a new instance.

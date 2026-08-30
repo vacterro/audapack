@@ -12,6 +12,7 @@ Presentation-only in-memory model:
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,7 @@ from PySide6.QtCore import (
     Signal,
 )
 
-from audapack.audits import calculate_temperature, format_age_str
+from audapack.audits import calculate_temperature, format_age_str, format_created_str
 from audapack.config import app_dir
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
@@ -62,6 +63,17 @@ class ProjectRoomModel(QAbstractItemModel):
         "archive_info": Qt.ItemDataRole.UserRole + 18,
         "audit_profile_id": Qt.ItemDataRole.UserRole + 19,
         "archive_sync_status": Qt.ItemDataRole.UserRole + 20,
+        "hover_info": Qt.ItemDataRole.UserRole + 21,
+        "is_ignored": Qt.ItemDataRole.UserRole + 22,
+        "archive_temperature": Qt.ItemDataRole.UserRole + 23,
+        "archive_ignored": Qt.ItemDataRole.UserRole + 24,
+        "audit_copy_count": Qt.ItemDataRole.UserRole + 25,
+        "pack_progress": Qt.ItemDataRole.UserRole + 26,  # dict {files_added, bytes_written, current_path} or None
+        "pack_percent": Qt.ItemDataRole.UserRole + 27,  # 0..100 float or None
+        "archive_mtime": Qt.ItemDataRole.UserRole + 28,  # float epoch seconds or None
+        "source_dir_mtime": Qt.ItemDataRole.UserRole + 29,  # float epoch seconds or None
+        "source_older_than_archive": Qt.ItemDataRole.UserRole + 30,  # True/False/None
+        "archive_freshness_short": Qt.ItemDataRole.UserRole + 31,  # "fresh" | "stale" | "old" | "none"
     }
 
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None, parent: Optional[QObject] = None):
@@ -72,6 +84,19 @@ class ProjectRoomModel(QAbstractItemModel):
         self._projects: dict[tuple[str, int], Project] = {}  # (group, slot) -> Project
         self._snapshots: dict[str, AuditSnapshot] = {}  # project_id -> AuditSnapshot
         self._pack_states: dict[str, tuple[str, str]] = {}  # project_id -> (state, message)
+        # Per-project live pack progress (files_added, bytes_written, current_path).
+        # Populated via update_pack_progress() from a worker thread callback; cleared
+        # when the pack state transitions away from PACKING/QUEUED.
+        self._pack_progress: dict[str, dict] = {}
+        # Monotonic counter so coalesced progress callbacks for a previous run
+        # cannot bleed into a fresh pack.
+        self._pack_run_id: dict[str, int] = {}
+        # Archive freshness cache. The source tree freshness probe is a bounded
+        # filesystem walk; running it on every data()/paint would stall the GUI
+        # thread (white flashes). All archive roles read this cache; it is
+        # invalidated after a pack and refreshed by the temperature tick.
+        self._archive_fresh_cache: dict[str, dict] = {}
+        self._archive_fresh_ttl = 10.0
 
         # Performance counters for diagnostics & tests
         self.model_reset_count: int = 0
@@ -86,29 +111,27 @@ class ProjectRoomModel(QAbstractItemModel):
         if not initial:
             self.full_refresh_count += 1
 
+        old_projects = {p.id: p for p in self._projects.values() if p}
+        old_snapshots = self._snapshots
         self.beginResetModel()
         self._groups = self._service.active_groups()
         self._projects = {}
-        # Single-pass load: reuse one list_projects() result and avoid double scan.
+        # Single-pass structural rebuild; audit enrichment stays asynchronous.
         projects = self._service.list_projects()
         for p in projects:
             g = p.priority_group.upper()
             self._projects[(g, p.slot)] = p
 
-        # Snapshots: startup is now lazy (0 disk reads) — async enrichment populates.
-        # Explicit reload (user Refresh All) still preloads synchronously for immediate feedback.
         self._snapshots = {}
-        if not initial:
-            for p in projects:
-                try:
-                    if hasattr(self._audit_service, "indexer"):
-                        snap = self._audit_service.indexer.scan_project(p)
-                    else:
-                        snap = self._audit_service.get_snapshot(p.id)
-                    if snap:
-                        self._snapshots[p.id] = snap
-                except Exception:
-                    pass
+        for p in projects:
+            previous = old_projects.get(p.id)
+            if previous and (
+                previous.source_path == p.source_path
+                and previous.audit_project_name == p.audit_project_name
+            ):
+                snap = old_snapshots.get(p.id)
+                if snap:
+                    self._snapshots[p.id] = snap
         self.endResetModel()
 
     def reload(self):
@@ -153,12 +176,15 @@ class ProjectRoomModel(QAbstractItemModel):
         project: Project,
         swapped_project: Optional[Project] = None,
     ):
-        """Applies a project move/swap in-memory and emits targeted dataChanged signals. ZERO model reset."""
+        """Applies a project move/swap in-memory and emits layoutChanged for reliable repaint."""
         self.targeted_project_update_count += 1
         src_g = src_group.upper()
         tgt_g = tgt_group.upper()
 
         self.ensure_group_exists(tgt_g)
+
+        # Emit layoutAboutToBeChanged so the view saves persistent indexes
+        self.layoutAboutToBeChanged.emit()
 
         if swapped_project:
             self._projects[(src_g, src_slot)] = swapped_project
@@ -167,13 +193,8 @@ class ProjectRoomModel(QAbstractItemModel):
 
         self._projects[(tgt_g, tgt_slot)] = project
 
-        src_idx = self.index_for_slot(src_g, src_slot)
-        tgt_idx = self.index_for_slot(tgt_g, tgt_slot)
-
-        if src_idx.isValid():
-            self.dataChanged.emit(src_idx, src_idx)
-        if tgt_idx.isValid():
-            self.dataChanged.emit(tgt_idx, tgt_idx)
+        # layoutChanged forces complete re-layout — guaranteed repaint for swaps
+        self.layoutChanged.emit()
 
     def update_project_metadata(self, project: Project):
         """Updates in-memory project data and emits single-row dataChanged."""
@@ -188,10 +209,38 @@ class ProjectRoomModel(QAbstractItemModel):
     def update_audit_snapshot(self, project_id: str, snapshot: Optional[AuditSnapshot]):
         """Updates pre-loaded snapshot for a single project and notifies the view."""
         self.targeted_project_update_count += 1
+        old_snap = self._snapshots.get(project_id)
         if snapshot:
             self._snapshots[project_id] = snapshot
         else:
             self._snapshots.pop(project_id, None)
+
+        # Reset copy counter when audit completely refreshed (new run or new final hash)
+        if snapshot and old_snap:
+            new_run = getattr(snapshot, "campaign_run_id", "") or ""
+            old_run = getattr(old_snap, "campaign_run_id", "") or ""
+            new_sha = getattr(snapshot, "final_handoff_sha256", "") or getattr(snapshot, "all3_sha256", "") or ""
+            old_sha = getattr(old_snap, "final_handoff_sha256", "") or getattr(old_snap, "all3_sha256", "") or ""
+            is_new_audit = False
+            if new_run and old_run and new_run != old_run:
+                is_new_audit = True
+            elif new_sha and old_sha and new_sha != old_sha:
+                is_new_audit = True
+            elif getattr(snapshot, "audit_timestamp", None) and getattr(old_snap, "audit_timestamp", None):
+                try:
+                    if snapshot.audit_timestamp and old_snap.audit_timestamp and snapshot.audit_timestamp > old_snap.audit_timestamp:
+                        # newer timestamp + HOT means fresh ingest
+                        if getattr(snapshot, "audit_age_seconds", 9999) is not None and snapshot.audit_age_seconds < 300:
+                            is_new_audit = True
+                except Exception:
+                    pass
+            if is_new_audit:
+                proj = next((p for p in self._service.list_projects() if p.id == project_id), None)
+                if proj and getattr(proj, "audit_copy_count", 0):
+                    try:
+                        self._service.update_project(project_id, lambda p: setattr(p, "audit_copy_count", 0))
+                    except Exception:
+                        pass
 
         idx = self.index_for_project_id(project_id)
         if idx.isValid():
@@ -201,6 +250,48 @@ class ProjectRoomModel(QAbstractItemModel):
         """Updates packing progress/completion status for a project row."""
         self.targeted_project_update_count += 1
         self._pack_states[project_id] = (state, message)
+        if state not in ("PACKING", "QUEUED"):
+            # Pack finished (COMPLETE / FAILED / IDLE): drop any in-flight progress,
+            # bump the run id so a stale worker callback becomes a no-op, and force
+            # the archive freshness cache to recompute (a failed pack may have moved
+            # the archive to a .PARTIAL.* name / restored the previous good one).
+            self._pack_progress.pop(project_id, None)
+            self._pack_run_id[project_id] = self._pack_run_id.get(project_id, 0) + 1
+            self._archive_fresh_cache.pop(project_id, None)
+        else:
+            # A fresh run is starting: invalidate any previous run id so a
+            # lingering worker for the prior pack cannot update progress here.
+            self._pack_run_id[project_id] = self._pack_run_id.get(project_id, 0) + 1
+            self._pack_progress.pop(project_id, None)
+        idx = self.index_for_project_id(project_id)
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx)
+
+    def get_current_pack_run_id(self, project_id: str) -> int:
+        """Returns the active run id for ``project_id`` (0 if no run is registered)."""
+        return int(self._pack_run_id.get(project_id, 0))
+
+    def update_pack_progress(self, project_id: str, files_added: int, bytes_written: int, current_path: str = "", run_id: int = 0):
+        """Live progress callback for a single pack run.
+
+        ``run_id`` must equal the most recent ``update_pack_state`` run id for
+        this project. When a pack finishes (state != PACKING/QUEUED) the run id
+        is bumped; any worker that still calls this with the old id becomes a
+        no-op so the UI never shows stale progress.
+        """
+        if run_id != self._pack_run_id.get(project_id, 0):
+            # Stale worker callback for an older (or unregistered) run: drop it.
+            return
+        if project_id not in self._pack_states:
+            return
+        state, _ = self._pack_states[project_id]
+        if state not in ("PACKING", "QUEUED"):
+            return
+        self._pack_progress[project_id] = {
+            "files_added": max(0, int(files_added or 0)),
+            "bytes_written": max(0, int(bytes_written or 0)),
+            "current_path": str(current_path or ""),
+        }
         idx = self.index_for_project_id(project_id)
         if idx.isValid():
             self.dataChanged.emit(idx, idx)
@@ -260,6 +351,20 @@ class ProjectRoomModel(QAbstractItemModel):
 
         for idx in changed_indexes:
             self.dataChanged.emit(idx, idx)
+
+        # PERF-001: recompute archive/source freshness for entries whose TTL
+        # expired. _get_archive_fresh marks them stale during a paint read and
+        # this periodic tick does the filesystem work off the data() path.
+        stale_ids = getattr(self, "_stale_projects", None)
+        if stale_ids:
+            for pid in list(stale_ids):
+                stale_ids.discard(pid)
+                proj = self.project_by_id(pid)
+                if proj:
+                    self._archive_fresh_cache[pid] = self._compute_archive_fresh(proj)
+                    idx = self.index_for_project_id(pid)
+                    if idx.isValid():
+                        self.dataChanged.emit(idx, idx)
 
     def group_count(self, group: str) -> int:
         """Returns count of active projects in a group."""
@@ -356,6 +461,12 @@ class ProjectRoomModel(QAbstractItemModel):
             return str(proj.source_path)
         if role == self.ROLES["enabled"]:
             return bool(proj.enabled)
+        if role == self.ROLES["is_ignored"]:
+            return bool(getattr(proj, "ignored", False))
+        if role == self.ROLES["archive_ignored"]:
+            return bool(getattr(proj, "ignore_archive", False))
+        if role == self.ROLES["audit_copy_count"]:
+            return int(getattr(proj, "audit_copy_count", 0) or 0)
 
         # Audit roles
         snap = self._snapshots.get(proj.id)
@@ -381,6 +492,43 @@ class ProjectRoomModel(QAbstractItemModel):
             return "A10" if prof == "super10" else "A3"
         if role == self.ROLES["archive_sync_status"]:
             return self.get_archive_sync_status(proj, snap)
+        if role == self.ROLES["archive_temperature"]:
+            return self._get_archive_temperature(proj)
+        if role == self.ROLES["pack_progress"]:
+            return self._pack_progress.get(proj.id)
+        if role == self.ROLES["pack_percent"]:
+            prog = self._pack_progress.get(proj.id)
+            if not prog:
+                return None
+            # Source size = best estimate. We only know the running bytes_written.
+            # Use a moving estimate: bytes_written / max(bytes_written + chunk, total_seen).
+            # Without a total, we cap to 99% and let COMPLETE/FAILED clear it.
+            ba = int(prog.get("bytes_written") or 0)
+            # The packing engine emits progress at 1 + every 50 files; we have no
+            # total file count yet. Use a simple bounded log-scale proxy:
+            # 1 MB = 5%, 10 MB = 25%, 100 MB = 60%, 1 GB = 90%, >1 GB ~ 95%.
+            mb = ba / (1024 * 1024)
+            if mb <= 0:
+                pct = 1.0
+            elif mb < 1:
+                pct = 1 + (mb * 4.0)            # 0->1, 0.25->2, 0.99->5
+            elif mb < 10:
+                pct = 5 + (mb - 1) * (20 / 9)   # 1->5, 10->25
+            elif mb < 100:
+                pct = 25 + (mb - 10) * (35 / 90)
+            elif mb < 1024:
+                pct = 60 + (mb - 100) * (30 / 924)
+            else:
+                pct = min(95, 90 + (mb - 1024) * (5 / 1024))
+            return float(pct)
+        if role == self.ROLES["archive_mtime"]:
+            return self._get_archive_mtime(proj)
+        if role == self.ROLES["source_dir_mtime"]:
+            return self._get_source_dir_mtime(proj)
+        if role == self.ROLES["source_older_than_archive"]:
+            return self._source_older_than_archive(proj)
+        if role == self.ROLES["archive_freshness_short"]:
+            return self._get_archive_freshness_short(proj)
 
         # Pack state role
         if role == self.ROLES["pack_state"]:
@@ -390,41 +538,220 @@ class ProjectRoomModel(QAbstractItemModel):
             _st, msg = self._pack_states.get(proj.id, ("IDLE", ""))
             return msg
 
+        # Rich hover info dict — everything the tooltip builder needs
+        if role == self.ROLES["hover_info"]:
+            snap = self._snapshots.get(proj.id)
+            arc_data = self.get_archive_info(proj)
+            pack_st, pack_msg = self._pack_states.get(proj.id, ("IDLE", ""))
+            return {
+                "project": proj,
+                "snapshot": snap,
+                "archive_info": arc_data,
+                "pack_state": pack_st,
+                "pack_message": pack_msg,
+                "pack_progress": self._pack_progress.get(proj.id),
+                "pack_percent": self._pack_progress.get(proj.id) and self.data(index, self.ROLES["pack_percent"]) or None,
+                "archive_sync_status": self.get_archive_sync_status(proj, snap),
+                "archive_freshness_short": self._get_archive_freshness_short(proj),
+                "source_older_than_archive": self._source_older_than_archive(proj),
+                "group": group,
+                "slot": slot,
+                "total_groups": len(self._groups),
+                "group_count": self.group_count(group),
+            }
+
         return None
 
     def get_archive_info(self, proj: Project) -> tuple[bool, str, str, Optional[Path]]:
-        """Returns (exists, size_str, age_str, path)."""
-        if not proj or not proj.source_path:
-            return (False, "", "", None)
-        try:
-            out_dir = resolve_output_dir(proj.source_path, self._service.config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
-            arc = find_archive_for_project(proj, out_dir)
-            if arc and arc.exists():
-                st = arc.stat()
-                age_s = time.time() - st.st_mtime
-                return (True, human_mb(st.st_size), format_age_str(age_s), arc)
-        except Exception:
-            pass
+        """Returns (exists, size_str, created_str, path) — pure cache reads.
+
+        PERF-001: never stat on paint; size/created are already captured into
+        the cached snapshot at compute time.
+        """
+        entry = self._get_archive_fresh(proj)
+        if entry["exists"] and entry["path"]:
+            size_str = entry.get("size_str") or ""
+            created_str = entry.get("created_str") or ""
+            return (True, size_str, created_str, entry["path"])
         return (False, "", "", None)
 
     def get_archive_sync_status(self, proj: Project, snap: Optional[AuditSnapshot]) -> str:
-        """Returns 'SYNCED', 'OUTDATED', or 'NO_ARCHIVE'."""
-        if not proj or not proj.source_path:
+        """Returns 'SYNCED', 'OUTDATED', or 'NO_ARCHIVE' (cache-backed)."""
+        entry = self._get_archive_fresh(proj)
+        if not entry["exists"] or not entry["path"]:
             return "NO_ARCHIVE"
-        arc_info = self.get_archive_info(proj)
-        arc_exists, _size, _age, arc_path = arc_info
-        if not arc_exists or not arc_path:
-            return "NO_ARCHIVE"
+        return entry.get("sync_status", "SYNCED")
+
+    # ---------------------------------------------------------------- Archive freshness cache
+    #
+    # The source-tree freshness probe is a bounded filesystem walk. If it ran on
+    # every data()/paint call the GUI thread would stall (white flashes every
+    # repaint). All archive roles below read ONE cached snapshot per project,
+    # recomputed at most every ``_archive_fresh_ttl`` seconds.
+
+    def _compute_archive_fresh(self, proj: Project) -> dict:
+        """Single bounded disk pass: archive + source freshness for a project.
+
+        Returns a dict consumed by the archive roles. Never raises. The source
+        walk is capped both by file count and wall-clock budget so even a huge
+        tree cannot stall the UI thread.
+        """
+        entry = {
+            "computed_at": time.time(),
+            "exists": False,
+            "path": None,
+            "mtime": None,
+            "size_str": "",
+            "created_str": "",
+            "temperature": AuditTemperature.NONE,
+            "sync_status": "NO_ARCHIVE",
+            "source_mtime": None,
+            "source_older": None,
+            "freshness_short": "none",
+        }
+        try:
+            if not proj or not proj.source_path:
+                return entry
+            sp = Path(proj.source_path)
+            if not sp.exists():
+                return entry
+
+            out_dir = resolve_output_dir(proj.source_path, self._service.config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
+            arc = find_archive_for_project(proj, out_dir)
+
+            arc_mt: Optional[float] = None
+            if arc and arc.exists():
+                try:
+                    arc_mt = float(arc.stat().st_mtime)
+                except OSError:
+                    arc_mt = None
+                if arc_mt is not None:
+                    entry["exists"] = True
+                    entry["path"] = arc
+                    entry["mtime"] = arc_mt
+                    try:
+                        st = arc.stat()
+                        entry["size_str"] = human_mb(st.st_size)
+                        entry["created_str"] = format_created_str(getattr(st, "st_ctime", st.st_mtime))
+                    except OSError:
+                        entry["size_str"] = ""
+                        entry["created_str"] = ""
+                    cfg = self._service.config.audits
+                    entry["temperature"] = calculate_temperature(max(0.0, time.time() - arc_mt), cfg)
+                    age_s = max(0.0, time.time() - arc_mt)
+                    entry["freshness_short"] = "fresh" if age_s < 3600 else ("stale" if age_s < 86400 else "old")
+                    snap = self._snapshots.get(proj.id)
+                    entry["sync_status"] = self._sync_status_from(proj, snap, arc, arc_mt)
+
+            # Bounded source probe (only when an archive exists to compare against;
+            # skip entirely when nothing is packed so the row never pays for the walk).
+            if arc_mt is not None:
+                src_mt, src_complete = self._probe_source_mtime(sp)
+                if src_mt is not None:
+                    entry["source_mtime"] = src_mt
+                    # PERF-001: only a COMPLETE traversal may prove the source is
+                    # newer (or older) than the archive. A budget/interrupt-limited
+                    # scan is UNKNOWN, never evidence of freshness.
+                    if src_complete:
+                        entry["source_older"] = src_mt > arc_mt + 0.5
+        except Exception:
+            pass
+        return entry
+
+    def _sync_status_from(self, proj: Project, snap: Optional[AuditSnapshot], arc_path: Path, arc_mtime: float) -> str:
+        """SYNCED / OUTDATED / NO_ARCHIVE using the cached archive mtime."""
         if not snap or not snap.audit_timestamp:
             return "SYNCED"
         try:
-            arc_mtime = arc_path.stat().st_mtime
             audit_ts = snap.audit_timestamp.timestamp()
             if audit_ts > arc_mtime + 60:
                 return "OUTDATED"
         except Exception:
             pass
         return "SYNCED"
+
+    def _probe_source_mtime(self, sp: Path) -> tuple[Optional[float], bool]:
+        """Newest file mtime under ``sp``. File cap + time budget bound the walk.
+
+        Returns ``(mtime, complete)``. When the budget or file cap is exhausted
+        ``complete`` is ``False`` and the mtime is the best-effort newest seen so
+        far -- callers MUST NOT treat it as proof that source is older than the
+        archive (PERF-001).
+        """
+        try:
+            if sp.is_file():
+                return float(sp.stat().st_mtime), True
+            max_entries = 1000
+            budget_s = 0.15
+            deadline = time.monotonic() + budget_s
+            newest = sp.stat().st_mtime
+            count = 0
+            for root, _dirs, files in os.walk(sp):
+                if count >= max_entries or time.monotonic() >= deadline:
+                    return float(newest), False
+                for f in files:
+                    if count >= max_entries or time.monotonic() >= deadline:
+                        return float(newest), False
+                    try:
+                        mt = (Path(root) / f).stat().st_mtime
+                        if mt > newest:
+                            newest = mt
+                    except OSError:
+                        continue
+                    count += 1
+            return float(newest), True
+        except Exception:
+            return None, False
+
+    def _get_archive_fresh(self, proj: Project) -> dict:
+        """Cached archive freshness entry.
+
+        PERF-001: this is a PURE READ of the precomputed snapshot. On TTL expiry
+        the stale entry is returned immediately and a deferred recompute flag is
+        set; the actual filesystem walk happens in ``update_temperature_all()``
+        (called from the temperature tick timer, never during data()/paint).
+        """
+        if not proj:
+            return {
+                "computed_at": time.time(), "exists": False, "path": None, "mtime": None,
+                "size_str": "", "created_str": "", "temperature": AuditTemperature.NONE,
+                "sync_status": "NO_ARCHIVE", "source_mtime": None, "source_older": None,
+                "freshness_short": "none",
+            }
+        now = time.time()
+        entry = self._archive_fresh_cache.get(proj.id)
+        if entry is None:
+            # Cache miss: initial populate / post-invalidation read. This is the
+            # only synchronous compute path (startup enrichment, invalidation
+            # follow-up); normal paints hit the TTL branch below.
+            entry = self._compute_archive_fresh(proj)
+            self._archive_fresh_cache[proj.id] = entry
+            return entry
+        if (now - entry.get("computed_at", 0)) >= self._archive_fresh_ttl:
+            # Stale but serve it; recompute is scheduled in update_temperature_all.
+            if not hasattr(self, "_stale_projects"):
+                self._stale_projects = set()
+            self._stale_projects.add(proj.id)
+        return entry
+
+    def invalidate_archive_fresh(self, project_id: str) -> None:
+        """Force the next archive freshness read to recompute (after a pack)."""
+        self._archive_fresh_cache.pop(project_id, None)
+
+    def _get_archive_temperature(self, proj: Project) -> AuditTemperature:
+        return self._get_archive_fresh(proj)["temperature"]
+
+    def _get_archive_mtime(self, proj: Project) -> Optional[float]:
+        return self._get_archive_fresh(proj)["mtime"]
+
+    def _get_source_dir_mtime(self, proj: Project) -> Optional[float]:
+        return self._get_archive_fresh(proj)["source_mtime"]
+
+    def _source_older_than_archive(self, proj: Project) -> Optional[bool]:
+        return self._get_archive_fresh(proj)["source_older"]
+
+    def _get_archive_freshness_short(self, proj: Project) -> str:
+        return self._get_archive_fresh(proj)["freshness_short"]
 
     def supportedDropActions(self) -> Qt.DropAction:
         return Qt.DropAction.MoveAction | Qt.DropAction.CopyAction

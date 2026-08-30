@@ -1,5 +1,6 @@
 """Unit tests for SingleInstance mutex guard."""
 
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ class TestSingleInstance(unittest.TestCase):
         finally:
             inst1.release()
 
+    @unittest.skipUnless(sys.platform == "win32", "zombie mutex/window recovery is Win32-only")
     def test_second_instance_zombie_holder_self_corrects(self):
         """Regression for "app doesn't open via launcher": a held mutex with NO
         visible window is a zombie holder. The second instance must self-correct
@@ -39,6 +41,7 @@ class TestSingleInstance(unittest.TestCase):
             inst1.release()
             inst2.release()
 
+    @unittest.skipUnless(sys.platform == "win32", "visible-window detection is Win32-only")
     def test_second_instance_with_window_detected(self):
         """If a mutex is held AND an AUDAPACK window is reachable, the guard
         correctly reports "already running" so the launcher can foreground it."""
@@ -57,6 +60,7 @@ class TestSingleInstance(unittest.TestCase):
                 inst1.release()
                 inst2.release()
 
+    @unittest.skipUnless(sys.platform == "win32", "foreground activation is Win32-only")
     def test_activate_existing_window_returns_bool(self):
         """activate_existing_window must signal whether it actually foregrounded
         something, so the launcher can recover when the holder is a zombie."""

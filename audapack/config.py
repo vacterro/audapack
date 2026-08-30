@@ -6,6 +6,7 @@ never leaving mutable tokens or state in the source repository.
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import json
 import logging
@@ -13,11 +14,13 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:  # Win32 byte-range locks (stdlib, Windows only)
     import msvcrt
@@ -310,6 +313,23 @@ def cross_process_lock(path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
         yield
 
 
+def scoped_config_write(mutator: Callable[[AppConfig], None], base_dir: Optional[Path] = None) -> bool:
+    """W2-007: transactional, scoped persistence of UI-owned config fields.
+
+    Acquires the cross-process registry lock, reloads the latest on-disk config,
+    applies ``mutator`` to that LATEST object, and saves the merged result.
+    The mutator must touch only fields it owns (geometry, browser preference,
+    language, packing/audit/bridge/launcher settings) and never the project
+    registry, which ProjectRegistry owns. Returns True on verified save; on
+    failure the on-disk state is left untouched.
+    """
+    lock_path = get_registry_lock_path(base_dir)
+    with cross_process_lock(lock_path):
+        latest = load_config(base_dir)
+        mutator(latest)
+        return bool(save_config(latest, base_dir))
+
+
 # Output layout modes (CORE-009 / T-26):
 #   single_folder      -- every archive is written to PackingConfig.output_dir
 #                         (or the app runtime dir if empty). This is the legacy
@@ -412,11 +432,80 @@ class BridgeConfig:
 
 
 @dataclass
+class LauncherConfig:
+    id: str
+    name: str
+    short_label: str
+    command_template: str = ""
+    agent_type: str = "powershell"  # "powershell", "cmd", "executable", "custom"
+    enabled: bool = True
+    max_instances: int = 0  # 0 = unlimited; FreeBuff defaults to one global window
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "short_label": self.short_label,
+            "command_template": self.command_template,
+            "agent_type": self.agent_type,
+            "enabled": self.enabled,
+            "max_instances": self.max_instances,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LauncherConfig:
+        launcher_id = str(data.get("id", "")).strip()
+        default_limit = 1 if launcher_id == "freebuff" else 0
+        try:
+            max_instances = max(0, int(data.get("max_instances", default_limit)))
+        except (TypeError, ValueError):
+            max_instances = default_limit
+        return cls(
+            id=launcher_id,
+            name=str(data.get("name", "")).strip(),
+            short_label=str(data.get("short_label", "")).strip(),
+            command_template=str(data.get("command_template", "")).strip(),
+            agent_type=str(data.get("agent_type", "powershell")).strip(),
+            enabled=bool(data.get("enabled", True)),
+            max_instances=max_instances,
+        )
+
+
+DEFAULT_LAUNCHERS: list[LauncherConfig] = [
+    LauncherConfig(id="opencode", name="OpenCode", short_label="OC", command_template="", agent_type="powershell", enabled=True),
+    LauncherConfig(id="freebuff", name="FreeBuff", short_label="FB", command_template="", agent_type="powershell", enabled=True, max_instances=1),
+    LauncherConfig(id="cline", name="Cline", short_label="CL", command_template="", agent_type="powershell", enabled=True),
+    LauncherConfig(id="main_codex", name="Codex 1", short_label="C1", command_template="", agent_type="powershell", enabled=True),
+    LauncherConfig(id="main_codex2", name="Codex 2", short_label="C2", command_template="", agent_type="powershell", enabled=True),
+    LauncherConfig(id="main_codex3_free", name="Codex Free", short_label="CF", command_template="", agent_type="powershell", enabled=True),
+]
+
+
+def create_default_launchers() -> list[LauncherConfig]:
+    return [LauncherConfig.from_dict(launcher.to_dict()) for launcher in DEFAULT_LAUNCHERS]
+
+
+DEFAULT_GG_TEMPLATE = "/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {path}"
+
+
+@dataclass
 class UIConfig:
     window_size: list[int] = field(default_factory=lambda: [760, 680])
+    window_pos: list[int] = field(default_factory=lambda: [])
+    window_maximized: bool = False
     reply_language: str = "et"
     ui_language: str = "ru"  # UI label language: 'ru' (default) or 'en'
     preferred_browser: str = ""  # Path to preferred browser executable (optional)
+    gg_template: str = DEFAULT_GG_TEMPLATE
+    auto_copy_gg_on_launch: bool = True  # Auto-copy GG command to clipboard when launching agent
+    tooltip_style: str = "golden"  # Tooltip style: 'golden' (default) or 'classic'
+    tooltip_delay_ms: int = 600  # Tooltip hover delay in milliseconds (0 = instant)
+    tooltip_duration_ms: int = 15000  # Tooltip visible duration in milliseconds (-1 = system default)
+    flash_duration_ms: int = 800  # Status bar flash duration in milliseconds
+    show_tooltips: bool = True  # Show tooltips on hover
+    compact_tooltips: bool = True  # Compact tooltip mode (vs verbose)
+    compact_rows: bool = False  # One-line project rows; false keeps full two-line details
+    launcher_letters: bool = True  # True: OC/FB/CL/C1/C2/CF, False: 1/2/3/4/5/6
 
 
 @dataclass
@@ -428,6 +517,7 @@ class AppConfig:
     audits: AuditsConfig = field(default_factory=AuditsConfig)
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    launchers: list[LauncherConfig] = field(default_factory=create_default_launchers)
 
     def normalize_paths(self) -> bool:
         """Normalize every persisted path string to OS-native separators in place.
@@ -464,6 +554,87 @@ class AppConfig:
 
         return changed
 
+    def heal_project_slots(self) -> bool:
+        """Heal out-of-range/duplicate project slots in place.
+
+        A project may carry a slot outside [1, SLOTS_PER_GROUP] or collide with
+        another project in the same group (historical/imported config data).
+        Such projects are invisible in the Project Room (slots 1..SLOTS_PER_GROUP
+        only) yet still match duplicate checks, producing confusing messages like
+        "already exists in [MAIN0 #7]". This reassigns them to the first free
+        valid slot in the same group, falling back to the next free slot across
+        canonical groups, then SIDE groups.
+
+        Returns True when any project was moved.
+        """
+        from audapack.models import CANONICAL_GROUPS, SLOTS_PER_GROUP
+
+        def occupied_slots(group: str) -> set[int]:
+            return {p.slot for p in self.projects if p.priority_group.upper() == group and 1 <= p.slot <= SLOTS_PER_GROUP}
+
+        def free_slot(group: str) -> int:
+            used = occupied_slots(group)
+            for s in range(1, SLOTS_PER_GROUP + 1):
+                if s not in used:
+                    return s
+            return 0
+
+        changed = False
+        moved_ids: set[str] = set()
+
+        all_groups = list(CANONICAL_GROUPS)
+        for p in self.projects:
+            grp = p.priority_group.upper()
+            if grp not in all_groups and grp.startswith("SIDE"):
+                all_groups.append(grp)
+
+        def sort_key(name: str) -> tuple[int, int]:
+            m = re.match(r'SIDE(\d+)', name)
+            return (1, int(m.group(1))) if m else (0, 0)
+        all_groups.sort(key=sort_key)
+
+        for p in self.projects:
+            grp = p.priority_group.upper()
+            slot = p.slot
+            valid = 1 <= slot <= SLOTS_PER_GROUP
+            collision = False
+            if valid:
+                for q in self.projects:
+                    if q is not p and q.priority_group.upper() == grp and q.slot == slot:
+                        collision = True
+                        break
+            if valid and not collision:
+                continue
+            if p.id in moved_ids:
+                continue
+
+            new_slot = free_slot(grp)
+            new_grp = grp
+            if not new_slot:
+                for g in all_groups:
+                    if g == grp:
+                        continue
+                    cand = free_slot(g)
+                    if cand:
+                        new_grp, new_slot = g, cand
+                        break
+            if not new_slot:
+                side_num = 0
+                while not new_slot:
+                    cand_grp = f"SIDE{side_num}"
+                    cand = free_slot(cand_grp)
+                    if cand:
+                        new_grp, new_slot = cand_grp, cand
+                        break
+                    side_num += 1
+            if new_grp != grp or new_slot != slot:
+                p.priority_group = new_grp
+                p.slot = new_slot
+                moved_ids.add(p.id)
+                changed = True
+
+        return changed
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -473,6 +644,7 @@ class AppConfig:
             "audits": asdict(self.audits),
             "bridge": self.bridge.to_safe_dict(),
             "ui": asdict(self.ui),
+            "launchers": [launcher.to_dict() for launcher in self.launchers],
         }
 
     def get_project_by_id(self, project_id: str) -> Optional[Project]:
@@ -498,6 +670,13 @@ class AppConfig:
 
 def get_token_file_path() -> Path:
     return get_secrets_dir() / "token.txt"
+
+
+class TokenPersistenceError(RuntimeError):
+    """Bridge auth token cannot be made durable; do not start with an ephemeral secret."""
+
+
+_TOKEN_REPLACE_LOCK = threading.Lock()
 
 
 LEGACY_ACCEPTANCE_MARKER_NAME = "legacy_token_acceptance.revoked"
@@ -546,11 +725,42 @@ def ensure_token(bridge_cfg: BridgeConfig, base_dir: Optional[Path] = None) -> s
     """
     Ensures bridge token is generated and persisted under secrets/token.txt.
     Migrates legacy token from repository root if present.
+
+    W2-005: a token is only reported as durable when token.txt was actually
+    written. Persistence failure raises TokenPersistenceError so the caller can
+    refuse to start the Bridge with an ephemeral secret.
     """
     if base_dir:
         token_file = Path(base_dir) / "token.txt"
     else:
         token_file = get_token_file_path()
+
+    def _persist(tok: str) -> None:
+        with _TOKEN_REPLACE_LOCK:
+            token_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = token_file.with_name(f".{token_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(tok + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                for attempt in range(3):
+                    try:
+                        tmp.replace(token_file)
+                        break
+                    except OSError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.02 * (attempt + 1))
+            except Exception as exc:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                raise TokenPersistenceError(
+                    f"Failed to persist bridge auth token to {token_file}: {exc}"
+                ) from exc
 
     # Check for legacy repo token to migrate
     repo_token_file = app_dir() / "token.txt"
@@ -558,14 +768,15 @@ def ensure_token(bridge_cfg: BridgeConfig, base_dir: Optional[Path] = None) -> s
         try:
             tok = repo_token_file.read_text(encoding="utf-8").strip()
             if tok:
-                token_file.parent.mkdir(parents=True, exist_ok=True)
-                token_file.write_text(tok, encoding="utf-8")
+                _persist(tok)
                 bridge_cfg.token = tok
                 try:
                     repo_token_file.unlink()
                 except OSError:
                     pass
                 return tok
+        except TokenPersistenceError:
+            raise
         except Exception:
             pass
 
@@ -575,24 +786,20 @@ def ensure_token(bridge_cfg: BridgeConfig, base_dir: Optional[Path] = None) -> s
             if tok and len(tok) >= 16:
                 bridge_cfg.token = tok
                 return tok
-        except Exception:
-            pass
+        except TokenPersistenceError:
+            raise
+        except Exception as exc:
+            raise TokenPersistenceError(
+                f"Bridge auth token file {token_file} is unreadable: {exc}"
+            ) from exc
 
     if bridge_cfg.token and len(bridge_cfg.token) >= 16:
-        try:
-            token_file.parent.mkdir(parents=True, exist_ok=True)
-            token_file.write_text(bridge_cfg.token, encoding="utf-8")
-        except Exception:
-            pass
+        _persist(bridge_cfg.token)
         return bridge_cfg.token
 
     new_token = secrets.token_urlsafe(32)
     bridge_cfg.token = new_token
-    try:
-        token_file.parent.mkdir(parents=True, exist_ok=True)
-        token_file.write_text(new_token, encoding="utf-8")
-    except Exception:
-        pass
+    _persist(new_token)
     return new_token
 
 
@@ -694,6 +901,8 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                         source_path=str(p_data.get("source_path", "")),
                         enabled=bool(p_data.get("enabled", True)),
                         ignored=bool(p_data.get("ignored", False)),
+                        ignore_archive=bool(p_data.get("ignore_archive", False)),
+                        audit_copy_count=int(p_data.get("audit_copy_count", 0) or 0),
                         priority_group=str(p_data.get("priority_group", "MAIN0")),
                         slot=int(p_data.get("slot", 1)),
                         archive_name=str(p_data.get("archive_name", "")),
@@ -714,6 +923,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         excludes=list(packing_raw.get("excludes", data.get("excludes", DEFAULT_EXCLUDES))),
         manifest_enabled=bool(packing_raw.get("manifest_enabled", data.get("manifest_enabled", True))),
         output_layout=normalize_output_layout(packing_raw.get("output_layout", DEFAULT_OUTPUT_LAYOUT)),
+        include_timestamp=bool(packing_raw.get("include_timestamp", True)),
     )
 
     audits_raw = data.get("audits", {})
@@ -738,10 +948,35 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
     ui_raw = data.get("ui", {})
     ui_cfg = UIConfig(
         window_size=list(ui_raw.get("window_size", data.get("window_size", [760, 680]))),
+        window_pos=list(ui_raw.get("window_pos", [])),
+        window_maximized=bool(ui_raw.get("window_maximized", False)),
         reply_language=str(ui_raw.get("reply_language", "et")),
         ui_language=str(ui_raw.get("ui_language", "ru")).lower().strip() or "ru",
         preferred_browser=str(ui_raw.get("preferred_browser", "")),
+        gg_template=str(ui_raw.get("gg_template", DEFAULT_GG_TEMPLATE)),
+        auto_copy_gg_on_launch=bool(ui_raw.get("auto_copy_gg_on_launch", True)),
+        tooltip_style=str(ui_raw.get("tooltip_style", "golden")),
+        tooltip_delay_ms=int(ui_raw.get("tooltip_delay_ms", 600)),
+        tooltip_duration_ms=int(ui_raw.get("tooltip_duration_ms", 10000)),
+        flash_duration_ms=int(ui_raw.get("flash_duration_ms", 800)),
+        show_tooltips=bool(ui_raw.get("show_tooltips", True)),
+        compact_tooltips=bool(ui_raw.get("compact_tooltips", True)),
+        compact_rows=bool(ui_raw.get("compact_rows", False)),
+        launcher_letters=bool(ui_raw.get("launcher_letters", True)),
     )
+
+    launchers_raw = data.get("launchers")
+    if isinstance(launchers_raw, list) and launchers_raw:
+        launchers = [LauncherConfig.from_dict(raw_launcher) for raw_launcher in launchers_raw if isinstance(raw_launcher, dict)]
+    else:
+        launchers = create_default_launchers()
+
+    # Migrate numeric 1..6 short_labels to letters OC/FB/CL/C1/C2/CF when letters mode is on
+    if getattr(ui_cfg, "launcher_letters", True):
+        _letter_map = {"opencode": "OC", "freebuff": "FB", "cline": "CL", "main_codex": "C1", "main_codex2": "C2", "main_codex3_free": "CF"}
+        for _lc in launchers:
+            if _lc.short_label in ("1", "2", "3", "4", "5", "6") and _lc.id in _letter_map:
+                _lc.short_label = _letter_map[_lc.id]
 
     return AppConfig(
         schema_version=SCHEMA_VERSION,
@@ -750,6 +985,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         audits=audits_cfg,
         bridge=bridge_cfg,
         ui=ui_cfg,
+        launchers=launchers,
     )
 
 
@@ -810,12 +1046,20 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
                 p.source_path = healed
                 healed_any = True
 
+        # Heal invalid/colliding slots (historical data can carry slot 7/8 in a
+        # 6-slot group; those projects vanish from the room but still match
+        # duplicate checks, producing misleading "already exists in [X #N]").
+        if cfg.heal_project_slots():
+            healed_any = True
+
         # Guarantee native separators on every loaded path (reliable round-trip)
         if cfg.normalize_paths():
             healed_any = True
 
-        # Resilient recovery: if projects list is empty in production, restore from backup or defaults
-        if not cfg.projects and not base_dir:
+        # CORE-005: resilient recovery only for a genuinely uninitialized config.
+        # A successfully parsed config with initialized=true and projects=[] is an
+        # intentional user-curated empty registry and must NEVER be resurrected.
+        if not cfg.projects and not base_dir and not cfg.initialized:
             backup_file = cfg_file.with_name("config.backup_latest.json")
             bak2 = cfg_file.with_name("config.json.bak")
             recovered = False
@@ -888,24 +1132,54 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
 
 
 def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> bool:
-    """Atomically saves configuration to disk with durable backup preservation."""
+    """Atomically saves configuration to disk with durable backup preservation.
+
+    Safety: if the existing config has >2 projects and the new config drops
+    to ≤1 project, the save is REFUSED with a warning to prevent accidental
+    project list truncation (e.g. from a test script writing to the real path).
+    """
     cfg_file = config_path(base_dir)
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = cfg_file.with_name(f"{cfg_file.name}.tmp.{os.getpid()}")
+    tmp_file = cfg_file.with_name(f"{cfg_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
 
     try:
-        # Pre-save backup of healthy existing configuration (for user runtime)
-        if base_dir is None and cfg_file.exists():
+        raw_existing = None
+        existing_data = None
+        if cfg_file.exists():
             try:
                 raw_existing = cfg_file.read_text(encoding="utf-8")
                 existing_data = json.loads(raw_existing)
-                if existing_data.get("projects"):
-                    bak_file = cfg_file.with_name("config.backup_latest.json")
-                    bak_file.write_text(raw_existing, encoding="utf-8")
-                    bak_file2 = cfg_file.with_name("config.json.bak")
-                    bak_file2.write_text(raw_existing, encoding="utf-8")
             except Exception:
-                pass
+                existing_data = None
+
+        # Pre-save safety check: protect against project list truncation
+        if base_dir is None and isinstance(existing_data, dict):
+            existing_count = len(existing_data.get("projects") or [])
+            new_count = len(config.projects)
+            if existing_count > 2 and new_count <= 1 and not config.initialized:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"save_config BLOCKED: project count drops from {existing_count} to {new_count}. "
+                    "Refusing to truncate the project list. Use --force or manually restore from backup."
+                )
+                return False
+
+        # Pre-save backup of healthy existing configuration
+        if base_dir is None and isinstance(existing_data, dict) and existing_data.get("projects"):
+            bak_file = cfg_file.with_name("config.backup_latest.json")
+            bak_file.write_text(raw_existing, encoding="utf-8")
+            bak_file2 = cfg_file.with_name("config.json.bak")
+            bak_file2.write_text(raw_existing, encoding="utf-8")
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            bak_ts = cfg_file.with_name(f"config.{ts}.json.bak")
+            if not bak_ts.exists():
+                bak_ts.write_text(raw_existing, encoding="utf-8")
+            backups = sorted(cfg_file.parent.glob("config.*.json.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old_backup in backups[3:]:
+                try:
+                    old_backup.unlink()
+                except OSError:
+                    pass
 
         # Normalize paths before persisting so the on-disk form always uses
         # native separators, independent of where the value originated

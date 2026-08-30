@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 from audapack.bridge.lifecycle import is_bridge_healthy
 from audapack.components.manager import ComponentManager
-from audapack.config import AppConfig, get_user_runtime_dir, load_config, save_config
+from audapack.config import AppConfig, get_user_runtime_dir, load_config
 from audapack.ui.i18n import t
 from audapack.ui.theme import FONT_FAMILY, PALETTE
 
@@ -515,8 +515,15 @@ class SettingsDialog(tk.Toplevel):
                 b = browsers[sel[0]]
                 chosen_exe = b["exe"]
                 if remember_var.get():
-                    self.config.ui.preferred_browser = chosen_exe
-                    save_config(self.config)
+                    try:
+                        from audapack.config import scoped_config_write
+                        ok = scoped_config_write(lambda cfg: setattr(cfg.ui, "preferred_browser", chosen_exe))
+                        if not ok:
+                            messagebox.showerror("Save Error", "Could not persist browser preference.", parent=dlg)
+                            return
+                    except Exception as exc:
+                        messagebox.showerror("Save Error", f"Browser preference save failed: {exc}", parent=dlg)
+                        return
                 open_widget_in_browser(chosen_exe, use_bridge=bridge_healthy)
                 result[0] = b["name"]
             dlg.destroy()
@@ -577,10 +584,13 @@ class SettingsDialog(tk.Toplevel):
         self._refresh_components()
 
     def _restore_defaults(self):
-        from audapack.config import create_default_projects
+        from audapack.config import create_default_projects, scoped_config_write
         if messagebox.askyesno(t("settings.restore_defaults"), t("settings.restore_defaults_confirm"), parent=self):
-            self.config.projects = create_default_projects()
-            save_config(self.config)
+            ok = scoped_config_write(lambda cfg: setattr(cfg, "projects", create_default_projects()))
+            if not ok:
+                messagebox.showerror("Save Error", t("settings.save_error"), parent=self)
+                return
+            self.config = load_config()
             if self.on_saved:
                 try:
                     self.on_saved()
@@ -589,17 +599,23 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showinfo(t("settings.restore_defaults"), t("settings.restore_defaults_done"), parent=self)
 
     def _on_save(self):
-        latest = load_config()
-        latest.packing.output_dir = self.ent_out.get().strip()
-        latest.audits.root = self.ent_aud.get().strip()
-        latest.packing.delete_old = self.del_old_val
-        latest.packing.manifest_enabled = self.manifest_val
-
+        from audapack.config import scoped_config_write
+        out_dir = self.ent_out.get().strip()
+        aud_root = self.ent_aud.get().strip()
+        del_old = self.del_old_val
+        manifest = self.manifest_val
         raw_excl = self.txt_excludes.get("1.0", tk.END).strip().splitlines()
-        latest.packing.excludes = [line.strip() for line in raw_excl if line.strip()]
+        excludes = [line.strip() for line in raw_excl if line.strip()]
 
-        if save_config(latest):
-            self.config = latest
+        def _mutate(cfg):
+            cfg.packing.output_dir = out_dir
+            cfg.audits.root = aud_root
+            cfg.packing.delete_old = del_old
+            cfg.packing.manifest_enabled = manifest
+            cfg.packing.excludes = excludes
+
+        if scoped_config_write(_mutate):
+            self.config = load_config()
             if self.on_saved:
                 try:
                     self.on_saved()

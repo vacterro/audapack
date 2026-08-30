@@ -1,5 +1,6 @@
 """Unit tests for Windows context menu registration."""
 
+import sys
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,7 @@ class TestContextMenu(unittest.TestCase):
         self.assertIn("AUDAPACK.pyw", cmd)
         self.assertTrue(cmd.startswith('"'))
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows registry context menu; mocked adapter only on Windows")
     def test_install_and_remove_mocked(self):
         from unittest import mock
         fake_reg = {}
@@ -117,6 +119,59 @@ class TestAgentLaunchers(unittest.TestCase):
                 win._on_open_with_codex(proj, "main_codex")
                 self.assertTrue(mock_popen.called)
 
+            with patch("audapack.ui_qt.main_window.Path.exists", return_value=True), \
+                 patch("subprocess.Popen") as mock_popen:
+                win._on_open_with_codex(proj, "main_codex2")
+                command = " ".join(mock_popen.call_args.args[0])
+                self.assertIn("Start-Codex-Account2.ps1", command)
+                self.assertIn("-WorkDir", command)
+
+            with patch("audapack.ui_qt.main_window.Path.exists", return_value=False), \
+                 patch("subprocess.Popen") as mock_popen, \
+                 patch.object(win.statusBar(), "showMessage") as mock_status:
+                win._on_open_with_codex(proj, "main_codex2")
+                mock_popen.assert_not_called()
+                mock_status.assert_called_once()
+
+            # Generic launcher dispatch must route launcher_id to the right handler
+            with patch.object(win, "_launcher_block_reason", return_value=""), \
+                 patch.object(win, "_on_open_with_opencode") as mock_oc, \
+                 patch.object(win, "_on_open_with_freebuff") as mock_fb, \
+                 patch.object(win, "_on_open_with_cline") as mock_cl, \
+                 patch.object(win, "_on_open_with_codex") as mock_cx:
+
+                win._on_open_with_launcher(proj, "opencode")
+                mock_oc.assert_called_once()
+                mock_fb.assert_not_called()
+
+                win._on_open_with_launcher(proj, "freebuff")
+                mock_fb.assert_called_once()
+
+                win._on_open_with_launcher(proj, "cline")
+                mock_cl.assert_called_once()
+
+                win._on_open_with_launcher(proj, "main_codex")
+                mock_cx.assert_called_once_with(proj, "main_codex")
+
+                mock_cx.reset_mock()
+                win._on_open_with_launcher(proj, "main_codex2")
+                mock_cx.assert_called_once_with(proj, "main_codex2")
+
+            # Custom launcher with command_template goes through _launch_custom
+
+            cfg.launchers.append(type(cfg.launchers[0])(
+                id="custom1", name="Custom", short_label="CU",
+                command_template='Write-Host "{workdir}"', agent_type="powershell", enabled=True,
+            ))
+            with patch.object(win, "_launch_custom") as mock_lc:
+                win._on_open_with_launcher(proj, "custom1")
+                mock_lc.assert_called_once()
+
+            # Unknown launcher id — no crash, status message
+            with patch.object(win.statusBar(), "showMessage") as mock_sb:
+                win._on_open_with_launcher(proj, "nonexistent")
+                mock_sb.assert_called_once()
+
             # Test Copy Audit File Path (non-SAIPEN)
             audit_dir = Path(tmp) / "audits" / "testproj"
             audit_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +194,8 @@ class TestAgentLaunchers(unittest.TestCase):
                     slot=2,
                 )
                 win._on_copy_audit_file_path(saipen_proj)
-                self.assertEqual(QApplication.clipboard().text(), f"/saipen gg {audit_file.resolve()}")
+                expected_text = f"/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {audit_file.resolve()}"
+                self.assertEqual(QApplication.clipboard().text(), expected_text)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -152,7 +208,7 @@ class TestSeamlessProjectOperations(unittest.TestCase):
 
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtGui import QMouseEvent
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QToolBar
 
         from audapack.config import AppConfig
         from audapack.services.project_service import ProjectService
@@ -183,6 +239,30 @@ class TestSeamlessProjectOperations(unittest.TestCase):
             p2 = win._add_project_from_path(proj_dir2, default_group="MAIN0")
             self.assertIsNotNone(p2)
             self.assertEqual(p2.slot, 2)
+
+            # One toolbar action clears every dimming/archive/copy mark while
+            # preserving project enablement.
+            svc.update_project(
+                p1.id,
+                lambda p: (
+                    setattr(p, "ignored", True),
+                    setattr(p, "ignore_archive", True),
+                    setattr(p, "audit_copy_count", 3),
+                    setattr(p, "enabled", False),
+                ),
+            )
+            toolbar_actions = [
+                action.text()
+                for bar in win.findChildren(QToolBar)
+                for action in bar.actions()
+            ]
+            self.assertIn("RESET", toolbar_actions)
+            win._on_reset_project_marks()
+            cleared = svc.get_project(p1.id)
+            self.assertFalse(cleared.ignored)
+            self.assertFalse(cleared.ignore_archive)
+            self.assertEqual(cleared.audit_copy_count, 0)
+            self.assertFalse(cleared.enabled)
 
             # 2. Slot Move operations
             # Move Down p1 -> slot 2 (swaps with p2)
@@ -225,12 +305,14 @@ class TestSeamlessProjectOperations(unittest.TestCase):
             ):
                 # Trigger via shortcut
                 win.copy_shortcut.activated.emit()
-                mock_set_text.assert_called_with(f"/saipen gg {audit_file.resolve()}")
+                expected_gg = f"/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {audit_file.resolve()}"
+                mock_set_text.assert_called_with(expected_gg)
 
-                # Trigger via simulated mouse click on [GG] button
+                # GG row button removed as obsolete (2026-08-28) — old GG area now launcher or info
+                # Click at old GG position (now the last launcher button) must NOT trigger GG copy,
+                # and must route through launcher dispatch (mocked so no real process spawns).
                 idx = win.model.index_for_project_id(p2.id)
                 rect = win.tree.visualRect(idx)
-                # Position inside the [GG] button: (rect.right() - 20, rect.top() + 10)
                 from PySide6.QtCore import QPoint
                 from PySide6.QtGui import QMouseEvent
                 click_pos = QPoint(rect.right() - 20, rect.top() + 10)
@@ -241,14 +323,22 @@ class TestSeamlessProjectOperations(unittest.TestCase):
                     Qt.MouseButton.LeftButton,
                     Qt.KeyboardModifier.NoModifier,
                 )
-                with patch.object(win, "_on_copy_audit_file_path") as mock_copy_gg:
+                with patch.object(win, "_on_copy_audit_file_path") as mock_copy_gg, \
+                     patch.object(win, "_on_open_with_launcher") as mock_launch:
                     win.tree.mousePressEvent(event)
-                    mock_copy_gg.assert_called_once()
+                    mock_copy_gg.assert_not_called()
+                    mock_launch.assert_called_once()
+                # Verify ⓘ info button now exists at deterministic position
+                from audapack.ui_qt.models.project_delegate import compute_info_button_rect, compute_row_button_rects
+                launchers = getattr(win._service.config, "launchers", None)
+                lb, gg = compute_row_button_rects(rect, launchers)
+                info_rect = compute_info_button_rect(rect, lb, gg)
+                assert info_rect.width() == 18 and info_rect.height() == 20
 
             # 6. Test Drag & Drop: moving p2 from slot 1 to slot 4
-            from PySide6.QtCore import QByteArray, QMimeData, QPointF, QUrl
+            from PySide6.QtCore import QMimeData, QPointF, QUrl
             from PySide6.QtGui import QDropEvent
-            from audapack.ui_qt.models.project_room_model import MIME_TYPE_PROJECT
+
 
             s1_idx = win.model.index_for_project_id(p2.id)
             mime = win.model.mimeData([s1_idx])

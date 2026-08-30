@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -107,6 +108,102 @@ def atomic_write(filepath: Path, content: str):
             except OSError:
                 pass
         raise
+
+
+def capture_file_snapshots(paths: list[Path]) -> tuple[dict[Path, Optional[bytes]], Optional[str]]:
+    """Captures whether each path exists plus its exact previous bytes.
+
+    Returns (snapshots, error). Used to make multi-file commit boundaries
+    transactional: on failure, pre-existing files are restored byte-for-byte
+    and newly-created files are removed.
+    """
+    snapshots: dict[Path, Optional[bytes]] = {}
+    for path in dict.fromkeys(Path(p) for p in paths):
+        try:
+            snapshots[path] = path.read_bytes() if path.exists() else None
+        except OSError as exc:
+            return {}, f"Cannot snapshot {path.name} before write: {exc}"
+    return snapshots, None
+
+
+def restore_file_snapshots(snapshots: dict[Path, Optional[bytes]]) -> list[str]:
+    """Restores captured snapshots (see capture_file_snapshots). Never raises."""
+    errors: list[str] = []
+    for path, previous in snapshots.items():
+        tmp_path = path.with_name(f".{path.name}.rollback.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            if previous is None:
+                if path.exists():
+                    path.unlink()
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "wb") as handle:
+                handle.write(previous)
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+    return errors
+
+
+_RE_HISTORY_DIR = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})_(.+)$")
+
+
+def prune_audit_history(config: AppConfig, now: Optional[datetime] = None, days: Optional[int] = None) -> int:
+    """Removes expired completed per-run history directories under the audit root.
+
+    W2-011: applies ``BridgeConfig.history_retention_days`` at a maintenance
+    boundary. Only ``_history/<timestamp>_<run_hash>`` directories strictly
+    older than the retention threshold are removed; current canonical files and
+    everything outside the audit root are never touched. ``days<=0`` means
+    "keep nothing" and is validated explicitly.
+    """
+    threshold = days if days is not None else getattr(config.bridge, "history_retention_days", 30)
+    if threshold is None:
+        threshold = 30
+    current = now or datetime.now()
+    out_root = Path(config.audits.root).resolve()
+    if not out_root.exists():
+        return 0
+    removed = 0
+    for group_dir in out_root.iterdir():
+        if not group_dir.is_dir() or group_dir.name.startswith(("_", ".")):
+            continue
+        for proj_dir in group_dir.iterdir():
+            if not proj_dir.is_dir() or proj_dir.name.startswith(("_", ".")):
+                continue
+            hist_root = proj_dir / "_history"
+            if not hist_root.is_dir():
+                continue
+            for run_dir in hist_root.iterdir():
+                if not run_dir.is_dir() or run_dir.name.startswith(("_", ".")):
+                    continue
+                try:
+                    run_dir.relative_to(out_root)
+                except ValueError:
+                    continue
+                m = _RE_HISTORY_DIR.match(run_dir.name)
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S")
+                except ValueError:
+                    continue
+                age_days = (current - ts).total_seconds() / 86400.0
+                if age_days > max(0.0, float(threshold)):
+                    try:
+                        import shutil
+                        shutil.rmtree(run_dir, ignore_errors=True)
+                        removed += 1
+                    except Exception:
+                        pass
+    return removed
 
 
 def resolve_project_audit_dir(
@@ -310,13 +407,71 @@ def parse_wave(
 
     # Ticket consistency: unique ids of THIS wave's prefix only
     if n_tickets > 0:
-        ticket_pat = re.compile(rf"\[{re.escape(wave_def.ticket_prefix)}(\d+)\]")
-        found_tickets = set(int(m) for m in ticket_pat.findall(text))
-        if len(found_tickets) != n_tickets:
+        # CORE-004: validate ACTUAL ticket blocks against the profile contract
+        # instead of counting bare ID substrings. Each declared ticket must have
+        # a proper header line and every non-empty field named by ticket_fields
+        # inside ITS OWN block.
+        prefix_bracket = re.escape(wave_def.ticket_prefix)
+        header_pat = re.compile(rf"^\[P\d\]\s*\[{prefix_bracket}(\d+)\]\s*(.+)$")
+        blocks: list[tuple[int, int, str]] = []
+        for i, line_s in enumerate(lines):
+            m = header_pat.match(line_s)
+            if m:
+                blocks.append((i, int(m.group(1)), line_s.strip()))
+
+        unique_numbers = {num for _pos, num, _header in blocks}
+        if len(blocks) != n_tickets or len(unique_numbers) != len(blocks):
             return False, None, (
-                f"Expected {n_tickets} unique {wave_def.ticket_prefix} tickets, "
-                f"found {len(found_tickets)}"
+                f"Expected {n_tickets} unique {wave_def.ticket_prefix} ticket blocks, "
+                f"found {len(unique_numbers)}"
             )
+
+        ticket_fields = list(wave_def.ticket_fields or [])
+        if not ticket_fields:
+            ticket_fields = ["EVIDENCE", "DEFECT", "REPAIR", "VERIFY"]
+        field_anchors = tuple(f.upper() + ":" for f in ticket_fields)
+
+        def _block_fields(block_lines: list[str]) -> dict[str, str]:
+            fields: dict[str, str] = {}
+            for fld in ticket_fields:
+                anchor = fld.upper() + ":"
+                val_parts: list[str] = []
+                start = None
+                for i, bl in enumerate(block_lines):
+                    if bl.upper().startswith(anchor):
+                        start = i
+                        val_parts.append(bl[len(anchor):].strip())
+                        break
+                if start is not None:
+                    for bl in block_lines[start + 1:]:
+                        if bl.upper().startswith(field_anchors):
+                            break
+                        if bl.strip():
+                            val_parts.append(bl.strip())
+                fields[fld] = "\n".join(v for v in val_parts if v).strip()
+            return fields
+
+        for idx, (pos, num, _header) in enumerate(blocks):
+            end = blocks[idx + 1][0] if idx + 1 < len(blocks) else len(lines)
+            block_lines = lines[pos + 1:end]
+            fields = _block_fields(block_lines)
+            missing = [fld for fld in ticket_fields if not fields.get(fld)]
+            if missing:
+                return False, None, (
+                    f"Ticket [{wave_def.ticket_prefix}{num:03d}] is missing required "
+                    f"non-empty field(s): {', '.join(missing)} (expected "
+                    f"{', '.join(ticket_fields)} for each ticket)"
+                )
+    else:
+        # CORE-004: zero-ticket terminal form must carry the profile's configured
+        # no-findings marker instead of merely declaring TICKETS: 0.
+        no_findings = (wave_def.no_findings_marker or "").strip()
+        if no_findings:
+            if not any(no_findings in line_s for line_s in lines):
+                return False, None, (
+                    f"Missing no-findings marker {no_findings!r} for {wave_def.id} "
+                    f"(TICKETS: 0)"
+                )
 
     meta["full_text"] = text.strip()
     return True, meta, ""

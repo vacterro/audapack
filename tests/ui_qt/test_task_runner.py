@@ -8,8 +8,6 @@ Verifies:
 """
 
 import time
-import pytest
-from PySide6.QtCore import QCoreApplication
 
 from audapack.ui_qt.task_runner import TaskRunner
 
