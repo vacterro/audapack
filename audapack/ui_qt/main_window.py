@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMenu,
+    QSystemTrayIcon,
     QTabWidget,
     QToolBar,
     QToolTip,
@@ -45,6 +46,14 @@ from audapack.services.audit_service import AuditService
 from audapack.services.bridge_service import BridgeService
 from audapack.services.packing_service import PackingService
 from audapack.services.project_service import ProjectService
+from audapack.inaudit import (
+    get_active_inaudit_path,
+    get_inaudit_selected,
+    list_inaudit_layers,
+    set_inaudit_selected,
+    validate_inaudit_path,
+)
+from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
 from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
 from audapack.ui_qt.models.project_delegate import (
@@ -415,6 +424,8 @@ class MainWindow(QMainWindow):
         self._move_generation: int = 0
         self._last_audit_generation: int = 0
         self._active_pack_queue = False
+        self._notified_terminal: dict[str, str] = {}
+        self._init_tray_icon()
 
         # Background Task Runner for async I/O
         self.task_runner = TaskRunner(max_threads=4, parent=self)
@@ -453,6 +464,9 @@ class MainWindow(QMainWindow):
         act_pack = toolbar.addAction("PACK", self._on_pack)
         act_pack.setToolTip("Pack selected project in background")
 
+        act_send_audit = toolbar.addAction("START AUDIT", self._on_send_audit)
+        act_send_audit.setToolTip("Queue selected project for a free Brave/ChatGPT audit worker")
+
         act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
         act_pack_all.setToolTip("Pack all configured projects in background")
 
@@ -462,14 +476,17 @@ class MainWindow(QMainWindow):
         act_copy_gg = toolbar.addAction("GG", self._on_copy_audit_file_path)
         act_copy_gg.setToolTip("Copy /saipen gg audit path to clipboard (Ctrl+C)")
 
+        act_ia = toolbar.addAction("IA", self._on_ia_copy)
+        act_ia.setToolTip("IA — Copy selected INAUDIT path\nShift: saipen gg \"path\"\nCtrl: saipen cc \"path\"")
+
         act_copy_arc = toolbar.addAction("ZIP", self._on_copy_archive)
         act_copy_arc.setToolTip("Copy packed .zip archive file to clipboard")
 
         toolbar.addAction("REFRESH", self._on_refresh_all)
 
-        act_reset_marks = toolbar.addAction("RESET", self._on_reset_project_marks)
+        act_reset_marks = toolbar.addAction("RESET MARKS", self._on_reset_project_marks)
         act_reset_marks.setToolTip(
-            "Clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled"
+            "Clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
         )
 
         # Central Tabs: [Project Room] [Instances] [Settings]
@@ -512,10 +529,24 @@ class MainWindow(QMainWindow):
             parent=self.tabs,
         )
 
-        # Tab 2: Settings
+        # Tab 2: INAUDIT — project-local audit layers (audit/1.md ...)
+        def _inaudit_changed(_proj):
+            try:
+                p = _proj or self._selected_project() or self._active_project
+                if p:
+                    self.model.refresh_inaudit(p.id)
+                    if hasattr(self, "tree"):
+                        self.tree.viewport().update()
+            except Exception:
+                pass
+        self.inaudit_widget = InauditWidget(parent=self.tabs, on_changed=_inaudit_changed)
+        self.inaudit_widget.set_project(self._active_project)
+
+        # Tab 3: Settings
         self.settings_widget = SettingsWidget(service.config, self, on_saved=self._on_settings_saved)
 
         self.tabs.addTab(projects_tab, "Project Room")
+        self.tabs.addTab(self.inaudit_widget, "INAUDIT")
         self.tabs.addTab(self._instance_manager, "Instances")
         self.tabs.addTab(self.settings_widget, "Settings")
         self.tabs.setCurrentIndex(0)
@@ -625,6 +656,11 @@ QToolTip QLabel {
         self.pack_progress_timer.timeout.connect(self._flush_pack_progress)
         self.pack_progress_timer.start()
 
+        self.dispatch_status_timer = QTimer(self)
+        self.dispatch_status_timer.setInterval(10000)
+        self.dispatch_status_timer.timeout.connect(self._refresh_dispatch_status_async)
+        self.dispatch_status_timer.start()
+
         # Async initial enrichment (time-to-interactive optimization)
         QTimer.singleShot(50, self._async_initial_enrichment)
 
@@ -677,6 +713,58 @@ QToolTip QLabel {
             self.statusBar().showMessage(f"AUDAPACK Ready · {status_txt}")
 
         self.task_runner.submit("bridge:initial_check", _check_bridge, on_success=_on_bridge_done)
+        self._refresh_dispatch_status_async()
+
+    def _refresh_dispatch_status_async(self):
+        """Refresh live browser dispatch state without blocking the Qt thread."""
+        def _load():
+            return self._bridge.browser_jobs(), self._bridge.runtime_status()
+
+        def _apply(result):
+            response, status = result
+            if not response.get("ok"):
+                return
+            workers_by_id: dict[str, dict] = {}
+            used_labels: set[str] = set()
+            for w in (status.get("browser", {}) if isinstance(status, dict) else {}).get("workers", []):
+                wid = str(w.get("worker_id", ""))
+                if wid:
+                    bn = str(w.get("browser_name", "") or "Browser")
+                    widx = 1
+                    label = f"{bn} #{widx}"
+                    while label in used_labels:
+                        widx += 1
+                        label = f"{bn} #{widx}"
+                    used_labels.add(label)
+                    workers_by_id[wid] = {"browser_name": bn, "friendly_worker_label": label}
+            active = {}
+            for job in response.get("jobs", []):
+                project_id = str(job.get("project_id") or "")
+                if project_id:
+                    wid = str(job.get("assigned_worker_id") or "")
+                    if wid and wid in workers_by_id:
+                        job["browser_name"] = workers_by_id[wid]["browser_name"]
+                        job["friendly_worker_label"] = workers_by_id[wid]["friendly_worker_label"]
+                    active[project_id] = job
+                    self._notify_dispatch_terminal(
+                        str(job.get("dispatch_id") or ""),
+                        str(job.get("state") or ""),
+                        str(job.get("project_name") or project_id),
+                    )
+            for proj in self._service.list_projects():
+                self.model.update_dispatch_snapshot(proj.id, active.get(proj.id))
+            browser = status.get("browser", {}) if isinstance(status, dict) else {}
+            if browser:
+                self.statusBar().showMessage(
+                    f"BRIDGE ✓ | W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)}  "
+                    f"CLEAN {browser.get('clean_workers', 0)}  "
+                    f"BUSY {browser.get('busy_workers', 0)}  "
+                    f"Q {browser.get('queued_jobs', 0)}  "
+                    f"RUN {browser.get('active_jobs', 0)}  "
+                    f"! {browser.get('blocked_jobs', 0)}"
+                )
+
+        self.task_runner.submit_coalesced("bridge:dispatch_status", _load, on_success=_apply)
 
     # ---------------------------------------------------------------- Selection
 
@@ -696,14 +784,20 @@ QToolTip QLabel {
     def _on_current_changed(self, current: QModelIndex, _previous: QModelIndex):
         if not current.isValid():
             self._active_project = None
+            if hasattr(self, "inaudit_widget"):
+                self.inaudit_widget.set_project(None)
             return
         node_type = self.model.data(current, self.model.ROLES["node_type"])
         if node_type != "slot":
             self._active_project = None
+            if hasattr(self, "inaudit_widget"):
+                self.inaudit_widget.set_project(None)
             return
         group = self.model.data(current, self.model.ROLES["group"])
         slot = self.model.data(current, self.model.ROLES["slot"])
         self._active_project = self.model.project_at(group, slot)
+        if hasattr(self, "inaudit_widget"):
+            self.inaudit_widget.set_project(self._active_project)
 
     def _selected_project(self) -> Optional[Project]:
         """Resolves the currently targeted project with multi-layered fallback."""
@@ -1084,6 +1178,119 @@ QToolTip QLabel {
             self._flash_timer.stop()
         self.statusBar().setStyleSheet("")
 
+    def _init_tray_icon(self) -> None:
+        """W8: optional native tray notification. Best-effort only -- a headless
+        or tray-less session must never crash the desktop app."""
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray_icon = None
+                return
+            icon_path = app_dir() / "resources" / "app_icon.png"
+            icon = QIcon(str(icon_path)) if icon_path.exists() else self.windowIcon()
+            self._tray_icon = QSystemTrayIcon(icon, self)
+            self._tray_icon.setToolTip("AUDAPACK — Project Room")
+            self._tray_icon.show()
+        except Exception:
+            self._tray_icon = None
+
+    def _notify_dispatch_terminal(self, dispatch_id: str, state: str, project_name: str) -> None:
+        """W8: exactly-once native notification per dispatch terminal transition.
+
+        COMPLETE -> success; BLOCKED/FAILED -> needs-attention. The same
+        dispatch_id/state pair is never re-bubbled on refresh/restart."""
+        tray = getattr(self, "_tray_icon", None)
+        if tray is None:
+            return
+        key = f"{dispatch_id}:{state}"
+        if self._notified_terminal.get(key):
+            return
+        self._notified_terminal[key] = state
+        if state == "COMPLETE":
+            tray.showMessage(
+                "AUDAPACK — audit complete",
+                f"{project_name}: audit saved successfully.",
+                QSystemTrayIcon.Information,
+                6000,
+            )
+        elif state == "BLOCKED":
+            tray.showMessage(
+                "AUDAPACK — audit needs attention",
+                f"{project_name}: audit is blocked.",
+                QSystemTrayIcon.Warning,
+                8000,
+            )
+        elif state == "FAILED":
+            tray.showMessage(
+                "AUDAPACK — audit failed",
+                f"{project_name}: audit failed.",
+                QSystemTrayIcon.Critical,
+                8000,
+            )
+
+    def _on_send_audit(self):
+        proj = self._selected_project()
+        if not proj:
+            self._flash_status("SEND AUDIT: select a project first", "#D66464")
+            return
+        key = f"dispatch:{proj.id}"
+        if self.task_runner.is_running(key):
+            self._flash_status(f"START AUDIT already queued for {proj.display_name}", "#D4A840")
+            return
+        profile = getattr(self._service.config.audits, "profile", "quick3") or "quick3"
+        self._flash_status(f"START AUDIT: preparing {proj.display_name}", "#D4A840")
+
+        def _prepare():
+            active = self._bridge.active_browser_job(proj.id)
+            if active:
+                return {"active": active}
+            health = self._bridge.runtime_status()
+            if not health.get("healthy"):
+                started, _message = self._bridge.start()
+                if not started or not self._bridge.runtime_status().get("healthy"):
+                    raise RuntimeError("Bridge is not healthy")
+            packed = self._packing.ensure_fresh_archive(proj.id)
+            if not packed.success or not packed.output_path:
+                raise RuntimeError(packed.error_message or "Packing failed")
+            return {"archive": packed.output_path}
+
+        def _done(prepared):
+            if prepared.get("active"):
+                active = prepared["active"]
+                self._flash_status(
+                    f"START AUDIT already active for {proj.display_name} ({active.get('state', 'QUEUED')})",
+                    "#D4A840",
+                )
+                return
+            response = self._bridge.submit_browser_audit(proj, prepared["archive"], profile)
+            if response.get("ok"):
+                dispatch = response.get("dispatch", {})
+                self._flash_status(
+                    f"START AUDIT: {proj.display_name} queued ({dispatch.get('dispatch_id', 'queued')})",
+                    "#D4A840",
+                )
+            else:
+                self._flash_status(f"START AUDIT failed: {response.get('error', 'Bridge unavailable')}", "#D66464")
+
+        def _error(error):
+            self._flash_status(f"START AUDIT failed: {error}", "#D66464")
+
+        self.task_runner.submit(key, _prepare, on_success=_done, on_error=_error)
+
+    def _on_cancel_browser_audit(self, proj, dispatch):
+        try:
+            did = str(dispatch.get("dispatch_id") or "")
+            if not did:
+                self._flash_status("Cancel failed: no dispatch id", "#D66464")
+                return
+            response = self._bridge.cancel_browser_job(did)
+            if response.get("ok"):
+                self._flash_status(f"Audit cancelled for {proj.display_name}", "#D4A840")
+                self.model.update_dispatch_snapshot(proj.id, None)
+            else:
+                self._flash_status(f"Cancel failed: {response.get('error', 'Bridge error')}", "#D66464")
+        except Exception as exc:
+            self._flash_status(f"Cancel error: {exc}", "#D66464")
+
     def _on_pack(self):
         """Async background packing — GUI thread remains 100% interactive."""
         proj = self._selected_project()
@@ -1314,6 +1521,60 @@ QToolTip QLabel {
         # Auto-mark as Done when copying audit path (GG command = audit is ready)
         if not getattr(target, "ignored", False):
             self._on_toggle_ignored(target)
+
+    def _on_ia_copy(self, _checked: bool = False):
+        proj = self._selected_project()
+        if not proj:
+            self._flash_status("IA: no project selected", "#D66464")
+            return
+        p = get_active_inaudit_path(proj)
+        if p is None or not validate_inaudit_path(proj, p):
+            self._flash_status(f"IA: no INAUDIT layer for {proj.display_name}", "#D66464")
+            return
+        mods = QApplication.keyboardModifiers()
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            cmd = f'saipen gg "{p}"'
+            QApplication.clipboard().setText(cmd)
+            self._flash_status(f"IA GG copied: {p.name}", "#D4A840")
+            return
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            cmd = f'saipen cc "{p}"'
+            QApplication.clipboard().setText(cmd)
+            self._flash_status(f"IA CC copied: {p.name}", "#D4A840")
+            return
+        QApplication.clipboard().setText(str(p))
+        self._flash_status(f"IA copied: audit\\{p.name}", "#D4A840")
+
+    def _on_ia_copy_gg(self, proj: Project | None = None):
+        target = proj if isinstance(proj, Project) else self._selected_project()
+        if not target:
+            return
+        p = get_active_inaudit_path(target)
+        if p is None or not validate_inaudit_path(target, p):
+            self._flash_status("IA GG: no layer", "#D66464")
+            return
+        QApplication.clipboard().setText(f'saipen gg "{p}"')
+        self._flash_status(f"IA GG copied: {p.name}", "#D4A840")
+
+    def _on_ia_copy_cc(self, proj: Project | None = None):
+        target = proj if isinstance(proj, Project) else self._selected_project()
+        if not target:
+            return
+        p = get_active_inaudit_path(target)
+        if p is None or not validate_inaudit_path(target, p):
+            self._flash_status("IA CC: no layer", "#D66464")
+            return
+        QApplication.clipboard().setText(f'saipen cc "{p}"')
+        self._flash_status(f"IA CC copied: {p.name}", "#D4A840")
+
+    def _on_inaudit_selection_changed(self, proj: Project | None = None):
+        target = proj if isinstance(proj, Project) else self._selected_project()
+        if target:
+            try:
+                self.model.refresh_inaudit(target.id)
+                self.tree.viewport().update()
+            except Exception:
+                pass
 
     def _on_copy_archive(self, proj: Optional[Any] = None):
         """Copies the .zip archive file to clipboard."""
@@ -1762,12 +2023,48 @@ QToolTip QLabel {
             act_instances.triggered.connect(lambda: self._show_instance_manager(proj))
             menu.addSeparator()
 
+            # Actions group 0: live dispatch recovery (P0-9)
+            dispatch = (hover or {}).get("dispatch") or {}
+            dispatch_state = str(dispatch.get("state") or "")
+            if dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED", "FAILED"}:
+                cancellable = {"QUEUED", "RETRYABLE", "LEASED", "ARTIFACT_FETCHED", "ATTACHED", "BLOCKED"}
+                if dispatch_state in cancellable:
+                    act_cancel = menu.addAction(f"Cancel Audit ({dispatch_state})")
+                    act_cancel.triggered.connect(lambda _checked=False, p=proj, d=dispatch: self._on_cancel_browser_audit(p, d))
+                    menu.addSeparator()
+
             # Actions group 1: Packing
             act_pack = menu.addAction("Pack Project (PACK)")
             act_pack.triggered.connect(lambda: self._on_pack_specific(proj))
+            act_send_audit = menu.addAction("Start Audit on Free Browser Worker")
+            act_send_audit.triggered.connect(self._on_send_audit)
 
             act_pack_all = menu.addAction("Pack All Projects (PACK ALL)")
             act_pack_all.triggered.connect(self._on_pack_all)
+            menu.addSeparator()
+
+            # Actions group 1b: INAUDIT
+            try:
+                _layers = list_inaudit_layers(proj)
+                _sel = get_inaudit_selected(proj)
+                _p = get_active_inaudit_path(proj)
+                _has_ia = _p is not None and validate_inaudit_path(proj, _p)
+            except Exception:
+                _layers, _sel, _has_ia = [], None, False
+            ia_label = f"INAUDIT  —  {len(_layers)} layer(s)" + (f"  [{_sel}.md]" if _sel else "") if _layers else "INAUDIT — no layers"
+            act_ia_hdr = menu.addAction(ia_label)
+            act_ia_hdr.setEnabled(False)
+            act_ia_copy = menu.addAction("  Copy IA Path" + (f"  ({_p.name})" if _has_ia else ""))
+            act_ia_copy.setEnabled(_has_ia)
+            act_ia_copy.triggered.connect(lambda _c=False, p=proj: self._on_ia_copy())
+            act_ia_gg = menu.addAction('  Copy GG Command')
+            act_ia_gg.setEnabled(_has_ia)
+            act_ia_gg.triggered.connect(lambda _c=False, p=proj: self._on_ia_copy_gg(p))
+            act_ia_cc = menu.addAction('  Copy CC Command')
+            act_ia_cc.setEnabled(_has_ia)
+            act_ia_cc.triggered.connect(lambda _c=False, p=proj: self._on_ia_copy_cc(p))
+            act_ia_open = menu.addAction("  Open INAUDIT Tab")
+            act_ia_open.triggered.connect(lambda: self.tabs.setCurrentWidget(self.inaudit_widget))
             menu.addSeparator()
 
             # Actions group 2: Clipboard

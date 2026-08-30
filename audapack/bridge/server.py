@@ -15,9 +15,15 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from audapack import __version__
+from audapack.bridge.browser_dispatch import (
+    BrowserDispatcher,
+)
+from audapack.bridge.browser_dispatch import (
+    DispatchError as BrowserDispatchError,
+)
 from audapack.bridge.lifecycle import INSTANCE_NONCE, remove_pid, write_pid
 from audapack.bridge.state import (
     GenerationPersistenceError,
@@ -46,6 +52,7 @@ from audapack.campaign import (
 )
 from audapack.components.widget import get_bundled_widget_path
 from audapack.config import AppConfig, legacy_token_acceptance_revoked, load_config, normalize_bridge_host
+from audapack.packing import find_archive_for_project, resolve_output_dir
 from audapack.projects import ProjectRegistry, RegistrySaveError
 
 logger = logging.getLogger("audapack.bridge")
@@ -113,6 +120,21 @@ def _get_canonical_path(prof, state) -> Optional[Path]:
 
 class AudapackBridgeHandler(BaseHTTPRequestHandler):
     config: AppConfig
+    browser_dispatcher: Optional[BrowserDispatcher] = None
+
+    @classmethod
+    def set_browser_dispatcher(cls, dispatcher: BrowserDispatcher) -> None:
+        cls.browser_dispatcher = dispatcher
+
+    def _dispatcher(self) -> BrowserDispatcher:
+        dispatcher = getattr(self.__class__, "browser_dispatcher", None)
+        if dispatcher is None:
+            dispatcher = BrowserDispatcher(state_dir=Path(self.get_custom_base_dir()) / "browser_dispatch" if self.get_custom_base_dir() else None)
+            self.__class__.browser_dispatcher = dispatcher
+        return dispatcher
+
+    def _dispatch_error(self, status: int, exc: BrowserDispatchError) -> None:
+        self.send_json(status, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
 
     def log_message(self, format: str, *args):
         # Override to prevent default console spam; use logger
@@ -320,6 +342,60 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     pid: p.to_dict() for pid, p in profs.items()
                 },
             })
+        elif parsed.path == "/v1/browser/status":
+            if not self.check_auth():
+                return
+            dispatch = self._dispatcher().status()
+            dispatch["workers"] = [{
+                "worker_id": worker.worker_id,
+                "state": worker.state,
+                "widget_version": worker.widget_version,
+                "browser_name": worker.meta.get("browser_name", ""),
+                "is_brave": worker.is_brave,
+                "page_eligible": worker.page_eligible,
+                "url_path": worker.url_path,
+                "project_name": worker.project_name,
+                "last_seen_at": worker.last_seen_at,
+                "has_conversation_turns": worker.has_conversation_turns,
+                "clean_for_audit": worker.clean_for_audit,
+                "worker_class": "CLEAN" if worker.clean_for_audit else (
+                    "OCCUPIED" if worker.has_conversation_turns else (
+                        "DIRTY" if (worker.has_manual_draft or worker.has_attachments) else (
+                            "BUSY" if (worker.generating or worker.audit_start_in_flight or worker.action_in_flight) else "OCCUPIED"
+                        )
+                    )
+                ),
+            } for worker in self._dispatcher().list_workers()]
+            self.send_json(200, {"ok": True, "dispatch": dispatch})
+        elif parsed.path == "/v1/browser/jobs":
+            if not self.check_auth():
+                return
+            query = parse_qs(parsed.query)
+            project_id = str((query.get("project_id") or [""])[0]).strip()
+            jobs = self._dispatcher().list_jobs()
+            if project_id:
+                jobs = [job for job in jobs if job.project_id == project_id]
+            self.send_json(200, {
+                "ok": True,
+                "jobs": [{
+                    "dispatch_id": job.dispatch_id,
+                    "project_id": job.project_id,
+                    "project_name": job.project_name,
+                    "state": job.state,
+                    "assigned_worker_id": job.assigned_worker_id,
+                    "campaign_run_id": job.campaign_run_id,
+                    "updated_at": job.updated_at,
+                    "error": job.error,
+                    "final_handoff_path": job.final_handoff_path,
+                    "final_handoff_sha256": job.final_handoff_sha256,
+                    "completed_at": job.completed_at,
+                } for job in jobs],
+            })
+        elif parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/artifact"):
+            if not self.check_auth():
+                return
+            self._serve_artifact(parsed.path)
+            return
         else:
             self.send_json(404, {"ok": False, "error": "Endpoint not found"})
 
@@ -344,6 +420,22 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/v1/audits":
             self.handle_audit_submission()
+            return
+
+        if parsed.path == "/v1/browser/poll":
+            self._handle_browser_poll()
+            return
+
+        if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/state"):
+            self._handle_browser_state(parsed.path)
+            return
+
+        if parsed.path == "/v1/browser/jobs":
+            self._handle_browser_submit()
+            return
+
+        if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/cancel"):
+            self._handle_browser_cancel(parsed.path)
             return
 
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
@@ -1133,6 +1225,24 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+            # Transport COMPLETE is downstream of the durable final commit.
+            # If this request belongs to a browser dispatch, record terminal
+            # proof only after campaign.json/final handoff were written and
+            # validated above. A transient dispatcher failure leaves the job
+            # FINALIZING for reconciliation; it must never turn disk success
+            # into a false transport failure or vice versa.
+            if campaign_ready and finalization_ok and final_handoff_path and proj:
+                try:
+                    self._dispatcher().complete_for_run(
+                        str(proj.id),
+                        run_id,
+                        final_handoff_path,
+                        campaign_path=target_dir / "campaign.json",
+                        expected_wave_count=prof.wave_count,
+                    )
+                except BrowserDispatchError as exc:
+                    logger.warning("dispatch finalization pending for %s/%s: %s", proj.id, run_id, exc)
+
             files_written = [str(latest_path), str(history_path)]
             if campaign_ready and finalization_ok:
                 if final_handoff_path:
@@ -1167,6 +1277,232 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "generation_pending": generation_pending,
             })
 
+    # ------------------------------------------------------------------ #
+    # Browser worker dispatcher (SRC-005)
+    # ------------------------------------------------------------------ #
+
+    def _handle_browser_poll(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        dispatcher = self._dispatcher()
+        try:
+            dispatcher.expire_leases()
+            worker = dispatcher.register_worker(data)
+            job = dispatcher.claim_job(worker.worker_id, data)
+            wait_seconds = min(25.0, max(0.0, float(data.get("wait_seconds", 20))))
+            if job is None and wait_seconds:
+                with dispatcher._work_available:
+                    deadline = time.monotonic() + wait_seconds
+                    while job is None and time.monotonic() < deadline:
+                        dispatcher._work_available.wait(timeout=max(0.0, deadline - time.monotonic()))
+                        dispatcher.expire_leases()
+                        job = dispatcher.claim_job(worker.worker_id, data)
+        except (BrowserDispatchError, TypeError, ValueError) as exc:
+            if isinstance(exc, BrowserDispatchError):
+                self._dispatch_error(400, exc)
+            else:
+                self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "wait_seconds must be numeric", "retriable": False}})
+            return
+        if job is None:
+            owned = dispatcher.get_owned_job(worker.worker_id)
+            self.send_json(200, {
+                "ok": True,
+                "job": None,
+                "owned_job": {
+                    "dispatch_id": owned.dispatch_id,
+                    "state": owned.state,
+                    "campaign_run_id": owned.campaign_run_id,
+                    "lease_id": owned.lease_id,
+                    "project_id": owned.project_id,
+                    "project_name": owned.project_name,
+                    "archive_filename": owned.archive_filename,
+                    "archive_size": owned.archive_size,
+                    "archive_sha256": owned.archive_sha256,
+                    "profile": owned.requested_profile,
+                } if owned else None,
+                "worker_state": worker.state,
+                "status": dispatcher.status(),
+            })
+            return
+        self.send_json(200, {
+            "ok": True,
+            "worker_state": worker.state,
+            "status": dispatcher.status(),
+            "job": {
+                "dispatch_id": job.dispatch_id,
+                "project_id": job.project_id,
+                "project_name": job.project_name,
+                "archive_filename": job.archive_filename,
+                "archive_size": job.archive_size,
+                "archive_sha256": job.archive_sha256,
+                "profile": job.requested_profile,
+                "lease_id": job.lease_id,
+                "lease_expires_at": job.lease_expires_at,
+            },
+        })
+
+    def _handle_browser_state(self, path: str) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "state":
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        path_dispatch_id = parts[3]
+        dispatch_id = str(data.get("dispatch_id") or "").strip()
+        if dispatch_id != path_dispatch_id:
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "dispatch_id must match URL", "retriable": False}})
+            return
+        worker_id = str(data.get("worker_id") or "").strip()
+        lease_id = str(data.get("lease_id") or "").strip()
+        to_state = str(data.get("state") or "").strip()
+        if not (dispatch_id and worker_id and lease_id and to_state):
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "dispatch_id/worker_id/lease_id/state are required", "retriable": False}})
+            return
+        dispatcher = self._dispatcher()
+        try:
+            job = dispatcher.transition_job(dispatch_id, worker_id, lease_id, to_state, payload=data)
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        self.send_json(200, {
+            "ok": True,
+            "job": {
+                "dispatch_id": job.dispatch_id,
+                "state": job.state,
+                "lease_expires_at": job.lease_expires_at,
+                "campaign_run_id": job.campaign_run_id,
+                "conversation_id": job.conversation_id,
+                "final_handoff_path": job.final_handoff_path,
+                "final_handoff_sha256": job.final_handoff_sha256,
+                "completed_at": job.completed_at,
+            },
+        })
+
+    def _handle_browser_cancel(self, path: str) -> None:
+        """Operator-initiated cancel of a pre-start/queued/blocked dispatch.
+
+        Desktop caller (no worker/lease identity) may cancel any job that has
+        not crossed the START_PREPARED boundary, plus BLOCKED pre-start jobs.
+        """
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "cancel":
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        dispatch_id = parts[3]
+        dispatcher = self._dispatcher()
+        try:
+            dispatcher.cancel_job(dispatch_id)
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        self.send_json(200, {"ok": True, "dispatch_id": dispatch_id})
+
+    def _handle_browser_submit(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        dispatcher = self._dispatcher()
+        try:
+            self._validate_browser_submission(data)
+            job = dispatcher.enqueue_job(data)
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        self.send_json(200, {"ok": True, "dispatch": {"dispatch_id": job.dispatch_id, "state": job.state, "status": dispatcher.status()}})
+
+    def _validate_browser_submission(self, data: dict) -> None:
+        """Bind submitted artifacts to the registered project pack contract."""
+        project_id = str(data.get("project_id") or "").strip()
+        archive_raw = str(data.get("archive_path") or "").strip()
+        if not project_id or not archive_raw:
+            return
+        cfg = self.get_live_config()
+        registry = ProjectRegistry(cfg)
+        project = registry.get_project_by_id(project_id)
+        # Test/minimal Bridge configurations may have no registered projects;
+        # domain-level path and digest checks still apply in that mode.
+        if project is None and getattr(cfg, "projects", None):
+            raise BrowserDispatchError("unknown_project", "project_id is not registered", retriable=False)
+        if project is None:
+            return
+        if not project.enabled or not project.source_path:
+            raise BrowserDispatchError("ineligible_project", "project is disabled or has no source path", retriable=False)
+        output_dir = resolve_output_dir(
+            project.source_path,
+            cfg.packing,
+            fallback=Path.cwd(),
+            group=project.priority_group,
+            project=project,
+        )
+        expected = find_archive_for_project(project, output_dir)
+        submitted = Path(archive_raw).resolve()
+        if expected is None or submitted != expected.resolve():
+            raise BrowserDispatchError("artifact_ownership", "archive is not the canonical project pack artifact", retriable=False)
+        try:
+            stat = submitted.stat()
+        except OSError as exc:
+            raise BrowserDispatchError("missing_archive", str(exc), retriable=False) from exc
+        declared_size = int(data.get("archive_size") or 0)
+        declared_hash = str(data.get("archive_sha256") or "").strip().lower()
+        if declared_size and declared_size != stat.st_size:
+            raise BrowserDispatchError("changed_archive", "archive size does not match submission", retriable=False)
+        if declared_hash and declared_hash != self._sha256_path(submitted):
+            raise BrowserDispatchError("changed_archive", "archive digest does not match submission", retriable=False)
+
+    @staticmethod
+    def _sha256_path(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _serve_artifact(self, path: str) -> None:
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "artifact":
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        dispatch_id = parts[3]
+        worker_id = str(self.headers.get("X-Worker-Id") or "").strip()
+        lease_id = str(self.headers.get("X-Lease-Id") or "").strip()
+        if not (worker_id and lease_id):
+            self.send_json(403, {"ok": False, "error": {"code": "invalid_auth", "message": "X-Worker-Id and X-Lease-Id headers are required", "retriable": False}})
+            return
+        dispatcher = self._dispatcher()
+        try:
+            archive = dispatcher.resolve_artifact(dispatch_id, worker_id, lease_id)
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        if archive is None:
+            self.send_json(404, {"ok": False, "error": {"code": "unknown_job", "message": "dispatch_id is unknown", "retriable": False}})
+            return
+        try:
+            size = archive.stat().st_size
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{archive.name}"')
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "X-ACB-Token, X-Worker-Id, X-Lease-Id")
+            self.end_headers()
+            with archive.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (OSError, BrokenPipeError) as exc:
+            logger.warning("artifact stream interrupted: %s", exc)
+
 
 def run_bridge_server(config: AppConfig) -> int:
     """Runs the AUDAPACK Bridge HTTP daemon on configured loopback host/port."""
@@ -1177,6 +1513,7 @@ def run_bridge_server(config: AppConfig) -> int:
         pass
 
     HandlerWithConfig.config = config
+    HandlerWithConfig.set_browser_dispatcher(BrowserDispatcher())
 
     try:
         server = ThreadingHTTPServer((host, port), HandlerWithConfig)

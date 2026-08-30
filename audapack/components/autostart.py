@@ -1,4 +1,8 @@
-"""Windows Scheduled Task autostart manager for AUDAPACK Bridge."""
+"""Windows Scheduled Task autostart manager for AUDAPACK Bridge.
+
+P0-1: every subprocess call uses CREATE_NO_WINDOW + STARTF_USESHOWWINDOW
+so no console window ever flashes, even during explicit settings operations.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,25 @@ from typing import Any
 from audapack.config import app_dir
 
 TASK_NAME = "AUDAPACK Bridge"
+
+_HIDDEN = 0
+if sys.platform == "win32":
+    _HIDDEN = subprocess.CREATE_NO_WINDOW
+
+
+def _run_hidden(args: list[str], **kw) -> subprocess.CompletedProcess:
+    kwargs = dict(kw)
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    if sys.platform == "win32":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = _HIDDEN
+    return subprocess.run(args, **kwargs)
 
 
 def get_pythonw_executable() -> Path:
@@ -32,13 +55,7 @@ def query_task(task_name: str = TASK_NAME) -> tuple[bool, dict[str, str]]:
         return False, {}
 
     try:
-        res = subprocess.run(
-            ["schtasks", "/query", "/tn", task_name, "/fo", "LIST", "/v"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        res = _run_hidden(["schtasks", "/query", "/tn", task_name, "/fo", "LIST", "/v"])
         if res.returncode != 0:
             return False, {}
 
@@ -99,13 +116,7 @@ def install_autostart() -> tuple[bool, str]:
 
     cmd_str = get_canonical_autostart_command()
     try:
-        res = subprocess.run(
-            ["schtasks", "/create", "/tn", TASK_NAME, "/tr", cmd_str, "/sc", "ONLOGON", "/f", "/rl", "LIMITED"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        res = _run_hidden(["schtasks", "/create", "/tn", TASK_NAME, "/tr", cmd_str, "/sc", "ONLOGON", "/f", "/rl", "LIMITED"])
         if res.returncode == 0:
             return True, f"Autostart task '{TASK_NAME}' installed successfully."
         return False, f"schtasks error: {res.stderr.strip() or res.stdout.strip()}"
@@ -119,13 +130,7 @@ def remove_autostart() -> tuple[bool, str]:
         return False, "Scheduled Tasks are only supported on Windows."
 
     try:
-        res = subprocess.run(
-            ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        res = _run_hidden(["schtasks", "/delete", "/tn", TASK_NAME, "/f"])
         if res.returncode == 0:
             return True, f"Autostart task '{TASK_NAME}' removed."
         return False, f"schtasks error: {res.stderr.strip() or res.stdout.strip()}"
@@ -144,13 +149,7 @@ def run_autostart_task() -> tuple[bool, str]:
         return False, "Scheduled Tasks are only supported on Windows."
 
     try:
-        res = subprocess.run(
-            ["schtasks", "/run", "/tn", TASK_NAME],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        res = _run_hidden(["schtasks", "/run", "/tn", TASK_NAME])
         if res.returncode == 0:
             return True, f"Task '{TASK_NAME}' started."
         return False, f"Failed to run task: {res.stderr.strip()}"
@@ -164,13 +163,7 @@ def stop_autostart_task() -> tuple[bool, str]:
         return False, "Scheduled Tasks are only supported on Windows."
 
     try:
-        res = subprocess.run(
-            ["schtasks", "/end", "/tn", TASK_NAME],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        res = _run_hidden(["schtasks", "/end", "/tn", TASK_NAME])
         if res.returncode == 0:
             return True, f"Task '{TASK_NAME}' stopped."
         return False, f"Failed to stop task: {res.stderr.strip()}"

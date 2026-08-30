@@ -3,6 +3,9 @@
 import os
 import shutil
 import tempfile
+import threading
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -31,4 +34,44 @@ def qapp():
         yield app
     except ImportError:
         pytest.skip("PySide6 is not installed")
+
+
+@pytest.fixture
+def bridge_server():
+    """In-memory Bridge HTTP server for integration tests.
+
+    Yields ``(config, base_url)`` where ``config`` carries a test token and a
+    scratch audit root under a temp dir. The server binds port 0 (OS-assigned)
+    so concurrent test runs never collide.
+    """
+    from audapack.bridge.server import AudapackBridgeHandler
+    from audapack.config import AppConfig, save_config
+
+    temp_dir = tempfile.mkdtemp(prefix="audapack_bridge_test_")
+    audit_root = Path(temp_dir) / "AUDITING_IMPLEMENTATION"
+    audit_root.mkdir(parents=True)
+
+    config = AppConfig()
+    config.audits.root = str(audit_root)
+    config.bridge.host = "127.0.0.1"
+    config.bridge.port = 0
+    config.bridge.token = "test_secret_token_123456789"
+
+    class TestHandler(AudapackBridgeHandler):
+        pass
+
+    TestHandler.config = config
+    TestHandler.test_base_dir = temp_dir
+    save_config(config, base_dir=temp_dir)
+    server = ThreadingHTTPServer((config.bridge.host, config.bridge.port), TestHandler)
+    config.bridge.port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{config.bridge.host}:{config.bridge.port}"
+    try:
+        yield config, base_url
+    finally:
+        server.shutdown()
+        server.server_close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 

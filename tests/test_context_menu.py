@@ -256,7 +256,7 @@ class TestSeamlessProjectOperations(unittest.TestCase):
                 for bar in win.findChildren(QToolBar)
                 for action in bar.actions()
             ]
-            self.assertIn("RESET", toolbar_actions)
+            self.assertIn("RESET MARKS", toolbar_actions)
             win._on_reset_project_marks()
             cleared = svc.get_project(p1.id)
             self.assertFalse(cleared.ignored)

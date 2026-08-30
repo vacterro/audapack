@@ -674,7 +674,12 @@ function createHarness() {
     cancelAnimationFrame: id => timers.clearTimeout(id)
   };
 
-  const harness = { timers, gmStore, sessionStore, localStore, _observers: observers, api: null, dom: document, location, counters, window: windowObj };
+  const navigatorObj = {
+    userAgent: 'Mozilla/5.0 Chrome/140.0.0.0 Safari/537.36',
+    platform: 'test',
+    brave: { isBrave: () => Promise.resolve(true) }
+  };
+  const harness = { timers, gmStore, sessionStore, localStore, _observers: observers, api: null, dom: document, location, navigator: navigatorObj, counters, window: windowObj };
   document._harness = harness;
 
   const sandbox = {
@@ -682,8 +687,8 @@ function createHarness() {
     document,
     window: windowObj,
     location,
-    navigator: { userAgent: 'harness', platform: 'test' },
-    performance: { now: () => Date.now() },
+    navigator: navigatorObj,
+    performance: { now: () => timers.now },
     crypto: { randomUUID: nextUuid, getRandomValues: () => ({}) },
     Math,
     Date,

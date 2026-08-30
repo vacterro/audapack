@@ -17,7 +17,7 @@ class TestComponents(unittest.TestCase):
     def test_read_bundled_widget_metadata(self):
         meta = read_bundled_widget_metadata()
         self.assertTrue(meta["exists"])
-        self.assertEqual(meta["version"], "0.0.01")
+        self.assertRegex(meta["version"], r"^\d+\.\d+\.\d+$")
         self.assertIn("AUDAPACK", meta["name"])
 
     def test_component_manager_status(self):

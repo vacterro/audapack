@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -62,6 +63,17 @@ class IngestResult:
     all3_path: Optional[Path] = None
     message: str = ""
     error: str = ""
+
+
+def _extract_campaign_run_id(text: str) -> Optional[str]:
+    """Return the CAMPAIGN_RUN_ID header value from raw audit text, or None."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("`*_# ")
+        if line.upper().startswith("CAMPAIGN_RUN_ID:"):
+            val = line[len("CAMPAIGN_RUN_ID:"):].strip().strip("`*_ ")
+            if val:
+                return val
+    return None
 
 
 def clean_markdown_headers(text: str) -> str:
@@ -399,11 +411,63 @@ def ingest_audit_text(
     all3_path = None
 
     try:
-        # W2-006: allocate one immutable campaign run id up front, before any
-        # file write, and pass it to every artifact and index writer. Crossing a
-        # one-second boundary must never produce a split identity across the
-        # final artifact, campaign.json, and wave metadata.
-        ingest_run_id = f"ingest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        # W4-003: derive the canonical campaign run id from the wave content
+        # itself, so the same id flows through the wave files, the synthesized
+        # __00_AUDIT_ALL_3.md, the campaign.json index, and the Bridge payload
+        # that will carry them. Two patches above this line already extracted
+        # the `campaign_run_id` value via parse_wave; reading the raw header
+        # from each chunk is the most robust way to enforce cross-wave
+        # equality and to detect a third-party paste that swapped the id
+        # mid-campaign. The mint-only legacy path is preserved for ingest
+        # calls that supply no CAMPAIGN_RUN_ID header at all.
+        canonical_run_ids: set[str] = set()
+        for _wid, _path, chunk_clean in prepared:
+            rid = _extract_campaign_run_id(chunk_clean)
+            if rid:
+                canonical_run_ids.add(rid)
+        if len(canonical_run_ids) > 1:
+            return _ingest_failure(
+                resolved_name,
+                profile.profile_id,
+                "Multiple campaign run IDs detected across waves: "
+                + ", ".join(sorted(canonical_run_ids))
+                + ". All waves in a single ingest must share one CAMPAIGN_RUN_ID.",
+                snapshots,
+            )
+        if len(canonical_run_ids) == 1:
+            ingest_run_id = next(iter(canonical_run_ids))
+        else:
+            # Legacy path: wave content carries no CAMPAIGN_RUN_ID. Preserve
+            # the original W2-006 mint so existing callers that fabricate the
+            # id server-side keep working.
+            ingest_run_id = (
+                f"ingest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                f"{_uuid.uuid4().hex[:6]}"
+            )
+
+        # W4-003: also reject a drift against the on-disk campaign.json if the
+        # same project already has a finalized run. A new ingest that brings
+        # a different run id for an existing campaign means a transport /
+        # content split-brain, and the only honest answer is to refuse before
+        # any file write instead of silently rewriting the index.
+        existing_index = target_dir / "campaign.json"
+        if existing_index.exists() and canonical_run_ids:
+            try:
+                idx_doc = json.loads(existing_index.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                idx_doc = None
+            if isinstance(idx_doc, dict):
+                existing_run = (idx_doc.get("campaign_run_id") or "").strip()
+                if existing_run and existing_run != ingest_run_id:
+                    return _ingest_failure(
+                        resolved_name,
+                        profile.profile_id,
+                        f"Multiple campaign run IDs: existing campaign run id {existing_run!r} "
+                        f"disagrees with the new content CAMPAIGN_RUN_ID {ingest_run_id!r}. "
+                        f"A campaign run id is immutable; start a fresh run instead of "
+                        f"re-pasting under a different id.",
+                        snapshots,
+                    )
 
         if all_exist:
             parsed_d = {}

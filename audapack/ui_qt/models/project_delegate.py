@@ -224,6 +224,9 @@ class ProjectItemDelegate(QStyledItemDelegate):
 
         total_waves = index.data(Qt.ItemDataRole.UserRole + 15) or 3
         prof_label = index.data(Qt.ItemDataRole.UserRole + 19) or ("A10" if total_waves == 10 else "A3")
+        dispatch_state = str(index.data(Qt.ItemDataRole.UserRole + 33) or "")
+        dispatch_browser = str(index.data(Qt.ItemDataRole.UserRole + 35) or "")
+        inaudit_label = str(index.data(Qt.ItemDataRole.UserRole + 40) or "")
 
         # ── Vertical indicator column (fixed width, stacked top→bottom) ────────
         # Every project row uses the SAME column layout: consistent order and
@@ -254,6 +257,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         line_h = 18
         base_y = y + 4
 
+        # ── INAUDIT badge (kept tiny, only when layers exist)
         # ── Audit wave text (always audit, pack shown separately)
         if all_ready:
             wave_text = f"\u2713 {prof_label} {completed_waves}/{total_waves}"
@@ -264,6 +268,24 @@ class ProjectItemDelegate(QStyledItemDelegate):
         else:
             wave_text = f"{prof_label} 0/{total_waves}"
             wave_color = QColor(PALETTE["textMuted"])
+        if dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED"}:
+            state_labels = {
+                "QUEUED": "WAIT",
+                "LEASED": "ATTACH",
+                "ARTIFACT_FETCHED": "ATTACH",
+                "ATTACHED": "START",
+                "START_PREPARED": "START",
+                "STARTED": "AUDIT",
+                "AUDITING": "AUDIT",
+                "FINALIZING": "SAVE",
+                "BLOCKED": "! BLOCKED",
+                "FAILED": "FAILED",
+                "RETRYABLE": "WAIT",
+            }
+            label = state_labels.get(dispatch_state, dispatch_state)
+            suffix = f" {dispatch_browser}" if dispatch_browser and dispatch_state not in {"QUEUED", "RETRYABLE"} else ""
+            wave_text = f"{label}{suffix}"
+            wave_color = QColor(PALETTE["warning"] if dispatch_state not in {"BLOCKED", "FAILED"} else PALETTE["dangerText"])
         if compact_rows:
             wave_text = wave_text.replace("✓ ", "✓", 1)
         # Pack badge after ZIP
@@ -318,6 +340,8 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # copy counter
         copy_cnt = int(index.data(Qt.ItemDataRole.UserRole + 25) or 0)
         copy_display = f"  ×{copy_cnt}" if copy_cnt > 0 else ""
+        inaudit_display = f"  {inaudit_label}" if inaudit_label else ""
+        inaudit_color = QColor(PALETTE["borderGolden"]) if inaudit_label else QColor(PALETTE["textMuted"])
 
         # ── ZIP text — "ZIP: 156,7 MB 28.08 01:12" — size + creation date
         freshness_tag = ""
@@ -366,13 +390,12 @@ class ProjectItemDelegate(QStyledItemDelegate):
             else:
                 pack_display = " [!]"
 
-        # Try single-line layout if wave+age+copy+ZIP+pack fits in col_w
+        # Try single-line layout if wave+age+copy+IA+ZIP+pack fits in col_w
         painter.setFont(self.font_small)
         single_gap = "  " if zip_text != "\u2014" else ""
-        single_line = wave_text + audit_display + copy_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
+        single_line = wave_text + audit_display + copy_display + inaudit_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
         single_w = painter.fontMetrics().horizontalAdvance(single_line)
         if compact_rows or (zip_text != "\u2014" and single_w <= col_w):
-            # ── Single line: wave age copy ZIP pack on one row, vertically centered
             single_y = y + (h - line_h) // 2
             painter.setPen(wave_color)
             painter.drawText(QRect(col_x, single_y, col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, wave_text)
@@ -385,6 +408,10 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 painter.setPen(QColor(PALETTE["borderGolden"]))
                 painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, copy_display)
                 cur_x1 += painter.fontMetrics().horizontalAdvance(copy_display)
+            if inaudit_display:
+                painter.setPen(inaudit_color)
+                painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, inaudit_display)
+                cur_x1 += painter.fontMetrics().horizontalAdvance(inaudit_display)
             if single_gap:
                 gap_w = painter.fontMetrics().horizontalAdvance(single_gap)
                 painter.setPen(arc_color)
@@ -394,9 +421,8 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 painter.setPen(pack_color)
                 painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, pack_display)
         else:
-            # ── Two-line layout: line0 = wave age copy, line1 = ZIP pack
+            full_line1 = wave_text + audit_display + copy_display + inaudit_display
             painter.setFont(self.font_small)
-            full_line1 = wave_text + audit_display + copy_display
             painter.setPen(wave_color)
             painter.drawText(QRect(col_x, _line_top(0), col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, full_line1)
             if audit_display:
@@ -407,6 +433,10 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 base_w = painter.fontMetrics().horizontalAdvance(wave_text + audit_display)
                 painter.setPen(QColor(PALETTE["borderGolden"]))
                 painter.drawText(QRect(col_x + base_w, _line_top(0), col_w - base_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, copy_display)
+            if inaudit_display:
+                base2 = painter.fontMetrics().horizontalAdvance(wave_text + audit_display + copy_display)
+                painter.setPen(inaudit_color)
+                painter.drawText(QRect(col_x + base2, _line_top(0), col_w - base2, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, inaudit_display)
             # line1 ZIP + pack together (or live progress bar while packing)
             painter.setFont(self.font_small)
             if pack_state in ("PACKING", "QUEUED") and isinstance(pack_progress, dict):
@@ -618,11 +648,50 @@ class ProjectItemDelegate(QStyledItemDelegate):
         else:
             lines.append("<b>Archive</b>: <font color='#999999'>Not packed yet</font>")
 
+        dispatch = hover_info.get("dispatch") or {}
+        dispatch_state = str(dispatch.get("state") or "")
+        if dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED"}:
+            dispatch_browser = str(dispatch.get("friendly_worker_label") or dispatch.get("browser_name") or dispatch.get("assigned_worker_id") or "")
+            dispatch_error = str(dispatch.get("error") or dispatch.get("last_error_code") or "")
+            dispatch_expected = str(dispatch.get("archive_filename") or "")
+            dispatch_updated = str(dispatch.get("updated_at") or "")
+            lines.append("")
+            lines.append(f"<b>Dispatch</b>: {dispatch_state}" + (f"  <font color='#777766'>{dispatch_browser}</font>" if dispatch_browser and dispatch_state not in {"QUEUED", "RETRYABLE"} else ""))
+            if dispatch_expected:
+                lines.append(f"  Expected: <font color='#D4C89A'>{dispatch_expected}</font>")
+            if dispatch_browser or dispatch.get("assigned_worker_id"):
+                raw_wid = str(dispatch.get("assigned_worker_id") or dispatch_browser)[:32]
+                lines.append(f"  Worker: {dispatch_browser or raw_wid}" + (f" <font color='#777766'>{raw_wid}</font>" if dispatch_browser and raw_wid != dispatch_browser else ""))
+            if dispatch_state:
+                lines.append(f"  State: {dispatch_state}")
+            if dispatch_error:
+                lines.append(f"  <font color='#FF8866'>Error: {dispatch_error[:120]}</font>")
+            if dispatch_updated:
+                try:
+                    from datetime import datetime as _dt
+                    upd = float(dispatch_updated)
+                    when = _dt.fromtimestamp(upd).strftime("%H:%M:%S")
+                except Exception:
+                    when = dispatch_updated[:19]
+                lines.append(f"  <font color='#777766'>Updated: {when}</font>")
+
         # Pack state
         if pack_state and pack_state != "IDLE":
             lines.append(f"<b>Pack</b>: <font color='#D4A840'>{pack_state}</font>")
             if pack_msg:
                 lines.append(f"  <font color='#777766'>{pack_msg}</font>")
+
+        layers = hover_info.get("inaudit_layers") or []
+        sel = hover_info.get("inaudit_selected")
+        if layers:
+            lines.append("")
+            lines.append(f"<b>INAUDIT</b>  {len(layers)} layer(s)" + (f" — selected {sel}.md" if sel else ""))
+            for lay in layers[:8]:
+                mark = " ◀" if lay.number == sel else ""
+                empty = " — EMPTY" if lay.size_bytes == 0 else ""
+                lines.append(f"  [{lay.number}] {lay.number}.md — {lay.size_str}{empty}{mark}")
+            if len(layers) > 8:
+                lines.append(f"  <font color='#777766'>+{len(layers)-8} more</font>")
 
         # Copy counter
         cc = int(getattr(proj, "audit_copy_count", 0) or 0)

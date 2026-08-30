@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.01
+// @version      0.0.03
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -118,9 +118,12 @@
   const BRIDGE_JOB_PREFIX = 'ai_chatbuttons_bridge_job_v1:';
   const BRIDGE_JOB_INDEX_KEY = 'ai_chatbuttons_bridge_job_index_v1';
   const BRIDGE_QUEUE_SIGNAL_KEY = 'ai_chatbuttons_bridge_queue_signal_v1';
+  const BRIDGE_DIAGNOSTIC_LOG_KEY = 'ai_chatbuttons_bridge_diagnostic_log_v1';
+  const BRIDGE_DIAGNOSTIC_LOG_MAX = 80;
   const BRIDGE_FLUSH_LEASE_KEY = 'ai_chatbuttons_bridge_flush_lease_v1';
   const BRIDGE_FLUSH_LEASE_MS = 30000;
   const BRIDGE_REQUEST_TIMEOUT_MS = 12000;
+  const BROWSER_WORKER_PROTOCOL_VERSION = 'AUDAPACK_WIDGET/3';
   const BRIDGE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 120000, 300000]);
   const BRIDGE_API_VERSION = 3;
   const AUDIT_RESULT_INDEX_KEY = 'ai_chatbuttons_audit_result_index_v1';
@@ -2109,6 +2112,33 @@ ordinal/name of the entrypoint file.`;
   color: var(--borderHighlight) !important;
   border-color: var(--warning) !important;
 }
+#acb-bridge-diagnostics {
+  margin-top: 4px !important;
+}
+#acb-bridge-diagnostics-head {
+  min-height: 24px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 4px !important;
+}
+#acb-bridge-diagnostics-head .acb-label {
+  margin: 0 !important;
+}
+#acb-bridge-log {
+  height: 112px !important;
+  margin: 0 !important;
+  padding: 4px !important;
+  overflow: auto !important;
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  background: var(--compareBack) !important;
+  color: var(--textSecondary) !important;
+  border: 2px solid !important;
+  border-color: var(--borderDark) var(--bevelLight) var(--bevelLight) var(--borderDark) !important;
+  font: 10px/1.25 Verdana, sans-serif !important;
+  user-select: text !important;
+}
 #acb-browser-fallback {
   margin-top: 6px !important;
   padding-top: 5px !important;
@@ -3035,6 +3065,77 @@ ordinal/name of the entrypoint file.`;
       await new Promise(resolve => setTimeout(resolve, 350));
     }
     return chatGPTReadyAttachmentSummary();
+  }
+
+  function browserWorkerClockNow() {
+    return typeof globalThis.performance?.now === 'function' ? globalThis.performance.now() : Date.now();
+  }
+
+  function observedAttachmentSize(tile) {
+    if (!tile) return 0;
+    const values = [
+      tile.getAttribute?.('data-file-size'),
+      tile.getAttribute?.('data-size'),
+      tile.dataset?.fileSize,
+      tile.dataset?.size,
+      tile.file?.size
+    ];
+    for (const value of values) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return 0;
+  }
+
+  async function waitForExactProjectAttachment({ filename, expectedSize, timeoutMs = 40000 }) {
+    const startedAt = browserWorkerClockNow();
+    let lastObservedNames = [];
+    while (browserWorkerClockNow() - startedAt < timeoutMs) {
+      const root = chatGPTComposerRoot();
+      if (!root || root.hasAttribute('inert')) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        continue;
+      }
+      const tiles = chatGPTProjectComposerAttachments(root);
+      const names = tiles.map(t => String(t.getAttribute('aria-label') || t.textContent || '').trim()).filter(Boolean);
+      lastObservedNames = names;
+      if (names.length > 0) {
+        const exactTile = tiles.find((tile, index) => names[index] === filename);
+        if (exactTile) {
+          const observedSize = observedAttachmentSize(exactTile);
+          if (Number(expectedSize) > 0 && observedSize > 0 && observedSize !== Number(expectedSize)) {
+            return { ok: false, filename, observedNames: names, observedSize, reason: 'artifact-size-mismatch', detail: `expected ${expectedSize} bytes, observed ${observedSize}` };
+          }
+          return { ok: true, filename, observedNames: names, observedSize, reason: 'exact-match' };
+        }
+        return { ok: false, filename, observedNames: names, reason: 'attachment-identity-mismatch', detail: `expected ${filename}, observed ${names.join(', ')}` };
+      }
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    return { ok: false, filename, observedNames: lastObservedNames, reason: 'attachment-registration-timeout', detail: 'no matching tile appeared within timeout' };
+  }
+
+  async function waitForExactProjectAttachmentWithRetry({ filename, expectedSize, timeoutMs = 40000, maxAttempts = 3 }) {
+    const startedAt = browserWorkerClockNow();
+    const attempts = Math.max(1, Number(maxAttempts) || 1);
+    let lastResult = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const elapsed = browserWorkerClockNow() - startedAt;
+      const remaining = Math.max(0, Number(timeoutMs) - elapsed);
+      if (remaining <= 0) break;
+      const remainingAttempts = attempts - attempt + 1;
+      const attemptTimeout = Math.max(1, Math.floor(remaining / remainingAttempts));
+      lastResult = await waitForExactProjectAttachment({ filename, expectedSize, timeoutMs: attemptTimeout });
+      if (lastResult?.ok || lastResult?.reason !== 'attachment-registration-timeout') {
+        return { ...lastResult, attempts: attempt };
+      }
+      if (attempt < attempts) {
+        const afterAttempt = browserWorkerClockNow() - startedAt;
+        const backoff = Math.min(250 * (2 ** (attempt - 1)), Math.max(0, Number(timeoutMs) - afterAttempt));
+        if (backoff > 0) await new Promise(resolve => setTimeout(resolve, backoff));
+      }
+    }
+    return { ...(lastResult || { ok: false, filename, observedNames: [], reason: 'attachment-registration-timeout' }), attempts };
   }
 
   function miniStartAuditState() {
@@ -4530,6 +4631,31 @@ ordinal/name of the entrypoint file.`;
         }
       }
 
+      // Dispatch workers must cross the durable START_PREPARED boundary before
+      // triggerSend can perform any irreversible composer submission. Manual
+      // starts do not provide this hook and retain the existing path.
+      if (typeof options.beforeIrreversibleSend === 'function') {
+        let permitted = false;
+        try {
+          permitted = Boolean(await options.beforeIrreversibleSend({
+            receipt: String(preset?.machineReceipt || ''),
+            campaignRunId: String(autoRuntime?.runId || ''),
+            projectName: String(autoRuntime?.projectName || ''),
+            site,
+            input,
+            preset,
+            attachmentDelivery,
+            attachment
+          }));
+        } catch (_) {
+          permitted = false;
+        }
+        if (!permitted) {
+          setStatus(`Automatic Send for ${preset.name} was canceled because its durable START_PREPARED acknowledgement was not accepted. Nothing was sent.`, 'error');
+          return { ok: false, sent: false, reason: 'irreversible-send-checkpoint-failed' };
+        }
+      }
+
       const result = await triggerSend(site, input, {
         waitForReadyMs: attachmentDelivery ? CHATGPT_ATTACHMENT_TIMEOUT_MS : 12000,
         fence: (options.autoOwnership || options.canonicalComposerOnly)
@@ -5348,6 +5474,157 @@ ordinal/name of the entrypoint file.`;
     };
   }
 
+  function bridgeDiagnosticValue(value, maxLength = 320) {
+    return String(value ?? '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, maxLength);
+  }
+
+  function readBridgeDiagnosticLog() {
+    try {
+      const raw = GM_getValue(BRIDGE_DIAGNOSTIC_LOG_KEY, null);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter(entry => entry && entry.version === 1 && Number(entry.at) > 0 && entry.event)
+        .slice(-BRIDGE_DIAGNOSTIC_LOG_MAX);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function appendBridgeDiagnostic(event, details = {}) {
+    const job = details.job && typeof details.job === 'object' ? details.job : {};
+    const now = Date.now();
+    const entry = {
+      version: 1,
+      at: now,
+      event: bridgeDiagnosticValue(event, 60) || 'bridge_event',
+      severity: bridgeDiagnosticValue(details.severity || (details.code || details.message ? 'error' : 'info'), 12),
+      bridgeState: bridgeDiagnosticValue(details.bridgeState || bridgeState, 24),
+      status: Math.max(0, Number(details.status) || 0),
+      code: bridgeDiagnosticValue(details.code || details.errorCode || job.errorCode, 80),
+      message: bridgeDiagnosticValue(details.message || job.lastError, 320),
+      jobId: bridgeDiagnosticValue(details.jobId || job.jobId || job.receipt, 160),
+      runId: bridgeDiagnosticValue(details.runId || job.deliveryRunId || job.runId, 120),
+      project: bridgeDiagnosticValue(details.project || job.project, 100),
+      wave: bridgeDiagnosticValue(details.wave || job.wave, 60),
+      attempts: Math.max(0, Number(details.attempts ?? job.attempts) || 0),
+      repeats: 1
+    };
+
+    try {
+      const entries = readBridgeDiagnosticLog();
+      const previous = entries[entries.length - 1];
+      const duplicate = previous &&
+        previous.event === entry.event &&
+        previous.code === entry.code &&
+        previous.message === entry.message &&
+        previous.jobId === entry.jobId &&
+        previous.status === entry.status &&
+        now - Number(previous.at || 0) < 60000;
+      if (duplicate) {
+        entries[entries.length - 1] = {
+          ...previous,
+          ...entry,
+          repeats: Math.max(1, Number(previous.repeats) || 1) + 1
+        };
+      } else {
+        entries.push(entry);
+      }
+      GM_setValue(BRIDGE_DIAGNOSTIC_LOG_KEY, JSON.stringify(entries.slice(-BRIDGE_DIAGNOSTIC_LOG_MAX)));
+      return true;
+    } catch (_) {
+      // Diagnostics must never interfere with queue persistence or delivery.
+      return false;
+    }
+  }
+
+  function bridgeDiagnosticJobState(job) {
+    if (job?.permanent) return 'FAILED';
+    if (job?.deliveredAwaitingAck) return 'WAITING_ACK';
+    if (Number(job?.inFlightAt) > 0) return 'IN_FLIGHT';
+    return 'QUEUED';
+  }
+
+  function bridgeDiagnosticTime(value) {
+    const timestamp = Number(value) || 0;
+    if (!timestamp) return 'unknown';
+    try {
+      return new Date(timestamp).toISOString();
+    } catch (_) {
+      return 'invalid';
+    }
+  }
+
+  function bridgeDiagnosticsText(jobsSnapshot = null, logSnapshot = null) {
+    const stats = bridgeQueueStats('', jobsSnapshot);
+    const events = Array.isArray(logSnapshot) ? logSnapshot : readBridgeDiagnosticLog();
+    const lines = [
+      'AUDAPACK BRIDGE DIAGNOSTICS',
+      `state=${bridgeState} message=${bridgeDiagnosticValue(bridgeMessage) || 'none'}`,
+      `url=${normalizedBridgeUrl() || 'invalid'} token=${bridgeToken() ? 'stored' : 'missing'} server=${bridgeDiagnosticValue(bridgeServerVersion, 80) || 'unknown'}`,
+      `last_check=${bridgeDiagnosticTime(bridgeLastCheckedAt)} queue_total=${stats.total} queued=${stats.pending} failed=${stats.failed}`
+    ];
+
+    const jobs = [...stats.jobs].sort((a, b) => {
+      const failureDelta = Number(Boolean(b.permanent)) - Number(Boolean(a.permanent));
+      if (failureDelta) return failureDelta;
+      return Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0);
+    });
+    if (!jobs.length) {
+      lines.push('', 'CURRENT JOBS: none');
+    } else {
+      lines.push('', `CURRENT JOBS: ${jobs.length}`);
+      for (const job of jobs) {
+        lines.push(
+          `[${bridgeDiagnosticJobState(job)}] updated=${bridgeDiagnosticTime(job.updatedAt || job.createdAt)} code=${bridgeDiagnosticValue(job.errorCode, 80) || 'none'} attempts=${Math.max(0, Number(job.attempts) || 0)}`,
+          `project=${bridgeDiagnosticValue(job.project, 100) || 'unknown'} wave=${bridgeDiagnosticValue(job.wave, 60) || 'unknown'} run_id=${bridgeDiagnosticValue(job.deliveryRunId || job.runId, 120) || 'unknown'}`,
+          `receipt=${bridgeDiagnosticValue(job.receipt || job.jobId, 160) || 'unknown'}`,
+          `cause=${bridgeDiagnosticValue(job.lastError) || (job.permanent ? 'missing failure detail' : 'waiting for delivery')}`
+        );
+      }
+    }
+
+    lines.push('', `RECENT EVENTS: ${Math.min(events.length, 20)}`);
+    if (!events.length) {
+      lines.push('none recorded');
+    } else {
+      for (const entry of events.slice(-20).reverse()) {
+        const context = [
+          entry.code ? `code=${bridgeDiagnosticValue(entry.code, 80)}` : '',
+          entry.status ? `http=${Number(entry.status) || 0}` : '',
+          entry.attempts ? `attempts=${Number(entry.attempts) || 0}` : '',
+          Number(entry.repeats) > 1 ? `repeats=${Number(entry.repeats)}` : '',
+          entry.project ? `project=${bridgeDiagnosticValue(entry.project, 100)}` : '',
+          entry.wave ? `wave=${bridgeDiagnosticValue(entry.wave, 60)}` : '',
+          entry.runId ? `run_id=${bridgeDiagnosticValue(entry.runId, 120)}` : '',
+          entry.jobId ? `receipt=${bridgeDiagnosticValue(entry.jobId, 160)}` : ''
+        ].filter(Boolean).join(' ');
+        lines.push(
+          `${bridgeDiagnosticTime(entry.at)} ${bridgeDiagnosticValue(entry.severity, 12).toUpperCase() || 'INFO'} ${bridgeDiagnosticValue(entry.event, 60)}${context ? ` ${context}` : ''}`,
+          `cause=${bridgeDiagnosticValue(entry.message) || 'none'}`
+        );
+      }
+    }
+
+    lines.push('', 'Token value and audit content are intentionally excluded.');
+    return lines.join('\n');
+  }
+
+  async function copyBridgeDiagnostics() {
+    const text = bridgeDiagnosticsText();
+    const copied = await copyAuditText(text);
+    if (!copied) {
+      setStatus('Bridge diagnostics could not be copied because clipboard access was rejected.', 'error');
+      return false;
+    }
+    setStatus(`Bridge diagnostics copied (${text.length.toLocaleString()} characters, token and audit content excluded).`, 'success');
+    return true;
+  }
+
   function saveBridgeJob(job, options = {}) {
     if (!job?.jobId) return false;
     const key = bridgeJobKey(job.jobId);
@@ -5553,9 +5830,32 @@ ordinal/name of the entrypoint file.`;
 
     const runId = String(record.runId || autoRuntime?.runId || ensureAuditRunId());
     if (!runId) return false;
+
+    // W4-003: the durable audit record is the single owner of the run id once
+    // a handoff is captured. A re-arm (Reset / fresh Core) mints a new runtime
+    // id, but the on-disk record and its queued content were captured under the
+    // previous id. Enqueueing under the new id would hand the Bridge a payload
+    // whose transport run_id disagrees with the content's CAMPAIGN_RUN_ID, so
+    // refuse instead of letting the mismatch reach the server.
+    const durable = readAuditResultFresh(record.kind, record.conversationKey);
+    if (durable) {
+      const durableRunId = String(durable.runId || '');
+      if (durableRunId && durableRunId !== runId) {
+        setStatus(
+          `Audit run ${runId} cannot overwrite the durable record for run ${durableRunId}. ` +
+          `Start a fresh audit or SAVE this conversation as a new run.`,
+          'warning'
+        );
+        return false;
+      }
+    }
+
     const deliveryRunId = String(options.deliveryRunId || runId);
     const canonicalReceipt = String(record.bridgeReceipt || createBridgeReceipt(runId, record.kind));
     const receipt = options.freshReceipt ? createBridgeMaterializeReceipt(deliveryRunId, record.kind) : canonicalReceipt;
+    const profileId = String(record.profileId || autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3');
+    const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[profileId] || getActiveProfile();
+    const waveDef = findWaveDefinitionForStageOrKind(record.kind, profile);
 
     const existingJob = readBridgeJob(receipt);
     if (existingJob && !options.force) {
@@ -5575,6 +5875,10 @@ ordinal/name of the entrypoint file.`;
       conversationId: bridgeConversationIdFromKey(record.conversationKey),
       project: record.projectName || 'PROJECT',
       wave: record.kind,
+      profileId,
+      profileVersion: String(record.profileVersion || profile?.profile_version || '1.0.0'),
+      waveIndex: Number(record.waveIndex) || Number(waveDef?.ordinal) || 1,
+      waveCount: Number(record.waveCount) || Number(profile?.waves?.length) || 1,
       completedAt: Number(record.completedAt) || now,
       content: String(record.text),
       attempts: 0,
@@ -5628,7 +5932,13 @@ ordinal/name of the entrypoint file.`;
     // Phase 2: expose the job to delivery only after queued metadata exists. If
     // this write fails, the staged job remains durable and flush-time
     // reconciliation can safely complete or discard it without remote I/O.
-    saveBridgeJob({ ...job, staged: false, updatedAt: Date.now() }, { signal: false });
+    const activeJob = { ...job, staged: false, updatedAt: Date.now() };
+    saveBridgeJob(activeJob, { signal: false });
+    appendBridgeDiagnostic('job_queued', {
+      severity: 'info',
+      job: activeJob,
+      message: 'Audit save job persisted and queued for Bridge delivery.'
+    });
     signalBridgeQueueChange();
     if (options.deferFlush) {
       renderAutoAuditState();
@@ -5645,8 +5955,10 @@ ordinal/name of the entrypoint file.`;
   }
 
   function bridgeJobRequest(job) {
-    const waveDef = findWaveDefinitionForStageOrKind(job.wave);
-    const prof = getActiveProfile();
+    const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    const contentProfileId = extractCampaignProfileFromText(job.content || '');
+    const prof = profiles[job.profileId] || profiles[contentProfileId] || getActiveProfile();
+    const waveDef = findWaveDefinitionForStageOrKind(job.wave, prof);
     return {
       api_version: BRIDGE_API_VERSION,
       receipt: job.receipt,
@@ -5690,6 +6002,13 @@ ordinal/name of the entrypoint file.`;
       ...(canCompact ? { content: '', contentOmitted: true } : {})
     };
     if (!saveBridgeJob(next)) return false;
+    appendBridgeDiagnostic('job_failed', {
+      severity: 'error',
+      status: response.status,
+      code: errorCode,
+      message: next.lastError,
+      job: next
+    });
     patchAuditResult(latest.wave, record => {
       record.bridgeError = next.lastError;
       record.saveError = next.lastError;
@@ -5712,6 +6031,13 @@ ordinal/name of the entrypoint file.`;
       inFlightAt: 0
     };
     if (!saveBridgeJob(next)) return false;
+    appendBridgeDiagnostic('job_retry_scheduled', {
+      severity: 'warning',
+      status: response.status,
+      code: next.errorCode,
+      message: next.lastError,
+      job: next
+    });
     patchAuditResult(latest.wave, record => {
       record.bridgeError = next.lastError;
       record.saveError = '';
@@ -5742,6 +6068,13 @@ ordinal/name of the entrypoint file.`;
     }, job.conversationKey, { expectedRunId });
 
     if (patched) {
+      appendBridgeDiagnostic('job_saved', {
+        severity: 'info',
+        job,
+        message: response.data?.duplicate
+          ? 'Bridge acknowledged an already-saved audit receipt.'
+          : `Bridge saved the audit${files.length ? ` to ${files.length} file(s)` : ''}.`
+      });
       deleteBridgeJob(job.jobId);
       return true;
     }
@@ -5780,6 +6113,21 @@ ordinal/name of the entrypoint file.`;
   async function deliverBridgeJob(job) {
     if (job.deliveredAwaitingAck) {
       return markBridgeJobSaved(job, { ok: true, data: job.deliveredData || {} });
+    }
+
+    // W4-003: refuse a queued payload whose embedded content carries a
+    // CAMPAIGN_RUN_ID header that disagrees with the queued run id. The
+    // Bridge v3 contract rejects that exact mismatch server-side, but the
+    // widget must not even POST a payload it can prove is wrong: the queued
+    // content was captured under one run and the queue record claims another.
+    const queuedRunId = String(job.deliveryRunId || job.runId || '');
+    const contentRunId = extractCampaignRunIdFromText(job.content || '');
+    if (queuedRunId && contentRunId && queuedRunId !== contentRunId) {
+      markBridgeJobPermanent(job, {
+        errorCode: 'run_id_mismatch',
+        message: `Payload run_id '${queuedRunId}' does not match content CAMPAIGN_RUN_ID '${contentRunId}'.`
+      });
+      return false;
     }
 
     const activeJob = {
@@ -6048,6 +6396,72 @@ ordinal/name of the entrypoint file.`;
     return changed;
   }
 
+  function retryAllBridgeFailedJobs() {
+    let retried = 0;
+    let skipped = 0;
+    const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    for (const job of listBridgeJobs()) {
+      if (!job.permanent) continue;
+      let content = String(job.content || '');
+      let canonical = null;
+      if (!content || job.contentOmitted) {
+        canonical = readAuditResultFresh(job.wave, job.conversationKey);
+        const expectedRunId = String(job.sourceRunId || job.runId || '');
+        if (
+          !canonical?.text ||
+          (expectedRunId && String(canonical.runId || '') !== expectedRunId)
+        ) {
+          skipped += 1;
+          appendBridgeDiagnostic('manual_retry_skipped', {
+            severity: 'error',
+            code: 'retry_content_unavailable',
+            message: 'Manual retry could not rebuild the compacted payload from the matching durable audit record.',
+            job
+          });
+          continue;
+        }
+        content = String(canonical.text);
+      }
+
+      const profileId = String(
+        job.profileId ||
+        canonical?.profileId ||
+        extractCampaignProfileFromText(content) ||
+        'quick3'
+      );
+      const profile = profiles[profileId] || getActiveProfile();
+      const waveDef = findWaveDefinitionForStageOrKind(job.wave, profile);
+      const next = {
+        ...job,
+        content,
+        contentOmitted: false,
+        profileId: String(profile?.profile_id || profileId),
+        profileVersion: String(job.profileVersion || canonical?.profileVersion || profile?.profile_version || '1.0.0'),
+        waveIndex: Number(job.waveIndex) || Number(canonical?.waveIndex) || Number(waveDef?.ordinal) || 1,
+        waveCount: Number(job.waveCount) || Number(canonical?.waveCount) || Number(profile?.waves?.length) || 1,
+        permanent: false,
+        attempts: 0,
+        errorCode: '',
+        lastError: '',
+        nextAttemptAt: Date.now(),
+        inFlightAt: 0,
+        updatedAt: Date.now()
+      };
+      if (!saveBridgeJob(next)) {
+        skipped += 1;
+        continue;
+      }
+      retried += 1;
+      appendBridgeDiagnostic('manual_retry', {
+        severity: 'info',
+        message: 'User explicitly requeued a failed audit save job.',
+        job: next
+      });
+    }
+    if (retried) scheduleBridgeFlush(50);
+    return { retried, skipped };
+  }
+
   function clearBridgeQueue(onlyFailed = false) {
     let count = 0;
     for (const job of listBridgeJobs()) {
@@ -6057,6 +6471,10 @@ ordinal/name of the entrypoint file.`;
       }
     }
     signalBridgeQueueChange();
+    appendBridgeDiagnostic('queue_cleared', {
+      severity: 'warning',
+      message: `User cleared ${count} ${onlyFailed ? 'failed' : 'queued/failed'} audit save job(s) from local storage.`
+    });
     renderAutoAuditState();
     return count;
   }
@@ -6065,6 +6483,7 @@ ordinal/name of the entrypoint file.`;
     if (!state?.bridgeEnabled) {
       bridgeState = 'disabled';
       bridgeMessage = 'Bridge integration is disabled.';
+      appendBridgeDiagnostic('check_skipped', { severity: 'warning', code: 'disabled', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6073,6 +6492,7 @@ ordinal/name of the entrypoint file.`;
     if (!url) {
       bridgeState = 'error';
       bridgeMessage = 'Invalid URL. Use http://127.0.0.1:<port> or http://localhost:<port>.';
+      appendBridgeDiagnostic('check_failed', { severity: 'error', code: 'invalid_bridge_url', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6086,6 +6506,9 @@ ordinal/name of the entrypoint file.`;
       bridgeState = 'offline';
       bridgeMessage = health.message || 'Bridge is offline.';
       bridgeLastCheckedAt = Date.now();
+      appendBridgeDiagnostic('health_failed', {
+        severity: 'error', status: health.status, code: health.errorCode || 'offline', message: bridgeMessage
+      });
       renderAutoAuditState();
       return false;
     }
@@ -6098,6 +6521,7 @@ ordinal/name of the entrypoint file.`;
         ? 'A legacy ACBBridge is answering on this port. Stop it or switch ports.'
         : `Wrong service on this port: ${healthService}.`;
       bridgeLastCheckedAt = Date.now();
+      appendBridgeDiagnostic('identity_failed', { severity: 'error', code: 'wrong_service', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6105,6 +6529,7 @@ ordinal/name of the entrypoint file.`;
       bridgeState = 'wrong_service';
       bridgeMessage = 'Unidentified service on this port (no service identity in /health).';
       bridgeLastCheckedAt = Date.now();
+      appendBridgeDiagnostic('identity_failed', { severity: 'error', code: 'missing_service_identity', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6117,6 +6542,7 @@ ordinal/name of the entrypoint file.`;
       bridgeState = 'api_incompatible';
       bridgeMessage = `Bridge speaks API v${healthApi}; this widget requires v${BRIDGE_API_VERSION}. Update the other side.`;
       bridgeLastCheckedAt = Date.now();
+      appendBridgeDiagnostic('api_failed', { severity: 'error', code: 'api_incompatible', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6125,6 +6551,7 @@ ordinal/name of the entrypoint file.`;
       bridgeState = 'auth';
       bridgeMessage = 'Bridge is running. Paste/save the token to enable audit writes.';
       bridgeLastCheckedAt = Date.now();
+      appendBridgeDiagnostic('auth_failed', { severity: 'error', code: 'token_missing', message: bridgeMessage });
       renderAutoAuditState();
       return false;
     }
@@ -6139,6 +6566,9 @@ ordinal/name of the entrypoint file.`;
       bridgeMessage = !status.ok
         ? (status.message || 'Bridge status check failed.')
         : 'Bridge /v1/status returned HTTP success without a valid JSON status payload.';
+      appendBridgeDiagnostic('status_failed', {
+        severity: 'error', status: status.status, code: status.errorCode || 'invalid_status_payload', message: bridgeMessage
+      });
       renderAutoAuditState();
       return false;
     }
@@ -6154,9 +6584,14 @@ ordinal/name of the entrypoint file.`;
     bridgeMessage = bridgeOutputRoot
       ? `Connected · ${bridgeOutputRoot}`
       : 'Connected · automatic audit persistence ready.';
+    appendBridgeDiagnostic('check_connected', {
+      severity: 'info',
+      message: bridgeOutputRoot ? 'Authenticated Bridge status check passed; output root is available.' : bridgeMessage
+    });
     renderAutoAuditState();
 
     resetBridgeFailedJobs('');
+    startBrowserWorker();
 
     if (!options.suppressFlush) {
       scheduleBridgeFlush(options.force ? 0 : 50);
@@ -6174,6 +6609,8 @@ ordinal/name of the entrypoint file.`;
     node.dataset.state = bridgeState === 'connected' ? 'ready' : bridgeState === 'checking' || bridgeState === 'unknown' ? 'warning' : 'error';
     node.textContent = `${labels[bridgeState] || 'UNKNOWN'} · queued ${stats.pending} · failed ${stats.failed}`;
     node.title = `${bridgeMessage}${tokenPresent ? ' Token stored.' : ' No token stored.'}${bridgeServerVersion ? ` Bridge ${bridgeServerVersion}.` : ''}${bridgeOutputRoot ? ` Output: ${bridgeOutputRoot}` : ''} Browser-fallback ALL_3 uses compact_v1. Server-generated __00_AUDIT_ALL_3.md also requires the included ACBBridge 1.0.1 compact patch.`;
+    const logNode = panel?.querySelector('#acb-bridge-log');
+    if (logNode) logNode.textContent = bridgeDiagnosticsText(stats.jobs);
   }
 
   function currentBridgeSaveState(conversationKey = autoBoundConversationKey || currentConversationKey(), jobsSnapshot = null) {
@@ -10278,6 +10715,13 @@ ordinal/name of the entrypoint file.`;
     return match ? match[1].trim() : null;
   }
 
+  function extractCampaignRunIdFromText(text) {
+    const match = String(text || '').match(/^\s*CAMPAIGN_RUN_ID\s*:\s*(.+?)\s*$/im);
+    if (!match) return null;
+    const value = match[1].trim();
+    return value ? value : null;
+  }
+
   function resolveAuditResponseStage(stage, text, profileOrId = null) {
     const rawStage = String(stage || '');
     if (!['sending-continuation', 'await-continuation-user'].includes(rawStage)) return rawStage;
@@ -10962,6 +11406,23 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     }
 
     if (!(await ownership.verify())) return false;
+    if (typeof options.beforeIrreversibleSend === 'function') {
+      let permitted = false;
+      try {
+        permitted = Boolean(await options.beforeIrreversibleSend({
+          receipt: String(handoff.receipt || ''),
+          campaignRunId: String(autoRuntime?.runId || ''),
+          projectName: String(autoRuntime?.projectName || ''),
+          handoff
+        }));
+      } catch (_) {
+        permitted = false;
+      }
+      if (!permitted) {
+        if (options.reschedule !== false) scheduleArmedStartRecovery(700);
+        return false;
+      }
+    }
     const clicking = markStartAuditHandoffClicking(handoff);
     if (!clicking) return false;
 
@@ -10984,7 +11445,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     return true;
   }
 
-  async function startAuditCoreFromReadyAttachment() {
+  async function startAuditCoreFromReadyAttachment(options = {}) {
     if (auditStartInFlight || actionInFlight) {
       setStatus('START AUDITING is already preparing/sending Audit Core.', 'info');
       return false;
@@ -10999,7 +11460,11 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     const prepared = readStartAuditHandoff();
     if (startHandoffIsPrepared(prepared)) {
       setStatus('START AUDITING already has one canonical Core receipt prepared. Retrying that exact Send instead of creating another audit start.', 'info');
-      return recoverArmedStartSend({ waitMs: 2500, reschedule: true });
+      return recoverArmedStartSend({
+        waitMs: 2500,
+        reschedule: true,
+        beforeIrreversibleSend: options.beforeIrreversibleSend
+      });
     }
 
     if (autoRuntime.stage !== 'idle') {
@@ -11097,6 +11562,15 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
       autoRuntime.archiveTimestampSource = archiveFreshness.source;
     }
 
+    // Reserve and persist the one campaign lineage before writing the Core
+    // prompt or notifying the Bridge. Every downstream wave must reuse it.
+    const canonicalRunId = ensureAuditRunId();
+    if (!canonicalRunId) {
+      setStatus('START AUDITING failed: the canonical campaign run id could not be persisted. Nothing was sent.', 'error');
+      renderAutoAuditState();
+      return false;
+    }
+
     const startHandoff = beginStartAuditHandoff();
     if (!startHandoff) {
       setStatus('START AUDITING could not create its durable handoff checkpoint. Nothing was sent; A3 state was left unchanged.', 'error');
@@ -11115,12 +11589,19 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     auditStartInFlight = true;
     renderAutoAuditState();
     try {
-      const startPreset = { ...preset, machineReceipt: startHandoff.receipt };
+      const startPreset = {
+        ...preset,
+        text: firstWave
+          ? buildAuditWavePrompt(prof, firstWave, { runId: canonicalRunId })
+          : String(preset.text || '').replace(/^(\s*CAMPAIGN_RUN_ID\s*:\s*).*$/im, `$1${canonicalRunId}`),
+        machineReceipt: startHandoff.receipt
+      };
       const result = await executePreset(startPreset, 'run', {
         canonicalComposerOnly: true,
         autoOwnership: ownership,
         beforeSend: async () => Boolean(armStartAuditHandoffForSend(startHandoff)),
-        beforeClick: async () => Boolean(isLeaseTokenCurrent(token) && markStartAuditHandoffClicking(startHandoff))
+        beforeClick: async () => Boolean(isLeaseTokenCurrent(token) && markStartAuditHandoffClicking(startHandoff)),
+        beforeIrreversibleSend: options.beforeIrreversibleSend
       });
 
       if (!result?.sent) {
@@ -11232,7 +11713,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     }
   }
 
-  function currentChatAuditRecords(conversationKey = autoBoundConversationKey || currentConversationKey()) {
+  function currentChatAuditRecords(conversationKey = autoBoundConversationKey || currentConversationKey(), options = {}) {
     if (autoRuntime && autoRuntime.conversationKey === conversationKey && autoRuntime.resetBarrierActive) return [];
     const storedRuntime = readStoredRuntime(conversationKey);
     if (storedRuntime.corrupt) return [];
@@ -11266,11 +11747,12 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
 
     if (runtimeRunId && groups.has(runtimeRunId)) {
       selected = groups.get(runtimeRunId);
-    } else if (runtimeRunId) {
+    } else if (runtimeRunId && !options.allowHistoricalComplete) {
       return [];
     } else {
       if (
         autoRuntime &&
+        !options.allowHistoricalComplete &&
         (autoRuntime.stage.startsWith('wait-') || autoRuntime.stage.startsWith('sending-') || autoRuntime.stage.startsWith('await-'))
       ) {
         return [];
@@ -11336,7 +11818,9 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
       backfillVisibleCompletedAuditResults();
     }
 
-    const records = currentChatAuditRecords(conversationKey);
+    const records = currentChatAuditRecords(conversationKey, {
+      allowHistoricalComplete: Boolean(options.manualSync || options.forceAll)
+    });
     if (!records.length) {
       setStatus(
         options.manualSync
@@ -12199,7 +12683,11 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     setWaveUserId(firstWaveId, autoRuntime.anchorUserId);
     setWaveUserId('core', autoRuntime.anchorUserId);
     autoRuntime.expectedKind = '';
-    autoRuntime.runId = createAuditRunId();
+    // The Core prompt is the canonical lineage owner. Reuse its concrete
+    // CAMPAIGN_RUN_ID when present; mint only for legacy prompts that predate
+    // the field. Never fork a second run id during hydration.
+    const embeddedRunId = extractCampaignRunIdFromText(getTurnText(userTurn));
+    autoRuntime.runId = embeddedRunId || createAuditRunId();
     autoRuntime.startedAt = Date.now();
     autoRuntime.waitStartedAt = Date.now();
     autoRuntime.stableResponseKey = '';
@@ -15168,21 +15656,33 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     });
 
     panel.querySelector('#acb-bridge-retry-queue')?.addEventListener('click', () => {
-      const count = resetBridgeFailedJobs('');
-      setStatus(`Retrying ${count} failed audit save job(s)...`, 'info');
+      const result = retryAllBridgeFailedJobs();
+      setStatus(
+        `Retrying ${result.retried} failed audit save job(s)${result.skipped ? `; ${result.skipped} could not be rebuilt from durable audit data` : ''}.`,
+        result.skipped ? 'warning' : 'info'
+      );
       renderBridgeState();
       scheduleBridgeFlush(50);
+    });
+
+    panel.querySelector('#acb-bridge-copy-log')?.addEventListener('click', () => {
+      copyBridgeDiagnostics().catch(error => {
+        setStatus(`Bridge diagnostics copy failed: ${error?.message || 'unexpected clipboard error'}.`, 'error');
+      });
     });
 
     panel.querySelector('#acb-bridge-state')?.addEventListener('click', () => {
       const stats = bridgeQueueStats();
       if (stats.failed > 0) {
         if (confirm(`Bridge queue has ${stats.failed} failed jobs. Clear them all?\n(OK = Clear all, Cancel = Retry)`)) {
-          const count = clearBridgeQueue();
+          const count = clearBridgeQueue(true);
           setStatus(`Cleared ${count} failed audit job(s).`, 'success');
         } else {
-          resetBridgeFailedJobs('');
-          setStatus('Retrying failed audit save jobs...', 'info');
+          const result = retryAllBridgeFailedJobs();
+          setStatus(
+            `Retrying ${result.retried} failed audit save job(s)${result.skipped ? `; ${result.skipped} could not be rebuilt` : ''}.`,
+            result.skipped ? 'warning' : 'info'
+          );
           scheduleBridgeFlush(50);
         }
       } else {
@@ -15807,6 +16307,13 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
               <button id="acb-bridge-retry-queue" type="button" title="Retry all failed audit save jobs immediately.">Retry queue</button>
             </div>
             <div id="acb-bridge-state" data-state="warning" title="Click to clear or retry failed jobs">UNKNOWN · queued 0 · failed 0</div>
+            <div id="acb-bridge-diagnostics">
+              <div id="acb-bridge-diagnostics-head">
+                <span class="acb-label">Bridge diagnostics (token excluded)</span>
+                <button id="acb-bridge-copy-log" type="button" title="Copy connection state, queue job causes, and recent Bridge events for troubleshooting.">Copy log</button>
+              </div>
+              <pre id="acb-bridge-log" tabindex="0">No Bridge diagnostics recorded yet.</pre>
+            </div>
           </div>
 
           <div class="acb-section">
@@ -15927,6 +16434,392 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     armWidgetBootstrap();
   }
 
+  let browserWorkerPollTimer = 0;
+  let browserWorkerPollInFlight = false;
+  let browserWorkerStopRequested = false;
+  let browserWorkerLease = null;
+  let browserWorkerCompletionTimer = 0;
+  const BROWSER_WORKER_LEASE_SESSION_KEY = 'audapack_browser_worker_lease_v1';
+
+  function persistBrowserWorkerLease() {
+    try {
+      if (browserWorkerLease) {
+        sessionStorage.setItem(BROWSER_WORKER_LEASE_SESSION_KEY, JSON.stringify({
+          ...browserWorkerLease,
+          worker_id: String(autoTabId || browserWorkerLease.worker_id || '')
+        }));
+      } else {
+        sessionStorage.removeItem(BROWSER_WORKER_LEASE_SESSION_KEY);
+      }
+    } catch (_) { }
+  }
+
+  function restoreBrowserWorkerLease() {
+    try {
+      const raw = sessionStorage.getItem(BROWSER_WORKER_LEASE_SESSION_KEY);
+      if (!raw) return null;
+      const value = JSON.parse(raw);
+      if (!value || String(value.worker_id || '') !== String(autoTabId || '') ||
+          !value.dispatch_id || !value.lease_id) return null;
+      browserWorkerLease = {
+        dispatch_id: String(value.dispatch_id),
+        worker_id: String(value.worker_id),
+        lease_id: String(value.lease_id),
+        project_id: String(value.project_id || ''),
+        project_name: String(value.project_name || ''),
+        campaign_run_id: String(value.campaign_run_id || ''),
+        start_receipt: String(value.start_receipt || '')
+      };
+      return browserWorkerLease;
+    } catch (_) {
+      return null;
+    }
+  }
+
+let browserWorkerBrowserName = '';
+let browserWorkerBraveConfirmed = false;
+
+  function browserWorkerHasBraveCapability() {
+    try {
+      return typeof globalThis.navigator?.brave?.isBrave === 'function';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function browserWorkerPageEligible() {
+    try {
+      return String(location.hostname || '').toLowerCase() === 'chatgpt.com' &&
+        String(location.pathname || '/') === '/';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function detectBrowserWorkerBrowserName() {
+    if (browserWorkerBrowserName) return browserWorkerBrowserName;
+    try {
+      const nav = globalThis.navigator;
+      if (browserWorkerHasBraveCapability()) {
+        // Brave deliberately uses a Chromium UA. Its native API makes the
+        // first heartbeat correct without waiting for the async confirmation.
+        browserWorkerBrowserName = 'Brave';
+      } else if (nav) {
+        const ua = String(nav.userAgent || '').toLowerCase();
+        const brands = Array.from(nav.userAgentData?.brands || []).map(item => String(item?.brand || '').toLowerCase()).join(' ');
+        browserWorkerBrowserName = ua.includes('edg/') || brands.includes('edge')
+          ? 'Edge'
+          : ua.includes('chrome') || brands.includes('chromium')
+            ? 'Chrome'
+            : ua.includes('firefox')
+              ? 'Firefox'
+              : '';
+      }
+      if (nav && browserWorkerHasBraveCapability()) {
+        const bravePromise = nav.brave?.isBrave?.();
+        if (bravePromise && typeof bravePromise.then === 'function') {
+          bravePromise.then(isBrave => {
+            browserWorkerBraveConfirmed = Boolean(isBrave);
+            if (isBrave) browserWorkerBrowserName = 'Brave';
+          }).catch(() => {});
+        }
+      }
+    } catch (_) {}
+    if (!browserWorkerBrowserName) browserWorkerBrowserName = 'Browser';
+    return browserWorkerBrowserName;
+  }
+
+  function browserWorkerSnapshot() {
+    const input = rawChatGPTComposerInput();
+    const draft = input ? composerPlainText(input) : '';
+    const attachment = chatGPTReadyAttachmentSummary();
+    const active = Boolean(autoRuntime && autoRuntime.stage && autoRuntime.stage !== 'idle' && autoRuntime.stage !== 'complete');
+    const lease = browserWorkerLease;
+    const handoff = readStartAuditHandoff();
+    const browserName = detectBrowserWorkerBrowserName();
+    const isBrave = browserWorkerHasBraveCapability();
+    const pageEligible = browserWorkerPageEligible();
+    const turns = getChatGPTTurns ? getChatGPTTurns() : [];
+    const hasConversationTurns = Boolean(turns && turns.length > 0);
+    const cleanForAudit = pageEligible && !hasConversationTurns && !Boolean(draft.trim()) &&
+      !Boolean(attachment?.count) && !chatGPTIsGenerating() &&
+      !auditStartInFlight && !actionInFlight && !active &&
+      !Boolean(autoRuntime?.runId) && !Boolean(lease);
+    return {
+      worker_id: String(autoTabId || ''),
+      widget_version: BROWSER_WORKER_PROTOCOL_VERSION,
+      bridge_api_version: String(BRIDGE_API_VERSION || 3),
+      site: detectSite().key,
+      conversation_key: String(autoBoundConversationKey || currentConversationKey() || ''),
+      conversation_id: String(getTurnId?.(latestChatGPTUserTurn?.()) || ''),
+      url_path: String(location.pathname || ''),
+      browser_name: browserWorkerBrowserName || browserName,
+      is_brave: isBrave,
+      brave_confirmed: browserWorkerBraveConfirmed,
+      page_eligible: pageEligible,
+      project_name: String(autoRuntime?.projectName || lease?.project_name || ''),
+      profile: String(autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3'),
+      campaign_run_id: String(autoRuntime?.runId || lease?.campaign_run_id || ''),
+      start_receipt: String(handoff?.receipt || lease?.start_receipt || ''),
+      dispatch_id: lease ? String(lease.dispatch_id || '') : '',
+      lease_id: lease ? String(lease.lease_id || '') : '',
+      state: lease ? (String(autoRuntime?.stage || '') === 'complete' ? 'AUDITING' : (active ? 'AUDITING' : 'RESERVED')) : (active ? 'AUDITING' : 'FREE'),
+      generating: Boolean(chatGPTIsGenerating()),
+      has_manual_draft: Boolean(draft.trim()),
+      has_attachments: Boolean(attachment?.count),
+      audit_start_in_flight: Boolean(auditStartInFlight),
+      action_in_flight: Boolean(actionInFlight),
+      has_conversation_turns: hasConversationTurns,
+      clean_for_audit: cleanForAudit,
+      worker_class: hasConversationTurns ? 'OCCUPIED' : (Boolean(draft.trim()) || Boolean(attachment?.count) ? 'DIRTY' : (chatGPTIsGenerating() || auditStartInFlight || actionInFlight ? 'BUSY' : (cleanForAudit ? 'CLEAN' : 'OCCUPIED')))
+    };
+  }
+
+  function browserWorkerCanClaim() {
+    const snap = browserWorkerSnapshot();
+    return snap.is_brave && snap.page_eligible && detectSite().key === 'chatgpt' &&
+      !snap.generating && !snap.has_manual_draft && !snap.has_attachments &&
+      !snap.audit_start_in_flight && !snap.action_in_flight &&
+      !snap.campaign_run_id && snap.state === 'FREE' &&
+      !snap.has_conversation_turns && snap.clean_for_audit &&
+      (!autoRuntime || ['idle', 'complete'].includes(String(autoRuntime.stage || 'idle'))) &&
+      !Boolean(autoRuntime?.runId);
+  }
+
+  function browserWorkerStatePath(dispatchId) {
+    return `/v1/browser/jobs/${encodeURIComponent(String(dispatchId || ''))}/state`;
+  }
+
+  function browserWorkerTransition(stateName, extra = {}) {
+    const lease = browserWorkerLease;
+    if (!lease?.dispatch_id || !lease.worker_id || !lease.lease_id) return Promise.resolve({ ok: false, error: { code: 'no-lease', message: 'No active browser worker lease', retriable: false } });
+    return bridgeRequest('POST', browserWorkerStatePath(lease.dispatch_id), {
+      dispatch_id: lease.dispatch_id,
+      worker_id: lease.worker_id,
+      lease_id: lease.lease_id,
+      state: stateName,
+      ...extra
+    }, { timeout: 7000 }).then(result => result);
+  }
+
+  function browserWorkerFetchArtifact(job) {
+    return new Promise(resolve => {
+      const base = normalizedBridgeUrl();
+      const token = bridgeToken();
+      if (!base || !token || !job?.dispatch_id || !browserWorkerLease?.lease_id) {
+        resolve({ ok: false, reason: 'artifact-request-not-authorized' });
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `${base}/v1/browser/jobs/${encodeURIComponent(job.dispatch_id)}/artifact`,
+        headers: {
+          Accept: 'application/zip',
+          'X-ACB-Token': token,
+          'X-Worker-Id': browserWorkerLease.worker_id,
+          'X-Lease-Id': browserWorkerLease.lease_id
+        },
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        onload(response) {
+          const status = Number(response.status) || 0;
+          if (status < 200 || status >= 300 || !response.response) {
+            resolve({ ok: false, reason: `artifact-http-${status}` });
+            return;
+          }
+          const bytes = response.response instanceof ArrayBuffer ? response.response : response.response.buffer;
+          const expectedSize = Number(job.archive_size || 0);
+          if (expectedSize && bytes.byteLength !== expectedSize) {
+            resolve({ ok: false, reason: 'artifact-size-mismatch' });
+            return;
+          }
+          resolve({ ok: true, file: new File([bytes], String(job.archive_filename || 'AUDAPACK.zip'), { type: 'application/zip', lastModified: Date.now() }) });
+        },
+        onerror() { resolve({ ok: false, reason: 'artifact-request-failed' }); },
+        ontimeout() { resolve({ ok: false, reason: 'artifact-request-timeout' }); }
+      });
+    });
+  }
+
+  async function browserWorkerConsume(job, dependencies = null) {
+    const transition = dependencies?.transition || browserWorkerTransition;
+    const fetchArtifact = dependencies?.fetchArtifact || browserWorkerFetchArtifact;
+    const uploadInput = dependencies?.uploadInput || chatGPTUploadInput;
+    const composerRoot = dependencies?.composerRoot || chatGPTComposerRoot;
+    const injectFiles = dependencies?.injectFiles || setNativeFileList;
+    const waitForAttachment = dependencies?.waitForAttachment || waitForExactProjectAttachmentWithRetry;
+    const startAudit = dependencies?.startAudit || startAuditCoreFromReadyAttachment;
+    const expectedFilename = String(job.archive_filename || '');
+    if (!expectedFilename || expectedFilename !== expectedFilename.split(/[\\/]/).pop()) {
+      return false;
+    }
+    if (!expectedFilename.toLowerCase().endsWith('.zip')) {
+      return false;
+    }
+    browserWorkerLease = {
+      dispatch_id: String(job.dispatch_id || ''),
+      worker_id: String(autoTabId || ''),
+      lease_id: String(job.lease_id || ''),
+      project_id: String(job.project_id || ''),
+      project_name: String(job.project_name || ''),
+      campaign_run_id: String(job.campaign_run_id || ''),
+      start_receipt: String(job.start_receipt || '')
+    };
+    persistBrowserWorkerLease();
+if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return false;
+    // /v1/browser/poll atomically claims QUEUED -> LEASED before returning the
+    // job. Re-acknowledging LEASED here is an illegal LEASED -> LEASED edge.
+    const artifact = await fetchArtifact(job);
+    if (!artifact.ok) {
+      const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+      if (acknowledged.ok) {
+        browserWorkerLease = null;
+        persistBrowserWorkerLease();
+      }
+      return false;
+    }
+    if (!(await transition('ARTIFACT_FETCHED')).ok) return false;
+    const input = uploadInput();
+    const root = composerRoot();
+    if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
+      const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
+      if (acknowledged.ok) {
+        browserWorkerLease = null;
+        persistBrowserWorkerLease();
+      }
+      return false;
+    }
+    const ready = await waitForAttachment({
+      filename: String(artifact.file.name || ''),
+      expectedSize: Number(job.archive_size || 0),
+      timeoutMs: 40000
+    });
+    if (!ready?.ok) {
+      const reason = String(ready?.reason || 'attachment-not-ready');
+      const acknowledged = await transition('RETRYABLE', { error: reason });
+      if (acknowledged.ok) {
+        browserWorkerLease = null;
+        persistBrowserWorkerLease();
+      }
+      return false;
+    }
+    if (!(await transition('ATTACHED')).ok) return false;
+    const started = await startAudit({
+      beforeIrreversibleSend: async ({ receipt, campaignRunId }) => {
+        // P0-5/17: clean ownership revalidated immediately before the
+        // irreversible Send. A worker may have been clean at claim time and
+        // become unsafe later (foreign draft/attachment/turn/generation).
+        // Fail closed: never overwrite human activity in a ChatGPT tab.
+        const snap = browserWorkerSnapshot();
+        const hasLease = Boolean(browserWorkerLease?.dispatch_id && browserWorkerLease?.lease_id);
+        const sameDispatch = String(snap.dispatch_id || '') === String(browserWorkerLease?.dispatch_id || '');
+        const foreignActivity = snap.generating || snap.has_manual_draft ||
+          (snap.has_attachments && !(ready?.ok)) || snap.has_conversation_turns;
+        if (!hasLease || !sameDispatch || foreignActivity) {
+          await transition('BLOCKED', { error: 'clean-state-lost' });
+          return false;
+        }
+        if (browserWorkerLease) {
+          browserWorkerLease.campaign_run_id = String(campaignRunId || autoRuntime?.runId || '');
+          browserWorkerLease.start_receipt = String(receipt || '');
+          persistBrowserWorkerLease();
+        }
+        const ack = await transition('START_PREPARED', {
+          campaign_run_id: String(campaignRunId || autoRuntime?.runId || ''),
+          start_receipt: String(receipt || '')
+        });
+        return Boolean(ack.ok);
+      }
+    });
+    const preserved = readStartAuditHandoff();
+    if (!started) {
+      if (preserved && (startHandoffIsPrepared(preserved) || startHandoffIsCommitted(preserved))) {
+        return false;
+      }
+      const acknowledged = await transition('BLOCKED', { error: 'canonical-start-rejected' });
+      if (acknowledged.ok) {
+        browserWorkerLease = null;
+        persistBrowserWorkerLease();
+      }
+      return false;
+    }
+    if (!(await transition('STARTED', { campaign_run_id: String(autoRuntime?.runId || ''), conversation_id: String(autoRuntime?.conversationKey || '') })).ok) return false;
+    if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
+    return true;
+  }
+
+  async function browserWorkerPollOnce() {
+    if (browserWorkerPollInFlight || browserWorkerStopRequested || !state?.bridgeEnabled) return false;
+    browserWorkerPollInFlight = true;
+    try {
+      if (browserWorkerLease && String(autoRuntime?.stage || '') === 'complete') {
+        // Browser completion only means all responses were observed. Bridge
+        // persistence is authoritative, so keep the lease and report the
+        // non-terminal FINALIZING state until the disk commit acknowledges it.
+        await browserWorkerTransition('FINALIZING', { campaign_run_id: String(autoRuntime?.runId || '') });
+      }
+      const snapshot = browserWorkerSnapshot();
+      const result = await bridgeRequest('POST', '/v1/browser/poll', snapshot, { timeout: 25000 });
+      if (!result.ok) return false;
+      if (browserWorkerLease && result.data?.owned_job?.dispatch_id === browserWorkerLease.dispatch_id &&
+          result.data?.owned_job?.state === 'COMPLETE') {
+        // Positive terminal acknowledgement from Bridge is the only point at
+        // which local recovery identity may be destroyed.
+        browserWorkerLease = null;
+        persistBrowserWorkerLease();
+      }
+      const owned = result.data?.owned_job;
+      if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
+          ['LEASED', 'ARTIFACT_FETCHED', 'ATTACHED'].includes(String(owned.state || '')) &&
+          !autoRuntime?.runId) {
+        // Same-tab reload before START: resume the leased attachment path,
+        // never ask the broker for a second job.
+        await browserWorkerConsume(owned);
+      }
+      if (result.data?.job && browserWorkerCanClaim()) await browserWorkerConsume(result.data.job);
+      return true;
+    } finally {
+      browserWorkerPollInFlight = false;
+    }
+  }
+
+  function scheduleBrowserWorkerPoll(delay = 25000) {
+    if (browserWorkerStopRequested || browserWorkerPollTimer) return;
+    browserWorkerPollTimer = setTimeout(() => {
+      browserWorkerPollTimer = 0;
+      browserWorkerPollOnce().finally(() => scheduleBrowserWorkerPoll(300));
+    }, Math.max(250, Number(delay) || 25000));
+  }
+
+  function startBrowserWorker() {
+    restoreBrowserWorkerLease();
+    const recoveringOwnedAudit = Boolean(browserWorkerLease?.dispatch_id || autoRuntime?.runId);
+    if (!browserWorkerHasBraveCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
+      stopBrowserWorker();
+      return false;
+    }
+    browserWorkerStopRequested = false;
+    clearTimeout(browserWorkerPollTimer);
+    browserWorkerPollTimer = 0;
+    browserWorkerPollOnce().finally(() => scheduleBrowserWorkerPoll(0));
+    return true;
+  }
+
+  function stopBrowserWorker() {
+    browserWorkerStopRequested = true;
+    clearTimeout(browserWorkerPollTimer);
+    browserWorkerPollTimer = 0;
+    // P0-12: stopping the worker loop must NOT destroy an active non-terminal
+    // lease — that would erase START recovery lineage. Only clear the lease
+    // after a terminal Bridge ACK (handled in browserWorkerPollOnce) or an
+    // explicit abandon. A pre-start lease is resumed on the next start.
+    if (!browserWorkerLease?.dispatch_id) {
+      browserWorkerLease = null;
+      persistBrowserWorkerLease();
+    }
+    return true;
+  }
+
   if (globalThis.__ACB_ENABLE_TEST_HOOK__) {
     Object.defineProperty(globalThis, '__ACB_TEST__', {
       configurable: true,
@@ -15943,9 +16836,11 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
           AUTO_AUDIT_RESULT_SIGNAL_KEY,
           AUTO_TAB_SESSION_KEY,
           AUTO_DRAFT_SESSION_KEY,
-          BRIDGE_DEFAULT_URL,
-          BRIDGE_JOB_PREFIX,
-          BRIDGE_QUEUE_SIGNAL_KEY
+           BRIDGE_DEFAULT_URL,
+           BRIDGE_JOB_PREFIX,
+           BRIDGE_QUEUE_SIGNAL_KEY,
+           BRIDGE_DIAGNOSTIC_LOG_KEY,
+           BRIDGE_DIAGNOSTIC_LOG_MAX
         },
         storage: {
           gmGet: GM_getValue,
@@ -15997,8 +16892,25 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
         normalizedBridgeUrl,
         bridgeQueueStats,
         enqueueBridgeAuditRecord,
-        bridgeJobRequest,
-        readBridgeJob,
+         bridgeJobRequest,
+         readBridgeJob,
+         saveBridgeJob,
+         deliverBridgeJob,
+         resetBridgeFailedJobs,
+         retryAllBridgeFailedJobs,
+         readBridgeDiagnosticLog,
+         appendBridgeDiagnostic,
+         bridgeDiagnosticsText,
+         copyBridgeDiagnostics,
+         browserWorkerSnapshot,
+         browserWorkerCanClaim,
+         browserWorkerHasBraveCapability,
+         browserWorkerPageEligible,
+         browserWorkerPollOnce,
+         browserWorkerConsume,
+         browserWorkerTransition,
+         startBrowserWorker,
+         stopBrowserWorker,
         auditHandoffIntegrity,
         concreteHandoffState,
         responseGate,
@@ -16074,6 +16986,8 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
         scheduleMiniAttachmentRefresh,
         miniStartAuditState,
         startAuditCoreFromReadyAttachment,
+        waitForExactProjectAttachment,
+        waitForExactProjectAttachmentWithRetry,
         startHandoffComposerStillPrepared,
         recoverArmedStartSend,
         readStartAuditHandoff,

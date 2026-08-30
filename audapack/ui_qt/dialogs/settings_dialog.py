@@ -356,9 +356,22 @@ class SettingsWidget(QWidget):
             self.lbl_bridge_state.setStyleSheet("color: #4A7A20; font-weight: bold; font-size: 11px;")
             ver = info.get("version", "?")
             api_ver = info.get("api_version", "?")
+            browser = st.get("browser", {}) or {}
+            worker_line = (
+                f"Workers: {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)} · "
+                f"Free: {browser.get('free_workers', 0)} · Busy: {browser.get('busy_workers', 0)} · "
+                f"Queue: {browser.get('queued_jobs', 0)} · Active audits: {browser.get('active_jobs', 0)} · "
+                f"Finalizing: {browser.get('finalizing_jobs', 0)} · Blocked: {browser.get('blocked_jobs', 0)} · "
+                f"Failed: {browser.get('failed_jobs', 0)}"
+            )
+            workers = browser.get("workers", []) or []
+            worker_rows = "\n".join(
+                f"{item.get('worker_id', '?')}  {item.get('browser_name', '') or '-'}  {item.get('state', '?')}  {item.get('project_name', '') or '-'}"
+                for item in workers[:6]
+            )
             self.lbl_bridge_details.setText(
                 f"Service: AUDAPACK Bridge {ver} (API v{api_ver}) · Output Root: {self._config.audits.root}\n"
-                f"Windows Autostart: {auto}"
+                f"Windows Autostart: {auto}\n{worker_line}\n{worker_rows}"
             )
             self.btn_bridge_start.setEnabled(False)
             self.btn_bridge_stop.setEnabled(True)

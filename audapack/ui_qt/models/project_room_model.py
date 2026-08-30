@@ -30,6 +30,7 @@ from PySide6.QtCore import (
 
 from audapack.audits import calculate_temperature, format_age_str, format_created_str
 from audapack.config import app_dir
+from audapack.inaudit import get_inaudit_selected, list_inaudit_layers
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
 from audapack.services.audit_service import AuditService
@@ -74,6 +75,15 @@ class ProjectRoomModel(QAbstractItemModel):
         "source_dir_mtime": Qt.ItemDataRole.UserRole + 29,  # float epoch seconds or None
         "source_older_than_archive": Qt.ItemDataRole.UserRole + 30,  # True/False/None
         "archive_freshness_short": Qt.ItemDataRole.UserRole + 31,  # "fresh" | "stale" | "old" | "none"
+        "dispatch_id": Qt.ItemDataRole.UserRole + 32,
+        "dispatch_state": Qt.ItemDataRole.UserRole + 33,
+        "dispatch_worker": Qt.ItemDataRole.UserRole + 34,
+        "dispatch_browser": Qt.ItemDataRole.UserRole + 35,
+        "dispatch_run_id": Qt.ItemDataRole.UserRole + 36,
+        "dispatch_error": Qt.ItemDataRole.UserRole + 37,
+        "inaudit_count": Qt.ItemDataRole.UserRole + 38,
+        "inaudit_selected": Qt.ItemDataRole.UserRole + 39,
+        "inaudit_label": Qt.ItemDataRole.UserRole + 40,
     }
 
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None, parent: Optional[QObject] = None):
@@ -84,6 +94,7 @@ class ProjectRoomModel(QAbstractItemModel):
         self._projects: dict[tuple[str, int], Project] = {}  # (group, slot) -> Project
         self._snapshots: dict[str, AuditSnapshot] = {}  # project_id -> AuditSnapshot
         self._pack_states: dict[str, tuple[str, str]] = {}  # project_id -> (state, message)
+        self._dispatch_snapshots: dict[str, dict] = {}
         # Per-project live pack progress (files_added, bytes_written, current_path).
         # Populated via update_pack_progress() from a worker thread callback; cleared
         # when the pack state transitions away from PACKING/QUEUED.
@@ -468,6 +479,39 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["audit_copy_count"]:
             return int(getattr(proj, "audit_copy_count", 0) or 0)
 
+        dispatch = self._dispatch_snapshots.get(proj.id, {})
+        if role == self.ROLES["dispatch_id"]:
+            return str(dispatch.get("dispatch_id") or "")
+        if role == self.ROLES["dispatch_state"]:
+            return str(dispatch.get("state") or "")
+        if role == self.ROLES["dispatch_worker"]:
+            return str(dispatch.get("assigned_worker_id") or "")
+        if role == self.ROLES["dispatch_browser"]:
+            return str(dispatch.get("friendly_worker_label") or dispatch.get("browser_name") or "")
+        if role == self.ROLES["dispatch_run_id"]:
+            return str(dispatch.get("campaign_run_id") or "")
+        if role == self.ROLES["dispatch_error"]:
+            return str(dispatch.get("error") or dispatch.get("last_error_code") or "")
+        if role == self.ROLES["inaudit_count"]:
+            try:
+                return len(list_inaudit_layers(proj))
+            except Exception:
+                return 0
+        if role == self.ROLES["inaudit_selected"]:
+            try:
+                return get_inaudit_selected(proj) or 0
+            except Exception:
+                return 0
+        if role == self.ROLES["inaudit_label"]:
+            try:
+                layers = list_inaudit_layers(proj)
+                if not layers:
+                    return ""
+                sel = get_inaudit_selected(proj) or layers[0].number
+                return f"IA {sel}/{len(layers)}"
+            except Exception:
+                return ""
+
         # Audit roles
         snap = self._snapshots.get(proj.id)
         if role == self.ROLES["audit_temperature"]:
@@ -538,22 +582,29 @@ class ProjectRoomModel(QAbstractItemModel):
             _st, msg = self._pack_states.get(proj.id, ("IDLE", ""))
             return msg
 
-        # Rich hover info dict — everything the tooltip builder needs
         if role == self.ROLES["hover_info"]:
             snap = self._snapshots.get(proj.id)
             arc_data = self.get_archive_info(proj)
             pack_st, pack_msg = self._pack_states.get(proj.id, ("IDLE", ""))
+            try:
+                layers = list_inaudit_layers(proj)
+                sel = get_inaudit_selected(proj)
+            except Exception:
+                layers, sel = [], None
             return {
                 "project": proj,
                 "snapshot": snap,
                 "archive_info": arc_data,
                 "pack_state": pack_st,
                 "pack_message": pack_msg,
+                "dispatch": dispatch,
                 "pack_progress": self._pack_progress.get(proj.id),
                 "pack_percent": self._pack_progress.get(proj.id) and self.data(index, self.ROLES["pack_percent"]) or None,
                 "archive_sync_status": self.get_archive_sync_status(proj, snap),
                 "archive_freshness_short": self._get_archive_freshness_short(proj),
                 "source_older_than_archive": self._source_older_than_archive(proj),
+                "inaudit_layers": layers,
+                "inaudit_selected": sel,
                 "group": group,
                 "slot": slot,
                 "total_groups": len(self._groups),
@@ -561,6 +612,26 @@ class ProjectRoomModel(QAbstractItemModel):
             }
 
         return None
+
+    def refresh_inaudit(self, project_id: str) -> None:
+        idx = self.index_for_project_id(str(project_id))
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx)
+
+    def update_dispatch_snapshot(self, project_id: str, snapshot: Optional[dict]) -> None:
+        """Publish lightweight live transport state without touching audit disk state."""
+        if snapshot:
+            self._dispatch_snapshots[str(project_id)] = dict(snapshot)
+        else:
+            self._dispatch_snapshots.pop(str(project_id), None)
+        for group in self._groups:
+            for slot in range(1, self.group_count(group) + 1):
+                proj = self._projects.get((group, slot))
+                if proj and proj.id == str(project_id):
+                    parent = self.index(self._groups.index(group), 0, QModelIndex())
+                    slot_idx = self.index(slot - 1, 0, parent)
+                    self.dataChanged.emit(slot_idx, slot_idx, list(self.ROLES.values()))
+                    return
 
     def get_archive_info(self, proj: Project) -> tuple[bool, str, str, Optional[Path]]:
         """Returns (exists, size_str, created_str, path) — pure cache reads.
