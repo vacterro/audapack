@@ -2079,8 +2079,7 @@ QToolTip QLabel {
         proj = self.model.project_at(group, slot)
         if proj:
             self._active_project = proj
-            self.tabs.setCurrentWidget(self.inaudit_widget)
-            self.inaudit_widget.set_project(proj)
+            self._show_instance_manager(proj)
         else:
             self._on_add_project(default_group=group, default_slot=slot)
 
