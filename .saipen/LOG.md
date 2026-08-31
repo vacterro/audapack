@@ -332,3 +332,5 @@
 - 31.08.26 08:07 [E-527] [parent: E-526] [op: transition-e3d6f7e4e3ff4500832877d6b0924b13] DEC: goal_tickets 8->9
 - 31.08.26 08:09 [E-528] [parent: E-527] [T-51] [agent: opencode] [op: checkpoint-32dc4f48b115484eb36fdb06e4eb079d] DEC: REVIEW SHIP pass 2 -- fresh release bytes: 374 pytest, 24 widget suites/156 tests, ruff, compileall, validate core, diff check; no P0/P1 findings
 - 31.08.26 08:09 [E-529] [parent: E-528] [T-51] [agent: opencode] [op: transition-132bdab183634a528f426ae5dcb72f62] RUN: transition to SHIP -- REVIEW PASS -- publish v0.2.2 one-click START AUDIT fix
+- 31.08.26 08:10 [E-530] [parent: E-529] [T-51] [agent: opencode] [op: checkpoint-637a35a0a9d84739816b04df652441d0] RUN: ship v0.2.2 -> pushed f4d5be0 (branch main and tag v0.2.2); 374 pytest + 24 widget suites/156 tests + ruff + compileall + ship gate green
+- 31.08.26 08:10 [E-531] [parent: E-530] [T-51] [agent: opencode] [op: finish-9a99cb719b4f40cb8ad0a58ad0889ba7] DEC: ticket finished via SAIOPS -- completion (from SHIP)
