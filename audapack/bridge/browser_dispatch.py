@@ -1,6 +1,6 @@
 """Browser audit worker dispatcher -- broker / scheduler / lease authority.
 
-SRC-005: AUDAPACK -> FREE BRAVE AUDIT WORKER DISPATCHER.
+SRC-005: AUDAPACK -> FREE CHROMIUM AUDIT WORKER DISPATCHER.
 
 The desktop is the producer, the localhost Bridge is the broker, and every
 AUDAPACK_WIDGET.user.js tab is a browser worker that PULLS work from the
@@ -160,6 +160,7 @@ class WorkerRecord:
     audit_start_in_flight: bool = False
     action_in_flight: bool = False
     is_brave: bool = False
+    is_chromium: bool = False
     page_eligible: bool = False
     has_conversation_turns: bool = False
     clean_for_audit: bool = False
@@ -341,10 +342,23 @@ class BrowserDispatcher:
             wid = str(payload.get("worker_id") or "").strip()
             if not WORKER_ID_RE.fullmatch(wid):
                 raise DispatchError("invalid_worker_id", "worker_id must be 1-128 safe identifier characters")
+            url_path = str(payload.get("url_path") or "")
+            if (
+                str(payload.get("widget_version") or "").startswith("AUDAPACK_WIDGET")
+                and url_path.startswith("/backend-api/sentinel/")
+            ):
+                # Old Widget builds ran inside ChatGPT's matching sentinel
+                # iframe. Purge any prior record before rejecting the poll so
+                # embedded documents can never consume a real tab slot.
+                self._workers.pop(wid, None)
+                raise DispatchError(
+                    "ineligible_worker_context",
+                    "embedded ChatGPT frames cannot register as browser workers",
+                )
             if wid not in self._workers and len(self._workers) >= MAX_ACTIVE_WORKERS:
                 incoming_supported = (
                     str(payload.get("widget_version") or "") == SUPPORTED_BROWSER_WIDGET_VERSION
-                    and bool(payload.get("is_brave", False))
+                    and bool(payload.get("is_chromium", payload.get("is_brave", False)))
                     and bool(payload.get("page_eligible", False))
                     and str(payload.get("site") or "chatgpt") == "chatgpt"
                     and str(payload.get("url_path") or "") == "/"
@@ -374,7 +388,7 @@ class BrowserDispatcher:
             record.site = str(payload.get("site") or "chatgpt")
             record.conversation_key = str(payload.get("conversation_key") or record.conversation_key)
             record.conversation_id = str(payload.get("conversation_id") or record.conversation_id)
-            record.url_path = str(payload.get("url_path") or "")
+            record.url_path = url_path
             record.project_name = str(payload.get("project_name") or "")
             record.profile = str(payload.get("profile") or "")
             record.campaign_run_id = str(payload.get("campaign_run_id") or "")
@@ -384,6 +398,7 @@ class BrowserDispatcher:
             record.audit_start_in_flight = bool(payload.get("audit_start_in_flight", False))
             record.action_in_flight = bool(payload.get("action_in_flight", False))
             record.is_brave = bool(payload.get("is_brave", False))
+            record.is_chromium = bool(payload.get("is_chromium", record.is_brave))
             record.page_eligible = bool(payload.get("page_eligible", False))
             record.has_conversation_turns = bool(payload.get("has_conversation_turns", False))
             record.clean_for_audit = bool(payload.get("clean_for_audit", False))
@@ -423,7 +438,7 @@ class BrowserDispatcher:
         if worker.widget_version.startswith("AUDAPACK_WIDGET"):
             if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
                 return False
-            if not worker.is_brave or not worker.page_eligible:
+            if not worker.is_chromium or not worker.page_eligible:
                 return False
             if worker.site != "chatgpt" or worker.url_path != "/":
                 return False

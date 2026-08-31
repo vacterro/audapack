@@ -319,13 +319,20 @@ class SettingsWidget(QWidget):
         hlp_layout.setContentsMargins(0, 4, 0, 0)
         hlp_layout.setSpacing(6)
 
-        btn_install_widget = QPushButton("Install/Update Widget in Browser", grp_status)
+        btn_install_widget = QPushButton("Install Widget in AUDAPACK Chromium", grp_status)
         btn_install_widget.clicked.connect(self._on_bridge_install_widget)
+
+        btn_launch_worker = QPushButton("Launch AUDAPACK Chromium", grp_status)
+        btn_launch_worker.setToolTip(
+            "Open the isolated AUDAPACK browser profile with background throttling disabled"
+        )
+        btn_launch_worker.clicked.connect(self._on_launch_browser_worker)
 
         btn_open_audits = QPushButton("Open Audits Folder", grp_status)
         btn_open_audits.clicked.connect(self._on_bridge_open_audits)
 
         hlp_layout.addWidget(btn_install_widget)
+        hlp_layout.addWidget(btn_launch_worker)
         hlp_layout.addWidget(btn_open_audits)
         s_layout.addWidget(hlp_row)
 
@@ -453,6 +460,11 @@ class SettingsWidget(QWidget):
 
     def _on_bridge_install_widget(self):
         ok, msg = self._comp_mgr.trigger_widget_install()
+        self.lbl_bridge_state.setText(f"✓ {msg}" if ok else f"✗ {msg}")
+        self.lbl_bridge_state.setStyleSheet("color: #4A7A20; font-weight: bold; font-size: 11px;" if ok else "color: #D9534F; font-weight: bold; font-size: 11px;")
+
+    def _on_launch_browser_worker(self):
+        ok, msg = self._comp_mgr.launch_browser_worker()
         self.lbl_bridge_state.setText(f"✓ {msg}" if ok else f"✗ {msg}")
         self.lbl_bridge_state.setStyleSheet("color: #4A7A20; font-weight: bold; font-size: 11px;" if ok else "color: #D9534F; font-weight: bold; font-size: 11px;")
 

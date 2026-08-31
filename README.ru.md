@@ -7,11 +7,11 @@
 <p align="center"><strong>Рабочее место Windows для проверенной упаковки ZIP, многоэтапного AI-аудита и локального браузерного моста.</strong></p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.1.2-D4B86A?style=for-the-badge" alt="Релиз v0.1.2"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.2.0-D4B86A?style=for-the-badge" alt="Релиз v0.2.0"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/платформа-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
-  <a href="tests/"><img src="https://img.shields.io/badge/Python%20тесты-230%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="230 тестов Python проходят"></a>
-  <a href="tests/widget/"><img src="https://img.shields.io/badge/тесты%20виджета-122%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="122 теста виджета проходят"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Python%20тесты-365%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="365 тестов Python проходят"></a>
+  <a href="tests/widget/"><img src="https://img.shields.io/badge/тесты%20виджета-152%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="152 теста виджета проходят"></a>
 </p>
 
 <p align="center"><a href="README.md">English</a> · <a href="README.ru.md"><strong>Русский</strong></a></p>
@@ -27,6 +27,7 @@ AUDAPACK объединяет проекты, аудиторские матер�
 - **Кампании Quick3 и Super10** — профили аудита с динамическими волнами, изоляцией запусков, проверкой lineage и каноническими итоговыми handoff-файлами.
 - **Локальный Bridge** — HTTP-сервис на `127.0.0.1:17843`; текущий API — v3, совместимость с API v2 сохранена.
 - **Tampermonkey-виджет** — отправляет волны аудита из ChatGPT, восстанавливает прерванные запуски и связывает кампанию с собственным `runId`.
+- **Надёжный INAUDIT Inbox** — сохраняет стабильные ответы ChatGPT, отдельные блоки или текст буфера до выбора проекта, а затем назначает исходный текст в следующий безопасный слой `audit/N.md`.
 - **Интеграция Windows** — контекстное меню Проводника, тихие VBScript-лаунчеры, передача файлов через буфер и Scheduled Task для Bridge.
 - **Golden Vintage UI** — тёмная эстетика Windows 95, компактные рельефные элементы и намеренно чёткий текст без сглаживания.
 
@@ -56,6 +57,8 @@ python AUDAPACK.pyw --ui tkinter
 
 Браузерную часть установите отдельно: добавьте `resources/AUDAPACK_WIDGET.user.js` в Tampermonkey и откройте ChatGPT. При работающем Bridge виджет подключится к локальному сервису.
 
+Для автономных аудитов используйте **Settings → Components → Launch AUDAPACK Chromium**. AUDAPACK выбирает установленный Chromium-браузер (Chrome, Cent, Edge, Vivaldi или Opera раньше Brave), запускает его в отдельном профиле `%LOCALAPPDATA%\AUDAPACK\browser_worker` и отключает Chromium-throttling таймеров, перекрытых окон и renderer-процессов. В этом выделенном профиле нужно один раз установить Tampermonkey и виджет. Worker продолжает работу при свёрнутом окне, поверх других приложений и при выключенных экранах; сон или гибернация Windows всё равно останавливают все процессы, поэтому для автономного запуска их нужно отдельно отключить.
+
 ## Project Room
 
 В каждой занятой строке проекта могут отображаться прогресс аудита, его возраст, свежесть архива, размер ZIP, счётчики копирования и состояние упаковки. Размер ZIP показывается в двоичных единицах (`B`, `KB`, `MB`, `GB`, `TB`) и обновляется после упаковки. В режиме **Full** подробности ZIP находятся во второй строке; включите **Settings → General → Compact project rows**, чтобы оставить основные данные и размер в одной строке.
@@ -81,6 +84,14 @@ python AUDAPACK.pyw --ui tkinter
 - **Super10** — глубокий аудит из десяти волн с синтезом кампании и итоговым handoff для реализации.
 
 Bridge проверяет авторизацию, идентичность проекта и запуска, манифест профиля, порядок волн и признаки завершения перед записью файлов. После сбоя виджет восстанавливает сохранённое состояние и не подменяет один запуск другим.
+
+Новый аудит может забрать только чистая корневая вкладка ChatGPT в Chromium-браузере. Вкладки с существующим диалогом, черновиком, вложением, генерацией или некорневым URL закрыты для выдачи заданий.
+
+## Сбор материалов INAUDIT
+
+У стабильного ответа ChatGPT нажмите `IA` рядом со всем ответом или отдельным блоком. Подтверждённая запись Bridge показывает `IA ✓`; если Bridge недоступен, ограниченная очередь IndexedDB показывает `IA QUEUED` и позднее повторяет отправку с тем же идентификатором. В AUDAPACK откройте **INAUDIT → Inbox**, проверьте происхождение и доказательства классификации, выберите зарегистрированный проект и нажмите **Assign**, **Assign + GG** или **Assign + CC**. Кнопка `IA+` на панели сохраняет текущий буфер Windows через то же надёжное хранилище.
+
+При назначении AUDAPACK заново сканирует `audit`, создаёт `max(N) + 1` без перезаписи, сверяет хеш тела и только после этого предлагает каноническую команду GG/CC.
 
 ## Справка по командной строке
 
@@ -129,7 +140,7 @@ ruff check audapack tests
 Get-ChildItem tests/widget -Filter *.test.js | ForEach-Object { node $_.FullName }
 ```
 
-Текущая база: **230 тестов Python** и **122 Node-теста виджета в 17 наборах**.
+Текущая база: **365 тестов Python** и **152 Node-теста виджета**.
 
 ## Карта репозитория
 

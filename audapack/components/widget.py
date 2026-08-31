@@ -10,7 +10,7 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from audapack.config import app_dir
+from audapack.config import app_dir, get_user_runtime_dir
 
 WIDGET_FILE_NAME = "AUDAPACK_WIDGET.user.js"
 
@@ -234,20 +234,157 @@ def read_bundled_widget_metadata() -> dict[str, str]:
     return meta
 
 
-BRAVE_KEEPALIVE_FLAGS = [
+CHROMIUM_KEEPALIVE_FLAGS = [
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
-    "--disable-features=TabDiscarding",
+    "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,TabDiscarding,MemorySaverMode",
     "--no-first-run",
     "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
 ]
+
+# Kept for callers that imported the old name. The flags apply to every
+# Chromium worker now, not only Brave.
+BRAVE_KEEPALIVE_FLAGS = CHROMIUM_KEEPALIVE_FLAGS
+
+AUDAPACK_WORKER_URL = "https://chatgpt.com/?audapack_worker=1"
 
 
 def _is_brave_exe(exe_path: str) -> bool:
     """Returns True if the executable path points to a Brave-based browser."""
     lower = Path(exe_path).stem.lower()
     return "brave" in lower
+
+
+def _is_chromium_exe(exe_path: str) -> bool:
+    """Return whether *exe_path* is a supported Chromium-family browser."""
+    lower_path = str(exe_path).lower()
+    name = Path(exe_path).name.lower()
+    if any(token in lower_path for token in ("firefox", "librewolf", "waterfox", "zen")):
+        return False
+    return name in {
+        "brave.exe", "brave-portable.exe", "chrome.exe", "msedge.exe",
+        "opera.exe", "vivaldi.exe", "cent.exe", "arc.exe", "yandex.exe",
+    }
+
+
+def get_dedicated_chromium_profile_dir() -> Path:
+    """Canonical browser profile used only by the AUDAPACK worker."""
+    return get_user_runtime_dir() / "browser_worker" / "chromium_profile"
+
+
+def select_dedicated_chromium(browser_exe: Optional[str] = None) -> Optional[str]:
+    """Choose a stable installed Chromium, preferring non-Brave browsers."""
+    if browser_exe:
+        candidate = Path(browser_exe)
+        return str(candidate.resolve()) if candidate.is_file() and _is_chromium_exe(str(candidate)) else None
+
+    cfg = None
+    try:
+        from audapack.config import load_config
+        cfg = load_config()
+        preferred = str(getattr(cfg.ui, "preferred_browser", "") or "")
+        if preferred:
+            candidate = Path(preferred)
+            if candidate.is_file() and _is_chromium_exe(str(candidate)):
+                return str(candidate.resolve())
+    except Exception:
+        pass
+
+    priority = {
+        "Google Chrome": 0,
+        "Cent Browser": 1,
+        "Microsoft Edge": 2,
+        "Vivaldi": 3,
+        "Opera": 4,
+        "Brave Browser": 5,
+    }
+    candidates = [
+        item for item in detect_installed_browsers()
+        if _is_chromium_exe(str(item.get("exe") or ""))
+        and "ms-playwright" not in str(item.get("exe") or "").lower()
+    ]
+    candidates.sort(key=lambda item: (
+        priority.get(str(item.get("name") or ""), 50),
+        not bool(item.get("running", False)),
+        str(item.get("exe") or "").lower(),
+    ))
+    return str(candidates[0]["exe"]) if candidates else None
+
+
+def dedicated_chromium_command(
+    browser_exe: str,
+    profile_dir: Path,
+    target: str = AUDAPACK_WORKER_URL,
+) -> list[str]:
+    """Build the isolated worker launch command without starting a process."""
+    if not _is_chromium_exe(browser_exe):
+        raise ValueError("AUDAPACK worker requires a Chromium-family browser")
+    return [
+        browser_exe,
+        *CHROMIUM_KEEPALIVE_FLAGS,
+        f"--user-data-dir={profile_dir}",
+        "--profile-directory=Default",
+        "--new-window",
+        target,
+    ]
+
+
+def _launch_dedicated_chromium(
+    target: str,
+    browser_exe: Optional[str] = None,
+) -> tuple[bool, str, Optional[str], Path]:
+    selected = select_dedicated_chromium(browser_exe)
+    profile = get_dedicated_chromium_profile_dir()
+    if not selected:
+        return False, "No supported Chromium browser was found.", None, profile
+    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        command = dedicated_chromium_command(selected, profile, target)
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+    except Exception as exc:
+        return False, f"Failed to launch dedicated Chromium: {exc}", selected, profile
+    return True, "", selected, profile
+
+
+def launch_dedicated_chromium_worker(browser_exe: Optional[str] = None) -> tuple[bool, str]:
+    """Launch an isolated Chromium profile configured for background work.
+
+    Chromium flags prevent timer/renderer throttling for minimized or occluded
+    windows. They cannot run JavaScript while Windows itself is asleep or
+    hibernating.
+    """
+    ok, error, selected, profile = _launch_dedicated_chromium(AUDAPACK_WORKER_URL, browser_exe)
+    if not ok or not selected:
+        return False, error
+    return True, f"AUDAPACK Chromium started ({_clean_browser_name('', selected)}; profile: {profile})."
+
+
+def open_widget_in_dedicated_chromium(
+    browser_exe: Optional[str] = None,
+    use_bridge: bool = False,
+    bridge_url: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Open the widget installer inside the same isolated worker profile."""
+    widget = get_bundled_widget_path()
+    if not widget.exists():
+        return False, "Bundled AUDAPACK Widget was not found."
+    if use_bridge and not bridge_url:
+        from audapack.config import load_config
+        cfg = load_config()
+        bridge_url = f"http://{cfg.bridge.host}:{cfg.bridge.port}/widget.user.js"
+    target = str(bridge_url) if use_bridge else widget.as_uri()
+    ok, error, selected, profile = _launch_dedicated_chromium(target, browser_exe)
+    if not ok or not selected:
+        return False, error
+    return True, f"Widget installer opened in AUDAPACK Chromium ({_clean_browser_name('', selected)}; profile: {profile})."
 
 
 def open_widget_in_browser(browser_exe: Optional[str] = None, use_bridge: bool = False) -> bool:
@@ -279,8 +416,8 @@ def open_widget_in_browser(browser_exe: Optional[str] = None, use_bridge: bool =
     if browser_exe:
         try:
             args = [browser_exe]
-            if _is_brave_exe(browser_exe):
-                args.extend(BRAVE_KEEPALIVE_FLAGS)
+            if _is_chromium_exe(browser_exe):
+                args.extend(CHROMIUM_KEEPALIVE_FLAGS)
             args.append(target)
             subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True

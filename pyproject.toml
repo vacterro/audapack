@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audapack"
-version = "0.1.2"
+version = "0.2.0"
 description = "Windows desktop cockpit for verified ZIP packaging, multi-wave AI audit handoff, and a local browser bridge"
 readme = "README.md"
 authors = [

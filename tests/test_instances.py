@@ -333,13 +333,18 @@ def test_main_window_enforces_limit_and_project_click_opens_manager(tmp_path, qa
             assert "Launch blocked" in window.statusBar().currentMessage()
 
         index = window.model.index_for_project_id(p2.id)
-        with patch.object(window, "_show_instance_manager") as show_manager:
-            window._on_tree_double_clicked(index)
-            show_manager.assert_called_once_with(p2)
+        assert window.tabs.count() >= 2
+        window.tabs.setCurrentIndex(0)
+        window._on_tree_double_clicked(index)
+        assert window.tabs.currentWidget() is window.inaudit_widget
+        assert window.inaudit_widget._project is p2
 
+        index = window.model.index_for_project_id(p1.id)
         with patch.object(window, "_show_instance_manager") as show_manager:
+            index_before = window.tabs.currentWidget()
             window.tree.clicked.emit(index)
             show_manager.assert_not_called()
+            assert window.tabs.currentWidget() is index_before
 
         window._show_instance_manager(p2)
         assert window.tabs.currentWidget() is window._instance_manager

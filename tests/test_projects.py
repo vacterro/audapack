@@ -240,6 +240,66 @@ class TestRegistryTransactions(unittest.TestCase):
         self.assertIn("SIDE1", groups)
         self.assertIn("SIDE2", groups)  # SIDE1 full -> SIDE2 growth
 
+    def test_config_save_retries_transient_windows_replace_failure(self):
+        from unittest import mock
+
+        original_replace = Path.replace
+        attempts = 0
+
+        def flaky_replace(source, destination):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("simulated sharing violation")
+            return original_replace(source, destination)
+
+        with mock.patch.object(Path, "replace", autospec=True, side_effect=flaky_replace):
+            self.assertTrue(save_config(AppConfig(), self.base_dir))
+        self.assertEqual(attempts, 3)
+
+    def test_token_read_retries_transient_windows_sharing_failure(self):
+        from unittest import mock
+
+        from audapack.config import BridgeConfig, ensure_token
+
+        expected = "stable-token-value-for-test"
+        token_file = self.base_dir / "token.txt"
+        token_file.write_text(expected, encoding="utf-8")
+        original_read_text = Path.read_text
+        attempts = 0
+
+        def flaky_read(path, *args, **kwargs):
+            nonlocal attempts
+            if path == token_file:
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated sharing violation")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky_read):
+            self.assertEqual(ensure_token(BridgeConfig(), self.base_dir), expected)
+        self.assertEqual(attempts, 3)
+
+    def test_config_read_retries_transient_windows_sharing_failure(self):
+        from unittest import mock
+
+        cfg_file = self.base_dir / "config.json"
+        original_read_text = Path.read_text
+        attempts = 0
+
+        def flaky_read(path, *args, **kwargs):
+            nonlocal attempts
+            if path == cfg_file:
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated sharing violation")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky_read):
+            loaded = load_config(self.base_dir)
+        self.assertIsInstance(loaded, AppConfig)
+        self.assertGreaterEqual(attempts, 3)
+
     def test_save_failure_never_reports_success(self):
         from unittest import mock
 
@@ -272,12 +332,19 @@ class TestRegistryTransactions(unittest.TestCase):
         self.assertEqual(final.projects, [])
 
     def test_project_ignored_flag(self):
-        p = Project(id="test", display_name="Test", source_path=r"C:\Test", ignored=True)
+        p = Project(
+            id="test",
+            display_name="Test",
+            source_path=r"C:\Test",
+            ignored=True,
+            inaudit_aliases=["TEST TOOL", "TST"],
+        )
         d = p.to_dict()
         self.assertTrue(d["ignored"])
 
         p2 = Project.from_dict(d)
         self.assertTrue(p2.ignored)
+        self.assertEqual(p2.inaudit_aliases, ["TEST TOOL", "TST"])
 
         # Default is False
         p3 = Project.from_dict({"id": "test3", "display_name": "Test 3", "source_path": r"C:\Test3"})

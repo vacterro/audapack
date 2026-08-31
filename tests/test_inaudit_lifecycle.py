@@ -6,7 +6,6 @@ from pathlib import Path
 
 from audapack.inaudit import (
     delete_inaudit_layer,
-    ensure_next_layer,
     get_inaudit_selected,
     list_inaudit_layers,
     resolve_inaudit_path,

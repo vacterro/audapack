@@ -15,6 +15,7 @@ test('SRC-005 worker snapshot identifies stable tab and safe FREE state', () => 
   assert.strictEqual(snapshot.site, 'chatgpt');
   assert.strictEqual(snapshot.browser_name, 'Brave');
   assert.strictEqual(snapshot.is_brave, true);
+  assert.strictEqual(snapshot.is_chromium, true);
   assert.strictEqual(snapshot.page_eligible, true);
   assert.strictEqual(snapshot.state, 'FREE');
   assert.strictEqual(snapshot.generating, false);
@@ -39,16 +40,27 @@ test('SRC-005 worker start and stop are idempotent controls', () => {
   assert.strictEqual(api.stopBrowserWorker(), true);
 });
 
-test('SRC-005 worker refuses Chrome and non-root ChatGPT pages', () => {
+test('SRC-005 worker accepts Chrome but refuses non-root ChatGPT pages', () => {
   const { h, api } = setup();
   h.location.pathname = '/';
   delete h.navigator.brave;
   assert.strictEqual(api.browserWorkerSnapshot().browser_name, 'Chrome');
-  assert.strictEqual(api.browserWorkerCanClaim(), false);
-  assert.strictEqual(api.startBrowserWorker(), false);
+  assert.strictEqual(api.browserWorkerSnapshot().is_chromium, true);
+  assert.strictEqual(api.browserWorkerCanClaim(), true);
+  assert.strictEqual(api.startBrowserWorker(), true);
 
   h.navigator.brave = { isBrave: () => Promise.resolve(true) };
   h.location.pathname = '/c/existing-chat';
+  assert.strictEqual(api.browserWorkerCanClaim(), false);
+  assert.strictEqual(api.startBrowserWorker(), false);
+});
+
+test('SRC-005 worker refuses non-Chromium browsers', () => {
+  const { h, api } = setup();
+  h.location.pathname = '/';
+  delete h.navigator.brave;
+  h.navigator.userAgent = 'Mozilla/5.0 Firefox/128.0';
+  assert.strictEqual(api.browserWorkerHasChromiumCapability(), false);
   assert.strictEqual(api.browserWorkerCanClaim(), false);
   assert.strictEqual(api.startBrowserWorker(), false);
 });

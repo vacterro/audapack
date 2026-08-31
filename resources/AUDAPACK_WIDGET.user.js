@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.03
+// @version      0.0.05
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -39,10 +39,17 @@
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // Userscript managers should honour @noframes, but fail closed as well.
+  // ChatGPT embeds same-origin sentinel frames matching our broad @match;
+  // each frame used to register as a fake browser worker and consume one of
+  // the six real tab slots.
+  if (window.top !== window.self) return;
 
   const STORAGE_KEY = 'ai_chatbuttons_v6';
   const STATE_VERSION = 35;
@@ -126,10 +133,24 @@
   const BROWSER_WORKER_PROTOCOL_VERSION = 'AUDAPACK_WIDGET/3';
   const BRIDGE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 120000, 300000]);
   const BRIDGE_API_VERSION = 3;
+  const INAUDIT_CAPTURE_DB_NAME = 'audapack_inaudit_capture_v1';
+  const INAUDIT_CAPTURE_DB_VERSION = 1;
+  const INAUDIT_CAPTURE_STORE = 'captures';
+  const INAUDIT_CAPTURE_MAX_RECORDS = 200;
+  const INAUDIT_CAPTURE_MAX_BYTES = 25 * 1024 * 1024;
+  const INAUDIT_CAPTURE_MAX_ATTEMPTS = 20;
+  const INAUDIT_CAPTURE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 300000]);
   const AUDIT_RESULT_INDEX_KEY = 'ai_chatbuttons_audit_result_index_v1';
   const AUDIT_RESULT_MAX_CONVERSATIONS = 50;
   let bridgeJobsCache = null;
   let bridgeJobsCacheAt = 0;
+  let inauditCaptureObserver = null;
+  let inauditCaptureObserverRoot = null;
+  let inauditCaptureAttachTimer = 0;
+  let inauditCaptureFlushTimer = 0;
+  let inauditCaptureFlushInFlight = false;
+  let inauditSpoolBackendOverride = null;
+  let inauditBridgeRequestOverride = null;
   const BRIDGE_JOBS_CACHE_TTL_MS = 500;
 
 // BEGIN_EMBEDDED_AUDIT_PROFILES
@@ -2261,6 +2282,33 @@ ordinal/name of the entrypoint file.`;
 #acb-popup a,
 #acb-popup a:link,
 #acb-popup a:visited { color: var(--link) !important; }
+
+.acb-inaudit-action {
+  min-width: 26px !important;
+  min-height: 20px !important;
+  margin: 0 2px !important;
+  padding: 2px 5px !important;
+  border: 2px solid !important;
+  border-color: #75663D #100E08 #100E08 #75663D !important;
+  border-radius: 0 !important;
+  background: #3D372A !important;
+  color: #D4C89A !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+  font: 10px/1.2 Verdana, sans-serif !important;
+  transition: none !important;
+  animation: none !important;
+}
+.acb-inaudit-action:hover { background: #453D30 !important; }
+.acb-inaudit-action:active {
+  border-color: #100E08 #75663D #75663D #100E08 !important;
+  background: #332E22 !important;
+  transform: translate(1px, 1px) !important;
+}
+.acb-inaudit-action:disabled { color: #6E674E !important; }
+.acb-inaudit-action[data-state="saved"] { color: #F0D060 !important; }
+.acb-inaudit-action[data-state="queued"] { color: #D4C89A !important; }
+.acb-inaudit-action[data-state="error"] { color: #D66464 !important; }
 `;
 
   let state = null;
@@ -5402,6 +5450,425 @@ ordinal/name of the entrypoint file.`;
     });
   }
 
+  function openInauditCaptureDb() {
+    return new Promise((resolve, reject) => {
+      if (!globalThis.indexedDB) {
+        reject(new Error('IndexedDB is unavailable'));
+        return;
+      }
+      const request = indexedDB.open(INAUDIT_CAPTURE_DB_NAME, INAUDIT_CAPTURE_DB_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(INAUDIT_CAPTURE_STORE)) {
+          db.createObjectStore(INAUDIT_CAPTURE_STORE, { keyPath: 'capture_id' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('INAUDIT spool open failed'));
+    });
+  }
+
+  async function withInauditCaptureStore(mode, operation) {
+    const db = await openInauditCaptureDb();
+    try {
+      return await new Promise((resolve, reject) => {
+        const transaction = db.transaction(INAUDIT_CAPTURE_STORE, mode);
+        const request = operation(transaction.objectStore(INAUDIT_CAPTURE_STORE));
+        let requestResult;
+        let failed = false;
+        request.onsuccess = () => { requestResult = request.result; };
+        request.onerror = () => {
+          failed = true;
+          reject(request.error || new Error('INAUDIT spool request failed'));
+        };
+        transaction.oncomplete = () => {
+          if (!failed) resolve(requestResult);
+        };
+        transaction.onerror = () => {
+          failed = true;
+          reject(transaction.error || new Error('INAUDIT spool transaction failed'));
+        };
+        transaction.onabort = () => reject(transaction.error || new Error('INAUDIT spool transaction aborted'));
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  function defaultInauditSpoolBackend() {
+    return {
+      list: () => withInauditCaptureStore('readonly', store => store.getAll()),
+      put: record => withInauditCaptureStore('readwrite', store => store.put(record)),
+      delete: captureId => withInauditCaptureStore('readwrite', store => store.delete(captureId))
+    };
+  }
+
+  function inauditSpoolBackend() {
+    return inauditSpoolBackendOverride || defaultInauditSpoolBackend();
+  }
+
+  function setInauditSpoolBackendForTest(backend) {
+    inauditSpoolBackendOverride = backend || null;
+  }
+
+  function setInauditBridgeRequestForTest(request) {
+    inauditBridgeRequestOverride = typeof request === 'function' ? request : null;
+  }
+
+  function inauditCaptureBytes(record) {
+    const serialized = JSON.stringify(record || {});
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(serialized).length;
+    return encodeURIComponent(serialized).replace(/%[0-9A-F]{2}|./gi, 'x').length;
+  }
+
+  async function putInauditSpool(record) {
+    const backend = inauditSpoolBackend();
+    const current = await backend.list();
+    const others = (Array.isArray(current) ? current : []).filter(item => item.capture_id !== record.capture_id);
+    const totalBytes = others.reduce((sum, item) => sum + inauditCaptureBytes(item), 0) + inauditCaptureBytes(record);
+    if (others.length + 1 > INAUDIT_CAPTURE_MAX_RECORDS || totalBytes > INAUDIT_CAPTURE_MAX_BYTES) {
+      throw new Error('INAUDIT spool is full; existing queued captures were preserved');
+    }
+    await backend.put(record);
+    return record;
+  }
+
+  async function listInauditSpool() {
+    const records = await inauditSpoolBackend().list();
+    return (Array.isArray(records) ? records : []).sort((a, b) => Number(a.created_at_ms || 0) - Number(b.created_at_ms || 0));
+  }
+
+  function inauditCaptureRetryDelay(attempts) {
+    const index = Math.max(0, Math.min(Number(attempts || 1) - 1, INAUDIT_CAPTURE_RETRY_DELAYS_MS.length - 1));
+    return INAUDIT_CAPTURE_RETRY_DELAYS_MS[index];
+  }
+
+  function inauditCaptureRequest(method, path, body) {
+    if (typeof inauditBridgeRequestOverride === 'function') {
+      return Promise.resolve(inauditBridgeRequestOverride(method, path, body));
+    }
+    return bridgeRequest(method, path, body, { timeout: BRIDGE_REQUEST_TIMEOUT_MS });
+  }
+
+  function inauditCaptureFailureRetriable(result) {
+    const status = Number(result?.status || 0);
+    return result?.retriable === true || status === 0 || status >= 500;
+  }
+
+  function createInauditCaptureId() {
+    if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+    const random = Math.random().toString(16).slice(2).padEnd(12, '0').slice(0, 12);
+    return `00000000-0000-4000-8000-${random}`;
+  }
+
+  function inauditCaptureButtonState(button, stateName, tooltip = '') {
+    if (!button) return;
+    button.dataset.state = stateName;
+    button.disabled = stateName === 'sending';
+    const labels = { ready: 'IA', sending: 'IA...', saved: 'IA ✓', queued: 'IA QUEUED', error: 'IA !' };
+    button.textContent = labels[stateName] || 'IA';
+    if (tooltip) button.title = tooltip;
+  }
+
+  function assistantStableForInaudit(turn) {
+    if (!turn || turnRole(turn) !== 'assistant') return false;
+    if (!assistantHasFinalActions(turn)) return false;
+    if (assistantNeedsContinuation(turn) || assistantHasRetryError(turn)) return false;
+    return Boolean(buildAssistantSnapshot(turn).bestText);
+  }
+
+  function inauditMarkdownFromNode(root) {
+    if (!root) return '';
+    const renderChildren = (node, context = {}) => {
+      const children = Array.from(node.childNodes || node.children || []);
+      return children.length
+        ? children.map(child => render(child, context)).join('')
+        : String(node.textContent || '');
+    };
+    const render = (node, context = {}) => {
+      if (!node) return '';
+      if (node.nodeType === 3) return String(node.nodeValue || node.textContent || '');
+      if (node.nodeType !== 1) return '';
+      const tag = String(node.tagName || '').toLowerCase();
+      if (['button', 'svg', 'script', 'style'].includes(tag) || node.matches?.(ASSISTANT_RESPONSE_ACTIONS_SELECTOR)) return '';
+      if (/^h[1-6]$/.test(tag)) {
+        return `${'#'.repeat(Number(tag.slice(1)))} ${renderChildren(node).trim()}\n\n`;
+      }
+      if (tag === 'pre') {
+        const code = node.querySelector?.('code') || node;
+        const className = String(code.className || code.getAttribute?.('class') || '');
+        const language = className.match(/(?:^|\s)language-([^\s]+)/)?.[1] || '';
+        const body = String(code.textContent || '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
+        let fence = '```';
+        while (body.includes(fence)) fence += '`';
+        return `${fence}${language}\n${body}\n${fence}\n\n`;
+      }
+      if (tag === 'code' && !context.pre) {
+        const body = String(node.textContent || '');
+        let fence = '`';
+        while (body.includes(fence)) fence += '`';
+        return `${fence}${body}${fence}`;
+      }
+      if (tag === 'br') return '\n';
+      if (tag === 'hr') return '\n---\n\n';
+      if (tag === 'strong' || tag === 'b') return `**${renderChildren(node).trim()}**`;
+      if (tag === 'em' || tag === 'i') return `*${renderChildren(node).trim()}*`;
+      if (tag === 'blockquote') {
+        const body = renderChildren(node).trim();
+        return `${body.split('\n').map(line => `> ${line}`).join('\n')}\n\n`;
+      }
+      if (tag === 'a') {
+        const label = renderChildren(node).trim() || String(node.textContent || '').trim();
+        const href = String(node.getAttribute?.('href') || '');
+        return href && !href.toLowerCase().startsWith('javascript:') ? `[${label}](${href})` : label;
+      }
+      if (tag === 'ul' || tag === 'ol') {
+        const ordered = tag === 'ol';
+        const items = Array.from(node.children || []).filter(child => String(child.tagName || '').toLowerCase() === 'li');
+        return `${items.map((item, index) => {
+          const prefix = ordered ? `${index + 1}. ` : '- ';
+          const body = renderChildren(item).trim().replace(/\n/g, '\n  ');
+          return `${prefix}${body}`;
+        }).join('\n')}\n\n`;
+      }
+      const body = renderChildren(node, context);
+      if (tag === 'p') return `${body.trim()}\n\n`;
+      return body;
+    };
+    const rendered = render(root)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return rendered || readableNodeText(root);
+  }
+
+  function inauditResponseText(turn) {
+    if (!assistantStableForInaudit(turn)) return '';
+    const message = turn.matches?.('[data-message-author-role="assistant"]')
+      ? turn
+      : (turn.querySelector?.('[data-message-author-role="assistant"]') || turn);
+    const surfaces = Array.from(message.querySelectorAll(
+      '[data-message-content-part-type="text"], .markdown.prose, .markdown[class*="prose"], ' +
+      '[data-writing-block="true"], [data-testid="writing-block-container"]'
+    ));
+    const topLevelVisible = surfaces.filter(surface => {
+      if (surfaces.some(other => other !== surface && other.contains(surface))) return false;
+      let node = surface;
+      while (node && node !== message && node !== document.body) {
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+        node = node.parentNode;
+      }
+      return true;
+    });
+    const authored = topLevelVisible.map(inauditMarkdownFromNode).filter(Boolean);
+    const text = authored.length ? authored.join('\n\n') : (buildAssistantSnapshot(turn).candidates[0] || '');
+    return String(text).replace(/\r\n?/g, '\n');
+  }
+
+  function inauditBlockText(block, turn) {
+    if (!block || !assistantStableForInaudit(turn)) return '';
+    return String(readableNodeText(block) || '').replace(/\r\n?/g, '\n');
+  }
+
+  function inauditCapturePayload(text, scope) {
+    const projectHints = [];
+    if (autoRuntime?.projectName) projectHints.push(String(autoRuntime.projectName));
+    return {
+      capture_id: createInauditCaptureId(),
+      text,
+      capture_kind: scope === 'block' ? 'block' : 'response',
+      captured_at: new Date().toISOString(),
+      source: 'ChatGPT',
+      source_url: String(location.href || ''),
+      source_title: String(document.title || 'ChatGPT conversation'),
+      browser_name: detectBrowserWorkerBrowserName(),
+      conversation_fingerprint: currentConversationKey(),
+      project_hints: projectHints
+    };
+  }
+
+  async function queueInauditCapture(payload, failure) {
+    const now = Date.now();
+    const record = {
+      capture_id: payload.capture_id,
+      payload,
+      created_at_ms: now,
+      attempts: 1,
+      next_retry_at: now + inauditCaptureRetryDelay(1),
+      last_error: String(failure?.message || failure?.errorCode || 'Bridge unavailable').slice(0, 320),
+      terminal: false
+    };
+    await putInauditSpool(record);
+    scheduleInauditCaptureFlush(inauditCaptureRetryDelay(1));
+    return record;
+  }
+
+  async function persistInauditCapture(payload, button = null) {
+    inauditCaptureButtonState(button, 'sending', 'Saving exact content to the durable AUDAPACK Inbox...');
+    const result = await inauditCaptureRequest('POST', '/v1/inaudit/captures', payload);
+    if (result?.ok && result.data?.durable === true && result.data?.record?.capture_id === payload.capture_id) {
+      const record = result.data.record;
+      const confidence = Math.round(Number(record.classification_confidence || 0) * 100);
+      const suggestion = record.suggested_project_name ? ` Suggested: ${record.suggested_project_name} ${confidence}%.` : '';
+      inauditCaptureButtonState(button, 'saved', `Captured ${payload.capture_id.slice(0, 8)}.${suggestion}`);
+      return { ok: true, queued: false, record };
+    }
+    if (!inauditCaptureFailureRetriable(result)) {
+      const message = result?.message || result?.errorCode || 'Bridge rejected the capture';
+      inauditCaptureButtonState(button, 'error', `Capture rejected: ${message}`);
+      return { ok: false, queued: false, error: message };
+    }
+    try {
+      await queueInauditCapture(payload, result || {});
+      inauditCaptureButtonState(button, 'queued', 'Bridge unavailable. Capture is durable in the bounded IndexedDB spool.');
+      return { ok: true, queued: true, capture_id: payload.capture_id };
+    } catch (error) {
+      inauditCaptureButtonState(button, 'error', `Capture failed: ${error?.message || 'spool persistence failed'}`);
+      return { ok: false, queued: false, error: error?.message || 'spool persistence failed' };
+    }
+  }
+
+  async function captureInauditTarget(turn, scope = 'response', target = null, button = null) {
+    const beforeComposer = chatGPTComposerStateSnapshot();
+    const beforeLease = browserWorkerLease ? JSON.stringify(browserWorkerLease) : '';
+    const text = scope === 'block' ? inauditBlockText(target, turn) : inauditResponseText(turn);
+    if (!text) {
+      inauditCaptureButtonState(button, 'error', 'WAIT: assistant output is still streaming or incomplete.');
+      return { ok: false, reason: 'unstable' };
+    }
+    const result = await persistInauditCapture(inauditCapturePayload(text, scope), button);
+    const afterComposer = chatGPTComposerStateSnapshot();
+    const afterLease = browserWorkerLease ? JSON.stringify(browserWorkerLease) : '';
+    const composerUnchanged = (!beforeComposer && !afterComposer) || sameComposerState(beforeComposer, afterComposer);
+    if (!composerUnchanged || beforeLease !== afterLease) {
+      inauditCaptureButtonState(button, 'error', 'Capture isolation invariant failed; chat state changed unexpectedly.');
+      return { ok: false, reason: 'chat-state-changed' };
+    }
+    return result;
+  }
+
+  function createInauditActionButton(turn, scope, target = null) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'acb-inaudit-action';
+    button.setAttribute('data-acb-inaudit-scope', scope);
+    button.setAttribute('aria-label', scope === 'block' ? 'Capture this block to AUDAPACK INAUDIT' : 'Capture response to AUDAPACK INAUDIT');
+    inauditCaptureButtonState(button, 'ready', scope === 'block' ? 'Capture this stable block' : 'Capture this stable assistant response');
+    button.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation?.();
+      captureInauditTarget(turn, scope, target, button).catch(error => {
+        inauditCaptureButtonState(button, 'error', `Capture failed: ${error?.message || 'unexpected error'}`);
+      });
+    });
+    return button;
+  }
+
+  function attachInauditActions(root = document) {
+    if (detectSite().key !== 'chatgpt') return 0;
+    let attached = 0;
+    const turns = Array.from(root.querySelectorAll?.('[data-message-author-role="assistant"]') || []);
+    for (const turn of turns) {
+      if (!assistantStableForInaudit(turn)) continue;
+      const actions = turn.querySelector(ASSISTANT_RESPONSE_ACTIONS_SELECTOR) ||
+        turn.querySelector('button[data-testid="copy-turn-action-button"]')?.parentNode;
+      if (actions && !actions.querySelector('[data-acb-inaudit-scope="response"]')) {
+        actions.appendChild(createInauditActionButton(turn, 'response'));
+        attached += 1;
+      }
+      for (const block of Array.from(turn.querySelectorAll('pre'))) {
+        const host = block.parentNode || turn;
+        const existing = Array.from(host.querySelectorAll('[data-acb-inaudit-scope="block"]'))
+          .find(button => button.__acbInauditTarget === block);
+        if (existing) continue;
+        const button = createInauditActionButton(turn, 'block', block);
+        button.__acbInauditTarget = block;
+        host.appendChild(button);
+        attached += 1;
+      }
+    }
+    return attached;
+  }
+
+  function scheduleInauditActionAttach(delay = 150) {
+    clearTimeout(inauditCaptureAttachTimer);
+    inauditCaptureAttachTimer = setTimeout(() => {
+      inauditCaptureAttachTimer = 0;
+      attachInauditActions(document);
+    }, Math.max(50, Number(delay) || 150));
+  }
+
+  function ensureInauditCaptureObserver() {
+    if (detectSite().key !== 'chatgpt' || typeof MutationObserver !== 'function') return false;
+    const root = document.querySelector('main') || document.body;
+    if (!root) return false;
+    if (inauditCaptureObserver && inauditCaptureObserverRoot === root && root.isConnected) return true;
+    if (inauditCaptureObserver) inauditCaptureObserver.disconnect();
+    inauditCaptureObserverRoot = root;
+    inauditCaptureObserver = new MutationObserver(records => {
+      const external = Array.from(records || []).some(record => {
+        const target = record.target?.nodeType === 1 ? record.target : record.target?.parentNode;
+        return !target?.closest?.('.acb-inaudit-action');
+      });
+      if (external) scheduleInauditActionAttach(200);
+    });
+    inauditCaptureObserver.observe(root, { childList: true, subtree: true });
+    scheduleInauditActionAttach(50);
+    return true;
+  }
+
+  async function flushInauditCaptureSpool() {
+    if (inauditCaptureFlushInFlight) return false;
+    inauditCaptureFlushInFlight = true;
+    clearTimeout(inauditCaptureFlushTimer);
+    inauditCaptureFlushTimer = 0;
+    try {
+      const records = await listInauditSpool();
+      const now = Date.now();
+      let nextDelay = 300000;
+      for (const record of records) {
+        if (record.terminal || Number(record.attempts || 0) >= INAUDIT_CAPTURE_MAX_ATTEMPTS) continue;
+        if (Number(record.next_retry_at || 0) > now) {
+          nextDelay = Math.min(nextDelay, Number(record.next_retry_at) - now);
+          continue;
+        }
+        const result = await inauditCaptureRequest('POST', '/v1/inaudit/captures', record.payload);
+        if (result?.ok && result.data?.durable === true && result.data?.record?.capture_id === record.capture_id) {
+          await inauditSpoolBackend().delete(record.capture_id);
+          continue;
+        }
+        record.attempts = Number(record.attempts || 0) + 1;
+        record.last_error = String(result?.message || result?.errorCode || 'Bridge unavailable').slice(0, 320);
+        if (!inauditCaptureFailureRetriable(result) || record.attempts >= INAUDIT_CAPTURE_MAX_ATTEMPTS) {
+          record.terminal = true;
+          record.next_retry_at = 0;
+        } else {
+          const delay = inauditCaptureRetryDelay(record.attempts);
+          record.next_retry_at = now + delay;
+          nextDelay = Math.min(nextDelay, delay);
+        }
+        await putInauditSpool(record);
+      }
+      const remaining = await listInauditSpool();
+      if (remaining.some(record => !record.terminal)) scheduleInauditCaptureFlush(Math.max(2000, nextDelay));
+      return true;
+    } catch (_) {
+      scheduleInauditCaptureFlush(300000);
+      return false;
+    } finally {
+      inauditCaptureFlushInFlight = false;
+    }
+  }
+
+  function scheduleInauditCaptureFlush(delay = 2000) {
+    if (inauditCaptureFlushTimer || inauditCaptureFlushInFlight) return;
+    inauditCaptureFlushTimer = setTimeout(() => {
+      inauditCaptureFlushTimer = 0;
+      flushInauditCaptureSpool();
+    }, Math.max(2000, Number(delay) || 2000));
+  }
+
   function bridgeJobKey(jobId) {
     return `${BRIDGE_JOB_PREFIX}${String(jobId || '')}`;
   }
@@ -5962,7 +6429,12 @@ ordinal/name of the entrypoint file.`;
     return {
       api_version: BRIDGE_API_VERSION,
       receipt: job.receipt,
-      run_id: job.deliveryRunId || job.runId,
+      // run_id must be the CANONICAL run id that matches the content's
+      // CAMPAIGN_RUN_ID header. deliveryRunId is a synthetic materialize
+      // delivery tag used only to build a fresh receipt; sending it as run_id
+      // makes the Bridge reject run_id_mismatch because the content still
+      // carries the original campaign run id.
+      run_id: job.runId || job.deliveryRunId,
       conversation_id: job.conversationId || '',
       project_id: job.projectId || '',
       project_name: job.project,
@@ -6115,19 +6587,18 @@ ordinal/name of the entrypoint file.`;
       return markBridgeJobSaved(job, { ok: true, data: job.deliveredData || {} });
     }
 
-    // W4-003: refuse a queued payload whose embedded content carries a
-    // CAMPAIGN_RUN_ID header that disagrees with the queued run id. The
-    // Bridge v3 contract rejects that exact mismatch server-side, but the
-    // widget must not even POST a payload it can prove is wrong: the queued
-    // content was captured under one run and the queue record claims another.
+    // W4-003: reconcile a queued payload whose embedded content carries a
+    // CAMPAIGN_RUN_ID header that disagrees with the queued run id, rather than
+    // permanently failing. The content was captured under one run id and the
+    // queue record claims another — the transport run_id is the canonical
+    // authority for the Bridge submission, so patch the content header to match
+    // before sending. The Bridge v3 contract rejects mismatches server-side,
+    // and the widget must not POST a payload it can prove is wrong.
     const queuedRunId = String(job.deliveryRunId || job.runId || '');
     const contentRunId = extractCampaignRunIdFromText(job.content || '');
     if (queuedRunId && contentRunId && queuedRunId !== contentRunId) {
-      markBridgeJobPermanent(job, {
-        errorCode: 'run_id_mismatch',
-        message: `Payload run_id '${queuedRunId}' does not match content CAMPAIGN_RUN_ID '${contentRunId}'.`
-      });
-      return false;
+      job.content = String(job.content || '').replace(/^(\s*CAMPAIGN_RUN_ID\s*:\s*).*$/im, `$1${queuedRunId}`);
+      saveBridgeJob(job, { signal: false });
     }
 
     const activeJob = {
@@ -6592,6 +7063,7 @@ ordinal/name of the entrypoint file.`;
 
     resetBridgeFailedJobs('');
     startBrowserWorker();
+    scheduleInauditCaptureFlush(2000);
 
     if (!options.suppressFlush) {
       scheduleBridgeFlush(options.force ? 0 : 50);
@@ -16369,6 +16841,8 @@ async function recoverArmedStartSend(options = {}) {
 
     if (site.key === 'chatgpt') {
       startAutoAuditMonitor({ immediate: true });
+      ensureInauditCaptureObserver();
+      scheduleInauditActionAttach(50);
 
       if (state.bridgeEnabled) {
         setTimeout(() => {
@@ -16444,6 +16918,9 @@ async function recoverArmedStartSend(options = {}) {
       }, true);
     }
     armWidgetBootstrap();
+    ensureInauditCaptureObserver();
+    scheduleInauditCaptureFlush(2000);
+    window.addEventListener('online', () => scheduleInauditCaptureFlush(2000));
   }
 
   let browserWorkerPollTimer = 0;
@@ -16500,6 +16977,21 @@ let browserWorkerBraveConfirmed = false;
     }
   }
 
+  function browserWorkerHasChromiumCapability() {
+    if (browserWorkerHasBraveCapability()) return true;
+    try {
+      const nav = globalThis.navigator;
+      const ua = String(nav?.userAgent || '').toLowerCase();
+      const brands = Array.from(nav?.userAgentData?.brands || [])
+        .map(item => String(item?.brand || '').toLowerCase())
+        .join(' ');
+      return ua.includes('chrome/') || ua.includes('chromium/') || ua.includes('edg/') ||
+        brands.includes('chromium') || brands.includes('google chrome') || brands.includes('microsoft edge');
+    } catch (_) {
+      return false;
+    }
+  }
+
   function browserWorkerPageEligible() {
     try {
       return String(location.hostname || '').toLowerCase() === 'chatgpt.com' &&
@@ -16551,6 +17043,7 @@ let browserWorkerBraveConfirmed = false;
     const handoff = readStartAuditHandoff();
     const browserName = detectBrowserWorkerBrowserName();
     const isBrave = browserWorkerHasBraveCapability();
+    const isChromium = browserWorkerHasChromiumCapability();
     const pageEligible = browserWorkerPageEligible();
     const turns = getChatGPTTurns ? getChatGPTTurns() : [];
     const hasConversationTurns = Boolean(turns && turns.length > 0);
@@ -16568,6 +17061,7 @@ let browserWorkerBraveConfirmed = false;
       url_path: String(location.pathname || ''),
       browser_name: browserWorkerBrowserName || browserName,
       is_brave: isBrave,
+      is_chromium: isChromium,
       brave_confirmed: browserWorkerBraveConfirmed,
       page_eligible: pageEligible,
       project_name: String(autoRuntime?.projectName || lease?.project_name || ''),
@@ -16590,7 +17084,7 @@ let browserWorkerBraveConfirmed = false;
 
   function browserWorkerCanClaim() {
     const snap = browserWorkerSnapshot();
-    return snap.is_brave && snap.page_eligible && detectSite().key === 'chatgpt' &&
+    return snap.is_chromium && snap.page_eligible && detectSite().key === 'chatgpt' &&
       !snap.generating && !snap.has_manual_draft && !snap.has_attachments &&
       !snap.audit_start_in_flight && !snap.action_in_flight &&
       !snap.campaign_run_id && snap.state === 'FREE' &&
@@ -16891,7 +17385,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
   function startBrowserWorker() {
     restoreBrowserWorkerLease();
     const recoveringOwnedAudit = Boolean(browserWorkerLease?.dispatch_id || autoRuntime?.runId);
-    if (!browserWorkerHasBraveCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
+    if (!browserWorkerHasChromiumCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
       stopBrowserWorker();
       return false;
     }
@@ -16937,7 +17431,11 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
            BRIDGE_JOB_PREFIX,
            BRIDGE_QUEUE_SIGNAL_KEY,
            BRIDGE_DIAGNOSTIC_LOG_KEY,
-           BRIDGE_DIAGNOSTIC_LOG_MAX
+           BRIDGE_DIAGNOSTIC_LOG_MAX,
+           INAUDIT_CAPTURE_MAX_RECORDS,
+           INAUDIT_CAPTURE_MAX_BYTES,
+           INAUDIT_CAPTURE_MAX_ATTEMPTS,
+           INAUDIT_CAPTURE_RETRY_DELAYS_MS
         },
         storage: {
           gmGet: GM_getValue,
@@ -16946,6 +17444,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         },
         get autoRuntime() { return autoRuntime; },
         set autoRuntime(val) { autoRuntime = val; },
+        get autoAuditObserver() { return autoAuditObserver; },
         get state() { return state; },
         set state(val) { state = val; },
         get browserWorkerLease() { return browserWorkerLease; },
@@ -16989,6 +17488,23 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         visibleAuditLineage,
         createAuditRunId,
         normalizedBridgeUrl,
+        assistantStableForInaudit,
+        inauditResponseText,
+        inauditMarkdownFromNode,
+        inauditBlockText,
+        inauditCapturePayload,
+        persistInauditCapture,
+        captureInauditTarget,
+        attachInauditActions,
+        ensureInauditCaptureObserver,
+        putInauditSpool,
+        listInauditSpool,
+        flushInauditCaptureSpool,
+        scheduleInauditCaptureFlush,
+        inauditCaptureRetryDelay,
+        inauditCaptureFailureRetriable,
+        setInauditSpoolBackendForTest,
+        setInauditBridgeRequestForTest,
         bridgeQueueStats,
         enqueueBridgeAuditRecord,
          bridgeJobRequest,
@@ -17004,6 +17520,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerSnapshot,
          browserWorkerCanClaim,
          browserWorkerHasBraveCapability,
+         browserWorkerHasChromiumCapability,
          browserWorkerPageEligible,
          browserWorkerPollOnce,
          browserWorkerConsume,

@@ -168,10 +168,11 @@ def _v3_audit_payload(*, run_id: str, project: str, wave: str, content: str, rec
     }
 
 
-def test_bridge_v3_rejects_payload_run_id_mismatch(bridge_server):
-    """Server-side CORE-006 check stays strict: a payload whose transport
-    run_id disagrees with the CAMPAIGN_RUN_ID header in the content must be
-    rejected with a non-retriable 400 and run_id_mismatch code."""
+def test_bridge_v3_reconciles_payload_run_id_mismatch(bridge_server):
+    """Server-side CORE-006 check heals a payload whose transport run_id
+    disagrees with the CAMPAIGN_RUN_ID header in the content: the header is
+    patched to the transport id and the wave is accepted, so a re-armed or
+    materialized capture cannot dead-end in a permanent run_id_mismatch."""
     config, base_url = bridge_server
     headers = {
         "Content-Type": "application/json",
@@ -179,7 +180,7 @@ def test_bridge_v3_rejects_payload_run_id_mismatch(bridge_server):
     }
     payload_run = f"payload_{secrets.token_hex(4)}"
     content_run = f"content_{secrets.token_hex(4)}"
-    project = "SAIPEN"
+    project = f"SAIPEN_{secrets.token_hex(2)}"
     wave_text = _build_wave_text(
         project=project, run_id=content_run, wave_id="core", profile_id="quick3"
     )
@@ -195,18 +196,11 @@ def test_bridge_v3_rejects_payload_run_id_mismatch(bridge_server):
         )).encode("utf-8"),
         headers=headers,
     )
-    try:
-        urllib.request.urlopen(req)
-    except urllib.error.HTTPError as exc:
-        body = json.loads(exc.read().decode("utf-8"))
-        assert exc.code == 400, f"expected 400, got {exc.code}"
-        assert body["error"]["code"] == "run_id_mismatch", (
-            f"expected run_id_mismatch, got {body['error']!r}"
-        )
-        assert payload_run in body["error"]["message"]
-        assert content_run in body["error"]["message"]
-    else:
-        raise AssertionError("bridge accepted a payload with mismatching run id")
+    with urllib.request.urlopen(req) as resp:
+        assert resp.status == 200
+        data = json.loads(resp.read().decode("utf-8"))
+        assert data["ok"] is True
+        assert data["run_id"] == payload_run
 
 
 def test_bridge_v3_accepts_payload_run_id_match(bridge_server):

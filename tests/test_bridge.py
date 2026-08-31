@@ -1064,6 +1064,11 @@ class TestWidgetBranding(unittest.TestCase):
         src = self._widget_source()
         self.assertIn("BRIDGE_API_VERSION = 3", src)
 
+    def test_widget_is_top_level_only(self):
+        src = self._widget_source()
+        self.assertIn("// @noframes", src)
+        self.assertIn("if (window.top !== window.self) return;", src)
+
     def test_canonical_vbs_launchers(self):
         root = Path(__file__).resolve().parent.parent
         gui_vbs = (root / "AUDAPACK.vbs").read_text(encoding="utf-8", errors="replace")

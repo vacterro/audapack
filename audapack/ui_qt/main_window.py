@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFileDialog,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QSystemTrayIcon,
@@ -464,7 +465,7 @@ class MainWindow(QMainWindow):
         act_pack.setToolTip("Pack selected project in background")
 
         act_send_audit = toolbar.addAction("START AUDIT", self._on_send_audit)
-        act_send_audit.setToolTip("Queue selected project for a free Brave/ChatGPT audit worker")
+        act_send_audit.setToolTip("Queue selected project for a free Chromium/ChatGPT audit worker")
 
         act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
         act_pack_all.setToolTip("Pack all configured projects in background")
@@ -477,6 +478,9 @@ class MainWindow(QMainWindow):
 
         act_ia = toolbar.addAction("IA", self._on_ia_copy)
         act_ia.setToolTip("IA — Copy selected INAUDIT path\nShift: saipen gg \"path\"\nCtrl: saipen cc \"path\"")
+
+        act_ia_plus = toolbar.addAction("IA+", self._on_ia_plus_capture)
+        act_ia_plus.setToolTip("Capture clipboard text into the durable global INAUDIT Inbox")
 
         act_copy_arc = toolbar.addAction("ZIP", self._on_copy_archive)
         act_copy_arc.setToolTip("Copy packed .zip archive file to clipboard")
@@ -538,7 +542,11 @@ class MainWindow(QMainWindow):
                         self.tree.viewport().update()
             except Exception:
                 pass
-        self.inaudit_widget = InauditWidget(parent=self.tabs, on_changed=_inaudit_changed)
+        self.inaudit_widget = InauditWidget(
+            parent=self.tabs,
+            on_changed=_inaudit_changed,
+            config_provider=lambda: self._service.config,
+        )
         self.inaudit_widget.set_project(self._active_project)
 
         # Tab 3: Settings
@@ -903,6 +911,7 @@ QToolTip QLabel {
             slot=target_slot,
             archive_name=proj.archive_name,
             audit_project_name=proj.audit_project_name,
+            inaudit_aliases=list(proj.inaudit_aliases),
             enabled=proj.enabled,
             ignored=proj.ignored,
             last_copied_audit_hash=proj.last_copied_audit_hash,
@@ -921,6 +930,7 @@ QToolTip QLabel {
                 slot=src_slot,
                 archive_name=swap_proj.archive_name,
                 audit_project_name=swap_proj.audit_project_name,
+                inaudit_aliases=list(swap_proj.inaudit_aliases),
                 enabled=swap_proj.enabled,
                 ignored=swap_proj.ignored,
                 last_copied_audit_hash=swap_proj.last_copied_audit_hash,
@@ -1098,6 +1108,26 @@ QToolTip QLabel {
                 self.statusBar().showMessage(f"✓ Updated {new_name} path -> {p_path}")
             except Exception as e:
                 self.statusBar().showMessage(f"Error updating project: {e}")
+
+    def _on_ia_plus_capture(self):
+        self.tabs.setCurrentWidget(self.inaudit_widget)
+        self.inaudit_widget.capture_clipboard()
+
+    def _on_edit_inaudit_aliases(self, proj: Project):
+        current = ", ".join(getattr(proj, "inaudit_aliases", []))
+        text, accepted = QInputDialog.getText(
+            self,
+            "INAUDIT project aliases",
+            "Comma-separated exact aliases used for deterministic Inbox suggestions:",
+            text=current,
+        )
+        if not accepted:
+            return
+        aliases = list(dict.fromkeys(value.strip() for value in text.split(",") if value.strip()))
+        self._service.update_project(proj.id, lambda project: setattr(project, "inaudit_aliases", aliases))
+        self.model.reload()
+        self.tree.expandAll()
+        self.statusBar().showMessage(f"INAUDIT aliases saved for {proj.display_name}: {', '.join(aliases) or 'none'}")
 
     def _on_move_project_step(self, proj: Optional[Any] = None, step: int = -1):
         """Moves project up (-1) or down (+1) across slots without popups."""
@@ -1966,7 +1996,7 @@ QToolTip QLabel {
         )
 
     def _on_tree_double_clicked(self, index: QModelIndex):
-        """Double click handler: open instance manager on project row, add folder on empty slot, toggle on group."""
+        """Double click handler: open INAUDIT on project row, add folder on empty slot, toggle on group."""
         if not index.isValid():
             return
         node_type = self.model.data(index, self.model.ROLES["node_type"])
@@ -1982,7 +2012,8 @@ QToolTip QLabel {
         proj = self.model.project_at(group, slot)
         if proj:
             self._active_project = proj
-            self._show_instance_manager(proj)
+            self.tabs.setCurrentWidget(self.inaudit_widget)
+            self.inaudit_widget.set_project(proj)
         else:
             self._on_add_project(default_group=group, default_slot=slot)
 
@@ -2125,6 +2156,9 @@ QToolTip QLabel {
             # Actions group 4: Project Management & Slot Reordering
             act_folder = menu.addAction("Change Project Folder... (FOLDER)")
             act_folder.triggered.connect(lambda: self._on_change_project_folder(proj))
+
+            act_aliases = menu.addAction("Edit INAUDIT aliases...")
+            act_aliases.triggered.connect(lambda: self._on_edit_inaudit_aliases(proj))
 
             act_move_up = menu.addAction("Move Up (Slot -1)")
             act_move_up.triggered.connect(lambda: self._on_move_project_step(proj, -1))

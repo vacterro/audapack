@@ -218,6 +218,19 @@ def normalize_native_path(value: str) -> str:
 
 REGISTRY_LOCK_NAME = "registry.lock"
 _REGISTRY_LOCK_TIMEOUT = 15.0
+_WINDOWS_FILE_RETRY_ATTEMPTS = 6
+
+
+def _read_text_with_windows_retry(path: Path, *, encoding: str = "utf-8") -> str:
+    """Read a small config/secret file across transient Windows sharing locks."""
+    for attempt in range(_WINDOWS_FILE_RETRY_ATTEMPTS):
+        try:
+            return path.read_text(encoding=encoding)
+        except OSError:
+            if sys.platform != "win32" or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
+    return ""  # unreachable
 
 
 def get_registry_lock_path(base_dir: Optional[Path] = None) -> Path:
@@ -311,6 +324,18 @@ def cross_process_lock(path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
     lock = _CrossProcessLock(path, timeout=timeout)
     with lock:
         yield
+
+
+def _replace_config_file_with_retry(source: Path, destination: Path) -> None:
+    """Survive brief Windows sharing violations without hiding real failures."""
+    for attempt in range(_WINDOWS_FILE_RETRY_ATTEMPTS):
+        try:
+            source.replace(destination)
+            return
+        except OSError:
+            if sys.platform != "win32" or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
 
 
 def scoped_config_write(mutator: Callable[[AppConfig], None], base_dir: Optional[Path] = None) -> bool:
@@ -735,6 +760,9 @@ def ensure_token(bridge_cfg: BridgeConfig, base_dir: Optional[Path] = None) -> s
     else:
         token_file = get_token_file_path()
 
+    def _read_token() -> str:
+        return _read_text_with_windows_retry(token_file).strip()
+
     def _persist(tok: str) -> None:
         with _TOKEN_REPLACE_LOCK:
             token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -782,7 +810,7 @@ def ensure_token(bridge_cfg: BridgeConfig, base_dir: Optional[Path] = None) -> s
 
     if token_file.exists():
         try:
-            tok = token_file.read_text(encoding="utf-8").strip()
+            tok = _read_token()
             if tok and len(tok) >= 16:
                 bridge_cfg.token = tok
                 return tok
@@ -894,6 +922,9 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         for p_data in data["projects"]:
             if isinstance(p_data, dict):
                 p_id = str(p_data.get("id", "")).strip() or safe_slug(str(p_data.get("display_name", "proj")))
+                raw_inaudit_aliases = p_data.get("inaudit_aliases", [])
+                if not isinstance(raw_inaudit_aliases, (list, tuple)):
+                    raw_inaudit_aliases = []
                 projects.append(
                     Project(
                         id=p_id,
@@ -903,6 +934,11 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                         ignored=bool(p_data.get("ignored", False)),
                         ignore_archive=bool(p_data.get("ignore_archive", False)),
                         audit_copy_count=int(p_data.get("audit_copy_count", 0) or 0),
+                        inaudit_aliases=[
+                            str(value).strip()
+                            for value in raw_inaudit_aliases
+                            if str(value).strip()
+                        ],
                         priority_group=str(p_data.get("priority_group", "MAIN0")),
                         slot=int(p_data.get("slot", 1)),
                         archive_name=str(p_data.get("archive_name", "")),
@@ -1026,7 +1062,7 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
         return cfg
 
     try:
-        raw = cfg_file.read_text(encoding="utf-8")
+        raw = _read_text_with_windows_retry(cfg_file)
         data = json.loads(raw)
         legacy_token_present = (
             (isinstance(data.get("bridge"), dict) and bool(data["bridge"].get("token")))
@@ -1066,7 +1102,7 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
             for bk in [backup_file, bak2]:
                 if bk.exists():
                     try:
-                        bk_data = json.loads(bk.read_text(encoding="utf-8"))
+                        bk_data = json.loads(_read_text_with_windows_retry(bk))
                         bk_cfg = migrate_legacy_data(bk_data)
                         if bk_cfg.projects:
                             cfg.projects = bk_cfg.projects
@@ -1121,7 +1157,7 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
             for bk in [cfg_file.with_name("config.backup_latest.json"), cfg_file.with_name("config.json.bak")]:
                 if bk.exists():
                     try:
-                        bk_data = json.loads(bk.read_text(encoding="utf-8"))
+                        bk_data = json.loads(_read_text_with_windows_retry(bk))
                         cfg = migrate_legacy_data(bk_data)
                         ensure_token(cfg.bridge, base_dir)
                         save_config(cfg, base_dir)
@@ -1147,7 +1183,7 @@ def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> bool:
         existing_data = None
         if cfg_file.exists():
             try:
-                raw_existing = cfg_file.read_text(encoding="utf-8")
+                raw_existing = _read_text_with_windows_retry(cfg_file)
                 existing_data = json.loads(raw_existing)
             except Exception:
                 existing_data = None
@@ -1193,7 +1229,7 @@ def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> bool:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        tmp_file.replace(cfg_file)
+        _replace_config_file_with_retry(tmp_file, cfg_file)
 
         # Update backup if current save has projects
         if base_dir is None and data.get("projects"):

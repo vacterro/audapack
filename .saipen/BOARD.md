@@ -1,7 +1,7 @@
 # Board
 
 ## DOING
-- [/] T-50 [P0] SRC-005: FREE BRAVE AUDIT WORKER DISPATCHER -- browser_dispatch domain (6-worker registry, lease, job queue, transitions), /v1/browser/poll long-poll, /v1/browser/jobs/<id>/artifact ZIP stream, /v1/browser/status, widget worker registration + poll + artifact fetch + exactly-once START via existing startAuditCoreFromReadyAttachment, desktop GUI SEND AUDIT, queue durability, 40+ regressions. | verify: 298 pytest PASS, 135 widget PASS, ruff clean, 6-worker scenario proven, W8 tray notifications, mandatory 08/16/17/25/30 | owner: opencode | claim_time: 2026-08-30T20:45:16Z | source_receipts: SRC-003,SRC-004,SRC-005
+- [/] T-50 [P0] SRC-005: FREE BRAVE AUDIT WORKER DISPATCHER -- browser_dispatch domain (6-worker registry, lease, job queue, transitions), /v1/browser/poll long-poll, /v1/browser/jobs/<id>/artifact ZIP stream, /v1/browser/status, widget worker registration + poll + artifact fetch + exactly-once START via existing startAuditCoreFromReadyAttachment, desktop GUI SEND AUDIT, queue durability, 40+ regressions. | verify: 298 pytest PASS, 135 widget PASS, ruff clean, 6-worker scenario proven, W8 tray notifications, mandatory 08/16/17/25/30 | owner: opencode | claim_time: 2026-08-31T03:58:12Z | source_receipts: SRC-003,SRC-004,SRC-005,SRC-007,SRC-008
 
 ## TODO
 - [ ] T-51 [P1] 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window | verify: 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window is complete and the repository-declared verification harness passes

@@ -18,7 +18,8 @@ from audapack.components.autostart import (
 )
 from audapack.components.migration import detect_legacy_installation, perform_bridge_takeover
 from audapack.components.widget import (
-    open_widget_installation,
+    launch_dedicated_chromium_worker,
+    open_widget_in_dedicated_chromium,
     read_bundled_widget_metadata,
 )
 from audapack.config import AppConfig, load_config
@@ -107,18 +108,14 @@ class ComponentManager:
         return self.config.bridge.token
 
     def trigger_widget_install(self) -> tuple[bool, str]:
-        # Prefer serving via bridge if running
-        if is_bridge_healthy(self.config.bridge.host, self.config.bridge.port):
-            import webbrowser
-            url = f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js"
-            try:
-                opened = webbrowser.open(url)
-                if opened:
-                    return True, f"Opened {url} in browser."
-            except Exception:
-                pass
-        ok = open_widget_installation()
-        return ok, "Opened local widget script in browser." if ok else "Failed to open widget script."
+        bridge_healthy = is_bridge_healthy(self.config.bridge.host, self.config.bridge.port)
+        return open_widget_in_dedicated_chromium(
+            use_bridge=bridge_healthy,
+            bridge_url=f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js",
+        )
+
+    def launch_browser_worker(self) -> tuple[bool, str]:
+        return launch_dedicated_chromium_worker()
 
     def repair_all(self) -> dict[str, dict[str, Any]]:
         results = {}

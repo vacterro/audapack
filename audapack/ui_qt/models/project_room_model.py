@@ -31,6 +31,7 @@ from PySide6.QtCore import (
 from audapack.audits import calculate_temperature, format_age_str, format_created_str
 from audapack.config import app_dir
 from audapack.inaudit import get_inaudit_selected, list_inaudit_layers
+from audapack.inaudit_capture import InauditCaptureStore
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
 from audapack.services.audit_service import AuditService
@@ -95,6 +96,13 @@ class ProjectRoomModel(QAbstractItemModel):
         self._snapshots: dict[str, AuditSnapshot] = {}  # project_id -> AuditSnapshot
         self._pack_states: dict[str, tuple[str, str]] = {}  # project_id -> (state, message)
         self._dispatch_snapshots: dict[str, dict] = {}
+        service_base_dir = service.base_dir
+        self._inaudit_store = (
+            InauditCaptureStore(base_dir=service_base_dir)
+            if service_base_dir is None or isinstance(service_base_dir, (str, Path))
+            else None
+        )
+        self._inaudit_suggestions: dict[str, int] = {}
         # Per-project live pack progress (files_added, bytes_written, current_path).
         # Populated via update_pack_progress() from a worker thread callback; cleared
         # when the pack state transitions away from PACKING/QUEUED.
@@ -116,6 +124,20 @@ class ProjectRoomModel(QAbstractItemModel):
 
         self._reload(initial=True)
 
+    def _refresh_inaudit_suggestions(self) -> None:
+        counts: dict[str, int] = {}
+        if self._inaudit_store is None:
+            self._inaudit_suggestions = counts
+            return
+        try:
+            for record in self._inaudit_store.list_records(include_recovery=False):
+                project_id = str(record.get("suggested_project_id") or "")
+                if project_id and not record.get("assigned_project_id"):
+                    counts[project_id] = counts.get(project_id, 0) + 1
+        except OSError:
+            counts = {}
+        self._inaudit_suggestions = counts
+
     def _reload(self, initial: bool = False):
         """Full model reload (used ONLY on startup, explicit Refresh All, or major settings change)."""
         self.model_reset_count += 1
@@ -129,6 +151,7 @@ class ProjectRoomModel(QAbstractItemModel):
         self._projects = {}
         # Single-pass structural rebuild; audit enrichment stays asynchronous.
         projects = self._service.list_projects()
+        self._refresh_inaudit_suggestions()
         for p in projects:
             g = p.priority_group.upper()
             self._projects[(g, p.slot)] = p
@@ -505,10 +528,11 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["inaudit_label"]:
             try:
                 layers = list_inaudit_layers(proj)
-                if not layers:
+                suggestions = self._inaudit_suggestions.get(proj.id, 0)
+                if not layers and not suggestions:
                     return ""
-                sel = get_inaudit_selected(proj) or layers[0].number
-                return f"IA {sel}/{len(layers)}"
+                suffix = f" +{suggestions}" if suggestions else ""
+                return f"IA {len(layers)}{suffix}"
             except Exception:
                 return ""
 
@@ -614,6 +638,7 @@ class ProjectRoomModel(QAbstractItemModel):
         return None
 
     def refresh_inaudit(self, project_id: str) -> None:
+        self._refresh_inaudit_suggestions()
         idx = self.index_for_project_id(str(project_id))
         if idx.isValid():
             self.dataChanged.emit(idx, idx)

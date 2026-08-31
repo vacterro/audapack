@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-08-31
+
+### Added
+- Durable filesystem-backed INAUDIT Inbox with authenticated Bridge API, atomic capture/assignment, recovery, archive, duplicate detection, explainable project classification, aliases, and conversation affinity.
+- One-click `IA` response/block capture with exact Markdown preservation and a bounded idempotent IndexedDB offline spool.
+- Qt INAUDIT Inbox/Layers interface, assignment actions, project counters, clipboard `IA+`, and source provenance.
+- Dedicated AUDAPACK Chromium profile launcher and installer using Chrome/Cent/Edge/Vivaldi/Opera compatibility with background-throttling protections.
+
+### Fixed
+- Browser workers no longer require Brave; clean root ChatGPT tabs in supported Chromium browsers can claim audits while occupied tabs remain fail-closed.
+- Windows config/token persistence tolerates brief sharing violations while still surfacing persistent I/O failures.
+
 ## [0.1.3] - 2026-08-30
 
 ### Fixed

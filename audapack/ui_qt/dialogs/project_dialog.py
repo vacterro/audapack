@@ -98,7 +98,14 @@ class ProjectEditDialog(QDialog):
             self.ent_audit_name.setText(project.audit_project_name)
         form.addRow("Audit Name:", self.ent_audit_name)
 
-        # 7. Enabled
+        # 7. Deterministic INAUDIT aliases (optional, comma-separated)
+        self.ent_inaudit_aliases = QLineEdit(self)
+        if project and project.inaudit_aliases:
+            self.ent_inaudit_aliases.setText(", ".join(project.inaudit_aliases))
+        self.ent_inaudit_aliases.setToolTip("Comma-separated exact aliases used only for deterministic Inbox suggestions")
+        form.addRow("INAUDIT Aliases:", self.ent_inaudit_aliases)
+
+        # 8. Enabled
         self.chk_enabled = QCheckBox("Enabled for batch operations", self)
         self.chk_enabled.setChecked(project.enabled if project else True)
         form.addRow("", self.chk_enabled)
@@ -151,5 +158,10 @@ class ProjectEditDialog(QDialog):
             "slot": self.spin_slot.value(),
             "archive_name": self.ent_archive.text().strip(),
             "audit_project_name": self.ent_audit_name.text().strip(),
+            "inaudit_aliases": [
+                value.strip()
+                for value in self.ent_inaudit_aliases.text().split(",")
+                if value.strip()
+            ],
             "enabled": self.chk_enabled.isChecked(),
         }

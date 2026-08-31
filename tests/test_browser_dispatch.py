@@ -90,23 +90,46 @@ def test_seventh_worker_is_refused(tmp_path):
     assert exc.value.code == "worker_limit"
 
 
-def test_supported_brave_root_displaces_stale_incompatible_widget(tmp_path):
+def test_supported_chromium_root_displaces_stale_incompatible_widget(tmp_path):
     d = dispatcher(tmp_path)
     for i in range(MAX_ACTIVE_WORKERS):
         d.register_worker(worker(f"legacy{i}", widget_version="AUDAPACK_WIDGET/2"))
 
     d.register_worker(worker(
-        "brave-root",
+        "chrome-root",
         widget_version="AUDAPACK_WIDGET/3",
-        is_brave=True,
+        is_chromium=True,
         page_eligible=True,
         url_path="/",
-        browser_name="Brave",
+        browser_name="Chrome",
     ))
 
     live_ids = {item.worker_id for item in d.list_workers()}
-    assert "brave-root" in live_ids
+    assert "chrome-root" in live_ids
     assert len(live_ids) == MAX_ACTIVE_WORKERS
+
+
+def test_embedded_sentinel_frame_never_consumes_worker_slot(tmp_path):
+    d = dispatcher(tmp_path)
+    embedded = worker(
+        "sentinel-frame",
+        widget_version="AUDAPACK_WIDGET/2",
+        url_path="/backend-api/sentinel/frame.html",
+    )
+
+    with pytest.raises(DispatchError) as exc:
+        d.register_worker(embedded)
+
+    assert exc.value.code == "ineligible_worker_context"
+    assert d.list_workers() == []
+
+    # A legacy frame already present in the registry is purged on its next
+    # heartbeat instead of occupying a slot until TTL expiry.
+    record = d.register_worker(worker("sentinel-frame", widget_version="test"))
+    assert record.worker_id == "sentinel-frame"
+    with pytest.raises(DispatchError):
+        d.register_worker(embedded)
+    assert d.list_workers() == []
 
 
 def test_busy_worker_cannot_claim(tmp_path):
@@ -117,19 +140,19 @@ def test_busy_worker_cannot_claim(tmp_path):
     assert d.claim_job("w1") is None
 
 
-def test_only_v3_brave_root_widget_can_claim(tmp_path):
+def test_only_v3_chromium_root_widget_can_claim(tmp_path):
     d = dispatcher(tmp_path)
     path = archive(tmp_path)
     d.register_worker(worker("legacy", widget_version="AUDAPACK_WIDGET"))
     d.register_worker(worker("v2", widget_version="AUDAPACK_WIDGET/2"))
-    d.register_worker(worker("v3_chrome", widget_version="AUDAPACK_WIDGET/3", page_eligible=True, url_path="/", clean_for_audit=True, has_conversation_turns=False))
+    d.register_worker(worker("v3_unsupported", widget_version="AUDAPACK_WIDGET/3", page_eligible=True, url_path="/", clean_for_audit=True, has_conversation_turns=False))
     d.register_worker(worker("v3_chat", widget_version="AUDAPACK_WIDGET/3", is_brave=True, page_eligible=False, url_path="/c/old", clean_for_audit=False, has_conversation_turns=False))
-    d.register_worker(worker("v3_root", widget_version="AUDAPACK_WIDGET/3", is_brave=True, page_eligible=True, url_path="/", browser_name="Brave", clean_for_audit=True, has_conversation_turns=False))
+    d.register_worker(worker("v3_root", widget_version="AUDAPACK_WIDGET/3", is_chromium=True, page_eligible=True, url_path="/", browser_name="Chrome", clean_for_audit=True, has_conversation_turns=False))
     item = d.enqueue_job(job_payload(path))
 
     assert d.claim_job("legacy") is None
     assert d.claim_job("v2") is None
-    assert d.claim_job("v3_chrome") is None
+    assert d.claim_job("v3_unsupported") is None
     assert d.claim_job("v3_chat") is None
     assert d.claim_job("v3_root").dispatch_id == item.dispatch_id
 

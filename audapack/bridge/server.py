@@ -52,6 +52,7 @@ from audapack.campaign import (
 )
 from audapack.components.widget import get_bundled_widget_path
 from audapack.config import AppConfig, legacy_token_acceptance_revoked, load_config, normalize_bridge_host
+from audapack.inaudit_capture import InauditCaptureError, store_for_config
 from audapack.packing import find_archive_for_project, resolve_output_dir
 from audapack.projects import ProjectRegistry, RegistrySaveError
 
@@ -152,7 +153,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", self._cors_origin())
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-ACB-Token, Authorization")
         self.send_header("Access-Control-Allow-Credentials", "false")
         self.end_headers()
@@ -161,7 +162,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", self._cors_origin())
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-ACB-Token, Authorization")
         self.send_header("Access-Control-Allow-Credentials", "false")
         self.send_header("Access-Control-Max-Age", "86400")
@@ -331,6 +332,33 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     for p in live_cfg.projects
                 ],
             })
+        elif parsed.path == "/v1/inaudit/captures":
+            if not self.check_auth():
+                return
+            query = parse_qs(parsed.query)
+            include_archived = str((query.get("include_archived") or [""])[0]).lower() in {"1", "true", "yes"}
+            try:
+                records = self._inaudit_store().list_records(include_archived=include_archived)
+            except (OSError, UnicodeError) as exc:
+                self._send_inaudit_persistence_error("inbox_read_failed", exc)
+                return
+            self.send_json(200, {"ok": True, "captures": records})
+        elif parsed.path.startswith("/v1/inaudit/captures/"):
+            if not self.check_auth():
+                return
+            capture_id, action = self._inaudit_path_parts(parsed.path)
+            if not capture_id or action:
+                self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+                return
+            try:
+                result = self._inaudit_store().get(capture_id)
+            except InauditCaptureError as exc:
+                self._send_inaudit_error(exc)
+                return
+            except (OSError, UnicodeError) as exc:
+                self._send_inaudit_persistence_error("capture_read_failed", exc)
+                return
+            self.send_json(200, {"ok": True, **result})
         elif parsed.path == "/v1/profiles":
             if not self.check_auth():
                 return
@@ -352,6 +380,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "widget_version": worker.widget_version,
                 "browser_name": worker.meta.get("browser_name", ""),
                 "is_brave": worker.is_brave,
+                "is_chromium": worker.is_chromium,
                 "page_eligible": worker.page_eligible,
                 "url_path": worker.url_path,
                 "project_name": worker.project_name,
@@ -422,6 +451,22 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self.handle_project_resolve()
             return
 
+        if parsed.path == "/v1/inaudit/captures":
+            self._handle_inaudit_capture()
+            return
+
+        if parsed.path.startswith("/v1/inaudit/captures/"):
+            capture_id, action = self._inaudit_path_parts(parsed.path)
+            if action == "assign":
+                self._handle_inaudit_assign(capture_id)
+                return
+            if action == "archive":
+                self._handle_inaudit_archive(capture_id)
+                return
+            if action == "restore":
+                self._handle_inaudit_restore(capture_id)
+                return
+
         if parsed.path == "/v1/audits":
             self.handle_audit_submission()
             return
@@ -443,6 +488,116 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+
+    def do_DELETE(self):
+        if not self.is_valid_loopback_host() or not self._peer_is_loopback():
+            self.send_response(400)
+            self.end_headers()
+            return
+        if not self.check_auth():
+            return
+        parsed = urlparse(self.path)
+        capture_id, action = self._inaudit_path_parts(parsed.path)
+        if not capture_id or action:
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        try:
+            self._inaudit_store().delete(capture_id)
+        except InauditCaptureError as exc:
+            self._send_inaudit_error(exc)
+            return
+        except (OSError, UnicodeError) as exc:
+            self._send_inaudit_persistence_error("capture_delete_failed", exc)
+            return
+        self.send_json(200, {"ok": True, "capture_id": capture_id})
+
+    @staticmethod
+    def _inaudit_path_parts(path: str) -> tuple[str, str]:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 4 or parts[:3] != ["v1", "inaudit", "captures"] or len(parts) > 5:
+            return "", ""
+        return parts[3], parts[4] if len(parts) == 5 else ""
+
+    def _inaudit_store(self):
+        return store_for_config(self.get_live_config(), base_dir=self.get_custom_base_dir())
+
+    def _send_inaudit_error(self, exc: InauditCaptureError) -> None:
+        self.send_json(
+            exc.status,
+            {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": False}},
+        )
+
+    def _send_inaudit_persistence_error(self, code: str, exc: BaseException) -> None:
+        self.send_json(
+            500,
+            {"ok": False, "error": {"code": code, "message": str(exc), "retriable": True}},
+        )
+
+    def _handle_inaudit_capture(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        try:
+            result = self._inaudit_store().capture(data, self.get_live_config().projects)
+        except InauditCaptureError as exc:
+            self._send_inaudit_error(exc)
+            return
+        except OSError as exc:
+            self.send_json(
+                500,
+                {"ok": False, "error": {"code": "capture_persistence_failed", "message": str(exc), "retriable": True}},
+            )
+            return
+        self.send_json(200, {"ok": True, **result})
+
+    def _handle_inaudit_assign(self, capture_id: str) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        if any(key in data for key in ("path", "filename", "destination", "assigned_path")):
+            self._send_inaudit_error(
+                InauditCaptureError("path_not_allowed", "assignment accepts project_id, never a destination path")
+            )
+            return
+        try:
+            result = self._inaudit_store().assign(
+                capture_id,
+                str(data.get("project_id") or ""),
+                self.get_live_config().projects,
+                action=str(data.get("action") or ""),
+            )
+        except InauditCaptureError as exc:
+            self._send_inaudit_error(exc)
+            return
+        except OSError as exc:
+            self.send_json(
+                500,
+                {"ok": False, "error": {"code": "assignment_persistence_failed", "message": str(exc), "retriable": True}},
+            )
+            return
+        self.send_json(200, {"ok": True, **result})
+
+    def _handle_inaudit_archive(self, capture_id: str) -> None:
+        try:
+            record = self._inaudit_store().archive(capture_id)
+        except InauditCaptureError as exc:
+            self._send_inaudit_error(exc)
+            return
+        except (OSError, UnicodeError) as exc:
+            self._send_inaudit_persistence_error("archive_persistence_failed", exc)
+            return
+        self.send_json(200, {"ok": True, "record": record})
+
+    def _handle_inaudit_restore(self, capture_id: str) -> None:
+        try:
+            record = self._inaudit_store().restore(capture_id)
+        except InauditCaptureError as exc:
+            self._send_inaudit_error(exc)
+            return
+        except (OSError, UnicodeError) as exc:
+            self._send_inaudit_persistence_error("restore_persistence_failed", exc)
+            return
+        self.send_json(200, {"ok": True, "record": record})
 
     def _read_json_body(self) -> Optional[dict]:
         raw_length = self.headers.get("Content-Length")
@@ -658,15 +813,26 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 })
                 return
             if crid != run_id:
-                self.send_json(400, {
-                    "ok": False,
-                    "error": {
-                        "code": "run_id_mismatch",
-                        "message": f"Payload run_id '{run_id}' does not match content CAMPAIGN_RUN_ID '{crid}'",
-                        "retriable": False,
-                    }
-                })
-                return
+                # The transport run_id is the canonical authority for this
+                # delivery. A mismatch happens when the widget re-arms or
+                # materializes a capture under a different run id and the
+                # browser-side content still carries the legacy header.
+                # Patch the content CAMPAIGN_RUN_ID in place and proceed --
+                # the rest of the audit body is valid.
+                import re as _re
+                content, replaced = _re.subn(
+                    r'^(\s*CAMPAIGN_RUN_ID\s*:\s*).*$',
+                    rf'\1{run_id}',
+                    content,
+                    count=1,
+                    flags=_re.MULTILINE | _re.IGNORECASE,
+                )
+                if not replaced:
+                    # Append a header line if the content truly lacks one
+                    content = f"CAMPAIGN_RUN_ID: {run_id}\n{content}"
+                wave_meta_refreshed = parse_wave(content, wave_def.id, prof)
+                if wave_meta_refreshed[0]:
+                    _dummy, wave_meta, _ = wave_meta_refreshed
 
         # CORE-005: two explicit project identities (transport payload vs parsed
         # handoff PROJECT_NAME) must be reconciled before any registration, file,

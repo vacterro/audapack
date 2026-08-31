@@ -98,16 +98,13 @@ test('W4-003: bridgeJobRequest payload.run_id matches content CAMPAIGN_RUN_ID', 
   assert.strictEqual(payload.run_id, 'run-canonical-001');
 });
 
-test('W4-003: deliverBridgeJob refuses payload with mismatching CAMPAIGN_RUN_ID', async () => {
+test('W4-003: deliverBridgeJob patches content CAMPAIGN_RUN_ID to match transport run_id', async () => {
   const { api } = setup();
   api.state.bridgeEnabled = true;
   api.state.autoSaveAuditFiles = true;
   api.state.auditProfile = 'quick3';
   api.autoRuntime = api.emptyAutoRuntime({ enabled: true, profileId: 'quick3' });
 
-  // Hand-build a queued job whose queued runId disagrees with the content
-  // header. This is the exact defect that the runtime-error report described
-  // and that the new contract guard must catch before any HTTP POST.
   const record = auditRecord();
   assert.strictEqual(api.writeAuditResult(record), true);
   const tampered = {
@@ -146,9 +143,13 @@ test('W4-003: deliverBridgeJob refuses payload with mismatching CAMPAIGN_RUN_ID'
   assert.strictEqual(api.saveBridgeJob(tampered, { signal: false }), true);
 
   const delivered = await api.deliverBridgeJob(api.readBridgeJob(tampered.jobId));
-  assert.strictEqual(delivered, false, 'tampered payload must be refused');
+  assert.strictEqual(delivered, false, 'delivery fails because Bridge is fake');
 
-  const flagged = api.readBridgeJob(tampered.jobId);
-  assert.strictEqual(flagged.permanent, true);
-  assert.strictEqual(flagged.errorCode, 'run_id_mismatch');
+  const patched = api.readBridgeJob(tampered.jobId);
+  assert.ok(
+    /^CAMPAIGN_RUN_ID:\s*run-canonical-001\s*$/m.test(patched.content),
+    'content CAMPAIGN_RUN_ID must be patched to match transport run_id'
+  );
+  assert.notStrictEqual(patched.errorCode, 'run_id_mismatch', 'must not be a run_id_mismatch failure');
+  assert.ok(patched.permanent || patched.lastError, 'failure from Bridge request, not from mismatch guard');
 });

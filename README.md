@@ -7,11 +7,11 @@
 <p align="center"><strong>Windows desktop cockpit for verified ZIP packaging, multi-wave AI audit handoff, and a local browser bridge.</strong></p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.1.2-D4B86A?style=for-the-badge" alt="Release v0.1.2"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.0-D4B86A?style=for-the-badge" alt="Release v0.2.0"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/platform-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
-  <a href="tests/"><img src="https://img.shields.io/badge/Python%20tests-230%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="230 Python tests passing"></a>
-  <a href="tests/widget/"><img src="https://img.shields.io/badge/Widget%20tests-122%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="122 widget tests passing"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Python%20tests-365%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="365 Python tests passing"></a>
+  <a href="tests/widget/"><img src="https://img.shields.io/badge/Widget%20tests-152%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="152 widget tests passing"></a>
 </p>
 
 <p align="center"><a href="README.md"><strong>English</strong></a> · <a href="README.ru.md">Русский</a></p>
@@ -27,6 +27,7 @@ AUDAPACK keeps projects, audit evidence, and distributable archives in one compa
 - **Quick3 and Super10 campaigns** — data-driven audit profiles with wave progress, run isolation, lineage checks, and canonical final handoffs.
 - **Local Bridge** — loopback HTTP service on `127.0.0.1:17843`; API v3 is current and API v2 remains supported for compatibility.
 - **Tampermonkey widget** — sends audit waves from ChatGPT, recovers interrupted runs, and keeps each campaign bound to its own run ID.
+- **Durable INAUDIT Inbox** — captures stable ChatGPT responses, individual blocks, or clipboard text before a project is known, then assigns the exact body to the next safe `audit/N.md` layer.
 - **Windows integration** — Explorer context-menu packaging, silent VBScript launchers, clipboard handoff, and Scheduled Task support for the Bridge.
 - **Golden Vintage UI** — dark Windows 95-inspired colors, compact beveled controls, and intentionally crisp text rendering.
 
@@ -56,6 +57,8 @@ python AUDAPACK.pyw --ui tkinter
 
 Install the browser side separately by adding `resources/AUDAPACK_WIDGET.user.js` to Tampermonkey, then open ChatGPT. The widget connects to the local Bridge when it is running.
 
+For unattended audits, use **Settings → Components → Launch AUDAPACK Chromium**. AUDAPACK selects an installed Chromium browser (Chrome, Cent, Edge, Vivaldi, or Opera before Brave), launches it with an isolated profile under `%LOCALAPPDATA%\AUDAPACK\browser_worker`, and disables Chromium's background timer, occlusion, and renderer throttling. Install Tampermonkey and the widget once inside that dedicated profile. The worker remains active when its window is minimized, covered by other apps, or the displays are off; Windows sleep or hibernation still suspends every process and must be disabled separately for unattended runs.
+
 ## Project Room
 
 Each occupied project row can show audit progress, audit age, archive freshness, ZIP size, copy counters, and pack state. ZIP sizes use binary units (`B`, `KB`, `MB`, `GB`, `TB`) and are refreshed after packaging. Full rows keep detailed ZIP metadata on a second line; enable **Settings → General → Compact project rows** to fit the essential status and size on one line.
@@ -81,6 +84,14 @@ The widget supports two canonical profiles:
 - **Super10** — ten-wave deep audit with campaign synthesis and final implementation handoff.
 
 The Bridge validates authenticated requests, project/run identity, profile manifests, wave order, and completion evidence before writing artifacts. Interrupted widget sessions can recover their durable state instead of silently starting a different run.
+
+Only a clean root ChatGPT tab in a Chromium-family browser can claim a new audit. Existing conversations, drafts, attachments, generation, and non-root URLs fail closed.
+
+## INAUDIT capture workflow
+
+On a stable ChatGPT answer, use `IA` beside the response or a code block. A verified Bridge write shows `IA ✓`; if Bridge is unavailable, the bounded IndexedDB spool shows `IA QUEUED` and retries the same capture identity later. In AUDAPACK, open **INAUDIT → Inbox** to inspect provenance and classification evidence, choose a registered project, then use **Assign**, **Assign + GG**, or **Assign + CC**. The toolbar's `IA+` action captures the current Windows clipboard through the same durable store.
+
+Assignment always rescans the project's `audit` directory, writes `max(N) + 1` without overwriting, verifies the body hash, and only then offers the canonical GG/CC command.
 
 ## Command-line reference
 
@@ -129,7 +140,7 @@ ruff check audapack tests
 Get-ChildItem tests/widget -Filter *.test.js | ForEach-Object { node $_.FullName }
 ```
 
-Current baseline: **230 Python tests** and **122 Node widget tests across 17 suites**.
+Current baseline: **365 Python tests** and **152 Node widget tests**.
 
 ## Repository map
 

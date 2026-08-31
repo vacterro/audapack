@@ -55,6 +55,7 @@ class Project:
     ignored: bool = False
     ignore_archive: bool = False
     audit_copy_count: int = 0
+    inaudit_aliases: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,10 +76,14 @@ class Project:
             "ignored": self.ignored,
             "ignore_archive": self.ignore_archive,
             "audit_copy_count": self.audit_copy_count,
+            "inaudit_aliases": list(self.inaudit_aliases),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
+        raw_inaudit_aliases = data.get("inaudit_aliases", [])
+        if not isinstance(raw_inaudit_aliases, (list, tuple)):
+            raw_inaudit_aliases = []
         return cls(
             id=str(data.get("id", "")).strip(),
             display_name=str(data.get("display_name") or data.get("name", "")).strip(),
@@ -97,6 +102,7 @@ class Project:
             ignored=bool(data.get("ignored", False)),
             ignore_archive=bool(data.get("ignore_archive", False)),
             audit_copy_count=int(data.get("audit_copy_count", 0) or 0),
+            inaudit_aliases=[str(value).strip() for value in raw_inaudit_aliases if str(value).strip()],
         )
 
 
