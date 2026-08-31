@@ -83,15 +83,12 @@ class SingleInstance:
             # "AUDAPACK" matches too many unrelated windows (the IDE itself,
             # file explorer breadcrumbs, Explorer windows showing the project
             # folder) so a title is never identified by the bare substring.
-            app_markers = AUDAPACK_WINDOW_MARKERS
 
             def _matches(title_lower: str) -> bool:
-                if any(m in title_lower for m in app_markers):
-                    return True
                 # No generic prefix fallback: `_AUDAPACK` Explorer / IDE titles
                 # must not be mistaken for the application window. The caller
                 # prefix parameter is retained for signature compatibility only.
-                return False
+                return is_audapack_window_title(title_lower)
 
             def foreach_window(hwnd, lParam):
                 if IsWindowVisible(hwnd):

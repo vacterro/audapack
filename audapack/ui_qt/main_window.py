@@ -2310,11 +2310,6 @@ QToolTip QLabel {
         else:
             self.statusBar().showMessage(f"Audit Ingest Error: {res.error}")
 
-    def _on_bridge_status(self):
-        """Switches to the Settings tab -> Bridge sub-tab."""
-        self.tabs.setCurrentWidget(self.settings_widget)
-        self.settings_widget.sub_tabs.setCurrentIndex(3)
-
     def _generation_watch_paths(self):
         paths = [str(self._generation_path.parent), str(self._dispatch_generation_path.parent)]
         for generation_path in (self._generation_path, self._dispatch_generation_path):
@@ -2420,10 +2415,6 @@ QToolTip QLabel {
                 )
             except Exception:
                 pass
-
-    def _on_settings(self):
-        """Switches to the Settings tab."""
-        self.tabs.setCurrentWidget(self.settings_widget)
 
     def _on_settings_saved(self):
         """Applies updates when settings are saved in the Settings tab.

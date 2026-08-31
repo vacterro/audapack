@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
 from audapack.models import PackResult
@@ -89,17 +89,3 @@ class PackingService:
             except OSError:
                 pass
         return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
-
-    def pack_path(self, path: str | Path, **kw):
-        target = Path(path).resolve()
-        output_dir = resolve_output_dir(target, self.config.packing, fallback=app_dir())
-        excludes = set(self.config.packing.excludes)
-        stem = target.name
-        inc_ts = kw.pop("include_timestamp", getattr(self.config.packing, "include_timestamp", True))
-        return pack_single(source_path=target, output_dir=output_dir, archive_stem=stem, excludes=excludes, include_timestamp=inc_ts, **kw)
-
-    def pack_selected(self, project_ids: Iterable[str], **kw) -> List:
-        results = []
-        for pid in project_ids:
-            results.append(self.pack_project(pid, **kw))
-        return results

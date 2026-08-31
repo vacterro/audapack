@@ -130,9 +130,6 @@ class ProjectService:
         """Apply arbitrary field edits inside the registry transaction."""
         return self.registry.edit_project(project_id, editor)
 
-    def set_enabled(self, project_id: str, enabled: bool) -> bool:
-        return self.update_project(project_id, lambda p: setattr(p, "enabled", enabled))
-
     def clear_project_marks(self) -> int:
         """Clear Done/archive-ignore/copy marks for all projects in one transaction."""
         return self.registry.clear_project_marks()

@@ -238,18 +238,6 @@ def resolve_project_audit_dir(
     return target_dir, fs_name, proj, was_created
 
 
-def _extract_header_map(lines: list[str]) -> dict[str, str]:
-    headers = {}
-    for line_s in lines:
-        if ":" in line_s:
-            parts = line_s.split(":", 1)
-            key = parts[0].strip().strip("`*_ ").upper()
-            val = parts[1].strip().strip("`*_ ")
-            if key and key not in headers:
-                headers[key] = val
-    return headers
-
-
 def parse_wave(
     text: str,
     wave_or_id: str,

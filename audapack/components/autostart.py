@@ -155,17 +155,3 @@ def run_autostart_task() -> tuple[bool, str]:
         return False, f"Failed to run task: {res.stderr.strip()}"
     except Exception as exc:
         return False, str(exc)
-
-
-def stop_autostart_task() -> tuple[bool, str]:
-    """Stops any running instance of the Scheduled Task."""
-    if sys.platform != "win32":
-        return False, "Scheduled Tasks are only supported on Windows."
-
-    try:
-        res = _run_hidden(["schtasks", "/end", "/tn", TASK_NAME])
-        if res.returncode == 0:
-            return True, f"Task '{TASK_NAME}' stopped."
-        return False, f"Failed to stop task: {res.stderr.strip()}"
-    except Exception as exc:
-        return False, str(exc)

@@ -148,9 +148,6 @@ class ProjectRegistry:
                 return p
         return None
 
-    def _rebuild_id_index(self):
-        self._id_index = {p.id.lower(): p for p in self.config.projects}
-
     def get_project_by_name(self, name: str) -> Optional[Project]:
         """Matches project by display name, audit name, slug or normalized identity.
 

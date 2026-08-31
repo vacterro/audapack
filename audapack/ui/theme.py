@@ -61,24 +61,3 @@ FONT_SIZE_BODY = 9
 FONT_SIZE_SMALL = 8
 FONT_SIZE_TINY = 7
 
-
-def make_vintage_btn(parent, text: str, command=None, bg=None, fg=None, font_size=8, bold=False, **kwargs):
-    import tkinter as tk
-    b_bg = bg or PALETTE["surfaceRaised"]
-    b_fg = fg or PALETTE["textPrimary"]
-    f = (FONT_FAMILY, font_size, "bold" if bold else "normal")
-    return tk.Button(
-        parent,
-        text=text,
-        command=command,
-        bg=b_bg,
-        fg=b_fg,
-        activebackground=PALETTE["surfaceAlt"],
-        activeforeground=PALETTE["borderHighlight"],
-        font=f,
-        relief="raised",
-        bd=2,
-        highlightthickness=0,
-        **kwargs,
-    )
-

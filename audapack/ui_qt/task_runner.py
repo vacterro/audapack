@@ -169,10 +169,3 @@ class TaskRunner(QObject):
         if re_run:
             fn, s_cb, e_cb = re_run
             self.submit(result.key, fn, on_success=s_cb, on_error=e_cb)
-
-    def cancel_all(self):
-        with self._lock:
-            self._running.clear()
-            self._dirty.clear()
-            self._callbacks.clear()
-            self._generations.clear()
