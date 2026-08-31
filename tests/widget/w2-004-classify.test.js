@@ -95,6 +95,16 @@ test('W2-004: canonical command label classifies even when ChatGPT omits expand 
   assert.strictEqual(api.classifyAuditTurn(turn), 'core');
 });
 
+test('W2-004: arbitrary UI group labels never classify as audit commands', () => {
+  const { h, api } = setup();
+  const turn = userTurn(h, 'u1');
+  for (const label of ['core', 'performance', 'audit_second_wave_notes.md', 'Performance settings']) {
+    turn.appendChild(h.el('div', { role: 'group', 'aria-label': label }));
+  }
+  addTurns(h, [turn]);
+  assert.strictEqual(api.classifyAuditTurn(turn), '');
+});
+
 test('W2-004: turn text is the canonical source', () => {
   const { h, api } = setup();
   const turn = userTurn(h, 'u1', 'AUDIT PERFORMANCE — measure');

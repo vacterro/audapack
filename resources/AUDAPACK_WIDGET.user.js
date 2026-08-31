@@ -10738,7 +10738,7 @@ ordinal/name of the entrypoint file.`;
     // accessibility label is accepted only if it contains canonical framing.
     for (const tile of turn.querySelectorAll?.('[role="group"][aria-label], [aria-label*="AUDIT" i]') || []) {
       const label = String(tile.getAttribute('aria-label') || '').trim();
-      const kind = classifyAuditMessage(label) || auditKindFromPreset({ name: label, text: label });
+      const kind = classifyAuditMessage(label);
       if (kind) return kind;
     }
 
