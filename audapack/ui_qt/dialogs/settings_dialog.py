@@ -113,7 +113,10 @@ class SettingsWidget(QWidget):
         # Spinboxes -> debounced auto-save
         self.hot.valueChanged.connect(lambda: self._autosave_timer.start())
         self.warm.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.cool.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.cold.valueChanged.connect(lambda: self._autosave_timer.start())
         self.port.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.history_retention.valueChanged.connect(lambda: self._autosave_timer.start())
 
         # Checkboxes and Dropdowns -> immediate auto-save
         self.output_layout.currentIndexChanged.connect(lambda: self._save())
@@ -123,9 +126,7 @@ class SettingsWidget(QWidget):
         self.autostart.toggled.connect(self._on_autostart_toggled)
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
-        self.compact_tooltips.toggled.connect(lambda: self._save())
         self.compact_rows.toggled.connect(lambda: self._save())
-        self.tooltip_delay.valueChanged.connect(lambda: self._autosave_timer.start())
         self.flash_duration.valueChanged.connect(lambda: self._autosave_timer.start())
 
     # ---------------------------------------------------------------- builders
@@ -159,23 +160,9 @@ class SettingsWidget(QWidget):
         self.show_tooltips.setChecked(getattr(self._config.ui, "show_tooltips", True))
         f.addRow("Tooltips", self.show_tooltips)
 
-        self.compact_tooltips = QCheckBox("Compact tooltip mode (less verbose)")
-        self.compact_tooltips.setChecked(getattr(self._config.ui, "compact_tooltips", True))
-        f.addRow("", self.compact_tooltips)
-
         self.compact_rows = QCheckBox("Compact project rows (one line)")
         self.compact_rows.setChecked(getattr(self._config.ui, "compact_rows", False))
         f.addRow("Project rows", self.compact_rows)
-
-        self.tooltip_delay = QSpinBox()
-        self.tooltip_delay.setRange(0, 3000)
-        self.tooltip_delay.setSuffix(" ms")
-        self.tooltip_delay.setSingleStep(100)
-        self.tooltip_delay.setValue(getattr(self._config.ui, "tooltip_delay_ms", 600))
-        f.addRow("Tooltip delay", self.tooltip_delay)
-        lbl_hint2 = QLabel("0 = instant, 600 = default. Delay prevents accidental popups.", w)
-        lbl_hint2.setStyleSheet("color: #9C9371; font-size: 10px;")
-        f.addRow("", lbl_hint2)
 
         self.tooltip_duration = QSpinBox()
         self.tooltip_duration.setRange(1000, 60000)
@@ -230,11 +217,21 @@ class SettingsWidget(QWidget):
         self.audit_root = QLineEdit(self._config.audits.root)
         f.addRow("Audit root", self.audit_root)
         self.hot = QSpinBox()
+        self.hot.setRange(0, 400 * 24 * 3600)
         self.hot.setValue(self._config.audits.hot_seconds)
         f.addRow("Hot seconds", self.hot)
         self.warm = QSpinBox()
+        self.warm.setRange(0, 400 * 24 * 3600)
         self.warm.setValue(self._config.audits.warm_seconds)
         f.addRow("Warm seconds", self.warm)
+        self.cool = QSpinBox()
+        self.cool.setRange(0, 400 * 24 * 3600)
+        self.cool.setValue(self._config.audits.cool_seconds)
+        f.addRow("Cool seconds", self.cool)
+        self.cold = QSpinBox()
+        self.cold.setRange(0, 4000 * 24 * 3600)
+        self.cold.setValue(self._config.audits.cold_seconds)
+        f.addRow("Cold seconds", self.cold)
         return w
 
     def _build_bridge(self) -> QWidget:
@@ -259,6 +256,11 @@ class SettingsWidget(QWidget):
         self.autostart = QCheckBox("Start with Windows")
         self.autostart.setChecked(self._config.bridge.autostart)
         f.addRow("Autostart", self.autostart)
+        self.history_retention = QSpinBox()
+        self.history_retention.setRange(1, 3650)
+        self.history_retention.setSuffix(" days")
+        self.history_retention.setValue(getattr(self._config.bridge, "history_retention_days", 30))
+        f.addRow("History retention", self.history_retention)
         layout.addWidget(grp_cfg)
 
         # 2. Live Status Group
@@ -651,14 +653,15 @@ class SettingsWidget(QWidget):
         c.audits.root = self.audit_root.text().strip()
         c.audits.hot_seconds = self.hot.value()
         c.audits.warm_seconds = self.warm.value()
+        c.audits.cool_seconds = self.cool.value()
+        c.audits.cold_seconds = self.cold.value()
         c.bridge.host = self.host.text().strip()
         c.bridge.port = self.port.value()
         c.bridge.autostart = self.autostart.isChecked()
+        c.bridge.history_retention_days = self.history_retention.value()
         c.ui.auto_copy_gg_on_launch = self.auto_copy_gg.isChecked()
         c.ui.show_tooltips = self.show_tooltips.isChecked()
-        c.ui.compact_tooltips = self.compact_tooltips.isChecked()
         c.ui.compact_rows = self.compact_rows.isChecked()
-        c.ui.tooltip_delay_ms = self.tooltip_delay.value()
         c.ui.tooltip_duration_ms = self.tooltip_duration.value()
         c.ui.flash_duration_ms = self.flash_duration.value()
         ok = self._persist_settings(c)

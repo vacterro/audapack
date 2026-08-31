@@ -55,6 +55,32 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(save_config(cfg, self.base_dir))
         self.assertTrue(load_config(self.base_dir).ui.compact_rows)
 
+    def test_include_timestamp_false_survives_save_load_roundtrip(self):
+        cfg = AppConfig()
+        cfg.packing.include_timestamp = False
+        self.assertTrue(save_config(cfg, self.base_dir))
+        loaded = load_config(self.base_dir)
+        self.assertFalse(loaded.packing.include_timestamp, "user unchecked include_timestamp; restart must not revert it")
+
+    def test_tooltip_duration_default_is_single_consistent_value(self):
+        cfg = AppConfig()
+        self.assertEqual(cfg.ui.tooltip_duration_ms, 10000)
+        loaded = load_config(self.base_dir)
+        self.assertEqual(loaded.ui.tooltip_duration_ms, 10000)
+
+    def test_removed_dead_tooltip_settings_are_not_persisted(self):
+        cfg = AppConfig()
+        self.assertTrue(save_config(cfg, self.base_dir))
+        raw = (self.base_dir / "config.json").read_text(encoding="utf-8")
+        for dead in ("tooltip_style", "tooltip_delay_ms", "compact_tooltips"):
+            self.assertNotIn(dead, raw, f"dead setting {dead} must not persist")
+
+    def test_show_tooltips_setting_roundtrip(self):
+        cfg = AppConfig()
+        cfg.ui.show_tooltips = False
+        self.assertTrue(save_config(cfg, self.base_dir))
+        self.assertFalse(load_config(self.base_dir).ui.show_tooltips)
+
     def test_scoped_config_write_preserves_concurrent_external_mutation(self):
         """W2-007: a stale UI snapshot must never overwrite newer concurrent
         project-registry mutations; scoped write reloads the latest under the

@@ -523,12 +523,9 @@ class UIConfig:
     preferred_browser: str = ""  # Path to preferred browser executable (optional)
     gg_template: str = DEFAULT_GG_TEMPLATE
     auto_copy_gg_on_launch: bool = True  # Auto-copy GG command to clipboard when launching agent
-    tooltip_style: str = "golden"  # Tooltip style: 'golden' (default) or 'classic'
-    tooltip_delay_ms: int = 600  # Tooltip hover delay in milliseconds (0 = instant)
-    tooltip_duration_ms: int = 15000  # Tooltip visible duration in milliseconds (-1 = system default)
+    tooltip_duration_ms: int = 10000  # Tooltip visible duration in milliseconds (-1 = system default)
     flash_duration_ms: int = 800  # Status bar flash duration in milliseconds
     show_tooltips: bool = True  # Show tooltips on hover
-    compact_tooltips: bool = True  # Compact tooltip mode (vs verbose)
     compact_rows: bool = False  # One-line project rows; false keeps full two-line details
     launcher_letters: bool = True  # True: OC/FB/CL/C1/C2/CF, False: 1/2/3/4/5/6
 
@@ -991,12 +988,9 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         preferred_browser=str(ui_raw.get("preferred_browser", "")),
         gg_template=str(ui_raw.get("gg_template", DEFAULT_GG_TEMPLATE)),
         auto_copy_gg_on_launch=bool(ui_raw.get("auto_copy_gg_on_launch", True)),
-        tooltip_style=str(ui_raw.get("tooltip_style", "golden")),
-        tooltip_delay_ms=int(ui_raw.get("tooltip_delay_ms", 600)),
         tooltip_duration_ms=int(ui_raw.get("tooltip_duration_ms", 10000)),
         flash_duration_ms=int(ui_raw.get("flash_duration_ms", 800)),
         show_tooltips=bool(ui_raw.get("show_tooltips", True)),
-        compact_tooltips=bool(ui_raw.get("compact_tooltips", True)),
         compact_rows=bool(ui_raw.get("compact_rows", False)),
         launcher_letters=bool(ui_raw.get("launcher_letters", True)),
     )

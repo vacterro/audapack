@@ -2473,6 +2473,8 @@ QToolTip QLabel {
 
     def _show_project_info(self, hover_info: dict, anchor_pos: QPoint | None = None) -> None:
         """Popup near ⓘ button — replaces hover uncertainty with deterministic click."""
+        if not getattr(self._service.config.ui, "show_tooltips", True):
+            return
         try:
             html = ProjectItemDelegate.build_tooltip(hover_info or {})
         except Exception:
@@ -2489,7 +2491,7 @@ QToolTip QLabel {
         # Use QToolTip popup — lightweight, no separate window, click elsewhere dismisses
         tooltip_duration = 15000
         try:
-            tooltip_duration = int(getattr(self._service.config.ui, "tooltip_duration_ms", 15000))
+            tooltip_duration = int(getattr(self._service.config.ui, "tooltip_duration_ms", 10000))
         except Exception:
             pass
         QToolTip.showText(global_pos, html, self.tree, QRect(), tooltip_duration)
