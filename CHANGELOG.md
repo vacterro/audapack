@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-08-31
+
+### Added
+- Widget BLOCKED transparency: sticky banner with exact reason (clean-state-lost, canonical-start-rejected, bridge-marked-blocked) and numbered next-steps per failure class.
+- Widget Clear log button in Bridge diagnostics header wipes the `BRIDGE_DIAGNOSTIC_LOG_KEY` and starts fresh.
+- Qt tray toast now carries the job error string for BLOCKED/FAILED notifications.
+- Widget regression suite w4-007-browser-worker-blocked.test.js (4 tests for the blocked-message formatter).
+
 ## [0.2.0] - 2026-08-31
 
 ### Added
