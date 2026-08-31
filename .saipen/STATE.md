@@ -1,16 +1,16 @@
 ---
-phase: SCOUT
+phase: SHIP
 task: T-34
-next_action: "PHASE SCOUT T-34 -- verify classifyAuditTurn em-dash + tile-path behavior against current widget, then update w2-004 tests"
-blocker: ""
+next_action: "DONE -- all 9 goal tickets completed. Push pending explicit request. T14/T15/T-27/T-012/T-009 blocked on live Windows operator."
+blocker: "T14/T15 (six-run smoke + release cut), T-27 (WS_VISIBLE), T-012 (Windows e2e), T-009 (Tampermonkey migration) require live operator"
 agent: opencode
 saipen_version: 7
 schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
 transition_from: BUILD
-last_event: 557
-updated: "2026-08-31T13:15:00Z"
+last_event: 559
+updated: "2026-08-31T13:20:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
