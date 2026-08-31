@@ -7358,7 +7358,15 @@ ordinal/name of the entrypoint file.`;
       renderAuditFolderState();
       renderAutoAuditState();
       if (state?.autoSaveAuditFiles) {
-        setTimeout(() => { flushCurrentAuditResultsToFolder().catch(() => { }); }, 0);
+        setTimeout(() => {
+          flushCurrentAuditResultsToFolder().catch(error => {
+            auditDirectoryState = 'error';
+            auditDirectoryMessage = `automatic audit save failed: ${error?.message || error}`;
+            renderAuditFolderState();
+            renderAutoAuditState();
+            appendBridgeDiagnostic('auto_save_flush_failed', { message: String(error?.message || error) });
+          });
+        }, 0);
       }
       return true;
     }
@@ -12450,9 +12458,17 @@ async function recoverArmedStartSend(options = {}) {
       for (const record of currentChatAuditRecords(conversationKey)) {
         if (!Number(record.bridgeSavedAt)) enqueueBridgeAuditRecord(record);
       }
-      flushBridgeQueue({ force: true, conversationKey }).catch(() => { });
+      flushBridgeQueue({ force: true, conversationKey }).catch(error => {
+        appendBridgeDiagnostic('bridge_queue_flush_failed', { message: String(error?.message || error) });
+      });
     } else {
-      flushCurrentAuditResultsToFolder().catch(() => { });
+      flushCurrentAuditResultsToFolder().catch(error => {
+        auditDirectoryState = 'error';
+        auditDirectoryMessage = `automatic audit save failed: ${error?.message || error}`;
+        renderAuditFolderState();
+        renderAutoAuditState();
+        appendBridgeDiagnostic('auto_save_flush_failed', { message: String(error?.message || error) });
+      });
     }
     return true;
   }
