@@ -1275,7 +1275,7 @@ QToolTip QLabel {
     def _on_send_audit(self):
         proj = self._selected_project()
         if not proj:
-            self._flash_status("SEND AUDIT: select a project first", "#D66464")
+            self._flash_status("START AUDIT: select a project first", "#D66464")
             return
         key = f"dispatch:{proj.id}"
         if self.task_runner.is_running(key):
@@ -1293,11 +1293,11 @@ QToolTip QLabel {
                 started, _message = self._bridge.start()
                 if not started or not self._bridge.runtime_status().get("healthy"):
                     raise RuntimeError("Bridge is not healthy")
-            self._ensure_free_browser_worker(proj.display_name)
+            worker = self._ensure_free_browser_worker()
             packed = self._packing.ensure_fresh_archive(proj.id)
             if not packed.success or not packed.output_path:
                 raise RuntimeError(packed.error_message or "Packing failed")
-            return {"archive": packed.output_path}
+            return {"archive": packed.output_path, "worker": worker}
 
         def _done(prepared):
             if prepared.get("active"):
@@ -1310,9 +1310,22 @@ QToolTip QLabel {
             response = self._bridge.submit_browser_audit(proj, prepared["archive"], profile)
             if response.get("ok"):
                 dispatch = response.get("dispatch", {})
+                worker = prepared.get("worker", {})
+                worker_state = worker.get("state")
+                if worker_state == "launching":
+                    suffix = " · preparing audit worker"
+                elif worker_state == "busy":
+                    suffix = " · waiting for worker"
+                elif worker_state == "launch_failed":
+                    detail = worker.get("message") or "worker launch failed"
+                    suffix = f" · waiting for worker; automatic launch failed: {detail}"
+                else:
+                    suffix = ""
                 self._flash_status(
-                    f"START AUDIT: {proj.display_name} queued ({dispatch.get('dispatch_id', 'queued')})",
+                    f"START AUDIT: {proj.display_name} queued{suffix} "
+                    f"({dispatch.get('dispatch_id', 'queued')})",
                     "#D4A840",
+                    duration_ms=6000 if suffix else 3000,
                 )
             else:
                 self._flash_status(f"START AUDIT failed: {response.get('error', 'Bridge unavailable')}", "#D66464")
@@ -1322,38 +1335,25 @@ QToolTip QLabel {
 
         self.task_runner.submit(key, _prepare, on_success=_done, on_error=_error)
 
-    def _ensure_free_browser_worker(self, project_name: str) -> None:
-        """Make sure a free AUDAPACK Chromium widget window is open before
-        a SEND AUDIT job is enqueued. 1-click semantics: if no worker is
-        registered at all, launch the dedicated Chromium profile and tell
-        the user. If only busy workers exist, the Bridge will queue the
-        job — that is a legit state, not a failure.
+    def _ensure_free_browser_worker(self) -> dict[str, Any]:
+        """Prepare worker capacity without touching Qt from a worker thread.
+
+        The durable dispatch remains valid when workers are busy or automatic
+        launch fails, so both cases return status for the GUI-thread callback
+        instead of aborting the one-click start request.
         """
         status = self._bridge.browser_status() or {}
         dispatch = status.get("dispatch", {}) if isinstance(status, dict) else {}
         need = browser_worker_launch_need(dispatch)
         if need == "ready":
-            return
+            return {"state": "ready"}
         active_workers = int(dispatch.get("active_workers", 0) or 0)
         if need == "busy":
-            self._flash_status(
-                f"SEND AUDIT queued for {project_name}: all {active_workers} AUDAPACK workers are busy",
-                "#D4A840",
-            )
-            return
+            return {"state": "busy", "active_workers": active_workers}
         ok, message = self._comp_mgr.launch_browser_worker()
         if ok:
-            self._flash_status(
-                f"SEND AUDIT for {project_name}: launching AUDAPACK Chromium (no free worker). Wait for CLEAN then click SEND AUDIT again.",
-                "#D4A840",
-                duration_ms=6000,
-            )
-        else:
-            self._flash_status(
-                f"SEND AUDIT for {project_name}: no worker + launch failed: {message}",
-                "#D66464",
-                duration_ms=6000,
-            )
+            return {"state": "launching", "message": message}
+        return {"state": "launch_failed", "message": message}
 
     def _on_cancel_browser_audit(self, proj, dispatch):
         """Async cancel via TaskRunner — Qt UI must never block on HTTP."""

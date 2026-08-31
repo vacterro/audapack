@@ -46,7 +46,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def browser_worker_launch_need(dispatch: dict[str, Any]) -> str:
-    """Classify whether a SEND AUDIT needs a worker window launched.
+    """Classify whether START AUDIT needs a worker window launched.
 
     Returns one of:
       'ready'   -- at least one clean worker is free; submit directly.

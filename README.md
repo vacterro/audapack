@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.1-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.2-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/Platform-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
-  <a href="tests/"><img src="https://img.shields.io/badge/Tests-365%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest"></a>
-  <a href="resources/AUDAPACK_WIDGET.user.js"><img src="https://img.shields.io/badge/Widget-152%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Widget"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Tests-374%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest"></a>
+  <a href="resources/AUDAPACK_WIDGET.user.js"><img src="https://img.shields.io/badge/Widget-156%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Widget"></a>
   <a href="docs/wiki/UI-Golden-Vintage.md"><img src="https://img.shields.io/badge/Theme-Golden%20Vintage-75663D?style=for-the-badge" alt="Golden Vintage"></a>
 </p>
 

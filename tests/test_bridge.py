@@ -1097,6 +1097,25 @@ class BrowserWorkerLaunchNeedTests(unittest.TestCase):
         self.assertEqual(browser_worker_launch_need(None), "launch")
         self.assertEqual(browser_worker_launch_need({}), "launch")
 
+    def test_qt_start_audit_copy_never_requests_a_second_click(self):
+        import inspect
+
+        from audapack.ui_qt.main_window import MainWindow
+
+        source = inspect.getsource(MainWindow._on_send_audit)
+        source += inspect.getsource(MainWindow._ensure_free_browser_worker)
+        self.assertNotIn("SEND AUDIT", source)
+        self.assertNotIn("click START AUDIT again", source)
+        self.assertNotIn("click SEND AUDIT again", source)
+
+    def test_worker_preparation_does_not_update_qt_from_background_thread(self):
+        import inspect
+
+        from audapack.ui_qt.main_window import MainWindow
+
+        source = inspect.getsource(MainWindow._ensure_free_browser_worker)
+        self.assertNotIn("_flash_status", source)
+
 
 if __name__ == "__main__":
     unittest.main()

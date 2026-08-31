@@ -1,9 +1,9 @@
 # Board
 
 ## DOING
+- [/] T-51 [P1] 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window | verify: 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window is complete and the repository-declared verification harness passes | owner: opencode | claim_time: 2026-08-31T08:09:25Z
 
 ## TODO
-- [ ] T-51 [P1] 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window | verify: 1-click SEND AUDIT from Project Room to a free Brave/ChatGPT AUDAPACK Widget window is complete and the repository-declared verification harness passes
 - [ ] T-52 [P1] 6-worker broker via existing localhost Bridge (pull-based /v1/browser/poll long-poll), atomic lease, dispatch_id != CAMPAIGN_RUN_ID, exactly-once START, ZIP streamed via /v1/browser/jobs/<id>/artifact | verify: 6-worker broker via existing localhost Bridge (pull-based /v1/browser/poll long-poll), atomic lease, dispatch_id != CAMPAIGN_RUN_ID, exactly-once START, ZIP streamed via /v1/browser/jobs/<id>/artifact is complete and the repository-declared verification harness passes
 - [ ] T-45 [P1] Üksikklõps valib instance (ei ava). Project Room tree: single click = vali, double click = ava Instances tab. main_window.py: eemaldatud tree.clicked → _on_tree_clicked, _on_tree_clicked funktsioon kustutatud. doubleClicked _on_tree_double_clicked: slot + proj → _show_instance_manager. | verify: 258 pytest PASS, ruff PASS, gate proves emit tree.clicked.signaal no longer calls _show_instance_manager -- SHIP blocked (no origin, tag mismatch)
 - [ ] T-46 [P1] Praegu avaneb topeltklõpsuga | verify: Praegu avaneb topeltklõpsuga is complete and the repository-declared verification harness passes

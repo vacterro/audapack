@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-08-31
+
+### Fixed
+- `START AUDIT` now owns the complete zero-worker flow: it launches the dedicated Chromium worker, keeps the durable dispatch queued, and never asks for a second click.
+- Worker-capacity preparation no longer mutates Qt status UI from a background thread; busy and launch-failed states return to the GUI-thread completion callback.
+- Project Room uses consistent `START AUDIT` terminology for selection, queue, worker, and failure messages.
+
 ## [0.2.1] - 2026-08-31
 
 ### Added
