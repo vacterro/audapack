@@ -2136,6 +2136,41 @@ ordinal/name of the entrypoint file.`;
 #acb-bridge-diagnostics {
   margin-top: 4px !important;
 }
+.acb-worker-blocked {
+  margin-top: 6px !important;
+  padding: 6px 8px !important;
+  border: 1px solid var(--danger, #8a3030) !important;
+  background: rgba(80, 16, 16, 0.55) !important;
+  color: #f3dada !important;
+  font-size: 11px !important;
+  line-height: 1.4 !important;
+  border-radius: 2px !important;
+}
+.acb-worker-blocked .acb-worker-blocked-head {
+  font-weight: 600 !important;
+  color: #ffd6d6 !important;
+  margin-bottom: 4px !important;
+}
+.acb-worker-blocked .acb-worker-blocked-why {
+  margin-bottom: 4px !important;
+}
+.acb-worker-blocked .acb-worker-blocked-next {
+  margin: 4px 0 6px 18px !important;
+  padding: 0 !important;
+  list-style: decimal !important;
+}
+.acb-worker-blocked .acb-worker-blocked-next li {
+  margin: 2px 0 !important;
+}
+.acb-worker-blocked .acb-worker-blocked-action {
+  display: flex !important;
+  justify-content: flex-end !important;
+}
+.acb-worker-blocked .acb-worker-blocked-action button {
+  font-size: 10px !important;
+  padding: 2px 6px !important;
+  cursor: pointer !important;
+}
 #acb-bridge-diagnostics-head {
   min-height: 24px !important;
   display: flex !important;
@@ -6007,6 +6042,133 @@ ordinal/name of the entrypoint file.`;
       // Diagnostics must never interfere with queue persistence or delivery.
       return false;
     }
+  }
+
+  function clearBridgeDiagnosticLog() {
+    try {
+      const cleared = readBridgeDiagnosticLog().length;
+      GM_deleteValue(BRIDGE_DIAGNOSTIC_LOG_KEY);
+      if (cleared > 0) {
+        appendBridgeDiagnostic('diagnostic_log_cleared', { message: `diagnostics log cleared by user (${cleared} previous entries)` });
+      }
+      return cleared;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function formatBrowserWorkerBlockedMessage(reason, extra) {
+    const code = String(reason || '').trim() || 'unknown';
+    const detail = String(extra?.detail || extra?.message || '').trim();
+    const project = String(extra?.project || '').trim();
+    const base = {
+      'clean-state-lost': {
+        headline: 'Audit blocked: ChatGPT tab stopped being clean before Send.',
+        why: 'The widget found a fresh root ChatGPT tab, claimed a SEND AUDIT job, attached the project ZIP, then re-validated the tab right before the irreversible Send. Something changed in the meantime — a conversation turn appeared, a draft was typed, an attachment showed up, or ChatGPT started generating. The widget refuses to overwrite that human activity.',
+        next: [
+          '1. Close the current ChatGPT tab. Open a fresh https://chatgpt.com/ tab with no conversation, no draft, no attachments, and nothing generating.',
+          '2. Wait until the Bridge status shows the worker is CLEAN (no busy/orange badge).',
+          '3. Click the project SEND AUDIT again from the AUDAPACK Project Room.'
+        ]
+      },
+      'canonical-start-rejected': {
+        headline: 'Audit blocked: canonical START receipt could not be committed.',
+        why: 'The widget attached the project ZIP and called the start engine, but the engine refused to commit the START receipt. The exact reason is reported to the desktop Bridge; the lease has been dropped so a fresh attempt can claim a new job.',
+        next: [
+          '1. Open the Bridge diagnostics with Copy log and look for the most recent bridge event with code=canonical-start-rejected.',
+          '2. Open a fresh root ChatGPT tab (no conversation, no draft, no attachments) and click SEND AUDIT again.',
+          '3. If the second attempt also blocks, copy the diagnostics log and share it with the AUDAPACK team — the Bridge has the exact reason.'
+        ]
+      },
+      'ineligible_worker_context': {
+        headline: 'Audit blocked: this ChatGPT tab is not eligible (likely an embedded sentinel frame).',
+        why: 'The widget observed the audit workers as coming from an embedded frame inside ChatGPT, not the top-level root tab. Only the top-level root tab can claim jobs.',
+        next: [
+          '1. Close the current tab. Open a fresh https://chatgpt.com/ tab in the address bar (not from a project link or sidebar).',
+          '2. Make sure the URL is exactly https://chatgpt.com/ (no conversation selected, no /c/... path).',
+          '3. Click SEND AUDIT again from the Project Room.'
+        ]
+      },
+      'worker_limit': {
+        headline: 'Audit blocked: all six browser workers are busy.',
+        why: 'AUDAPACK allows at most six active workers in the browser. They are all currently working on other jobs. New audit work has to wait for one to finish.',
+        next: [
+          '1. Wait for a worker to finish (check the AUDAPACK Bridge status to see remaining jobs).',
+          '2. Or close one of the existing ChatGPT tabs that owns a job to free a slot.',
+          '3. Click SEND AUDIT again from the Project Room.'
+        ]
+      }
+    }[code] || {
+      headline: 'Audit blocked.',
+      why: detail || 'The Bridge returned BLOCKED with an unrecognized reason.',
+      next: [
+        '1. Open the Bridge diagnostics with Copy log for the most recent bridge event with code=' + code + '.',
+        '2. Open a fresh root ChatGPT tab and click SEND AUDIT again.',
+        '3. If the second attempt also blocks, copy the diagnostics log and share it with the AUDAPACK team.'
+      ]
+    };
+    if (project) {
+      base.why += ' Project: ' + project + '.';
+    }
+    return Object.assign({ code }, base);
+  }
+
+  function showBrowserWorkerBlocked(reason, extra) {
+    if (!panel) return;
+    let banner = panel.querySelector('#acb-worker-blocked');
+    const message = formatBrowserWorkerBlockedMessage(reason, extra);
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'acb-worker-blocked';
+      banner.className = 'acb-worker-blocked';
+      const bridgeSection = panel.querySelector('.acb-section-title')
+        ? Array.from(panel.querySelectorAll('.acb-section-title'))
+            .find(node => /Bridge/i.test(node.textContent || ''))
+            ?.parentElement
+        : null;
+      const target = bridgeSection || panel.querySelector('#acb-bridge-diagnostics')?.parentElement || panel;
+      if (target) {
+        target.appendChild(banner);
+      }
+    }
+    banner.dataset.code = message.code;
+    banner.innerHTML = '';
+    const head = document.createElement('div');
+    head.className = 'acb-worker-blocked-head';
+    head.textContent = message.headline;
+    banner.appendChild(head);
+    const why = document.createElement('div');
+    why.className = 'acb-worker-blocked-why';
+    why.textContent = message.why;
+    banner.appendChild(why);
+    const list = document.createElement('ol');
+    list.className = 'acb-worker-blocked-next';
+    for (const step of message.next) {
+      const li = document.createElement('li');
+      li.textContent = step;
+      list.appendChild(li);
+    }
+    banner.appendChild(list);
+    const action = document.createElement('div');
+    action.className = 'acb-worker-blocked-action';
+    const copyBtn = document.createElement('button');
+    copyBtn.id = 'acb-worker-blocked-copy-log';
+    copyBtn.type = 'button';
+    copyBtn.textContent = 'Copy diagnostics log';
+    copyBtn.title = 'Copy the latest Bridge diagnostics so the AUDAPACK team can read the exact reason.';
+    copyBtn.addEventListener('click', () => {
+      copyBridgeDiagnostics().catch(error => {
+        setStatus(`Bridge diagnostics copy failed: ${error?.message || 'unexpected clipboard error'}.`, 'error');
+      });
+    });
+    action.appendChild(copyBtn);
+    banner.appendChild(action);
+    banner.style.display = '';
+  }
+
+  function hideBrowserWorkerBlocked() {
+    const banner = panel?.querySelector('#acb-worker-blocked');
+    if (banner) banner.style.display = 'none';
   }
 
   function bridgeDiagnosticJobState(job) {
@@ -16155,6 +16317,17 @@ async function recoverArmedStartSend(options = {}) {
       });
     });
 
+    panel.querySelector('#acb-bridge-clear-log')?.addEventListener('click', () => {
+      const cleared = clearBridgeDiagnosticLog();
+      renderBridgeState();
+      setStatus(
+        cleared > 0
+          ? `Cleared ${cleared} Bridge diagnostics entry/entries. Next event is recorded from a clean slate.`
+          : 'Bridge diagnostics log was already empty.',
+        cleared > 0 ? 'success' : 'info'
+      );
+    });
+
     panel.querySelector('#acb-bridge-state')?.addEventListener('click', () => {
       const stats = bridgeQueueStats();
       if (stats.failed > 0) {
@@ -16193,6 +16366,7 @@ async function recoverArmedStartSend(options = {}) {
     });
 
     panel.querySelector('#acb-auto-reset').addEventListener('click', () => {
+      hideBrowserWorkerBlocked();
       resetAutoAuditRuntime();
       if (autoRuntime?.enabled) startAutoAuditMonitor({ immediate: true });
     });
@@ -16795,6 +16969,7 @@ async function recoverArmedStartSend(options = {}) {
               <div id="acb-bridge-diagnostics-head">
                 <span class="acb-label">Bridge diagnostics (token excluded)</span>
                 <button id="acb-bridge-copy-log" type="button" title="Copy connection state, queue job causes, and recent Bridge events for troubleshooting.">Copy log</button>
+                <button id="acb-bridge-clear-log" type="button" title="Clear the recorded Bridge diagnostics log so a fresh problem can be captured from a clean slate.">Clear log</button>
               </div>
               <pre id="acb-bridge-log" tabindex="0">No Bridge diagnostics recorded yet.</pre>
             </div>
@@ -17289,6 +17464,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           (snap.has_attachments && !(ready?.ok)) || snap.has_conversation_turns;
         if (!hasLease || !sameDispatch || foreignActivity) {
           await transition('BLOCKED', { error: 'clean-state-lost' });
+          showBrowserWorkerBlocked('clean-state-lost');
           return false;
         }
         if (browserWorkerLease) {
@@ -17309,6 +17485,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         return false;
       }
       const acknowledged = await transition('BLOCKED', { error: 'canonical-start-rejected' });
+      showBrowserWorkerBlocked('canonical-start-rejected');
       if (acknowledged.ok) {
         browserWorkerLease = null;
         persistBrowserWorkerLease();
@@ -17353,6 +17530,16 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           // side effects. Only after this ACK may the worker re-poll as clean.
           browserWorkerLease = null;
           persistBrowserWorkerLease();
+        } else if (ownedState === 'BLOCKED') {
+          // Bridge marked this dispatch terminal BLOCKED (post-START, restart
+          // reconciliation, or same-worker failure). Surface the real reason.
+          await transition('BLOCKED', { error: String(owned.error || owned.lastError || 'bridge-marked-blocked') });
+          showBrowserWorkerBlocked('bridge-marked-blocked', {
+            detail: String(owned.error || owned.lastError || ''),
+            project: String(owned.project || '')
+          });
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
         } else if (['LEASED', 'ARTIFACT_FETCHED', 'ATTACHED'].includes(ownedState)) {
           // Same-tab reload before START: resume the leased attachment path,
           // never ask the broker for a second job.
@@ -17383,6 +17570,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
   }
 
   function startBrowserWorker() {
+    hideBrowserWorkerBlocked();
     restoreBrowserWorkerLease();
     const recoveringOwnedAudit = Boolean(browserWorkerLease?.dispatch_id || autoRuntime?.runId);
     if (!browserWorkerHasChromiumCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
@@ -17517,6 +17705,10 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          appendBridgeDiagnostic,
          bridgeDiagnosticsText,
          copyBridgeDiagnostics,
+         clearBridgeDiagnosticLog,
+         formatBrowserWorkerBlockedMessage,
+         showBrowserWorkerBlocked,
+         hideBrowserWorkerBlocked,
          browserWorkerSnapshot,
          browserWorkerCanClaim,
          browserWorkerHasBraveCapability,

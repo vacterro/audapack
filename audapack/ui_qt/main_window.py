@@ -757,6 +757,7 @@ QToolTip QLabel {
                         str(job.get("dispatch_id") or ""),
                         str(job.get("state") or ""),
                         str(job.get("project_name") or project_id),
+                        str(job.get("error") or job.get("lastError") or ""),
                     )
             for proj in self._service.list_projects():
                 self.model.update_dispatch_snapshot(proj.id, active.get(proj.id))
@@ -1222,7 +1223,7 @@ QToolTip QLabel {
         except Exception:
             self._tray_icon = None
 
-    def _notify_dispatch_terminal(self, dispatch_id: str, state: str, project_name: str) -> None:
+    def _notify_dispatch_terminal(self, dispatch_id: str, state: str, project_name: str, error: str = "") -> None:
         """Native notification only when THIS running UI observes a transition
         from a non-terminal state to a terminal one.
 
@@ -1249,16 +1250,22 @@ QToolTip QLabel {
                 6000,
             )
         elif state == "BLOCKED":
+            msg = f"{project_name}: audit blocked."
+            if error:
+                msg += f" {error}"
             tray.showMessage(
                 "AUDAPACK — audit needs attention",
-                f"{project_name}: audit is blocked.",
+                msg,
                 QSystemTrayIcon.Warning,
                 8000,
             )
         elif state == "FAILED":
+            msg = f"{project_name}: audit failed."
+            if error:
+                msg += f" {error}"
             tray.showMessage(
                 "AUDAPACK — audit failed",
-                f"{project_name}: audit failed.",
+                msg,
                 QSystemTrayIcon.Critical,
                 8000,
             )
