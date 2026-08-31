@@ -303,3 +303,5 @@
 - 31.08.26 06:30 [E-498] [parent: E-497] [op: transition-54c0121bed9c48e989959862c9550a81] DEC: goal_tickets 5->6
 - 31.08.26 06:30 [E-499] [parent: E-498] [T-53] [agent: opencode] [op: checkpoint-875143162403491aa7a2d69fb8faa774] RUN: PASS REVIEW pass 1 independent rerun: compileall; ruff; pytest 368; 24 widget suites incl w4-007 (4 tests) green; no P0/P1 findings; conf: high
 - 31.08.26 06:30 [E-500] [parent: E-499] [T-53] [agent: opencode] [op: transition-243d819029b84532bd8f74f76b338f76] RUN: transition to SHIP
+- 31.08.26 06:37 [E-501] [parent: E-500] [T-53] [agent: opencode] [op: checkpoint-0289e094f652414383903eab63e7f0d0] RUN: ship v0.2.1 -> pushed 413ce48 (branch c930cc9..413ce48, tag v0.2.1); 368 pytest + 24 widget suites + ruff + compileall green; conf: high
+- 31.08.26 06:37 [E-502] [parent: E-501] [T-53] [agent: opencode] [op: finish-c485f361466e43a6b9f2a6a409132fd3] DEC: ticket finished via SAIOPS -- completion (from SHIP)
