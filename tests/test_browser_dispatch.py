@@ -537,3 +537,59 @@ def test_pre_start_blocked_can_cancel(tmp_path):
     d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_ARTIFACT_FETCHED)
     d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_ATTACHED)
     assert d.cancel_job(item.dispatch_id)
+
+
+def blocked_post_start(d, path, name="PROJECT"):
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path, name))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_BLOCKED, {"error": "worker lost after START_PREPARED; recovery required"})
+    return item
+
+
+def test_abandon_frees_a_stuck_post_start_blocked_project(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    item = blocked_post_start(d, path)
+    # Cancel must keep refusing: CANCELLED would assert no Core was sent.
+    with pytest.raises(DispatchError) as refused:
+        d.cancel_job(item.dispatch_id)
+    assert refused.value.code == "post_start_blocked"
+
+    job = d.abandon_job(item.dispatch_id, "operator forced unblock")
+    assert job.state == "FAILED"
+    assert job.last_error_code == "operator_abandoned"
+    assert "operator forced unblock" in job.error
+    assert job.campaign_run_id == "run" and job.start_receipt == "receipt", "post-start lineage must survive"
+    assert job.assigned_worker_id == "" and job.lease_id == ""
+    # Project lane is free again: a fresh dispatch is accepted.
+    fresh = d.enqueue_job(job_payload(path))
+    assert fresh.state == JOB_QUEUED
+
+
+def test_abandon_is_idempotent_and_refuses_non_blocked_runs(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    item = blocked_post_start(d, path)
+    first = d.abandon_job(item.dispatch_id)
+    assert d.abandon_job(item.dispatch_id).state == first.state
+
+    d.register_worker(worker("w2"))
+    live = d.enqueue_job(job_payload(path, "OTHER"))
+    with pytest.raises(DispatchError) as exc:
+        d.abandon_job(live.dispatch_id)
+    assert exc.value.code == "invalid_transition"
+    with pytest.raises(DispatchError) as unknown:
+        d.abandon_job("dsp-0000000000000000")
+    assert unknown.value.code == "unknown_job"
+
+
+def test_abandoned_run_is_never_reclaimed_by_a_worker(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    item = blocked_post_start(d, path)
+    d.abandon_job(item.dispatch_id)
+    d.register_worker(worker("w-fresh"))
+    assert d.claim_job("w-fresh") is None, "an abandoned run must never produce a second Core"

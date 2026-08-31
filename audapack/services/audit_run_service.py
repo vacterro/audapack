@@ -269,7 +269,7 @@ def _actions_for(operator_state: str) -> tuple[str, ...]:
     if operator_state == "BLOCKED_PRE_START":
         return ("RETRY", "CANCEL", "DETAILS")
     if operator_state in {"BLOCKED_POST_START", "RECOVERY"}:
-        return ("RECOVER", "DETAILS")
+        return ("RECOVER", "ABANDON", "DETAILS")
     if operator_state == "READY":
         return ("OPEN", "COPY", "DETAILS")
     return ("DETAILS",)
@@ -400,6 +400,27 @@ class AuditRunCoordinator:
         if isinstance(error, dict):
             error = error.get("message") or error.get("code") or "Bridge rejected cancellation"
         return AuditStartResult(False, project_id, str((intent or {}).get("intent_id") or ""), str(dispatch_id), "BLOCKED", str(error))
+
+    def abandon(self, dispatch_id: str, reason: str = "") -> AuditStartResult:
+        """Force a stuck BLOCKED run terminal so START AUDIT works again.
+
+        Cancel refuses a post-start BLOCKED dispatch because CANCELLED asserts
+        no Core was sent. Abandon is the honest terminal: the lane frees up,
+        the record stays FAILED with operator_abandoned, and no second START is
+        issued automatically.
+        """
+        response = self.bridge.abandon_browser_job(str(dispatch_id), reason)
+        intent = self.intents.find_for_dispatch(str(dispatch_id))
+        project_id = str((intent or {}).get("project_id") or "")
+        intent_id = str((intent or {}).get("intent_id") or "")
+        if response.get("ok"):
+            if intent:
+                self.intents.update(intent_id, status="FAILED", error="operator abandoned a stuck blocked run")
+            return AuditStartResult(True, project_id, intent_id, str(dispatch_id), "FAILED", "Run abandoned; project is free again")
+        error = response.get("error") or "Bridge refused abandon"
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("code") or "Bridge refused abandon"
+        return AuditStartResult(False, project_id, intent_id, str(dispatch_id), "BLOCKED", str(error))
 
     @staticmethod
     def _ready_proof(job: dict[str, Any], audit: Optional[AuditSnapshot]) -> tuple[bool, tuple[str, ...], str, str]:

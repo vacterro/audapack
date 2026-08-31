@@ -51,6 +51,7 @@ class FakeBridge:
         self.jobs = []
         self.workers = []
         self.cancel_error = ""
+        self.abandon_error = ""
         self.submits = 0
 
     def runtime_status(self):
@@ -110,6 +111,17 @@ class FakeBridge:
         job = next(item for item in self.jobs if item["dispatch_id"] == dispatch_id)
         job["state"] = "CANCELLED"
         return {"ok": True, "dispatch": dict(job)}
+
+    def abandon_browser_job(self, dispatch_id, reason=""):
+        if self.abandon_error:
+            return {"ok": False, "error": {"message": self.abandon_error}}
+        job = next(item for item in self.jobs if item["dispatch_id"] == dispatch_id)
+        if job["state"] != "BLOCKED":
+            return {"ok": False, "error": {"code": "invalid_transition", "message": "only a BLOCKED dispatch can be abandoned"}}
+        job["state"] = "FAILED"
+        job["error"] = reason or "operator abandoned a stuck blocked run"
+        job["last_error_code"] = "operator_abandoned"
+        return {"ok": True, "dispatch_id": dispatch_id, "state": "FAILED", "error": job["error"]}
 
 
 def project(project_id="p1"):
@@ -371,3 +383,47 @@ def test_busy_workers_queue_without_failure(tmp_path):
     service.start("p2")
     assert bridge.submits == 2
     assert all(job["state"] == "QUEUED" for job in bridge.jobs)
+
+
+def blocked_post_start_run(service, bridge):
+    started = service.start("p1")
+    bridge.jobs[0].update({
+        "state": "BLOCKED",
+        "campaign_run_id": "run-committed",
+        "start_receipt": "receipt-1",
+        "recovery_state": "AUDITING",
+        "error": "worker lost after START_PREPARED; recovery required",
+    })
+    return started
+
+
+def test_post_start_blocked_lane_offers_abandon_not_blind_start(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    blocked_post_start_run(service, bridge)
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "BLOCKED_POST_START"
+    assert "ABANDON" in run.actions
+    assert "RETRY" not in run.actions, "a post-start block must never offer a blind new START"
+    assert "CANCEL" not in run.actions, "CANCELLED would falsely assert no Core was sent"
+
+
+def test_abandon_frees_the_project_for_a_new_start(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = blocked_post_start_run(service, bridge)
+    abandoned = service.abandon(started.dispatch_id, "operator forced unblock")
+    assert abandoned.ok and abandoned.state == "FAILED"
+    assert bridge.jobs[0]["last_error_code"] == "operator_abandoned"
+
+    resumed = service.start("p1")
+    assert resumed.ok and not resumed.duplicate
+    assert bridge.submits == 2, "the freed project accepts exactly one fresh dispatch"
+
+
+def test_abandon_refusal_is_reported_honestly(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = blocked_post_start_run(service, bridge)
+    bridge.abandon_error = "bridge offline"
+    refused = service.abandon(started.dispatch_id)
+    assert not refused.ok and refused.state == "BLOCKED"
+    assert "bridge offline" in refused.message
+    assert bridge.jobs[0]["state"] == "BLOCKED", "a refused abandon must not mutate the run"

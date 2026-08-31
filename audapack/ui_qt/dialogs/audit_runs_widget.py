@@ -25,6 +25,7 @@ class AuditRunsWidget(QWidget):
 
     start_requested = Signal(str)
     cancel_requested = Signal(str)
+    abandon_requested = Signal(str)
     open_requested = Signal(str)
     diagnostics_requested = Signal(object)
 
@@ -59,13 +60,19 @@ class AuditRunsWidget(QWidget):
         actions.setSpacing(3)
         self.retry_button = QPushButton("START / RETRY", self)
         self.cancel_button = QPushButton("CANCEL", self)
+        self.abandon_button = QPushButton("FORCE UNBLOCK", self)
+        self.abandon_button.setToolTip(
+            "Stuck BLOCKED run: mark it terminally FAILED so this project can START AUDIT again.\n"
+            "Use only when the run is dead — a Core may already have been sent, so no new START is issued automatically."
+        )
         self.open_button = QPushButton("OPEN RESULT", self)
         self.details_button = QPushButton("COPY DETAILS", self)
         self.retry_button.clicked.connect(self._start_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
+        self.abandon_button.clicked.connect(self._abandon_selected)
         self.open_button.clicked.connect(self._open_selected)
         self.details_button.clicked.connect(self._details_selected)
-        for button in (self.retry_button, self.cancel_button, self.open_button, self.details_button):
+        for button in (self.retry_button, self.cancel_button, self.abandon_button, self.open_button, self.details_button):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -154,8 +161,14 @@ class AuditRunsWidget(QWidget):
         actions = set(run.actions) if run else set()
         self.retry_button.setEnabled(bool(run and actions.intersection({"RETRY", "RECOVER"})))
         self.cancel_button.setEnabled(bool(run and "CANCEL" in actions and run.dispatch_id))
+        self.abandon_button.setEnabled(bool(run and "ABANDON" in actions and run.dispatch_id))
         self.open_button.setEnabled(bool(run and "OPEN" in actions and run.handoff_path))
         self.details_button.setEnabled(bool(run))
+
+    def _abandon_selected(self) -> None:
+        run = self._selected()
+        if run and run.dispatch_id and "ABANDON" in set(run.actions):
+            self.abandon_requested.emit(run.dispatch_id)
 
     def _start_selected(self) -> None:
         run = self._selected()

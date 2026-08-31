@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QSystemTrayIcon,
     QTabWidget,
     QToolBar,
@@ -543,6 +544,7 @@ class MainWindow(QMainWindow):
         self.audit_runs_widget = AuditRunsWidget(self.tabs)
         self.audit_runs_widget.start_requested.connect(self._on_start_audit_project_id)
         self.audit_runs_widget.cancel_requested.connect(self._on_cancel_audit_dispatch_id)
+        self.audit_runs_widget.abandon_requested.connect(self._on_abandon_audit_dispatch_id)
         self.audit_runs_widget.open_requested.connect(self._on_open_audit_result)
         self.audit_runs_widget.diagnostics_requested.connect(self._on_copy_audit_diagnostics)
 
@@ -1388,6 +1390,44 @@ QToolTip QLabel {
             self._flash_status(f"Cancel error: {err}", "#D66464")
 
         self.task_runner.submit(key, _cancel, on_success=_on_cancelled, on_error=_on_cancel_error)
+
+    def _on_abandon_audit_dispatch_id(self, dispatch_id: str):
+        """Force a stuck BLOCKED run terminal after explicit operator confirmation."""
+        did = str(dispatch_id or "")
+        if not did:
+            return
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Force unblock audit run")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText("Mark this BLOCKED run as terminally FAILED?")
+        confirm.setInformativeText(
+            "This frees the project so START AUDIT works again.\n\n"
+            "A Core prompt may already have been sent in the browser, so AUDAPACK will NOT "
+            "start a new audit automatically. Check the chat before starting a fresh run.\n\n"
+            "This cannot be undone."
+        )
+        confirm.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes)
+        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        self._flash_status("Force unblocking audit run...", "#D4A840")
+        key = f"dispatch-abandon:{did}"
+
+        def _abandon():
+            return self._audit_runs.abandon(did, "operator forced unblock from Audit Runs panel")
+
+        def _done(result):
+            if result.ok:
+                self._flash_status("Run marked FAILED; project is free for a new START AUDIT", "#D4A840", duration_ms=6000)
+                self._refresh_audit_runs_async()
+            else:
+                self._flash_status(f"Force unblock refused: {result.message}", "#D66464", duration_ms=7000)
+
+        def _error(err):
+            self._flash_status(f"Force unblock error: {err}", "#D66464")
+
+        self.task_runner.submit(key, _abandon, on_success=_done, on_error=_error)
 
     def _on_open_audit_result(self, handoff_path: str):
         path = Path(str(handoff_path))

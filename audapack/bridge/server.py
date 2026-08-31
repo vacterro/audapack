@@ -493,6 +493,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self._handle_browser_cancel(parsed.path)
             return
 
+        if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/abandon"):
+            self._handle_browser_abandon(parsed.path)
+            return
+
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
 
     def do_DELETE(self):
@@ -1575,6 +1579,30 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
             return
         self.send_json(200, {"ok": True, "dispatch_id": dispatch_id})
+
+    def _handle_browser_abandon(self, path: str) -> None:
+        """Operator escape hatch for a stuck BLOCKED dispatch.
+
+        Cancel refuses post-start BLOCKED work because CANCELLED asserts no
+        Core was sent. Abandon instead marks the run terminal FAILED with an
+        honest operator_abandoned code, which frees the project lane without
+        ever re-leasing the dispatch or issuing a second START.
+        """
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "abandon":
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        data = self._read_json_body() if self.headers.get("Content-Length") else {}
+        if data is None:
+            return
+        dispatch_id = parts[3]
+        dispatcher = self._dispatcher()
+        try:
+            job = dispatcher.abandon_job(dispatch_id, str((data or {}).get("reason") or ""))
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        self.send_json(200, {"ok": True, "dispatch_id": dispatch_id, "state": job.state, "error": job.error})
 
     def _handle_browser_submit(self) -> None:
         data = self._read_json_body()

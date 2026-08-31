@@ -173,3 +173,13 @@ class BridgeService:
     def cancel_browser_job(self, dispatch_id: str) -> dict[str, Any]:
         from urllib.parse import quote
         return _browser_bridge_request(self.config, "POST", f"/v1/browser/jobs/{quote(str(dispatch_id), safe='')}/cancel")
+
+    def abandon_browser_job(self, dispatch_id: str, reason: str = "") -> dict[str, Any]:
+        """Force a stuck BLOCKED dispatch terminal so the project lane frees up."""
+        from urllib.parse import quote
+        return _browser_bridge_request(
+            self.config,
+            "POST",
+            f"/v1/browser/jobs/{quote(str(dispatch_id), safe='')}/abandon",
+            payload={"reason": str(reason or "")},
+        )

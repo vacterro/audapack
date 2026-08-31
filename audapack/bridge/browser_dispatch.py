@@ -113,6 +113,7 @@ JOB_TRANSITIONS: set[tuple[str, str]] = {
     (JOB_STARTED, JOB_BLOCKED),
     (JOB_AUDITING, JOB_BLOCKED),
     (JOB_BLOCKED, JOB_CANCELLED),
+    (JOB_BLOCKED, JOB_FAILED),         # operator abandon: never re-leased, never re-STARTed
     (JOB_LEASED, JOB_FAILED),
     (JOB_ARTIFACT_FETCHED, JOB_FAILED),
     (JOB_ATTACHED, JOB_FAILED),
@@ -898,6 +899,50 @@ class BrowserDispatcher:
                 worker.state = WORKER_FREE
                 worker.campaign_run_id = ""
                 worker.conversation_key = ""
+            self._generation_context = {"dispatch_id": job.dispatch_id, "project_id": job.project_id, "state": job.state}
+            self._persist_jobs()
+            self._work_available.notify_all()
+            return job
+
+    def abandon_job(self, dispatch_id: str, reason: str = "") -> DispatchJob:
+        """Operator escape hatch for a stuck post-start BLOCKED dispatch.
+
+        Cancel deliberately refuses a BLOCKED job that may already own an
+        irreversible START, because CANCELLED means "no Core was sent" and
+        cancelling would free the project for a second Core. Abandon is the
+        honest alternative: the run becomes terminal FAILED, so the lane stops
+        occupying capacity and START AUDIT works again, while the record keeps
+        its post-start lineage (campaign_run_id / start_receipt) and states
+        plainly that a Core may have been sent. The dispatch is never re-leased
+        and no automatic new START is issued.
+        """
+        with self._lock:
+            job = self._jobs.get(dispatch_id)
+            if job is None:
+                raise DispatchError("unknown_job", "dispatch_id is unknown")
+            if job.state in TERMINAL_STATES:
+                return job
+            if job.state != JOB_BLOCKED:
+                raise DispatchError(
+                    "invalid_transition",
+                    "only a BLOCKED dispatch can be abandoned; cancel pre-start work instead",
+                )
+            if self.safe_prestart_cancel(job):
+                raise DispatchError(
+                    "invalid_transition",
+                    "pre-start BLOCKED dispatch can be cancelled safely; abandon is for post-start recovery",
+                )
+            note = str(reason or "operator abandoned a stuck blocked run").strip()[:300]
+            job.state = JOB_FAILED
+            job.assigned_worker_id = ""
+            job.lease_id = ""
+            job.lease_expires_at = 0.0
+            job.last_error_code = "operator_abandoned"
+            job.error = (
+                f"{note} (was BLOCKED: {job.error})" if job.error else note
+            )[:500]
+            job.completed_at = _now()
+            job.updated_at = job.completed_at
             self._generation_context = {"dispatch_id": job.dispatch_id, "project_id": job.project_id, "state": job.state}
             self._persist_jobs()
             self._work_available.notify_all()
