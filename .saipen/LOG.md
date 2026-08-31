@@ -289,3 +289,17 @@
 - 31.08.26 08:14 [E-484] [parent: E-483] [T-50] [agent: opencode] [op: checkpoint-5b0c3d4e5f6a71b2c3d4e5f6a71b2c3d] RUN: PASS REVIEW pass 2 independent rerun: compileall; ruff; pytest 368 passed (+ regression test_assignment_falls_back_to_copy_when_hardlink_unsupported); Node widget 152 passed; os.link EXDEV now falls back to shutil.copyfile same journal; conf: high
 - 31.08.26 08:14 [E-485] [parent: E-484] [T-50] [agent: opencode] [op: checkpoint-6c1d4e5f6a71b2c3d4e5f6a71b2c3d4e] DEC: SHIP -- P1 os.link cross-volume fix verified pass 2/2; sentinel iframe purge live-proven (6->4 workers), dedicated Chromium profile, INAUDIT capture store + API + widget tests, T-50 verify gates green
 - 31.08.26 08:14 [E-486] [parent: E-485] [T-50] [agent: opencode] [op: transition-7d2e5f6a71b2c3d4e5f6a71b2c3d4e5f] RUN: transition to SHIP
+- 31.08.26 08:20 [E-487] [parent: E-486] [T-50] [agent: opencode] [op: checkpoint-9f0a1b2c3d4e5f6a71b2c3d4e5f6a71b] RUN: ship v0.2.0 -> pushed c930cc9 (branch c1e52d8..c930cc9, tag v0.2.0); merged remote README/badge restructure; 368 pytest + 23 widget suites + ruff + compileall green on final tree; conf: high
+- 31.08.26 05:47 [E-488] [parent: E-487] [agent: opencode] [op: reconcile-20260831054714720469] DEC: reconcile protocol state -- last_event 486->487
+- 31.08.26 05:47 [E-489] [parent: E-488] [T-50] [agent: opencode] [op: finish-df655985ed6d457a8c770213e8f60086] DEC: ticket finished via SAIOPS -- completion (from SHIP)
+- 31.08.26 06:14 [E-490] [parent: E-489] [T-53] [agent: opencode] [op: ticket-05e0d78e5033490f9be40cbd07f2ac65] DEC: ticket added via SAIOPS
+- 31.08.26 06:24 [E-491] [parent: E-490] [T-53] [agent: opencode] [op: claim-5753196e1b4848e897ce346bf7b65a2d] DEC: claimed via SAIOPS -- owner opencode
+- 31.08.26 06:24 [E-492] [parent: E-491] [T-53] [agent: opencode] [op: transition-36dc3877aaf94219944428a68e02e4b3] RUN: transition to BUILD
+- 31.08.26 06:26 [E-493] [parent: E-492] [T-53] [agent: opencode] [op: checkpoint-ba9c92a1d70d4c4db6c8648f8a499e58] RUN: SCOUT -- widget BLOCKED transparency banner + Clear log + Qt tray reason; 3 files, 239+/-3, committed 6f83382; 24 widget suites + 368 pytest + ruff + compileall green
+- 31.08.26 06:28 [E-494] [parent: E-493] [T-53] [agent: opencode] [op: transition-0424ff52e8db4535af15ad63c6d1d000] RUN: transition to VERIFY
+- 31.08.26 06:28 [E-495] [parent: E-494] [T-53] [agent: opencode] [op: checkpoint-a99dc9f33bc241c1b6bca4db3f72d2ef] RUN: VERIFY -- compileall; ruff; pytest 368; 24 widget suites incl w4-007 (4 tests) green; conf: high
+- 31.08.26 06:30 [E-496] [parent: E-495] [T-53] [agent: opencode] [op: checkpoint-dc8ee3a37f56439ca8d3de53f5da1b6d] RUN: PASS compileall; ruff; pytest 368; 24 widget suites incl w4-007 (4 tests); conf: high
+- 31.08.26 06:30 [E-497] [parent: E-496] [T-53] [agent: opencode] [op: transition-54c0121bed9c48e989959862c9550a81] RUN: transition to REVIEW
+- 31.08.26 06:30 [E-498] [parent: E-497] [op: transition-54c0121bed9c48e989959862c9550a81] DEC: goal_tickets 5->6
+- 31.08.26 06:30 [E-499] [parent: E-498] [T-53] [agent: opencode] [op: checkpoint-875143162403491aa7a2d69fb8faa774] RUN: PASS REVIEW pass 1 independent rerun: compileall; ruff; pytest 368; 24 widget suites incl w4-007 (4 tests) green; no P0/P1 findings; conf: high
+- 31.08.26 06:30 [E-500] [parent: E-499] [T-53] [agent: opencode] [op: transition-243d819029b84532bd8f74f76b338f76] RUN: transition to SHIP
