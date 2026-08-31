@@ -114,8 +114,16 @@ class ComponentManager:
             bridge_url=f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js",
         )
 
-    def launch_browser_worker(self) -> tuple[bool, str]:
-        return launch_dedicated_chromium_worker()
+    def launch_browser_worker(
+        self,
+        *,
+        managed_slot: Optional[int] = None,
+        managed_generation: Optional[int] = None,
+    ) -> tuple[bool, str]:
+        return launch_dedicated_chromium_worker(
+            managed_slot=managed_slot,
+            managed_generation=managed_generation,
+        )
 
     def repair_all(self) -> dict[str, dict[str, Any]]:
         results = {}

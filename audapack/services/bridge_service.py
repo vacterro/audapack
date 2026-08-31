@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from audapack.bridge.lifecycle import check_bridge_health, start_bridge_background, stop_bridge
 from audapack.components.autostart import get_autostart_status, install_autostart, remove_autostart
-from audapack.config import AppConfig, load_config
+from audapack.config import AppConfig, get_state_dir, load_config
 from audapack.packing import find_archive_for_project, resolve_output_dir
 
 
@@ -165,6 +165,10 @@ class BridgeService:
 
     def browser_status(self) -> dict[str, Any]:
         return _browser_bridge_request(self.config, "GET", "/v1/browser/status")
+
+    def browser_dispatch_generation_path(self) -> Path:
+        """Filesystem event source for durable browser-dispatch changes."""
+        return get_state_dir() / "browser_dispatch" / "browser_dispatch_generation.json"
 
     def cancel_browser_job(self, dispatch_id: str) -> dict[str, Any]:
         from urllib.parse import quote

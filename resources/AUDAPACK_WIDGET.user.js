@@ -6064,11 +6064,11 @@ ordinal/name of the entrypoint file.`;
     const base = {
       'clean-state-lost': {
         headline: 'Audit blocked: ChatGPT tab stopped being clean before Send.',
-        why: 'The widget found a fresh root ChatGPT tab, claimed a SEND AUDIT job, attached the project ZIP, then re-validated the tab right before the irreversible Send. Something changed in the meantime — a conversation turn appeared, a draft was typed, an attachment showed up, or ChatGPT started generating. The widget refuses to overwrite that human activity.',
+        why: 'The widget found a fresh root ChatGPT tab, claimed a START AUDIT job, attached the project ZIP, then re-validated the tab right before the irreversible Send. Something changed in the meantime — a conversation turn appeared, a draft was typed, an attachment showed up, or ChatGPT started generating. The widget refuses to overwrite that human activity.',
         next: [
           '1. Close the current ChatGPT tab. Open a fresh https://chatgpt.com/ tab with no conversation, no draft, no attachments, and nothing generating.',
           '2. Wait until the Bridge status shows the worker is CLEAN (no busy/orange badge).',
-          '3. Click the project SEND AUDIT again from the AUDAPACK Project Room.'
+          '3. Click the project START AUDIT again from the AUDAPACK Project Room.'
         ]
       },
       'canonical-start-rejected': {
@@ -6076,7 +6076,7 @@ ordinal/name of the entrypoint file.`;
         why: 'The widget attached the project ZIP and called the start engine, but the engine refused to commit the START receipt. The exact reason is reported to the desktop Bridge; the lease has been dropped so a fresh attempt can claim a new job.',
         next: [
           '1. Open the Bridge diagnostics with Copy log and look for the most recent bridge event with code=canonical-start-rejected.',
-          '2. Open a fresh root ChatGPT tab (no conversation, no draft, no attachments) and click SEND AUDIT again.',
+          '2. Open a fresh root ChatGPT tab (no conversation, no draft, no attachments) and click START AUDIT again.',
           '3. If the second attempt also blocks, copy the diagnostics log and share it with the AUDAPACK team — the Bridge has the exact reason.'
         ]
       },
@@ -6086,7 +6086,7 @@ ordinal/name of the entrypoint file.`;
         next: [
           '1. Close the current tab. Open a fresh https://chatgpt.com/ tab in the address bar (not from a project link or sidebar).',
           '2. Make sure the URL is exactly https://chatgpt.com/ (no conversation selected, no /c/... path).',
-          '3. Click SEND AUDIT again from the Project Room.'
+          '3. Click START AUDIT again from the Project Room.'
         ]
       },
       'worker_limit': {
@@ -6095,7 +6095,7 @@ ordinal/name of the entrypoint file.`;
         next: [
           '1. Wait for a worker to finish (check the AUDAPACK Bridge status to see remaining jobs).',
           '2. Or close one of the existing ChatGPT tabs that owns a job to free a slot.',
-          '3. Click SEND AUDIT again from the Project Room.'
+          '3. Click START AUDIT again from the Project Room.'
         ]
       }
     }[code] || {
@@ -6103,7 +6103,7 @@ ordinal/name of the entrypoint file.`;
       why: detail || 'The Bridge returned BLOCKED with an unrecognized reason.',
       next: [
         '1. Open the Bridge diagnostics with Copy log for the most recent bridge event with code=' + code + '.',
-        '2. Open a fresh root ChatGPT tab and click SEND AUDIT again.',
+        '2. Open a fresh root ChatGPT tab and click START AUDIT again.',
         '3. If the second attempt also blocks, copy the diagnostics log and share it with the AUDAPACK team.'
       ]
     };
@@ -17105,6 +17105,24 @@ async function recoverArmedStartSend(options = {}) {
   let browserWorkerCompletionTimer = 0;
   let browserWorkerConsecutivePollFailures = 0;
   const BROWSER_WORKER_LEASE_SESSION_KEY = 'audapack_browser_worker_lease_v1';
+  const BROWSER_WORKER_MANAGED_SESSION_KEY = 'audapack_managed_worker_v1';
+
+  function browserWorkerManagedIdentity() {
+    try {
+      const params = new URLSearchParams(String(location.search || ''));
+      const slot = Number(params.get('audapack_worker_slot') || 0);
+      const generation = Number(params.get('audapack_worker_generation') || 0);
+      if (Number.isInteger(slot) && slot >= 1 && slot <= 6 && Number.isInteger(generation) && generation >= 1) {
+        const identity = { slot, generation };
+        sessionStorage.setItem(BROWSER_WORKER_MANAGED_SESSION_KEY, JSON.stringify(identity));
+        return identity;
+      }
+      const saved = JSON.parse(sessionStorage.getItem(BROWSER_WORKER_MANAGED_SESSION_KEY) || 'null');
+      if (saved && Number.isInteger(saved.slot) && saved.slot >= 1 && saved.slot <= 6 &&
+          Number.isInteger(saved.generation) && saved.generation >= 1) return saved;
+    } catch (_) { }
+    return { slot: 0, generation: 0 };
+  }
 
   function persistBrowserWorkerLease() {
     try {
@@ -17222,12 +17240,15 @@ let browserWorkerBraveConfirmed = false;
     const pageEligible = browserWorkerPageEligible();
     const turns = getChatGPTTurns ? getChatGPTTurns() : [];
     const hasConversationTurns = Boolean(turns && turns.length > 0);
+    const managedIdentity = browserWorkerManagedIdentity();
     const cleanForAudit = pageEligible && !hasConversationTurns && !Boolean(draft.trim()) &&
       !Boolean(attachment?.count) && !chatGPTIsGenerating() &&
       !auditStartInFlight && !actionInFlight && !active &&
       !Boolean(autoRuntime?.runId) && !Boolean(lease);
     return {
       worker_id: String(autoTabId || ''),
+      managed_slot: managedIdentity.slot,
+      managed_generation: managedIdentity.generation,
       widget_version: BROWSER_WORKER_PROTOCOL_VERSION,
       bridge_api_version: String(BRIDGE_API_VERSION || 3),
       site: detectSite().key,

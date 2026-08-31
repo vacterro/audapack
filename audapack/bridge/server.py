@@ -387,6 +387,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "last_seen_at": worker.last_seen_at,
                 "has_conversation_turns": worker.has_conversation_turns,
                 "clean_for_audit": worker.clean_for_audit,
+                "managed_slot": worker.managed_slot,
+                "managed_generation": worker.managed_generation,
                 "worker_class": "CLEAN" if worker.clean_for_audit else (
                     "OCCUPIED" if worker.has_conversation_turns else (
                         "DIRTY" if (worker.has_manual_draft or worker.has_attachments) else (
@@ -413,6 +415,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "state": job.state,
                     "assigned_worker_id": job.assigned_worker_id,
                     "campaign_run_id": job.campaign_run_id,
+                    "conversation_id": job.conversation_id,
+                    "start_receipt": job.start_receipt,
+                    "profile": job.requested_profile,
+                    "created_at": job.created_at,
                     "updated_at": job.updated_at,
                     "error": job.error,
                     "final_handoff_path": job.final_handoff_path,

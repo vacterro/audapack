@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QStyleOptionViewItem
 
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import AuditSnapshot, AuditTemperature, Project
+from audapack.services.audit_run_service import AuditRunSnapshot
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.models.project_room_model import MIME_TYPE_PROJECT, ProjectRoomModel
 
@@ -59,6 +60,23 @@ def test_model_initial_hierarchy(model_fixture):
     assert s3_idx.isValid()
     assert model.data(s3_idx, model.ROLES["is_empty_slot"]) is True
 
+
+def test_composite_run_snapshot_is_targeted_and_preserves_wave_progress(model_fixture):
+    model, _service, _config, _tmp_path = model_fixture
+    before = model.model_reset_count
+    run = AuditRunSnapshot(
+        project_id="p1", project_name="Project 1", operator_state="AUDITING",
+        summary="AUDIT 1/3", dispatch_id="dsp-1", dispatch_state="AUDITING",
+        completed_waves=1, total_waves=3, campaign_run_id="run-1",
+    )
+    model.update_audit_run_snapshot("p1", run)
+    index = model.index_for_project_id("p1")
+    assert model.data(index, model.ROLES["audit_run_state"]) == "AUDITING"
+    assert model.data(index, model.ROLES["audit_run_summary"]) == "AUDIT 1/3"
+    assert model.data(index, model.ROLES["completed_waves"]) == 1
+    assert model.data(index, model.ROLES["total_waves"]) == 3
+    assert model.data(index, model.ROLES["dispatch_run_id"]) == "run-1"
+    assert model.model_reset_count == before
 
 def test_project_tree_does_not_clip_two_line_zip_rows(model_fixture, qapp):
     from audapack.ui_qt.main_window import MainWindow

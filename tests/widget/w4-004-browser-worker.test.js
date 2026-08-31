@@ -24,6 +24,21 @@ test('SRC-005 worker snapshot identifies stable tab and safe FREE state', () => 
   assert.strictEqual(api.browserWorkerCanClaim(), true);
 });
 
+test('T07 managed worker launch identity is reported without changing eligibility', () => {
+  const { h, api } = setup();
+  h.location.pathname = '/';
+  h.location.search = '?audapack_worker_slot=4&audapack_worker_generation=9';
+  const snapshot = api.browserWorkerSnapshot();
+  assert.strictEqual(snapshot.managed_slot, 4);
+  assert.strictEqual(snapshot.managed_generation, 9);
+  assert.strictEqual(api.browserWorkerCanClaim(), true);
+  h.location.search = '';
+  h.location.pathname = '/c/audit-run';
+  const navigated = api.browserWorkerSnapshot();
+  assert.strictEqual(navigated.managed_slot, 4);
+  assert.strictEqual(navigated.managed_generation, 9);
+});
+
 test('SRC-005 worker refuses FREE claim while runtime is active', () => {
   const { h, api } = setup();
   h.location.pathname = '/';

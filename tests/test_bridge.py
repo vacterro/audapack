@@ -1116,6 +1116,20 @@ class BrowserWorkerLaunchNeedTests(unittest.TestCase):
         source = inspect.getsource(MainWindow._ensure_free_browser_worker)
         self.assertNotIn("_flash_status", source)
 
+    def test_historical_terminal_run_does_not_renotify_after_gui_restart(self):
+        from types import SimpleNamespace
+
+        from audapack.ui_qt.main_window import MainWindow
+
+        messages = []
+        tray = SimpleNamespace(showMessage=lambda *args: messages.append(args))
+        window = SimpleNamespace(_notified_terminal={}, _tray_icon=tray)
+        MainWindow._notify_dispatch_terminal(window, "dsp-history", "COMPLETE", "Old")
+        assert messages == []
+        MainWindow._notify_dispatch_terminal(window, "dsp-live", "AUDITING", "Live")
+        MainWindow._notify_dispatch_terminal(window, "dsp-live", "COMPLETE", "Live")
+        assert len(messages) == 1
+
 
 if __name__ == "__main__":
     unittest.main()

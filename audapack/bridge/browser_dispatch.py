@@ -164,6 +164,8 @@ class WorkerRecord:
     page_eligible: bool = False
     has_conversation_turns: bool = False
     clean_for_audit: bool = False
+    managed_slot: int = 0
+    managed_generation: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -402,6 +404,12 @@ class BrowserDispatcher:
             record.page_eligible = bool(payload.get("page_eligible", False))
             record.has_conversation_turns = bool(payload.get("has_conversation_turns", False))
             record.clean_for_audit = bool(payload.get("clean_for_audit", False))
+            try:
+                record.managed_slot = max(0, min(MAX_ACTIVE_WORKERS, int(payload.get("managed_slot", 0) or 0)))
+                record.managed_generation = max(0, int(payload.get("managed_generation", 0) or 0))
+            except (TypeError, ValueError):
+                record.managed_slot = 0
+                record.managed_generation = 0
             if payload.get("browser_name"):
                 record.meta["browser_name"] = str(payload.get("browser_name"))[:80]
             record.last_seen_at = _now()

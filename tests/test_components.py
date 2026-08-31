@@ -64,6 +64,27 @@ class TestComponents(unittest.TestCase):
         with self.assertRaises(ValueError):
             dedicated_chromium_command("C:/Program Files/Mozilla Firefox/firefox.exe", Path("C:/profile"))
 
+    @patch("audapack.components.manager.launch_dedicated_chromium_worker")
+    def test_managed_worker_identity_reaches_launcher(self, launch):
+        launch.return_value = (True, "launched")
+        result = ComponentManager(AppConfig()).launch_browser_worker(
+            managed_slot=3,
+            managed_generation=7,
+        )
+        self.assertEqual(result, (True, "launched"))
+        launch.assert_called_once_with(managed_slot=3, managed_generation=7)
+
+    @patch("audapack.components.widget._launch_dedicated_chromium")
+    def test_managed_worker_launch_marks_url(self, launch):
+        from audapack.components.widget import launch_dedicated_chromium_worker
+
+        launch.return_value = (True, "", "C:/chrome.exe", Path("C:/profile"))
+        ok, _message = launch_dedicated_chromium_worker(managed_slot=2, managed_generation=5)
+        self.assertTrue(ok)
+        target = launch.call_args.args[0]
+        self.assertIn("audapack_worker_slot=2", target)
+        self.assertIn("audapack_worker_generation=5", target)
+
     @patch("audapack.components.manager.open_widget_in_dedicated_chromium")
     @patch("audapack.components.manager.is_bridge_healthy", return_value=True)
     def test_widget_install_uses_dedicated_profile(self, _healthy, open_dedicated):

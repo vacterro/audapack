@@ -34,6 +34,7 @@ from audapack.inaudit import get_inaudit_selected, list_inaudit_layers
 from audapack.inaudit_capture import InauditCaptureStore
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
+from audapack.services.audit_run_service import AuditRunSnapshot
 from audapack.services.audit_service import AuditService
 from audapack.services.project_service import ProjectService
 
@@ -85,6 +86,9 @@ class ProjectRoomModel(QAbstractItemModel):
         "inaudit_count": Qt.ItemDataRole.UserRole + 38,
         "inaudit_selected": Qt.ItemDataRole.UserRole + 39,
         "inaudit_label": Qt.ItemDataRole.UserRole + 40,
+        "audit_run_state": Qt.ItemDataRole.UserRole + 41,
+        "audit_run_summary": Qt.ItemDataRole.UserRole + 42,
+        "audit_run_ready": Qt.ItemDataRole.UserRole + 43,
     }
 
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None, parent: Optional[QObject] = None):
@@ -96,6 +100,7 @@ class ProjectRoomModel(QAbstractItemModel):
         self._snapshots: dict[str, AuditSnapshot] = {}  # project_id -> AuditSnapshot
         self._pack_states: dict[str, tuple[str, str]] = {}  # project_id -> (state, message)
         self._dispatch_snapshots: dict[str, dict] = {}
+        self._audit_run_snapshots: dict[str, AuditRunSnapshot] = {}
         service_base_dir = service.base_dir
         self._inaudit_store = (
             InauditCaptureStore(base_dir=service_base_dir)
@@ -502,19 +507,26 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["audit_copy_count"]:
             return int(getattr(proj, "audit_copy_count", 0) or 0)
 
+        run = self._audit_run_snapshots.get(proj.id)
         dispatch = self._dispatch_snapshots.get(proj.id, {})
         if role == self.ROLES["dispatch_id"]:
-            return str(dispatch.get("dispatch_id") or "")
+            return str(getattr(run, "dispatch_id", "") or dispatch.get("dispatch_id") or "")
         if role == self.ROLES["dispatch_state"]:
-            return str(dispatch.get("state") or "")
+            return str(getattr(run, "dispatch_state", "") or dispatch.get("state") or "")
         if role == self.ROLES["dispatch_worker"]:
-            return str(dispatch.get("assigned_worker_id") or "")
+            return str(getattr(run, "worker_id", "") or dispatch.get("assigned_worker_id") or "")
         if role == self.ROLES["dispatch_browser"]:
-            return str(dispatch.get("friendly_worker_label") or dispatch.get("browser_name") or "")
+            return str(getattr(run, "worker_label", "") or dispatch.get("friendly_worker_label") or dispatch.get("browser_name") or "")
         if role == self.ROLES["dispatch_run_id"]:
-            return str(dispatch.get("campaign_run_id") or "")
+            return str(getattr(run, "campaign_run_id", "") or dispatch.get("campaign_run_id") or "")
         if role == self.ROLES["dispatch_error"]:
-            return str(dispatch.get("error") or dispatch.get("last_error_code") or "")
+            return str(getattr(run, "error", "") or dispatch.get("error") or dispatch.get("last_error_code") or "")
+        if role == self.ROLES["audit_run_state"]:
+            return str(getattr(run, "operator_state", "") or "")
+        if role == self.ROLES["audit_run_summary"]:
+            return str(getattr(run, "summary", "") or "")
+        if role == self.ROLES["audit_run_ready"]:
+            return bool(getattr(run, "ready", False))
         if role == self.ROLES["inaudit_count"]:
             try:
                 return len(list_inaudit_layers(proj))
@@ -543,11 +555,13 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["audit_age_seconds"]:
             return getattr(snap, "audit_age_seconds", None)
         if role == self.ROLES["all_ready"]:
+            if run is not None:
+                return bool(run.ready)
             return bool(getattr(snap, "final_handoff_ready", False) or getattr(snap, "all3_ready", False) or getattr(snap, "all_ready", False))
         if role == self.ROLES["completed_waves"]:
-            return getattr(snap, "completed_waves", 0)
+            return run.completed_waves if run is not None else getattr(snap, "completed_waves", 0)
         if role == self.ROLES["total_waves"]:
-            return getattr(snap, "total_waves", 3)
+            return run.total_waves if run is not None else getattr(snap, "total_waves", 3)
         if role == self.ROLES["campaign_complete"]:
             return bool(getattr(snap, "campaign_complete", False))
         if role == self.ROLES["audit_age_str"]:
@@ -556,7 +570,7 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["archive_info"]:
             return self.get_archive_info(proj)
         if role == self.ROLES["audit_profile_id"]:
-            prof = getattr(snap, "audit_profile_id", "quick3") if snap else "quick3"
+            prof = run.profile_id if run is not None else (getattr(snap, "audit_profile_id", "quick3") if snap else "quick3")
             return "A10" if prof == "super10" else "A3"
         if role == self.ROLES["archive_sync_status"]:
             return self.get_archive_sync_status(proj, snap)
@@ -622,6 +636,7 @@ class ProjectRoomModel(QAbstractItemModel):
                 "pack_state": pack_st,
                 "pack_message": pack_msg,
                 "dispatch": dispatch,
+                "audit_run": run,
                 "pack_progress": self._pack_progress.get(proj.id),
                 "pack_percent": self._pack_progress.get(proj.id) and self.data(index, self.ROLES["pack_percent"]) or None,
                 "archive_sync_status": self.get_archive_sync_status(proj, snap),
@@ -657,6 +672,26 @@ class ProjectRoomModel(QAbstractItemModel):
                     slot_idx = self.index(slot - 1, 0, parent)
                     self.dataChanged.emit(slot_idx, slot_idx, list(self.ROLES.values()))
                     return
+
+    def update_audit_run_snapshot(self, project_id: str, snapshot: Optional[AuditRunSnapshot]) -> None:
+        """Publish one composite run state with a targeted row repaint."""
+        project_id = str(project_id)
+        if snapshot is None:
+            self._audit_run_snapshots.pop(project_id, None)
+        else:
+            self._audit_run_snapshots[project_id] = snapshot
+            self._dispatch_snapshots[project_id] = {
+                "dispatch_id": snapshot.dispatch_id,
+                "state": snapshot.dispatch_state,
+                "assigned_worker_id": snapshot.worker_id,
+                "friendly_worker_label": snapshot.worker_label,
+                "campaign_run_id": snapshot.campaign_run_id,
+                "error": snapshot.error,
+            }
+        idx = self.index_for_project_id(project_id)
+        if idx.isValid():
+            self.targeted_project_update_count += 1
+            self.dataChanged.emit(idx, idx, list(self.ROLES.values()))
 
     def get_archive_info(self, proj: Project) -> tuple[bool, str, str, Optional[Path]]:
         """Returns (exists, size_str, created_str, path) — pure cache reads.

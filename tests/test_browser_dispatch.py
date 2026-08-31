@@ -64,6 +64,13 @@ def test_worker_registration_is_idempotent(tmp_path):
     assert len(d.list_workers()) == 1
 
 
+def test_worker_registration_preserves_managed_slot_identity(tmp_path):
+    d = dispatcher(tmp_path)
+    record = d.register_worker(worker("w-managed", managed_slot=4, managed_generation=11))
+    assert record.managed_slot == 4
+    assert record.managed_generation == 11
+
+
 def test_worker_ttl_expires(tmp_path):
     d = dispatcher(tmp_path)
     record = d.register_worker(worker("w1"))

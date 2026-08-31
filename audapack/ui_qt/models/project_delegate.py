@@ -227,6 +227,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         dispatch_state = str(index.data(Qt.ItemDataRole.UserRole + 33) or "")
         dispatch_browser = str(index.data(Qt.ItemDataRole.UserRole + 35) or "")
         inaudit_label = str(index.data(Qt.ItemDataRole.UserRole + 40) or "")
+        audit_run_state = str(index.data(Qt.ItemDataRole.UserRole + 41) or "")
 
         # ── Vertical indicator column (fixed width, stacked top→bottom) ────────
         # Every project row uses the SAME column layout: consistent order and
@@ -268,7 +269,33 @@ class ProjectItemDelegate(QStyledItemDelegate):
         else:
             wave_text = f"{prof_label} 0/{total_waves}"
             wave_color = QColor(PALETTE["textMuted"])
-        if dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED"}:
+        if audit_run_state:
+            state_labels = {
+                "PREPARING": "PREPARING",
+                "INTERRUPTED": "INTERRUPTED",
+                "WAITING": "WAITING",
+                "RETRYING": "RETRYING",
+                "ATTACHING": "ATTACHING",
+                "STARTING": "STARTING",
+                "AUDITING": "AUDIT",
+                "SAVING": "SAVING",
+                "READY": "AUDIT READY ✓",
+                "BLOCKED_PRE_START": "! BLOCKED PRE",
+                "BLOCKED_POST_START": "! BLOCKED POST",
+                "RECOVERY": "! RECOVERY",
+                "FAILED": "FAILED",
+                "CANCELLED": "CANCELLED",
+            }
+            label = state_labels.get(audit_run_state, audit_run_state)
+            suffix = f" {dispatch_browser}" if dispatch_browser and audit_run_state in {"ATTACHING", "STARTING", "AUDITING"} else ""
+            wave_text = f"{label} {completed_waves}/{total_waves}{suffix}"
+            if audit_run_state == "READY":
+                wave_color = QColor(PALETTE["success"])
+            elif audit_run_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}:
+                wave_color = QColor(PALETTE["dangerText"])
+            else:
+                wave_color = QColor(PALETTE["warning"])
+        elif dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED"}:
             state_labels = {
                 "QUEUED": "WAIT",
                 "LEASED": "ATTACH",

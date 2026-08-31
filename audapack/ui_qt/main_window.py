@@ -50,10 +50,12 @@ from audapack.ingest import ingest_audit_text
 from audapack.instances import InstanceMonitor
 from audapack.models import Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
+from audapack.services.audit_run_service import AuditRunCoordinator, AuditRunSnapshot
 from audapack.services.audit_service import AuditService
 from audapack.services.bridge_service import BridgeService, browser_worker_launch_need
 from audapack.services.packing_service import PackingService
 from audapack.services.project_service import ProjectService
+from audapack.ui_qt.dialogs.audit_runs_widget import AuditRunsWidget
 from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
 from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
@@ -417,6 +419,13 @@ class MainWindow(QMainWindow):
         self._packing = PackingService(service.config, base_dir=service.base_dir)
         self._bridge = BridgeService(service.config)
         self._comp_mgr = ComponentManager(service.config)
+        self._audit_runs = AuditRunCoordinator(
+            service,
+            self._packing,
+            self._bridge,
+            self._audit_service,
+            component_manager=self._comp_mgr,
+        )
         self._active_project: Optional[Project] = None
         record_path = Path(service.base_dir) / "instances.json" if service.base_dir is not None else None
         self._instance_monitor = InstanceMonitor(record_path=record_path)
@@ -425,6 +434,7 @@ class MainWindow(QMainWindow):
 
         self._move_generation: int = 0
         self._last_audit_generation: int = 0
+        self._last_dispatch_generation: int = 0
         self._active_pack_queue = False
         self._notified_terminal: dict[str, str] = {}
         self._init_tray_icon()
@@ -468,6 +478,9 @@ class MainWindow(QMainWindow):
 
         act_send_audit = toolbar.addAction("START AUDIT", self._on_send_audit)
         act_send_audit.setToolTip("Queue selected project for a free Chromium/ChatGPT audit worker")
+
+        act_audit_group = toolbar.addAction("AUDIT GROUP", self._on_start_audit_group)
+        act_audit_group.setToolTip("Queue up to six projects from the selected group")
 
         act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
         act_pack_all.setToolTip("Pack all configured projects in background")
@@ -526,7 +539,14 @@ class MainWindow(QMainWindow):
         # Initial selection: auto-select first registered project
         self._auto_select_first_project()
 
-        # Tab 1: embedded instance management; never creates a separate window.
+        # Tab 1: six operator-facing audit run lanes.
+        self.audit_runs_widget = AuditRunsWidget(self.tabs)
+        self.audit_runs_widget.start_requested.connect(self._on_start_audit_project_id)
+        self.audit_runs_widget.cancel_requested.connect(self._on_cancel_audit_dispatch_id)
+        self.audit_runs_widget.open_requested.connect(self._on_open_audit_result)
+        self.audit_runs_widget.diagnostics_requested.connect(self._on_copy_audit_diagnostics)
+
+        # Tab 2: embedded instance management; never creates a separate window.
         self._instance_manager = InstanceManagerWidget(
             self._instance_monitor,
             self._service,
@@ -555,6 +575,7 @@ class MainWindow(QMainWindow):
         self.settings_widget = SettingsWidget(service.config, self, on_saved=self._on_settings_saved)
 
         self.tabs.addTab(projects_tab, "Project Room")
+        self.tabs.addTab(self.audit_runs_widget, "Audit Runs")
         self.tabs.addTab(self.inaudit_widget, "INAUDIT")
         self.tabs.addTab(self._instance_manager, "Instances")
         self.tabs.addTab(self.settings_widget, "Settings")
@@ -641,6 +662,7 @@ QToolTip QLabel {
 
         # Bridge generation watcher with slow polling fallback.
         self._generation_path = get_generation_file_path()
+        self._dispatch_generation_path = self._bridge.browser_dispatch_generation_path()
         self._generation_watcher = QFileSystemWatcher(self)
         self._generation_watcher.fileChanged.connect(self._on_generation_fs_event)
         self._generation_watcher.directoryChanged.connect(self._on_generation_fs_event)
@@ -652,6 +674,7 @@ QToolTip QLabel {
         self.bridge_timer = QTimer(self)
         self.bridge_timer.setInterval(30000)
         self.bridge_timer.timeout.connect(self._on_check_bridge_generation)
+        self.bridge_timer.timeout.connect(self._refresh_audit_runs_async)
         self.bridge_timer.start()
 
         # Pack progress flush timer: 250ms. Worker threads write to
@@ -664,11 +687,6 @@ QToolTip QLabel {
         self.pack_progress_timer.setInterval(250)
         self.pack_progress_timer.timeout.connect(self._flush_pack_progress)
         self.pack_progress_timer.start()
-
-        self.dispatch_status_timer = QTimer(self)
-        self.dispatch_status_timer.setInterval(10000)
-        self.dispatch_status_timer.timeout.connect(self._refresh_dispatch_status_async)
-        self.dispatch_status_timer.start()
 
         # Async initial enrichment (time-to-interactive optimization)
         QTimer.singleShot(50, self._async_initial_enrichment)
@@ -722,47 +740,32 @@ QToolTip QLabel {
             self.statusBar().showMessage(f"AUDAPACK Ready · {status_txt}")
 
         self.task_runner.submit("bridge:initial_check", _check_bridge, on_success=_on_bridge_done)
-        self._refresh_dispatch_status_async()
+        self._refresh_audit_runs_async()
 
     def _refresh_dispatch_status_async(self):
-        """Refresh live browser dispatch state without blocking the Qt thread."""
+        """Compatibility alias for the composite audit-run refresh."""
+        self._refresh_audit_runs_async()
+
+    def _refresh_audit_runs_async(self):
+        """Refresh composite run state without blocking the Qt thread."""
         def _load():
-            return self._bridge.browser_jobs(), self._bridge.runtime_status()
+            return self._audit_runs.refresh_runs(), self._bridge.runtime_status()
 
         def _apply(result):
-            response, status = result
-            if not response.get("ok"):
-                return
-            workers_by_id: dict[str, dict] = {}
-            used_labels: set[str] = set()
-            for w in (status.get("browser", {}) if isinstance(status, dict) else {}).get("workers", []):
-                wid = str(w.get("worker_id", ""))
-                if wid:
-                    bn = str(w.get("browser_name", "") or "Browser")
-                    widx = 1
-                    label = f"{bn} #{widx}"
-                    while label in used_labels:
-                        widx += 1
-                        label = f"{bn} #{widx}"
-                    used_labels.add(label)
-                    workers_by_id[wid] = {"browser_name": bn, "friendly_worker_label": label}
-            active = {}
-            for job in response.get("jobs", []):
-                project_id = str(job.get("project_id") or "")
-                if project_id:
-                    wid = str(job.get("assigned_worker_id") or "")
-                    if wid and wid in workers_by_id:
-                        job["browser_name"] = workers_by_id[wid]["browser_name"]
-                        job["friendly_worker_label"] = workers_by_id[wid]["friendly_worker_label"]
-                    active[project_id] = job
-                    self._notify_dispatch_terminal(
-                        str(job.get("dispatch_id") or ""),
-                        str(job.get("state") or ""),
-                        str(job.get("project_name") or project_id),
-                        str(job.get("error") or job.get("lastError") or ""),
-                    )
+            runs, status = result
+            latest: dict[str, AuditRunSnapshot] = {}
+            for run in runs:
+                latest.setdefault(run.project_id, run)
+                notify_state = "COMPLETE" if run.ready else run.dispatch_state
+                self._notify_dispatch_terminal(
+                    run.dispatch_id,
+                    notify_state,
+                    run.project_name or run.project_id,
+                    run.error,
+                )
             for proj in self._service.list_projects():
-                self.model.update_dispatch_snapshot(proj.id, active.get(proj.id))
+                self.model.update_audit_run_snapshot(proj.id, latest.get(proj.id))
+            self.audit_runs_widget.set_runs(runs)
             browser = status.get("browser", {}) if isinstance(status, dict) else {}
             if browser:
                 self.statusBar().showMessage(
@@ -774,7 +777,7 @@ QToolTip QLabel {
                     f"! {browser.get('blocked_jobs', 0)}"
                 )
 
-        self.task_runner.submit_coalesced("bridge:dispatch_status", _load, on_success=_apply)
+        self.task_runner.submit_coalesced("audit-runs:refresh", _load, on_success=_apply)
 
     # ---------------------------------------------------------------- Selection
 
@@ -1240,6 +1243,10 @@ QToolTip QLabel {
         terminal = {"COMPLETE", "BLOCKED", "FAILED", "CANCELLED"}
         prev = self._notified_terminal.get(dispatch_id, "")
         self._notified_terminal[dispatch_id] = state
+        if not dispatch_id or not prev:
+            # First observation may be reconstructed history after GUI restart.
+            # Seed the state map silently; only a later real transition may toast.
+            return
         if tray is None or state not in terminal:
             return
         if prev in terminal:
@@ -1277,58 +1284,55 @@ QToolTip QLabel {
         if not proj:
             self._flash_status("START AUDIT: select a project first", "#D66464")
             return
-        key = f"dispatch:{proj.id}"
-        if self.task_runner.is_running(key):
-            self._flash_status(f"START AUDIT already queued for {proj.display_name}", "#D4A840")
+        self._start_audit_projects([proj.id], proj.display_name)
+
+    def _on_start_audit_project_id(self, project_id: str):
+        proj = self._service.get_project(str(project_id))
+        if proj:
+            self._start_audit_projects([proj.id], proj.display_name)
+
+    def _on_start_audit_group(self):
+        proj = self._selected_project()
+        if not proj:
+            self._flash_status("AUDIT GROUP: select a project first", "#D66464")
+            return
+        group = proj.priority_group.upper()
+        projects = [
+            item.id for item in self._service.list_projects()
+            if item.enabled and item.source_path and item.priority_group.upper() == group
+        ][:6]
+        if not projects:
+            self._flash_status(f"AUDIT GROUP: no enabled projects in {group}", "#D66464")
+            return
+        self._start_audit_projects(projects, group)
+
+    def _start_audit_projects(self, project_ids: list[str], label: str):
+        project_ids = list(dict.fromkeys(str(value) for value in project_ids if value))[:6]
+        key = "dispatch:" + ",".join(project_ids)
+        if not project_ids or self.task_runner.is_running(key):
+            self._flash_status(f"START AUDIT already preparing {label}", "#D4A840")
             return
         profile = getattr(self._service.config.audits, "profile", "quick3") or "quick3"
-        self._flash_status(f"START AUDIT: preparing {proj.display_name}", "#D4A840")
+        self._flash_status(f"START AUDIT: preparing {label}", "#D4A840")
 
         def _prepare():
-            active = self._bridge.active_browser_job(proj.id)
-            if active:
-                return {"active": active}
-            health = self._bridge.runtime_status()
-            if not health.get("healthy"):
-                started, _message = self._bridge.start()
-                if not started or not self._bridge.runtime_status().get("healthy"):
-                    raise RuntimeError("Bridge is not healthy")
-            worker = self._ensure_free_browser_worker()
-            packed = self._packing.ensure_fresh_archive(proj.id)
-            if not packed.success or not packed.output_path:
-                raise RuntimeError(packed.error_message or "Packing failed")
-            return {"archive": packed.output_path, "worker": worker}
+            return self._audit_runs.start_batch(project_ids, profile)
 
-        def _done(prepared):
-            if prepared.get("active"):
-                active = prepared["active"]
+        def _done(results):
+            failed = [result for result in results if not result.ok]
+            queued = [result for result in results if result.ok and not result.duplicate]
+            duplicates = [result for result in results if result.duplicate]
+            if failed:
+                detail = "; ".join(f"{item.project_id}: {item.message}" for item in failed[:2])
                 self._flash_status(
-                    f"START AUDIT already active for {proj.display_name} ({active.get('state', 'QUEUED')})",
-                    "#D4A840",
-                )
-                return
-            response = self._bridge.submit_browser_audit(proj, prepared["archive"], profile)
-            if response.get("ok"):
-                dispatch = response.get("dispatch", {})
-                worker = prepared.get("worker", {})
-                worker_state = worker.get("state")
-                if worker_state == "launching":
-                    suffix = " · preparing audit worker"
-                elif worker_state == "busy":
-                    suffix = " · waiting for worker"
-                elif worker_state == "launch_failed":
-                    detail = worker.get("message") or "worker launch failed"
-                    suffix = f" · waiting for worker; automatic launch failed: {detail}"
-                else:
-                    suffix = ""
-                self._flash_status(
-                    f"START AUDIT: {proj.display_name} queued{suffix} "
-                    f"({dispatch.get('dispatch_id', 'queued')})",
-                    "#D4A840",
-                    duration_ms=6000 if suffix else 3000,
+                    f"START AUDIT: {len(queued)} queued, {len(failed)} failed · {detail}",
+                    "#D66464",
+                    duration_ms=7000,
                 )
             else:
-                self._flash_status(f"START AUDIT failed: {response.get('error', 'Bridge unavailable')}", "#D66464")
+                suffix = f", {len(duplicates)} already active" if duplicates else ""
+                self._flash_status(f"START AUDIT: {len(queued)} queued{suffix}", "#D4A840", duration_ms=4000)
+            self._refresh_audit_runs_async()
 
         def _error(error):
             self._flash_status(f"START AUDIT failed: {error}", "#D66464")
@@ -1361,23 +1365,43 @@ QToolTip QLabel {
         if not did:
             self._flash_status("Cancel failed: no dispatch id", "#D66464")
             return
-        self._flash_status(f"Cancelling audit for {proj.display_name}...", "#D4A840")
+        self._on_cancel_audit_dispatch_id(did, proj.display_name)
+
+    def _on_cancel_audit_dispatch_id(self, dispatch_id: str, project_name: str = "audit"):
+        did = str(dispatch_id or "")
+        if not did:
+            return
+        self._flash_status(f"Cancelling {project_name}...", "#D4A840")
         key = f"dispatch-cancel:{did}"
 
         def _cancel():
-            return self._bridge.cancel_browser_job(did)
+            return self._audit_runs.cancel(did)
 
-        def _on_cancelled(response):
-            if response.get("ok"):
-                self._flash_status(f"Audit cancelled for {proj.display_name}", "#D4A840")
-                self.model.update_dispatch_snapshot(proj.id, None)
+        def _on_cancelled(result):
+            if result.ok:
+                self._flash_status("Audit cancelled before START boundary", "#D4A840")
+                self._refresh_audit_runs_async()
             else:
-                self._flash_status(f"Cancel failed: {response.get('error', 'Bridge error')}", "#D66464")
+                self._flash_status(f"Cancel refused: {result.message}", "#D66464", duration_ms=7000)
 
         def _on_cancel_error(err):
             self._flash_status(f"Cancel error: {err}", "#D66464")
 
         self.task_runner.submit(key, _cancel, on_success=_on_cancelled, on_error=_on_cancel_error)
+
+    def _on_open_audit_result(self, handoff_path: str):
+        path = Path(str(handoff_path))
+        if not path.is_file():
+            self._flash_status("Audit result is not durable yet", "#D66464")
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            self._flash_status(f"Open result failed: {exc}", "#D66464")
+
+    def _on_copy_audit_diagnostics(self, snapshot: AuditRunSnapshot):
+        QApplication.clipboard().setText(self._audit_runs.diagnostics(snapshot))
+        self._flash_status("Redacted audit diagnostics copied", "#D4A840")
 
     def _on_pack(self):
         """Async background packing — GUI thread remains 100% interactive."""
@@ -2089,6 +2113,16 @@ QToolTip QLabel {
 
             act_pack_grp = menu.addAction(f"Pack All Projects in [{group}]")
             act_pack_grp.triggered.connect(lambda: self._on_pack_group(group))
+            act_audit_grp = menu.addAction(f"Start Audits in [{group}] (max 6)")
+            act_audit_grp.triggered.connect(
+                lambda _checked=False, g=group: self._start_audit_projects(
+                    [
+                        item.id for item in self._service.list_projects()
+                        if item.enabled and item.source_path and item.priority_group.upper() == g
+                    ][:6],
+                    g,
+                )
+            )
             menu.addSeparator()
 
             act_aud_root = menu.addAction("Open Audits Root Folder")
@@ -2283,9 +2317,10 @@ QToolTip QLabel {
         self.settings_widget.sub_tabs.setCurrentIndex(3)
 
     def _generation_watch_paths(self):
-        paths = [str(self._generation_path.parent)]
-        if self._generation_path.exists():
-            paths.append(str(self._generation_path))
+        paths = [str(self._generation_path.parent), str(self._dispatch_generation_path.parent)]
+        for generation_path in (self._generation_path, self._dispatch_generation_path):
+            if generation_path.exists():
+                paths.append(str(generation_path))
         current = set(self._generation_watcher.files()) | set(self._generation_watcher.directories())
         add = [path for path in paths if path not in current]
         if add:
@@ -2296,15 +2331,14 @@ QToolTip QLabel {
         self._generation_debounce.start()
 
     def _on_check_bridge_generation(self):
-        """Polls lightweight cross-process generation signal and updates affected project.
+        """Consume audit-file and dispatch generation signals.
 
-        W2-003: when the generation carries a project_id, do a targeted refresh.
-        For legacy name-only generations, fall back to the registry's name lookup
-        (which actually exists). Advance _last_audit_generation only after target
-        resolution and refresh scheduling succeed, so a processing failure never
-        burns the generation.
+        QFileSystemWatcher is primary; the 30-second timer is only a fallback.
+        Generation files are replaced atomically, so watcher paths are restored
+        after every event before the next read.
         """
         try:
+            refresh_runs = False
             info = get_generation_info()
             gen = info.get("generation", 0)
             if gen > self._last_audit_generation:
@@ -2321,8 +2355,19 @@ QToolTip QLabel {
                     )
                     self._last_audit_generation = gen
                 else:
-                    self._on_refresh_all()
                     self._last_audit_generation = gen
+                refresh_runs = True
+            try:
+                dispatch_info = json.loads(self._dispatch_generation_path.read_text(encoding="utf-8"))
+                dispatch_gen = int(dispatch_info.get("generation", 0) or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                dispatch_gen = self._last_dispatch_generation
+            if dispatch_gen > self._last_dispatch_generation:
+                self._last_dispatch_generation = dispatch_gen
+                refresh_runs = True
+            if refresh_runs:
+                self._refresh_audit_runs_async()
+            self._generation_watch_paths()
         except Exception:
             pass
 

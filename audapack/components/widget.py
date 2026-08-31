@@ -354,14 +354,24 @@ def _launch_dedicated_chromium(
     return True, "", selected, profile
 
 
-def launch_dedicated_chromium_worker(browser_exe: Optional[str] = None) -> tuple[bool, str]:
+def launch_dedicated_chromium_worker(
+    browser_exe: Optional[str] = None,
+    *,
+    managed_slot: Optional[int] = None,
+    managed_generation: Optional[int] = None,
+) -> tuple[bool, str]:
     """Launch an isolated Chromium profile configured for background work.
 
     Chromium flags prevent timer/renderer throttling for minimized or occluded
     windows. They cannot run JavaScript while Windows itself is asleep or
     hibernating.
     """
-    ok, error, selected, profile = _launch_dedicated_chromium(AUDAPACK_WORKER_URL, browser_exe)
+    target = AUDAPACK_WORKER_URL
+    if managed_slot is not None and managed_generation is not None:
+        slot = max(1, min(6, int(managed_slot)))
+        generation = max(1, int(managed_generation))
+        target = f"{AUDAPACK_WORKER_URL}?audapack_worker_slot={slot}&audapack_worker_generation={generation}"
+    ok, error, selected, profile = _launch_dedicated_chromium(target, browser_exe)
     if not ok or not selected:
         return False, error
     return True, f"AUDAPACK Chromium started ({_clean_browser_name('', selected)}; profile: {profile})."
