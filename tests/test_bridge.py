@@ -1079,5 +1079,24 @@ class TestWidgetBranding(unittest.TestCase):
         self.assertIn("--silent", silent_vbs)
 
 
+class BrowserWorkerLaunchNeedTests(unittest.TestCase):
+    def test_ready_when_clean_worker_exists(self):
+        from audapack.services.bridge_service import browser_worker_launch_need
+        self.assertEqual(browser_worker_launch_need({"active_workers": 3, "clean_workers": 1}), "ready")
+
+    def test_busy_when_workers_exist_but_none_clean(self):
+        from audapack.services.bridge_service import browser_worker_launch_need
+        self.assertEqual(browser_worker_launch_need({"active_workers": 3, "clean_workers": 0}), "busy")
+
+    def test_launch_when_no_worker_registered(self):
+        from audapack.services.bridge_service import browser_worker_launch_need
+        self.assertEqual(browser_worker_launch_need({"active_workers": 0, "clean_workers": 0}), "launch")
+
+    def test_launch_on_malformed_status(self):
+        from audapack.services.bridge_service import browser_worker_launch_need
+        self.assertEqual(browser_worker_launch_need(None), "launch")
+        self.assertEqual(browser_worker_launch_need({}), "launch")
+
+
 if __name__ == "__main__":
     unittest.main()

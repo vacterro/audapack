@@ -44,6 +44,26 @@ def _sha256_file(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+
+def browser_worker_launch_need(dispatch: dict[str, Any]) -> str:
+    """Classify whether a SEND AUDIT needs a worker window launched.
+
+    Returns one of:
+      'ready'   -- at least one clean worker is free; submit directly.
+      'busy'    -- workers exist but all are busy; job will queue normally.
+      'launch'  -- no worker is registered; launch the dedicated Chromium.
+    Never raises on malformed status payloads.
+    """
+    if not isinstance(dispatch, dict):
+        return "launch"
+    active = int(dispatch.get("active_workers", 0) or 0)
+    clean = int(dispatch.get("clean_workers", 0) or 0)
+    if clean > 0:
+        return "ready"
+    if active > 0:
+        return "busy"
+    return "launch"
+
 class BridgeService:
     def __init__(self, config: Optional[AppConfig] = None):
         self.config = config or load_config()

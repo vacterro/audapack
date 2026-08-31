@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from audapack.bridge.state import get_generation_file_path, get_generation_info
+from audapack.components.manager import ComponentManager
 from audapack.config import app_dir, save_config
 from audapack.inaudit import (
     get_active_inaudit_path,
@@ -50,7 +51,7 @@ from audapack.instances import InstanceMonitor
 from audapack.models import Project
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
 from audapack.services.audit_service import AuditService
-from audapack.services.bridge_service import BridgeService
+from audapack.services.bridge_service import BridgeService, browser_worker_launch_need
 from audapack.services.packing_service import PackingService
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
@@ -415,6 +416,7 @@ class MainWindow(QMainWindow):
         self._audit_service = audit_service or AuditService(service.config, base_dir=service.base_dir)
         self._packing = PackingService(service.config, base_dir=service.base_dir)
         self._bridge = BridgeService(service.config)
+        self._comp_mgr = ComponentManager(service.config)
         self._active_project: Optional[Project] = None
         record_path = Path(service.base_dir) / "instances.json" if service.base_dir is not None else None
         self._instance_monitor = InstanceMonitor(record_path=record_path)
@@ -1291,6 +1293,7 @@ QToolTip QLabel {
                 started, _message = self._bridge.start()
                 if not started or not self._bridge.runtime_status().get("healthy"):
                     raise RuntimeError("Bridge is not healthy")
+            self._ensure_free_browser_worker(proj.display_name)
             packed = self._packing.ensure_fresh_archive(proj.id)
             if not packed.success or not packed.output_path:
                 raise RuntimeError(packed.error_message or "Packing failed")
@@ -1318,6 +1321,39 @@ QToolTip QLabel {
             self._flash_status(f"START AUDIT failed: {error}", "#D66464")
 
         self.task_runner.submit(key, _prepare, on_success=_done, on_error=_error)
+
+    def _ensure_free_browser_worker(self, project_name: str) -> None:
+        """Make sure a free AUDAPACK Chromium widget window is open before
+        a SEND AUDIT job is enqueued. 1-click semantics: if no worker is
+        registered at all, launch the dedicated Chromium profile and tell
+        the user. If only busy workers exist, the Bridge will queue the
+        job — that is a legit state, not a failure.
+        """
+        status = self._bridge.browser_status() or {}
+        dispatch = status.get("dispatch", {}) if isinstance(status, dict) else {}
+        need = browser_worker_launch_need(dispatch)
+        if need == "ready":
+            return
+        active_workers = int(dispatch.get("active_workers", 0) or 0)
+        if need == "busy":
+            self._flash_status(
+                f"SEND AUDIT queued for {project_name}: all {active_workers} AUDAPACK workers are busy",
+                "#D4A840",
+            )
+            return
+        ok, message = self._comp_mgr.launch_browser_worker()
+        if ok:
+            self._flash_status(
+                f"SEND AUDIT for {project_name}: launching AUDAPACK Chromium (no free worker). Wait for CLEAN then click SEND AUDIT again.",
+                "#D4A840",
+                duration_ms=6000,
+            )
+        else:
+            self._flash_status(
+                f"SEND AUDIT for {project_name}: no worker + launch failed: {message}",
+                "#D66464",
+                duration_ms=6000,
+            )
 
     def _on_cancel_browser_audit(self, proj, dispatch):
         """Async cancel via TaskRunner — Qt UI must never block on HTTP."""
