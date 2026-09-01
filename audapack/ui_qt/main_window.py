@@ -472,14 +472,23 @@ def bridge_status_warning(browser: dict[str, Any]) -> str:
     that mysteriously never moved. Say it out loud instead.
     """
     stale = int(browser.get("stale_widget_workers", 0) or 0)
-    if not stale:
-        return ""
-    build = str(browser.get("required_widget_build", "") or "")
-    suffix = f" (needs {build})" if build else ""
-    return (
-        f"{stale} worker window(s) run an OUTDATED widget{suffix} — "
-        f"reinstall it from Settings ▸ Bridge; audits cannot start until then"
-    )
+    if stale:
+        build = str(browser.get("required_widget_build", "") or "")
+        suffix = f" (needs {build})" if build else ""
+        return (
+            f"{stale} worker window(s) run an OUTDATED widget{suffix} — "
+            f"reinstall it from Settings ▸ Bridge; audits cannot start until then"
+        )
+    launched = int(browser.get("managed_slots_launched", 0) or 0)
+    registered = int(browser.get("managed_slots_registered", 0) or 0)
+    missing = launched - registered
+    if missing > 0:
+        return (
+            f"{missing} worker window(s) opened but never reported in — the usual cause is "
+            f"the AUDAPACK browser profile being signed out of ChatGPT. Sign in there once; "
+            f"the pool stays short until then"
+        )
+    return ""
 
 
 class MainWindow(QMainWindow):

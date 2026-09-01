@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.32
+// @version      0.0.33
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18780,11 +18780,56 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     }, Math.max(250, Number(delay) || 25000));
   }
 
+  let browserWorkerUnusableReportedAt = 0;
+
+  function browserWorkerUnusableReason() {
+    // Why this window cannot be a worker, in the operator's terms. A managed
+    // window signed out of ChatGPT lands on the marketing page: no composer,
+    // no eligibility, no registration -- and so it was invisible to the pool,
+    // which reported W 1/6 with nothing anywhere saying why.
+    if (!browserWorkerHasChromiumCapability()) return 'browser-not-chromium';
+    if (detectSite().key !== 'chatgpt') return 'not-on-chatgpt';
+    if (typeof chatGPTSignedOut === 'function' && chatGPTSignedOut()) return 'signed-out';
+    if (!rawChatGPTComposerInput()) return 'no-composer';
+    if (location.pathname !== '/') return 'not-on-root-chat';
+    return 'page-ineligible';
+  }
+
+  function chatGPTSignedOut() {
+    // The logged-out landing page has no composer and offers a way in.
+    if (rawChatGPTComposerInput()) return false;
+    const nodes = document.querySelectorAll('a, button, [role="button"]');
+    for (const node of nodes) {
+      const name = cleanTurnText(String(node.getAttribute('aria-label') || node.innerText || '')).toLowerCase();
+      if (/^(log in|sign up|войти|зарегистр)/.test(name)) return true;
+    }
+    return false;
+  }
+
+  function browserWorkerReportUnusable() {
+    // Managed windows only: a human's own tab is allowed to be whatever it is.
+    if (!browserWorkerManagedIdentity()?.slot && !browserWorkerIsManagedProfile()) return false;
+    const now = Date.now();
+    if (now - browserWorkerUnusableReportedAt < 300000) return false;
+    browserWorkerUnusableReportedAt = now;
+    const reason = browserWorkerUnusableReason();
+    appendBridgeDiagnostic('worker_window_unusable', {
+      severity: 'info',
+      message: `managed worker window cannot register: ${reason}` + (
+        reason === 'signed-out'
+          ? '. Sign in to ChatGPT in the AUDAPACK worker profile; the pool stays short until then.'
+          : ''
+      )
+    });
+    return true;
+  }
+
   function startBrowserWorker() {
     hideBrowserWorkerBlocked();
     restoreBrowserWorkerLease();
     const recoveringOwnedAudit = Boolean(browserWorkerLease?.dispatch_id || autoRuntime?.runId);
     if (!browserWorkerHasChromiumCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
+      browserWorkerReportUnusable();
       // A managed window parked on /c/<id> after a run used to stop being a
       // worker permanently. Recycle it back to a clean root chat first.
       if (!recoveringOwnedAudit && browserWorkerRecycleToCleanChat('page-ineligible')) return true;
@@ -18941,6 +18986,8 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          chatGPTEnsureChatMode,
          chatGPTWorkModeControlNames,
          auditProfileIds,
+         browserWorkerUnusableReason,
+         chatGPTSignedOut,
          browserWorkerApplyDispatchedProfile,
          loadState,
          profileShortLabel,

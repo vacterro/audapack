@@ -253,3 +253,32 @@ def test_reset_all_says_nothing_to_do_when_the_queue_is_empty(window, monkeypatc
 
     window._on_reset_all_audit_runs()
     assert calls == []
+
+
+def test_worker_windows_that_never_report_in_are_named():
+    """W 1/6 with six windows open must not be silent.
+
+    A worker profile signed out of ChatGPT lands on the marketing page: no
+    composer, no eligibility, no registration -- and the pool stayed short with
+    nothing anywhere saying why.
+    """
+    from audapack.ui_qt.main_window import bridge_status_warning
+
+    healthy = {"active_workers": 6, "max_workers": 6, "clean_workers": 6,
+               "managed_slots_launched": 6, "managed_slots_registered": 6}
+    assert bridge_status_warning(healthy) == ""
+
+    short = {**healthy, "active_workers": 1, "clean_workers": 1,
+             "managed_slots_launched": 6, "managed_slots_registered": 1}
+    warning = bridge_status_warning(short)
+    assert "5 worker window(s) opened but never reported in" in warning
+    assert "signed out of ChatGPT" in warning
+
+
+def test_a_stale_widget_still_outranks_the_missing_window_warning():
+    """Both can be true; the one with a concrete fix comes first."""
+    from audapack.ui_qt.main_window import bridge_status_warning
+
+    both = {"stale_widget_workers": 2, "required_widget_build": "0.0.33",
+            "managed_slots_launched": 6, "managed_slots_registered": 0}
+    assert "OUTDATED widget" in bridge_status_warning(both)

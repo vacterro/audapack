@@ -568,6 +568,19 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             if not self.check_auth():
                 return
             dispatch = self._dispatcher().status()
+            # Windows the supervisor opened versus windows that actually came
+            # back. A worker profile signed out of ChatGPT lands on the
+            # marketing page, never registers, and used to be invisible: the
+            # operator saw W 1/6 with nothing anywhere saying why.
+            try:
+                slots = self._browser_slots_status().get("slots", [])
+                dispatch["managed_slots_launched"] = sum(
+                    1 for slot in slots if str(slot.get("state") or "") in {"LAUNCHING", "HEARTBEAT"}
+                )
+                dispatch["managed_slots_registered"] = sum(1 for slot in slots if slot.get("registered"))
+            except Exception:
+                dispatch["managed_slots_launched"] = 0
+                dispatch["managed_slots_registered"] = 0
             dispatch["workers"] = [{
                 "worker_id": worker.worker_id,
                 "state": worker.state,
