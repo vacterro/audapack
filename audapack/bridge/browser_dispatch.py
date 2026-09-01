@@ -573,10 +573,20 @@ class BrowserDispatcher:
                 if not (dispatch_id and lease_id):
                     raise DispatchError("invalid_lease", "dispatch_id and lease_id must be reported together")
                 job = self._jobs.get(dispatch_id)
-                if job and self._is_recovery_block(job):
-                    self.reconcile_job(dispatch_id, wid, lease_id, payload)
-                else:
-                    self.renew_lease(dispatch_id, wid, lease_id)
+                try:
+                    if job and self._is_recovery_block(job):
+                        self.reconcile_job(dispatch_id, wid, lease_id, payload)
+                    else:
+                        self.renew_lease(dispatch_id, wid, lease_id)
+                except DispatchError as exc:
+                    # Registration must never depend on one job's recovery
+                    # outcome. A refused reconcile (run id or receipt conflict,
+                    # an expired lease) used to propagate out of register_worker,
+                    # so the window stopped registering entirely: it vanished
+                    # from the pool, could not recycle, and its lane was lost
+                    # for good over a single stuck dispatch. The job stays
+                    # BLOCKED for the operator; the worker stays alive.
+                    record.meta["last_reconcile_error"] = f"{exc.code}: {exc}"[:200]
             return record
 
     def _worker_owns_live_job(self, worker: WorkerRecord) -> bool:

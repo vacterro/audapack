@@ -1164,3 +1164,37 @@ def test_a_stale_widget_build_is_named_not_reported_clean(tmp_path):
         assert d.worker_free_for_claim(workers["stale"]) is False
     finally:
         module._get_required_widget_build = original
+
+
+def test_a_refused_reconcile_never_unregisters_the_window(tmp_path):
+    """One stuck dispatch must not cost the pool a lane.
+
+    A refused reconcile propagated out of register_worker, so the window
+    stopped registering at all: invisible to the pool, unable to recycle, its
+    lane gone for good over a single blocked job.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("managed-1", managed_slot=1, managed_generation=1))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("managed-1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "managed-1", lease.lease_id, state,
+                         {"campaign_run_id": "run-real", "start_receipt": "receipt-real"})
+    # A Bridge restart blocks the live post-START run pending reconciliation.
+    lose_worker(d, "managed-1")
+    d.expire_leases()
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_STARTED
+    job.error = "Bridge restarted after START_PREPARED; same-worker reconciliation required"
+
+    # The window comes back but its runtime lost the campaign run id.
+    record = d.register_worker(supported_worker(
+        "managed-1", managed_slot=1, managed_generation=1,
+        dispatch_id=item.dispatch_id, lease_id=lease.lease_id, campaign_run_id="",
+    ))
+    assert record.worker_id == "managed-1"
+    assert "managed-1" in {w.worker_id for w in d.list_workers()}
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+    assert "run_id_conflict" in record.meta.get("last_reconcile_error", "")
