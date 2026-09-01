@@ -1,7 +1,7 @@
 ---
 phase: SHIP
-task: T-112
-next_action: "live quick3 run to READY; CM artifact needs widget 0.0.35 in the worker windows"
+task: T-115
+next_action: "6-lane live batch to READY; CM artifact still needs widget 0.0.36 installed in the worker windows"
 blocker: none
 agent: claude
 saipen_version: 7
@@ -9,8 +9,8 @@ schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
 transition_from: REVIEW
-last_event: 626
-updated: "2026-09-02T00:45:00Z"
+last_event: 629
+updated: "2026-09-02T02:15:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
