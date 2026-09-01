@@ -194,3 +194,94 @@ def test_a_polling_worker_keeps_its_run_past_the_lease(bridge_server, tmp_path):
     job = dispatcher.get_job(dispatch_id)
     assert job.state == "AUDITING"
     assert job.lease_expires_at > time.time()
+
+
+COMPRESS_WAVE = """PROJECT_NAME: CMPROJ
+DATE_TIME: 2026-09-01T18:30:00
+CAMPAIGN_PROFILE: compress
+CAMPAIGN_RUN_ID: {run_id}
+WAVE_ID: compress
+WAVE: COMPRESS AUDIT
+TARGET: CMPROJ repo
+BASELINE: cm-1
+STATUS: COMPRESS: COMPLETE
+TICKETS: 1
+HANDOFF: IMPLEMENTATION_AGENT
+
+[P1] [CMP-001] DELETE audapack/legacy_shim.py
+EVIDENCE: no importer, no entry point, no test references it
+WASTE: 240 lines and one dependency kept alive for a migration that finished
+ACTION: DELETE
+BEHAVIOR_GUARD: the public run() signature and its exit codes stay identical
+IMPACT: delete 1 file, remove ~240 source LOC, drop one dependency
+VERIFY: full suite green and the CLI smoke test still exits 0
+
+COMPRESS_DONE_WHEN: the file is gone and the suite is green."""
+
+
+def test_a_compress_campaign_writes_its_own_canonical_handoff(bridge_server, tmp_path):
+    """CM end to end: one wave in, __00_COMPRESS_AUDIT.md out.
+
+    A one-wave profile must not be pushed through the Super10 synthesis, and
+    the file it produces is what GG resolves.
+    """
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    run_id = "acb-cm-e2e-0001"
+
+    status, payload = _post(conn, "/v1/audits", {
+        "run_id": run_id,
+        "project": "CMPROJ",
+        "wave": "compress",
+        "profile_id": "compress",
+        "status": "complete",
+        "api_version": 3,
+        "receipt": "rcpt-cm-001",
+        "content": COMPRESS_WAVE.format(run_id=run_id),
+    }, config.bridge.token)
+    assert status == 200, payload
+    assert payload.get("ok") is True
+
+    root = Path(config.audits.root)
+    handoff = list(root.rglob("CMPROJ__00_COMPRESS_AUDIT.md"))
+    assert handoff, f"canonical compress handoff missing under {root}"
+    text = handoff[0].read_text(encoding="utf-8")
+    assert "CAMPAIGN_PROFILE: compress" in text
+    assert "[CMP-001]" in text
+    assert "COMPRESS_DONE_WHEN:" in text
+
+    assert list(root.rglob("CMPROJ__01_AUDIT_COMPRESS.md")), "the per-wave artifact must exist"
+    assert not list(root.rglob("*SUPER_AUDIT*")), "compress must never generate SUPER_AUDIT_* artifacts"
+    assert not list(root.rglob("*AUDIT_ALL_3*")), "compress must not borrow the quick3 name"
+
+    history = list(root.rglob("_history/**/CMPROJ__00_COMPRESS_AUDIT__*.md"))
+    assert history, "the canonical handoff needs its history twin"
+
+
+def test_the_compress_handoff_is_what_the_audit_index_calls_ready(bridge_server, tmp_path):
+    """GG resolves final_handoff_path; for CM that is __00_COMPRESS_AUDIT.md."""
+    from audapack.audits import AuditIndexer
+    from audapack.models import Project
+
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    run_id = "acb-cm-e2e-0002"
+
+    status, payload = _post(conn, "/v1/audits", {
+        "run_id": run_id, "project": "CMREADY", "wave": "compress",
+        "profile_id": "compress", "status": "complete", "api_version": 3,
+        "receipt": "rcpt-cm-002",
+        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", "CMREADY"),
+    }, config.bridge.token)
+    assert status == 200, payload
+
+    handoff = list(Path(config.audits.root).rglob("CMREADY__00_COMPRESS_AUDIT.md"))[0]
+    project = Project(id="cmready", display_name="CMREADY",
+                      source_path=str(tmp_path / "src"), priority_group="MAIN0", slot=1)
+    snapshot = AuditIndexer(config).scan_project(project)
+
+    assert snapshot.audit_profile_id == "compress"
+    assert snapshot.total_waves == 1
+    assert snapshot.campaign_complete is True
+    assert snapshot.final_handoff_ready is True
+    assert Path(snapshot.final_handoff_path).resolve() == handoff.resolve()
