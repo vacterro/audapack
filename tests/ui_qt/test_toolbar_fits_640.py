@@ -85,6 +85,38 @@ def test_the_whole_action_row_fits_640(toolbar):
     )
 
 
+def test_a_checked_button_is_not_clipped_by_its_pressed_padding(toolbar):
+    """The profile button that marks the current default is CHECKED.
+
+    The shared pressed rule widens horizontal padding from 4px to 12px to fake
+    the bevel shift, which is 8px a width-fitted button does not have: the
+    checked profile button rendered as "..." while every other label was fine.
+    """
+    from PySide6.QtCore import QSize
+    from PySide6.QtWidgets import QStyle, QStyleOptionToolButton
+
+    _window, bar = toolbar
+    checked = [a for a in bar.actions() if a.text() and a.isCheckable() and a.isChecked()]
+    assert checked, "one profile button must mark the current default"
+
+    for action in checked:
+        button = bar.widgetForAction(action)
+        button.ensurePolished()
+        metrics = button.fontMetrics()
+        option = QStyleOptionToolButton()
+        option.initFrom(button)
+        option.text = action.text()
+        needed = button.style().sizeFromContents(
+            QStyle.ContentsType.CT_ToolButton,
+            option,
+            QSize(metrics.horizontalAdvance(action.text()), metrics.height()),
+            button,
+        ).width()
+        assert button.width() >= needed, (
+            f"checked {action.text()} would render elided: {button.width()}px given, {needed}px needed"
+        )
+
+
 def test_ctrl_r_refreshes_everything(toolbar):
     """REFRESH lost its permanent slot, so the shortcut has to exist."""
     from PySide6.QtGui import QKeySequence, QShortcut

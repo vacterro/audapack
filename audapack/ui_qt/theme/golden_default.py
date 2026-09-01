@@ -57,6 +57,13 @@ QToolBar {{
     spacing: 1px;
     padding: 2px;
 }}
+QToolBar QToolButton:checked, QToolBar QToolButton:pressed {{
+    /* The shared pressed rule widens horizontal padding from 4px to 12px to
+       fake the bevel shift. On a width-fitted toolbar that is 8px the button
+       does not have, so the CHECKED profile button rendered as "...". Shift
+       vertically only. */
+    padding: 3px 2px 1px 2px;
+}}
 QToolBar QToolButton {{
     /* The action bar must fit one row at 640px: the shared button padding is
        sized for dialog buttons and turned a two-character label into a 74px
