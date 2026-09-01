@@ -82,6 +82,7 @@ test('W11: consuming a job arms the engine and applies the dispatched profile', 
   api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
 
   const transitions = [];
+  let armedBeforeSend = false;
   const input = {};
   const root = { contains: node => node === input };
   const archiveFile = { name: 'SMART_VAC.zip', size: 99 };
@@ -107,6 +108,7 @@ test('W11: consuming a job arms the engine and applies the dispatched profile', 
     injectFiles: () => true,
     waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [archiveFile.name] }),
     startAudit: async ({ beforeIrreversibleSend }) => {
+      armedBeforeSend = Boolean(api.autoRuntime && api.autoRuntime.enabled);
       await beforeIrreversibleSend({ receipt: 'receipt-1', campaignRunId: 'acb-cm-1' });
       return true;
     }
@@ -115,7 +117,36 @@ test('W11: consuming a job arms the engine and applies the dispatched profile', 
   assert.ok(ok);
   assert.strictEqual(api.getActiveProfile().profile_id, 'compress', 'the job names the profile');
   assert.strictEqual(Boolean(api.autoRuntime.enabled), true, 'the engine must be armed to commit the wave');
+  assert.ok(armedBeforeSend, 'arming after the send leaves startAudit running unarmed: no wave stage, nothing harvested');
   assert.deepStrictEqual(transitions, [
     'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
   ]);
+});
+
+test('W11: a live run whose engine went idle is put back on its own audit turn', () => {
+  // The Bridge says this window owns a post-start run and the engine is at
+  // stage idle: the Core was sent before the engine was armed, or route
+  // hydration dropped the runtime as the draft became /c/<id>. Either way the
+  // chat already holds the machine-authored turn.
+  const { h, api } = managedWindow();
+  composerFixture(h);
+  api.browserWorkerLease = {
+    dispatch_id: 'dsp-0123456789abcdef', worker_id: 'w', lease_id: 'l'
+  };
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  assert.strictEqual(String(api.autoRuntime.stage || 'idle'), 'idle');
+  api.browserWorkerRecoverIdleEngine();
+  assert.strictEqual(Boolean(api.autoRuntime.enabled), true);
+});
+
+test('W11: a run already mid-wave is never disturbed by the recovery', () => {
+  const { h, api } = managedWindow();
+  composerFixture(h);
+  api.browserWorkerLease = { dispatch_id: 'dsp-0123456789abcdef', worker_id: 'w', lease_id: 'l' };
+  api.autoRuntime = { ...api.emptyAutoRuntime({ enabled: true }), stage: 'wait-compress', runId: 'acb-live' };
+
+  assert.strictEqual(api.browserWorkerRecoverIdleEngine(), false);
+  assert.strictEqual(api.autoRuntime.stage, 'wait-compress');
+  assert.strictEqual(api.autoRuntime.runId, 'acb-live');
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.34
+// @version      0.0.35
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18148,6 +18148,34 @@ let browserWorkerBraveConfirmed = false;
     return true;
   }
 
+  let browserWorkerEngineRecoveredAt = 0;
+
+  function browserWorkerRecoverIdleEngine() {
+    // The Bridge says this window owns a live post-start run, and the engine
+    // that has to harvest it is sitting at stage idle. That happens when the
+    // Core was sent before the engine was armed, or when route hydration
+    // dropped the runtime as the draft became /c/<id>. The chat already holds
+    // the machine-authored audit turn, so the engine can be put back on it.
+    const stage = String(autoRuntime?.stage || 'idle');
+    if (stage !== 'idle' && stage !== 'complete') return false;
+    const now = Date.now();
+    if (now - browserWorkerEngineRecoveredAt < 60000) return false;
+    browserWorkerEngineRecoveredAt = now;
+    let repaired = false;
+    try {
+      browserWorkerArmAuditEngine();
+      const key = autoBoundConversationKey || currentConversationKey();
+      repaired = Boolean(key && reassertA3FromMachineReceipt(key));
+    } catch (_) {
+      repaired = false;
+    }
+    appendBridgeDiagnostic('worker_engine_recovered', {
+      severity: 'info',
+      message: `owned run is live but the audit engine was ${stage}; ${repaired ? 're-armed from the visible audit turn' : 'armed, no machine turn to adopt yet'}`
+    });
+    return repaired;
+  }
+
   function browserWorkerArmAuditEngine() {
     // A dispatched run is not a human toggling A3: the operator already asked
     // for this audit from the desktop, so the engine that harvests and commits
@@ -18320,6 +18348,13 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       }
     }
     if (!(await transition('ATTACHED')).ok) return false;
+    // Arm the audit engine BEFORE the send. The Bridge delivers the Core and
+    // moves the lane, but harvesting the response and committing the wave is
+    // the widget's own engine, and a worker window's engine is off by default.
+    // Arming afterwards was not enough: startAudit had already run unarmed, so
+    // no wave stage was ever entered and the run sat at stage idle -- the CM
+    // audit produced a valid terminal handoff in the chat and saved nothing.
+    browserWorkerArmAuditEngine();
     const started = await startAudit({
       beforeIrreversibleSend: async ({ receipt, campaignRunId }) => {
         // P0-5/17: clean ownership revalidated immediately before the
@@ -18381,13 +18416,6 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       }
       return false;
     }
-    // Arm the audit engine for this run. The Bridge sends the Core and moves
-    // the lane to AUDITING, but harvesting the response and committing the
-    // wave is the widget's own auto engine, and a worker window's engine is
-    // off by default: the CM audit ran for 11m34s, produced a valid terminal
-    // handoff in the chat, and nothing was ever saved. Only after the send,
-    // so it binds to the conversation the Core actually created.
-    browserWorkerArmAuditEngine();
     if (!(await transition('STARTED', { campaign_run_id: String(autoRuntime?.runId || ''), conversation_id: String(autoRuntime?.conversationKey || '') })).ok) return false;
     if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
     return true;
@@ -18722,6 +18750,10 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       // Idempotent: STARTED -> AUDITING is legal and AUDITING -> AUDITING is a
       // no-op ACK.
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
+          ['STARTED', 'AUDITING', 'FINALIZING'].includes(String(owned.state || ''))) {
+        browserWorkerRecoverIdleEngine();
+      }
+      if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           String(owned.state || '') === 'STARTED') {
         // No campaign_run_id on purpose. The Bridge already owns the run id
         // from START_PREPARED, and re-sending a runtime value that route
@@ -19018,6 +19050,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          chatGPTSignedOut,
          browserWorkerApplyDispatchedProfile,
          browserWorkerArmAuditEngine,
+         browserWorkerRecoverIdleEngine,
          loadState,
          profileShortLabel,
          nextAuditProfileId,
