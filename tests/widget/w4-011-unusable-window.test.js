@@ -72,3 +72,50 @@ test('W11: arming an engine that is already on is a no-op', () => {
   assert.strictEqual(api.browserWorkerArmAuditEngine(), true);
   assert.strictEqual(api.autoRuntime.runId, 'acb-live', 'an armed run must not be disturbed');
 });
+
+test('W11: consuming a job arms the engine and applies the dispatched profile', async () => {
+  // The full path, not just the helpers: a CM audit ran to a valid handoff in
+  // the chat and saved nothing, because the engine that harvests and commits
+  // the wave was never armed and the window was still on A3.
+  const { api } = setup();
+  api.state.auditProfile = 'quick3';
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  const transitions = [];
+  const input = {};
+  const root = { contains: node => node === input };
+  const archiveFile = { name: 'SMART_VAC.zip', size: 99 };
+
+  const ok = await api.browserWorkerConsume({
+    dispatch_id: 'dsp-0123456789abcdef',
+    worker_id: 'worker-1',
+    lease_id: 'lease-1',
+    project_id: 'smart_vac_cleaner',
+    project_name: 'Smart VAC Cleaner',
+    campaign_run_id: 'acb-cm-1',
+    profile: 'compress',
+    archive_filename: archiveFile.name,
+    archive_size: archiveFile.size
+  }, {
+    transition: async (state, payload = {}) => {
+      transitions.push(state);
+      return { ok: true };
+    },
+    fetchArtifact: async () => ({ ok: true, file: archiveFile }),
+    uploadInput: () => input,
+    composerRoot: () => root,
+    injectFiles: () => true,
+    waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [archiveFile.name] }),
+    startAudit: async ({ beforeIrreversibleSend }) => {
+      await beforeIrreversibleSend({ receipt: 'receipt-1', campaignRunId: 'acb-cm-1' });
+      return true;
+    }
+  });
+
+  assert.ok(ok);
+  assert.strictEqual(api.getActiveProfile().profile_id, 'compress', 'the job names the profile');
+  assert.strictEqual(Boolean(api.autoRuntime.enabled), true, 'the engine must be armed to commit the wave');
+  assert.deepStrictEqual(transitions, [
+    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
+  ]);
+});
