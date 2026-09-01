@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from PySide6.QtCore import QAbstractTableModel, QFileSystemWatcher, QModelIndex, QPoint, QRect, Qt, QTimer, QUrl  # noqa: I001
+from PySide6.QtCore import QFileSystemWatcher, QModelIndex, QPoint, QRect, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QDrag,
@@ -25,15 +25,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFileDialog,
-    QHeaderView,
     QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QSplitter,
     QSystemTrayIcon,
     QTabWidget,
-    QTableView,
     QToolBar,
     QToolTip,
     QTreeView,
@@ -73,157 +70,6 @@ from audapack.ui_qt.task_runner import TaskRunner
 from audapack.ui_qt.theme.golden_default import PALETTE, GoldenDefault
 
 logger = logging.getLogger(__name__)
-
-
-class ProjectStateTableModel(QAbstractTableModel):
-    """Flat per-project state table for the Project Room.
-
-    The tree keeps the group/slot structure and DnD; this model presents the
-    SAME data as an aligned table -- one row per project, one state dimension
-    per column (RUN, WAVES, ZIP, AGE, STATUS). It reads lazily from the
-    ProjectRoomModel's roles and mirrors its change signals.
-    """
-
-    HEADERS = ["PROJ", "GROUP", "SLOT", "RUN", "WAVES", "ZIP", "AGE", "STATUS"]
-
-    def __init__(self, source: "ProjectRoomModel", parent=None):
-        super().__init__(parent)
-        self._source = source
-        self._rows: list[tuple[str, int, str]] = []  # (group, slot, project_id)
-        self._sync()
-        for sig in ("modelReset", "layoutChanged"):
-            getattr(source, sig).connect(self._on_source_changed)
-        source.dataChanged.connect(self._on_source_data_changed)
-
-    # -- sync ---------------------------------------------------------- #
-
-    def _rows_from_source(self) -> list[tuple[str, int, str]]:
-        out: list[tuple[str, int, str]] = []
-        for (g, s), p in self._source._projects.items():
-            if p is not None:
-                out.append((g, s, p.id))
-        out.sort(key=lambda item: (str(item[0]), item[1]))
-        return out
-
-    def _sync(self) -> None:
-        self.beginResetModel()
-        self._rows = self._rows_from_source()
-        self.endResetModel()
-
-    def _on_source_changed(self, *_args) -> None:
-        self._sync()
-
-    def _on_source_data_changed(self, top_left, bottom_right, _roles=None) -> None:
-        # Recompute the affected row(s); cheap full rebuild is fine at this scale.
-        self._sync()
-
-    # -- Qt API -------------------------------------------------------- #
-
-    def rowCount(self, parent=None) -> int:
-        p = parent if parent is not None else QModelIndex()
-        return 0 if p.isValid() else len(self._rows)
-
-    def columnCount(self, parent=None) -> int:
-        p = parent if parent is not None else QModelIndex()
-        return 0 if p.isValid() else len(self.HEADERS)
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        if orientation == Qt.Orientation.Horizontal:
-            return self.HEADERS[section]
-        return section + 1
-
-    def project_id_at(self, row: int) -> str:
-        if 0 <= row < len(self._rows):
-            return self._rows[row][2]
-        return ""
-
-    def _src_index(self, row: int):
-        if not (0 <= row < len(self._rows)):
-            return QModelIndex()
-        g, s, _pid = self._rows[row]
-        return self._source.index_for_slot(g, s)
-
-    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        row, col = index.row(), index.column()
-        src_idx = self._src_index(row)
-        if not src_idx.isValid():
-            return None
-        src = self._source
-        g, s, pid = self._rows[row]
-
-        if role == Qt.ItemDataRole.UserRole + 1:  # project_id (for selection sync)
-            return pid
-
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
-            if col == 0:
-                return src.data(src_idx, src.ROLES["display_name"])
-            if col == 1:
-                return g
-            if col == 2:
-                return f"[{s}]"
-            if col == 3:
-                run_state = str(src.data(src_idx, src.ROLES["audit_run_state"]) or "")
-                if not run_state:
-                    disp = str(src.data(src_idx, src.ROLES["dispatch_state"]) or "")
-                    return disp or "—"
-                return run_state
-            if col == 4:
-                done = int(src.data(src_idx, src.ROLES["completed_waves"]) or 0)
-                total = int(src.data(src_idx, src.ROLES["total_waves"]) or 3)
-                return f"{done}/{total}"
-            if col == 5:
-                arc = src.data(src_idx, src.ROLES["archive_info"])
-                if not arc:
-                    return "—"
-                exists, size, _created, _path = arc
-                if not exists:
-                    return "—"
-                return str(size).replace(".", ",")
-            if col == 6:
-                return str(src.data(src_idx, src.ROLES["audit_age_str"]) or "—")
-            if col == 7:
-                pk = str(src.data(src_idx, src.ROLES["pack_state"]) or "IDLE")
-                ready = bool(src.data(src_idx, src.ROLES["all_ready"]))
-                if ready:
-                    return "READY"
-                if pk != "IDLE":
-                    return pk
-                return "—"
-        if role == Qt.ItemDataRole.ForegroundRole:
-            return self._foreground(src_idx, col)
-        if role == Qt.ItemDataRole.BackgroundRole:
-            return self._background(src_idx)
-        return None
-
-    # -- colors -------------------------------------------------------- #
-
-    def _foreground(self, src_idx, col):
-        from PySide6.QtGui import QColor as _Q
-        p = _Q(PALETTE["textSecondary"])
-        if col == 3:
-            run_state = str(self._source.data(src_idx, self._source.ROLES["audit_run_state"]) or "")
-            if run_state == "READY":
-                return _Q(PALETTE["success"])
-            if run_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}:
-                return _Q(PALETTE["dangerText"])
-            if run_state:
-                return _Q(PALETTE["warning"])
-        if col == 4:
-            ready = bool(self._source.data(src_idx, self._source.ROLES["all_ready"]))
-            return _Q(PALETTE["success"]) if ready else p
-        if col == 5:
-            st = str(self._source.data(src_idx, self._source.ROLES["archive_sync_status"]) or "SYNCED")
-            return _Q(PALETTE["dangerText"]) if st == "OUTDATED" else p
-        return p
-
-    def _background(self, src_idx):
-        from PySide6.QtGui import QColor as _Q
-        ignored = bool(self._source.data(src_idx, self._source.ROLES["is_ignored"]))
-        return _Q(PALETTE["borderDark"]) if ignored else None
 
 
 class ProjectTreeView(QTreeView):
@@ -694,36 +540,6 @@ class MainWindow(QMainWindow):
         # Initial selection: auto-select first registered project
         self._auto_select_first_project()
 
-        # State table — the same projects as aligned columns. The tree keeps
-        # DnD/group structure, the table gives a scannable per-project status
-        # grid (RUN · WAVES · ZIP · AGE · STATUS).
-        self.state_model = ProjectStateTableModel(self.model, parent=self)
-        self.state_table = QTableView(self.tabs)
-        self.state_table.setModel(self.state_model)
-        self.state_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.state_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.state_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.state_table.setShowGrid(False)
-        self.state_table.verticalHeader().setVisible(False)
-        self.state_table.horizontalHeader().setHighlightSections(False)
-        header = self.state_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
-        self.state_table.setColumnWidth(0, 180)
-        self.state_table.setColumnWidth(1, 60)
-        self.state_table.setColumnWidth(2, 44)
-        self.state_table.setColumnWidth(3, 110)
-        self.state_table.setColumnWidth(4, 56)
-        self.state_table.setColumnWidth(5, 90)
-        self.state_table.setColumnWidth(6, 90)
-        self.state_table.selectionModel().currentChanged.connect(self._on_state_table_current_changed)
-
-        self.project_splitter = QSplitter(Qt.Orientation.Vertical, projects_tab)
-        self.project_splitter.addWidget(self.tree)
-        self.project_splitter.addWidget(self.state_table)
-        self.project_splitter.setSizes([280, 160])
-        p_layout.addWidget(self.project_splitter)
-
         # Tab 1: six operator-facing audit run lanes.
         self.audit_runs_widget = AuditRunsWidget(self.tabs)
         self.audit_runs_widget.start_requested.connect(self._on_start_audit_project_id)
@@ -1017,33 +833,6 @@ QToolTip QLabel {
         self._active_project = self.model.project_at(group, slot)
         if hasattr(self, "inaudit_widget"):
             self.inaudit_widget.set_project(self._active_project)
-        self._sync_state_table_selection()
-
-    def _sync_state_table_selection(self):
-        """Highlight the matching row in the state table when the tree selection changes."""
-        if not hasattr(self, "state_table") or not self._active_project:
-            return
-        sm = self.state_table.selectionModel()
-        if sm is None:
-            return
-        pid = self._active_project.id
-        for row in range(self.state_model.rowCount()):
-            if self.state_model.project_id_at(row) == pid:
-                idx = self.state_model.index(row, 0)
-                sm.setCurrentIndex(idx, sm.SelectionFlag.ClearAndSelect | sm.SelectionFlag.Rows)
-                return
-
-    def _on_state_table_current_changed(self, current: QModelIndex, _previous: QModelIndex):
-        """Select the project in the tree when its state-table row is clicked."""
-        if not current.isValid():
-            return
-        pid = self.state_model.project_id_at(current.row())
-        if not pid:
-            return
-        tree_idx = self.model.index_for_project_id(pid)
-        if tree_idx.isValid():
-            self.tree.setCurrentIndex(tree_idx)
-            self.tree.scrollTo(tree_idx)
 
     def _selected_project(self) -> Optional[Project]:
         """Resolves the currently targeted project with multi-layered fallback."""
