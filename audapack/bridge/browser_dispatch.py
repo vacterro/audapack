@@ -56,6 +56,12 @@ PRE_START_OWNER_GRACE_SECONDS = 45.0
 #: refused poll never hands the lane to an unmanaged tab.
 MANAGED_SLOT_MEMORY_SECONDS = 150.0
 LEASE_SECONDS = 180
+#: How long a post-START run waits for its own window to come back before the
+#: Bridge stops calling it recoverable. A managed worker id lives in that
+#: window's sessionStorage, so a window that closes takes its identity with it
+#: and no relaunch can ever adopt the run. Long enough to survive a reload, a
+#: crashed tab that reopens, and a long ChatGPT generation.
+POST_START_RECOVERY_GRACE_SECONDS = 600.0
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
 PRE_START_MAX_RETRIES = 5
@@ -1351,6 +1357,51 @@ class BrowserDispatcher:
                 self._persist_jobs()
                 self._work_available.notify_all()
             return closed
+
+    def expire_unrecoverable_runs(self, grace_seconds: float = POST_START_RECOVERY_GRACE_SECONDS) -> int:
+        """Stop calling a run recoverable once its window is gone for good.
+
+        A post-START job blocks on "worker lost after START_PREPARED; recovery
+        required" and waits for that worker to come back. It never can: the
+        managed worker id lives in the window's sessionStorage, so a closed
+        window takes its identity with it and a relaunched slot registers as
+        somebody else. Observed live: SAIPET blocked at 02:06 and was still
+        blocked, with its slot empty and the supervisor skipping every pass as
+        "no-queued-work", because nothing in the system ever ends that wait.
+
+        Call this AFTER the completion reconcilers, so a run that actually
+        finished is closed as COMPLETE rather than failed here. This only
+        stops the lie -- it never re-runs an audit, because START_PREPARED is
+        the exactly-once boundary and re-crossing it is the operator's call.
+        """
+        grace = max(1.0, float(grace_seconds))
+        with self._lock:
+            now = _now()
+            failed = 0
+            for job in self._jobs.values():
+                if job.state == JOB_BLOCKED:
+                    if job.recovery_state not in POST_START_STATES:
+                        continue
+                elif job.state not in POST_START_STATES:
+                    continue
+                if job.assigned_worker_id and job.assigned_worker_id in self._workers:
+                    continue
+                if now - job.updated_at <= grace:
+                    continue
+                job.state = JOB_FAILED
+                job.recovery_state = ""
+                job.error = (
+                    "the worker window that ran this audit never came back; "
+                    "its identity died with the window, so the run cannot be recovered"
+                )
+                job.last_error_code = "worker_window_gone"
+                job.completed_at = now
+                job.updated_at = now
+                failed += 1
+            if failed:
+                self._persist_jobs()
+                self._work_available.notify_all()
+            return failed
 
     def reconcile_completed_blocked_runs(self) -> int:
         """Complete any live post-start run with durable COMPLETE proof.

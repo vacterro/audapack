@@ -1518,6 +1518,72 @@ def test_a_campaign_finished_while_the_lane_was_blocked_still_closes(tmp_path):
     assert closed.meta_run_id_drift == "acb-saved-under-another-id"
 
 
+def test_a_run_whose_window_never_returns_stops_claiming_to_be_recoverable(tmp_path):
+    """A managed worker id lives in its window's sessionStorage.
+
+    A closed window takes its identity with it, so a relaunched slot registers
+    as somebody else and no recovery is possible. Observed live: SAIPET blocked
+    on "worker lost after START_PREPARED; recovery required" with its slot
+    empty, and nothing in the system ever ended that wait.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "SAIPET"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_STARTED
+    job.error = "worker lost after START_PREPARED; recovery required"
+
+    # The window is gone from the registry, but not yet for long enough.
+    d._workers.pop("w1", None)
+    assert d.expire_unrecoverable_runs() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+
+    job.updated_at = time.time() - 601
+    assert d.expire_unrecoverable_runs() == 1
+    closed = d.get_job(item.dispatch_id)
+    assert closed.state == JOB_FAILED
+    assert closed.last_error_code == "worker_window_gone"
+    assert closed.recovery_state == ""
+
+
+def test_a_blocked_run_whose_window_is_still_registered_keeps_waiting(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "SAIPET"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_STARTED
+    job.updated_at = time.time() - 3600
+
+    assert d.expire_unrecoverable_runs() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+
+
+def test_a_pre_start_job_is_never_failed_as_unrecoverable(tmp_path):
+    """Nothing before START_PREPARED has an audit to lose: it requeues."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "SAIPET"))
+    d.claim_job("w1")
+    d._workers.pop("w1", None)
+    d.get_job(item.dispatch_id).updated_at = time.time() - 3600
+
+    assert d.expire_unrecoverable_runs() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+
 def test_a_campaign_finished_before_this_dispatch_started_closes_nothing(tmp_path):
     """Every project audited even once keeps a complete campaign on disk.
 

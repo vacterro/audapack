@@ -109,6 +109,7 @@ class DispatchSupervisor:
             "requeued": 0,
             "freed": 0,
             "reconciled_complete": 0,
+            "unrecoverable": 0,
             "queued_jobs": 0,
             "active_workers": 0,
             "clean_workers": 0,
@@ -144,6 +145,15 @@ class DispatchSupervisor:
                 result["reconciled_complete"] += int(reconcile_finished() or 0)
         except Exception as exc:
             logger.warning("dispatch supervisor could not reconcile finished campaigns: %s", exc)
+
+        try:
+            # Strictly after the completion reconcilers: a run that actually
+            # finished must close as COMPLETE, never fail here.
+            expire_unrecoverable = getattr(self.dispatcher, "expire_unrecoverable_runs", None)
+            if callable(expire_unrecoverable):
+                result["unrecoverable"] = int(expire_unrecoverable() or 0)
+        except Exception as exc:
+            logger.warning("dispatch supervisor could not expire unrecoverable runs: %s", exc)
 
         try:
             status = dict(self.dispatcher.status())
