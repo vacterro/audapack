@@ -229,3 +229,46 @@ def test_artifact_stream_carries_zip_bytes(bridge_server, tmp_path):
     assert resp.getheader("Content-Type") == "application/zip"
     assert resp.getheader("Content-Disposition", "").startswith("attachment;")
     assert body == b"PK\x03\x04fake-zip-bytes"
+
+
+def test_browser_slots_reports_all_six_slots(bridge_server):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload, _ = _get_with_headers(conn, "/v1/browser/slots", {
+        "X-ACB-Token": config.bridge.token,
+    })
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["max_lanes"] == 6
+    assert [item["slot"] for item in payload["slots"]] == [1, 2, 3, 4, 5, 6]
+    for item in payload["slots"]:
+        assert "state" in item and "registered" in item and "generation" in item
+
+
+def test_relaunch_slot_requires_an_integer_slot(bridge_server):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/relaunch-slot", {
+        "slot": "not-a-number",
+    }, config.bridge.token)
+    assert status == 400
+    assert payload["error"]["code"] == "invalid_slot"
+
+
+def test_relaunch_slot_without_supervisor_is_503(bridge_server):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/relaunch-slot", {
+        "slot": 3,
+    }, config.bridge.token)
+    assert status == 503
+    assert payload["error"]["code"] == "supervisor_unavailable"
+
+
+def test_relaunch_slot_rejects_unauthenticated_request(bridge_server):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, _ = _post(conn, "/v1/browser/relaunch-slot", {
+        "slot": 3,
+    }, "wrong-token")
+    assert status == 403

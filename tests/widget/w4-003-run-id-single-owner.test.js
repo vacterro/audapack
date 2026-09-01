@@ -113,7 +113,7 @@ test('W4-003: deliverBridgeJob patches content CAMPAIGN_RUN_ID to match transpor
     receipt: 'rcpt-tampered',
     runId: 'run-canonical-001',
     sourceRunId: 'run-canonical-001',
-    deliveryRunId: 'run-canonical-001',
+    deliveryBatchId: 'run-canonical-001',
     conversationKey: record.conversationKey,
     conversationId: 'w4-003',
     project: 'AUDAPACK',

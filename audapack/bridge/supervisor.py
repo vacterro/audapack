@@ -108,6 +108,7 @@ class DispatchSupervisor:
         result: dict[str, Any] = {
             "requeued": 0,
             "freed": 0,
+            "reconciled_complete": 0,
             "queued_jobs": 0,
             "active_workers": 0,
             "clean_workers": 0,
@@ -126,6 +127,13 @@ class DispatchSupervisor:
                 result["freed"] = int(reconcile() or 0)
         except Exception as exc:
             logger.warning("dispatch supervisor could not reconcile abandoned runs: %s", exc)
+
+        try:
+            reconcile_complete = getattr(self.dispatcher, "reconcile_completed_blocked_runs", None)
+            if callable(reconcile_complete):
+                result["reconciled_complete"] = int(reconcile_complete() or 0)
+        except Exception as exc:
+            logger.warning("dispatch supervisor could not reconcile completed blocked runs: %s", exc)
 
         try:
             status = dict(self.dispatcher.status())
@@ -185,6 +193,43 @@ class DispatchSupervisor:
         else:
             result["skipped"] = "nothing-to-launch"
         return result
+
+    def relaunch_managed_slot(self, slot: int) -> dict[str, Any]:
+        """Reopen a specific managed worker slot whose window was closed.
+
+        An explicit operator request: the slot's launch/cooldown accounting is
+        cleared and the unproductive-launch budget is reset so past failures or
+        grace pacing never block the request. A live worker already registered
+        on the slot is left alone (no duplicate window is ever opened).
+        """
+        slot = max(1, min(MAX_AUDIT_LANES, int(slot)))
+        self._unproductive_launches = 0
+        self._last_launch_at = 0.0
+        try:
+            self.workers._reset_slot(slot)
+            status = dict(self.dispatcher.status())
+        except Exception as exc:
+            logger.warning("could not prepare slot %s relaunch: %s", slot, exc)
+            return {"slot": slot, "success": False, "message": f"relaunch preparation failed: {exc}"}
+        status["workers"] = self._worker_rows()
+        try:
+            outcome = self.workers.ensure_capacity(status, max(1, slot))
+        except Exception as exc:
+            logger.warning("could not relaunch slot %s: %s", slot, exc)
+            return {"slot": slot, "success": False, "message": f"relaunch failed: {exc}"}
+        launched = [
+            item for item in outcome.get("launched", [])
+            if int(item.get("slot", 0) or 0) == slot
+        ]
+        return {
+            "slot": slot,
+            "generation": outcome.get("generation", 1),
+            "success": bool(launched),
+            "message": "managed worker window relaunched" if launched else (
+                "slot already has a live worker or no window was needed"
+            ),
+            "launched": launched,
+        }
 
     # -- thread lifecycle ------------------------------------------------- #
 

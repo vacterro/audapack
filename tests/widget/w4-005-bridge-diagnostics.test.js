@@ -11,7 +11,7 @@ function failedJob(overrides = {}) {
     jobId: 'receipt-diag-001',
     receipt: 'receipt-diag-001',
     runId: 'run-diag-001',
-    deliveryRunId: 'run-diag-001',
+    deliveryBatchId: 'run-diag-001',
     conversationKey: 'c:diag',
     project: 'AUDAPACK',
     wave: 'core',

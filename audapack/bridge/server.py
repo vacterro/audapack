@@ -8,17 +8,19 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from audapack import __version__
 from audapack.bridge.browser_dispatch import (
+    SUPPORTED_BROWSER_WIDGET_VERSION,
     BrowserDispatcher,
 )
 from audapack.bridge.browser_dispatch import (
@@ -67,6 +69,54 @@ logger = logging.getLogger("audapack.bridge")
 # Canonical API contract version. Advertised in /health; supports v2 and v3.
 BRIDGE_API_VERSION = 3
 SUPPORTED_API_VERSIONS = (2, 3)
+
+# Canonical browser-worker protocol advertised in /health; sourced from browser_dispatch.
+BROWSER_WORKER_PROTOCOL_VERSION = SUPPORTED_BROWSER_WIDGET_VERSION
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _get_build_identity() -> tuple[str, str]:
+    """Return (build_id, source_revision) from git or fallback."""
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=_REPO_ROOT,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+            cwd=_REPO_ROOT,
+        ).stdout.strip()
+        if rev:
+            source_revision = rev
+            build_id = f"{rev}-dirty" if dirty else rev
+        else:
+            build_id = "dev"
+            source_revision = ""
+    except Exception:
+        build_id = "dev"
+        source_revision = ""
+    return build_id, source_revision
+
+
+def _get_widget_bundle_info() -> tuple[str, str]:
+    """Return (widget_bundle_version, widget_bundle_sha256_prefix16)."""
+    path = get_bundled_widget_path()
+    widget_version = ""
+    sha256 = ""
+    if path and path.exists():
+        data = path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()[:16]
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("// @version"):
+                parts = stripped.split()
+                if len(parts) >= 3:
+                    widget_version = parts[2]
+                break
+    return widget_version, sha256
 
 # Global callback for notifying UI of new audits or auto-registered projects
 _ON_AUDIT_WRITTEN: Optional[Callable[[str, str], None]] = None
@@ -128,10 +178,15 @@ def _get_canonical_path(prof, state) -> Optional[Path]:
 class AudapackBridgeHandler(BaseHTTPRequestHandler):
     config: AppConfig
     browser_dispatcher: Optional[BrowserDispatcher] = None
+    dispatch_supervisor: Optional[Any] = None
 
     @classmethod
     def set_browser_dispatcher(cls, dispatcher: BrowserDispatcher) -> None:
         cls.browser_dispatcher = dispatcher
+
+    @classmethod
+    def set_dispatch_supervisor(cls, supervisor: Any) -> None:
+        cls.dispatch_supervisor = supervisor
 
     def _dispatcher(self) -> BrowserDispatcher:
         dispatcher = getattr(self.__class__, "browser_dispatcher", None)
@@ -142,6 +197,65 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
     def _dispatch_error(self, status: int, exc: BrowserDispatchError) -> None:
         self.send_json(status, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+
+    def _browser_slots_status(self) -> dict[str, Any]:
+        """Commissioning status for all managed worker slots (T07 data side)."""
+        from audapack.bridge.supervisor import MAX_AUDIT_LANES
+
+        managed = {}
+        for worker in self._dispatcher().list_workers():
+            slot = int(getattr(worker, "managed_slot", 0) or 0)
+            if 1 <= slot <= MAX_AUDIT_LANES:
+                managed.setdefault(slot, []).append(worker)
+
+        supervisor = getattr(self.__class__, "dispatch_supervisor", None)
+        doc = {}
+        generation = 1
+        if supervisor is not None:
+            try:
+                doc = supervisor.workers._load()
+            except Exception:
+                doc = {}
+            generation = max(1, int(doc.get("generation", 1) or 1))
+
+        slots = []
+        for slot in range(1, MAX_AUDIT_LANES + 1):
+            tracked = doc.get("slots", {}).get(str(slot), {}) if isinstance(doc, dict) else {}
+            slot_workers = managed.get(slot, [])
+            slots.append({
+                "slot": slot,
+                "generation": generation,
+                "state": str(tracked.get("state", "")),
+                "launch_attempts": int(tracked.get("launch_attempts", 0) or 0),
+                "last_seen_at": float(tracked.get("last_seen_at", 0.0) or 0.0),
+                "cooldown_until": float(tracked.get("cooldown_until", 0.0) or 0.0),
+                "message": str(tracked.get("message", ""))[:300],
+                "registered": len(slot_workers) > 0,
+                "worker_ids": [item.worker_id for item in slot_workers],
+            })
+        return {"max_lanes": MAX_AUDIT_LANES, "generation": generation, "slots": slots}
+
+    def _handle_relaunch_slot(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        try:
+            slot = int(data.get("slot", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {
+                "ok": False,
+                "error": {"code": "invalid_slot", "message": "slot must be an integer from 1 to 6", "retriable": False},
+            })
+            return
+        supervisor = getattr(self.__class__, "dispatch_supervisor", None)
+        if supervisor is None:
+            self.send_json(503, {
+                "ok": False,
+                "error": {"code": "supervisor_unavailable", "message": "dispatch supervisor is not running", "retriable": True},
+            })
+            return
+        result = supervisor.relaunch_managed_slot(slot)
+        self.send_json(200, {"ok": True, **result})
 
     def log_message(self, format: str, *args):
         # Override to prevent default console spam; use logger
@@ -266,10 +380,13 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         if parsed.path in ("/health", "/v1/health"):
             live_cfg = self.get_live_config()
             profs = load_profiles()
+            build_id, source_revision = _get_build_identity()
+            widget_bundle_version, widget_bundle_sha256 = _get_widget_bundle_info()
             self.send_json(200, {
                 "ok": True,
                 "service": "AUDAPACK Bridge",
                 "version": __version__,
+                "app_version": __version__,
                 "api_version": BRIDGE_API_VERSION,
                 "supported_api_versions": list(SUPPORTED_API_VERSIONS),
                 "profiles": list(profs.keys()),
@@ -277,6 +394,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "instance_id": f"audapack_{os.getpid()}",
                 "instance_nonce": INSTANCE_NONCE,
                 "registry_revision": len(live_cfg.projects),
+                "build_id": build_id,
+                "source_revision": source_revision,
+                "widget_bundle_version": widget_bundle_version,
+                "widget_bundle_sha256": widget_bundle_sha256,
+                "browser_worker_protocol": BROWSER_WORKER_PROTOCOL_VERSION,
             })
         elif parsed.path == "/widget.user.js":
             w_path = get_bundled_widget_path()
@@ -308,13 +430,21 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+            build_id, source_revision = _get_build_identity()
+            widget_bundle_version, widget_bundle_sha256 = _get_widget_bundle_info()
             self.send_json(200, {
                 "ok": True,
                 "version": __version__,
+                "app_version": __version__,
                 "pid": os.getpid(),
                 "output_root": str(out_root),
                 "output_exists": out_exists,
                 "output_writable": out_writable,
+                "build_id": build_id,
+                "source_revision": source_revision,
+                "widget_bundle_version": widget_bundle_version,
+                "widget_bundle_sha256": widget_bundle_sha256,
+                "browser_worker_protocol": BROWSER_WORKER_PROTOCOL_VERSION,
             })
         elif parsed.path in ["/v1/projects", "/v1/registry"]:
             if not self.check_auth():
@@ -441,6 +571,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 return
             self._serve_artifact(parsed.path)
             return
+        elif parsed.path == "/v1/browser/slots":
+            if not self.check_auth():
+                return
+            self.send_json(200, {"ok": True, **self._browser_slots_status()})
         else:
             self.send_json(404, {"ok": False, "error": "Endpoint not found"})
 
@@ -504,6 +638,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/abandon"):
             self._handle_browser_abandon(parsed.path)
+            return
+
+        if parsed.path == "/v1/browser/relaunch-slot":
+            self._handle_relaunch_slot()
             return
 
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
@@ -1185,9 +1323,36 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     })
                     return
 
-            # A completed wave is immutable within its run. Replacement would
-            # require descendant invalidation/replay; reject it instead.
+            # T04: A completed wave is immutable, but a retry with identical
+            # content is semantically a no-op. Treat it as success (idempotent
+            # duplicate) so old clients don't show false "data loss".
             if wave_state.get("complete"):
+                existing_sha = wave_state.get("sha256", "")
+                if existing_sha and existing_sha == content_hash:
+                    files_written = []
+                    if wave_state.get("latest_path"):
+                        files_written.append(str(wave_state["latest_path"]))
+                    if wave_state.get("history_path"):
+                        files_written.append(str(wave_state["history_path"]))
+                    is_ready = state.get("campaign_complete", False) or state.get("all3_complete", False)
+                    completed_count = len([w for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")])
+                    self.send_json(200, {
+                        "ok": True,
+                        "duplicate": True,
+                        "run_id": run_id,
+                        "profile_id": prof.profile_id,
+                        "project": project,
+                        "wave": wave_def.id,
+                        "wave_index": wave_def.ordinal,
+                        "wave_count": prof.wave_count,
+                        "completed_waves": completed_count,
+                        "total_waves": prof.wave_count,
+                        "campaign_ready": is_ready,
+                        "all3_ready": is_ready if prof.profile_id == "quick3" else state.get("all3_complete", False),
+                        "files": files_written,
+                    })
+                    return
+                # Content differs -> true mutation; reject to preserve immutability.
                 self.send_json(409, {
                     "ok": False,
                     "error": {
@@ -1783,6 +1948,7 @@ def run_bridge_server(config: AppConfig) -> int:
         supervisor.start()
     except Exception as exc:
         logger.warning("dispatch supervisor did not start: %s", exc)
+    HandlerWithConfig.set_dispatch_supervisor(supervisor)
     # W2-011: prune expired history on startup (best-effort, non-blocking).
     try:
         from audapack.bridge.storage import prune_audit_history

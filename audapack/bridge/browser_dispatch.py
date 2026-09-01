@@ -59,6 +59,27 @@ WORKER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SUPPORTED_BROWSER_WIDGET_VERSION = "AUDAPACK_WIDGET/3"
 INCOMPATIBLE_WIDGET_VERSIONS = {"AUDAPACK_WIDGET", "AUDAPACK_WIDGET/2"}
 
+
+def _get_required_widget_build() -> str:
+    """Read the @version of the bundled userscript on disk.
+
+    T02: a stale widget build (0.0.22 vs current 0.0.24) used to look
+    identical to the Bridge because the heartbeat reported only the
+    protocol version. The required build is the @version of the
+    userscript shipped with this Python package; stale tabs that still
+    heartbeat a different @version are marked STALE_WIDGET and cannot
+    claim audits.
+    """
+    try:
+        from audapack.components.widget import read_bundled_widget_metadata
+        meta = read_bundled_widget_metadata()
+        ver = str(meta.get("version") or "").strip()
+        if ver and ver != "0.0.01":
+            return ver
+    except Exception:
+        pass
+    return ""
+
 # Worker lifecycle states (spec section 1).
 WORKER_FREE = "FREE"
 WORKER_RESERVED = "RESERVED"
@@ -150,6 +171,8 @@ class WorkerRecord:
     worker_id: str
     state: str = WORKER_FREE
     widget_version: str = ""
+    widget_protocol: str = ""
+    widget_build_version: str = ""
     bridge_api_version: str = ""
     site: str = "chatgpt"
     conversation_key: str = ""
@@ -406,6 +429,14 @@ class BrowserDispatcher:
                 raise DispatchError("invalid_worker_state", f"unsupported worker state {reported_state!r}")
             record.state = reported_state
             record.widget_version = str(payload.get("widget_version") or record.widget_version)
+            record.widget_protocol = str(
+                payload.get("widget_protocol")
+                or payload.get("widget_version")
+                or record.widget_protocol
+            )
+            record.widget_build_version = str(
+                payload.get("widget_build_version") or record.widget_build_version
+            )
             record.bridge_api_version = str(payload.get("bridge_api_version") or record.bridge_api_version)
             record.site = str(payload.get("site") or "chatgpt")
             record.conversation_key = str(payload.get("conversation_key") or record.conversation_key)
@@ -477,6 +508,10 @@ class BrowserDispatcher:
             return True
         if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
             return False
+        if worker.widget_protocol.startswith("AUDAPACK_WIDGET"):
+            required = _get_required_widget_build()
+            if required and worker.widget_build_version and worker.widget_build_version != required:
+                return False
         if not worker.is_chromium or worker.site != "chatgpt":
             return False
         if worker.campaign_run_id or self._worker_owns_live_job(worker):
@@ -499,6 +534,10 @@ class BrowserDispatcher:
         if worker.widget_version.startswith("AUDAPACK_WIDGET"):
             if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
                 return False
+            if worker.widget_protocol.startswith("AUDAPACK_WIDGET"):
+                required = _get_required_widget_build()
+                if required and worker.widget_build_version and worker.widget_build_version != required:
+                    return False
             if not worker.is_chromium or not worker.page_eligible:
                 return False
             if worker.site != "chatgpt" or worker.url_path != "/":
@@ -950,6 +989,67 @@ class BrowserDispatcher:
                 self._work_available.notify_all()
             return freed
 
+    def reconcile_completed_blocked_runs(self) -> int:
+        """Complete BLOCKED post-start runs with durable COMPLETE campaign proof.
+
+        A BLOCKED job with a post-start recovery state may have finished its
+        audit before the lease loss was noticed. When the durable campaign
+        evidence is authoritative -- campaign.json exists and is COMPLETE with
+        all waves done -- the job is reconciled COMPLETE instead of left
+        permanently blocked.
+        """
+        with self._lock:
+            now = _now()
+            reconciled = 0
+            for job in self._jobs.values():
+                if job.state != JOB_BLOCKED:
+                    continue
+                if job.recovery_state not in POST_START_STATES:
+                    continue
+                if not job.campaign_run_id:
+                    continue
+                campaign_path = self._resolved_campaign_path(job)
+                if campaign_path is None or not campaign_path.is_file():
+                    continue
+                try:
+                    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    continue
+                if not isinstance(campaign, dict):
+                    continue
+                if campaign.get("campaign_status") != "COMPLETE":
+                    continue
+                if str(campaign.get("campaign_run_id") or "") != str(job.campaign_run_id):
+                    continue
+                wave_count = int(campaign.get("wave_count") or 0)
+                completed_count = int(campaign.get("completed_count") or 0)
+                if wave_count and completed_count < wave_count:
+                    continue
+                job.state = JOB_COMPLETE
+                job.result = "audit-complete"
+                job.completed_at = now
+                job.updated_at = now
+                reconciled += 1
+            if reconciled:
+                self._generation_context = {"dispatch_id": "", "project_id": "", "state": ""}
+                self._persist_jobs()
+                self._work_available.notify_all()
+            return reconciled
+
+    def _resolved_campaign_path(self, job: DispatchJob) -> Optional[Path]:
+        """Resolve the durable campaign.json path for a job, if any."""
+        base = None
+        if job.final_handoff_path:
+            try:
+                final = Path(job.final_handoff_path).resolve()
+            except OSError:
+                final = Path(job.final_handoff_path)
+            if final.parent.name == "runs":
+                base = final.parent
+        if base is None:
+            base = self.state_dir / "campaigns"
+        return base / f"{job.campaign_run_id}.json"
+
     def complete_for_run(
         self,
         project_id: str,
@@ -994,7 +1094,10 @@ class BrowserDispatcher:
                 job for job in self._jobs.values()
                 if job.project_id == str(project_id)
                 and job.campaign_run_id == str(campaign_run_id)
-                and job.state in (JOB_AUDITING, JOB_FINALIZING)
+                and (
+                    job.state in (JOB_AUDITING, JOB_FINALIZING)
+                    or (job.state == JOB_BLOCKED and job.recovery_state in POST_START_STATES)
+                )
             ]
             if not candidates:
                 return None

@@ -285,6 +285,21 @@ class ManagedWorkerSupervisor:
             _atomic_write_json(self.path, doc)
         return {"desired": desired, "registered": len(registered), "launched": launched, "generation": generation}
 
+    def _reset_slot(self, slot: int) -> None:
+        """Forget a slot's launch/cooldown accounting so it can be relaunched.
+
+        Called by the explicit operator relaunch path. Clearing the tracked
+        entry resets launch_attempts and the cooldown clock, so a slot whose
+        window was closed (and whose tracked state was stuck in LAUNCHING or
+        LAUNCH_FAILED) is treated as fresh by the next ``ensure_capacity``.
+        """
+        slot = max(1, min(MAX_AUDIT_LANES, int(slot)))
+        with cross_process_lock(self.lock_path):
+            doc = self._load()
+            doc["slots"].pop(str(slot), None)
+            doc["updated_at"] = time.time()
+            _atomic_write_json(self.path, doc)
+
 
 BLOCKED_REASONS: dict[str, tuple[str, str]] = {
     "missing_archive": (

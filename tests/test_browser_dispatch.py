@@ -892,3 +892,54 @@ def test_a_bridge_restart_does_not_kill_a_live_audit(tmp_path):
     restarted.register_worker(payload)
     assert restarted._jobs[job.dispatch_id].state == "AUDITING"
     assert restarted._jobs[job.dispatch_id].error == ""
+
+
+def test_complete_for_run_reconciles_blocked_post_start(tmp_path):
+    """A BLOCKED post-start run with durable COMPLETE campaign proof reconciles."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    final = tmp_path / "final.md"
+    final.write_text("final", encoding="utf-8")
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text(json.dumps({
+        "campaign_status": "COMPLETE",
+        "campaign_run_id": "run",
+        "wave_count": 3,
+        "completed_count": 3,
+    }), encoding="utf-8")
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_AUDITING
+    job.error = "restart recovery"
+    done = d.complete_for_run(item.project_id, "run", final, campaign_path=campaign, expected_wave_count=3)
+    assert done.state == JOB_COMPLETE
+    assert done.final_handoff_sha256
+
+
+def test_complete_for_run_rejects_blocked_without_recovery_state(tmp_path):
+    """A BLOCKED job without a post-start recovery state stays blocked."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    final = tmp_path / "final.md"
+    final.write_text("final", encoding="utf-8")
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text(json.dumps({
+        "campaign_status": "COMPLETE",
+        "campaign_run_id": "run",
+        "wave_count": 3,
+        "completed_count": 3,
+    }), encoding="utf-8")
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.error = "restart recovery"
+    assert d.complete_for_run(item.project_id, "run", final, campaign_path=campaign, expected_wave_count=3) is None

@@ -6080,7 +6080,7 @@ ordinal/name of the entrypoint file.`;
       code: bridgeDiagnosticValue(details.code || details.errorCode || job.errorCode, 80),
       message: bridgeDiagnosticValue(details.message || job.lastError, 320),
       jobId: bridgeDiagnosticValue(details.jobId || job.jobId || job.receipt, 160),
-      runId: bridgeDiagnosticValue(details.runId || job.deliveryRunId || job.runId, 120),
+      runId: bridgeDiagnosticValue(details.runId || job.deliveryBatchId || job.runId, 120),
       project: bridgeDiagnosticValue(details.project || job.project, 100),
       wave: bridgeDiagnosticValue(details.wave || job.wave, 60),
       attempts: Math.max(0, Number(details.attempts ?? job.attempts) || 0),
@@ -6341,7 +6341,7 @@ ordinal/name of the entrypoint file.`;
       for (const job of jobs) {
         lines.push(
           `[${bridgeDiagnosticJobState(job)}] updated=${bridgeDiagnosticTime(job.updatedAt || job.createdAt)} code=${bridgeDiagnosticValue(job.errorCode, 80) || 'none'} attempts=${Math.max(0, Number(job.attempts) || 0)}`,
-          `project=${bridgeDiagnosticValue(job.project, 100) || 'unknown'} wave=${bridgeDiagnosticValue(job.wave, 60) || 'unknown'} run_id=${bridgeDiagnosticValue(job.deliveryRunId || job.runId, 120) || 'unknown'}`,
+          `project=${bridgeDiagnosticValue(job.project, 100) || 'unknown'} wave=${bridgeDiagnosticValue(job.wave, 60) || 'unknown'} run_id=${bridgeDiagnosticValue(job.deliveryBatchId || job.runId, 120) || 'unknown'}`,
           `receipt=${bridgeDiagnosticValue(job.receipt || job.jobId, 160) || 'unknown'}`,
           `cause=${bridgeDiagnosticValue(job.lastError) || (job.permanent ? 'missing failure detail' : 'waiting for delivery')}`
         );
@@ -6549,7 +6549,7 @@ ordinal/name of the entrypoint file.`;
     return `${kind}-m-${Date.now().toString(36)}-${random}`;
   }
 
-  function createBridgeMaterializeRunId() {
+  function createBridgeMaterializeBatchId() {
     const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
       ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
       : `${Math.random().toString(36).slice(2, 8)}${Math.random().toString(36).slice(2, 8)}`;
@@ -6610,9 +6610,9 @@ ordinal/name of the entrypoint file.`;
       }
     }
 
-    const deliveryRunId = String(options.deliveryRunId || runId);
+    const deliveryBatchId = String(options.deliveryBatchId || runId);
     const canonicalReceipt = String(record.bridgeReceipt || createBridgeReceipt(runId, record.kind));
-    const receipt = options.freshReceipt ? createBridgeMaterializeReceipt(deliveryRunId, record.kind) : canonicalReceipt;
+    const receipt = options.freshReceipt ? createBridgeMaterializeReceipt(deliveryBatchId, record.kind) : canonicalReceipt;
     const profileId = String(record.profileId || autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3');
     const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[profileId] || getActiveProfile();
     const waveDef = findWaveDefinitionForStageOrKind(record.kind, profile);
@@ -6630,7 +6630,7 @@ ordinal/name of the entrypoint file.`;
       receipt,
       runId,
       sourceRunId: runId,
-      deliveryRunId,
+      deliveryBatchId,
       conversationKey: record.conversationKey,
       conversationId: bridgeConversationIdFromKey(record.conversationKey),
       project: record.projectName || 'PROJECT',
@@ -6667,7 +6667,7 @@ ordinal/name of the entrypoint file.`;
       next.bridgeError = '';
       if (options.freshReceipt) {
         next.bridgeMaterializeReceipt = receipt;
-        next.bridgeMaterializeRunId = deliveryRunId;
+        next.bridgeMaterializeBatchId = deliveryBatchId;
         next.bridgeMaterializeQueuedAt = now;
         next.bridgeSavedAt = 0;
         next.bridgeFiles = [];
@@ -6723,11 +6723,11 @@ ordinal/name of the entrypoint file.`;
       api_version: BRIDGE_API_VERSION,
       receipt: job.receipt,
       // run_id must be the CANONICAL run id that matches the content's
-      // CAMPAIGN_RUN_ID header. deliveryRunId is a synthetic materialize
+      // CAMPAIGN_RUN_ID header. deliveryBatchId is a synthetic materialize
       // delivery tag used only to build a fresh receipt; sending it as run_id
       // makes the Bridge reject run_id_mismatch because the content still
       // carries the original campaign run id.
-      run_id: job.runId || job.deliveryRunId,
+      run_id: job.runId || job.deliveryBatchId,
       conversation_id: job.conversationId || '',
       project_id: job.projectId || '',
       project_name: job.project,
@@ -6887,7 +6887,7 @@ ordinal/name of the entrypoint file.`;
     // authority for the Bridge submission, so patch the content header to match
     // before sending. The Bridge v3 contract rejects mismatches server-side,
     // and the widget must not POST a payload it can prove is wrong.
-    const queuedRunId = String(job.deliveryRunId || job.runId || '');
+    const queuedRunId = String(job.deliveryBatchId || job.runId || '');
     const contentRunId = extractCampaignRunIdFromText(job.content || '');
     if (queuedRunId && contentRunId && queuedRunId !== contentRunId) {
       job.content = String(job.content || '').replace(/^(\s*CAMPAIGN_RUN_ID\s*:\s*).*$/im, `$1${queuedRunId}`);
@@ -12762,10 +12762,10 @@ async function recoverArmedStartSend(options = {}) {
 
     // Manual forceAll is a fresh DELIVERY BATCH, not merely another receipt
     // for the historical audit run. Some bridges deduplicate by run_id + wave,
-    // so every click gets a new delivery run_id shared by Core/Second/Perf.
+    // so every click gets a new delivery batch id shared by Core/Second/Perf.
     // That preserves ALL_3 grouping while forcing the server down the write path.
-    const materializeRunId = options.forceAll
-      ? createBridgeMaterializeRunId()
+    const materializeBatchId = options.forceAll
+      ? createBridgeMaterializeBatchId()
       : '';
 
     if (options.forceAll) {
@@ -12797,7 +12797,7 @@ async function recoverArmedStartSend(options = {}) {
         enqueueBridgeAuditRecord(record, {
           force: true,
           freshReceipt: true,
-          deliveryRunId: materializeRunId,
+          deliveryBatchId: materializeBatchId,
           deferFlush: true
         });
         continue;
@@ -17714,6 +17714,8 @@ let browserWorkerBraveConfirmed = false;
       managed_slot: managedIdentity.slot,
       managed_generation: managedIdentity.generation,
       widget_version: BROWSER_WORKER_PROTOCOL_VERSION,
+      widget_protocol: BROWSER_WORKER_PROTOCOL_VERSION,
+      widget_build_version: (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '',
       bridge_api_version: String(BRIDGE_API_VERSION || 3),
       site: detectSite().key,
       conversation_key: String(autoBoundConversationKey || currentConversationKey() || ''),
@@ -18657,7 +18659,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         renewBridgeFlushLease,
         flushBridgeQueueManualReliable,
         createBridgeMaterializeReceipt,
-        createBridgeMaterializeRunId,
+        createBridgeMaterializeBatchId,
         setManualAuditSyncFeedback,
         saveCurrentChatAuditsNow,
         syncSaveCurrentChatStateNow,

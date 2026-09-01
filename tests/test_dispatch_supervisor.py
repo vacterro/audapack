@@ -37,6 +37,7 @@ class FakeWorkerSupervisor:
     def __init__(self, launched=True):
         self.calls = []
         self.launched = launched
+        self.resets = []
 
     def ensure_capacity(self, dispatch, desired):
         self.calls.append((dict(dispatch), desired))
@@ -46,6 +47,9 @@ class FakeWorkerSupervisor:
             "launched": [{"slot": desired, "ok": True, "message": "started"}] if self.launched else [],
             "generation": 1,
         }
+
+    def _reset_slot(self, slot):
+        self.resets.append(int(slot))
 
 
 class Clock:
@@ -168,3 +172,45 @@ def test_worker_rows_carry_managed_identity():
     passed = workers.calls[0][0]
     assert passed["workers"][0]["managed_slot"] == 2
     assert passed["workers"][0]["managed_generation"] == 1
+
+
+def test_relaunch_resets_unproductive_budget_and_clears_slot():
+    dispatcher = FakeDispatcher(queued_jobs=1, active_workers=0, clean_workers=0)
+    workers = FakeWorkerSupervisor()
+    clock = Clock()
+    sup = supervisor(dispatcher, workers, clock)
+    for _ in range(MAX_UNPRODUCTIVE_LAUNCHES):
+        clock.now += LAUNCH_GRACE_SECONDS + 1
+        sup.tick()
+    clock.now += LAUNCH_GRACE_SECONDS + 1
+    assert sup.tick()["skipped"] == "launch-budget-exhausted"
+
+    result = sup.relaunch_managed_slot(3)
+    assert result["slot"] == 3
+    assert result["success"] is True
+    assert workers.resets == [3]
+    # The unproductivity budget is gone, so the next tick can launch again.
+    clock.now += LAUNCH_GRACE_SECONDS + 1
+    assert sup.tick()["launched"]
+
+
+def test_relaunch_refuses_out_of_range_slots():
+    sup = supervisor(FakeDispatcher())
+    for bad in (0, 7, -1, 99):
+        result = sup.relaunch_managed_slot(bad)
+        assert result["slot"] in (1, 6)
+        assert result["success"] is True
+        assert result["slot"] == max(1, min(6, bad))
+
+
+def test_relaunch_succeeds_even_when_dispatcher_status_is_broken():
+    class Broken(FakeDispatcher):
+        def status(self):
+            raise RuntimeError("bridge state unreadable")
+
+    workers = FakeWorkerSupervisor()
+    sup = supervisor(Broken(), workers)
+    result = sup.relaunch_managed_slot(2)
+    assert result["success"] is False
+    assert "relaunch preparation failed" in result["message"]
+    assert workers.resets == [2]
