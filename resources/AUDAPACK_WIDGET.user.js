@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.24
+// @version      0.0.25
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18384,6 +18384,19 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         persistBrowserWorkerLease();
       }
       const owned = result.data?.owned_job;
+      // STARTED -> AUDITING is sent once, immediately after the irreversible
+      // Send, and was never retried. One lost response -- the 7s transition
+      // timeout is easy to exceed while the shared userscript request queue is
+      // busy with six windows' long polls -- stranded a running audit in
+      // STARTED forever: the browser kept auditing, the lane never advanced,
+      // and the wave landed on disk under a dispatch that still said STARTED.
+      // Re-assert it on every poll while this window is demonstrably auditing.
+      // Idempotent: STARTED -> AUDITING is legal and AUDITING -> AUDITING is a
+      // no-op ACK.
+      if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
+          String(owned.state || '') === 'STARTED' && autoRuntime?.runId) {
+        await browserWorkerTransition('AUDITING', { campaign_run_id: String(autoRuntime.runId || '') });
+      }
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           !autoRuntime?.runId) {
         const ownedState = String(owned.state || '');
@@ -18410,7 +18423,10 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           }
           // Bridge marked this dispatch terminal BLOCKED (post-START, restart
           // reconciliation, or same-worker failure). Surface the real reason.
-          await transition('BLOCKED', { error: String(owned.error || owned.lastError || 'bridge-marked-blocked') });
+          // `transition` is a local of browserWorkerConsume, not a binding in
+          // this scope: this line threw ReferenceError instead of ACKing the
+          // block, so a terminal BLOCKED dispatch was never acknowledged.
+          await browserWorkerTransition('BLOCKED', { error: String(owned.error || owned.lastError || 'bridge-marked-blocked') });
           showBrowserWorkerBlocked('bridge-marked-blocked', {
             detail: String(owned.error || owned.lastError || ''),
             project: String(owned.project || '')
@@ -18639,6 +18655,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerManagedIdentity,
          browserWorkerConsume,
          browserWorkerTransition,
+         browserWorkerPollOnce,
          startBrowserWorker,
          stopBrowserWorker,
          persistBrowserWorkerLease,
