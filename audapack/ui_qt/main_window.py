@@ -541,10 +541,14 @@ class MainWindow(QMainWindow):
             act.setCheckable(True)
             act.setChecked(profile_id == active_profile)
             try:
-                act.setToolTip(get_profile(profile_id).description or get_profile(profile_id).display_name)
+                detail = get_profile(profile_id).description or get_profile(profile_id).display_name
             except Exception:
-                act.setToolTip(label)
-            act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
+                detail = label
+            act.setToolTip(
+                f"Start {label} on the selected project right now, "
+                f"and make it the START AUDIT default. {detail}"
+            )
+            act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_launch_audit_profile(pid))
             self.profile_actions[profile_id] = act
         toolbar.addSeparator()
 
@@ -1370,6 +1374,20 @@ QToolTip QLabel {
                 8000,
             )
 
+    def _on_launch_audit_profile(self, profile_id: str):
+        """Start the selected project's audit with THIS profile, in one press.
+
+        Selecting a profile and then pressing START AUDIT is two actions for
+        one intention. These buttons do both: they make the profile the new
+        default and dispatch immediately.
+        """
+        self._on_select_audit_profile(profile_id)
+        proj = self._selected_project()
+        if not proj:
+            self._flash_status("START AUDIT: select a project first", "#D66464")
+            return
+        self._start_audit_projects([proj.id], proj.display_name, profile_id=str(profile_id))
+
     def _on_select_audit_profile(self, profile_id: str):
         """Pick which canonical profile START AUDIT launches."""
         chosen = str(profile_id or "quick3")
@@ -1454,25 +1472,32 @@ QToolTip QLabel {
             return
         self._start_audit_projects(projects, group)
 
-    def _start_audit_projects(self, project_ids: list[str], label: str):
+    def _start_audit_projects(self, project_ids: list[str], label: str, profile_id: str = ""):
         """Enqueue projects for the single serialized START AUDIT lane.
 
-        Every entry point (toolbar, row action, context menu, group) funnels
-        here. Nothing is dispatched inline: a press adds to the pending set and
-        restarts a short debounce, so pressing START AUDIT six times in a row
-        produces one batch that provisions six lanes at once.
+        Every entry point (toolbar, row action, context menu, group, and the
+        A3/A10/CM launch buttons) funnels here. Nothing is dispatched inline: a
+        press adds to the pending set and restarts a short debounce, so pressing
+        START AUDIT six times in a row produces one batch that provisions six
+        lanes at once.
+
+        ``profile_id`` rides with each queued project so a CM press and an A3
+        press can be in the queue at the same time without either inheriting
+        the other's profile.
         """
         wanted = [str(value) for value in project_ids if value]
+        queued = {pid for pid, _profile in self._audit_start_pending}
         added = [
             pid for pid in dict.fromkeys(wanted)
-            if pid not in self._audit_start_pending and pid not in self._audit_start_inflight
+            if pid not in queued and pid not in self._audit_start_inflight
         ]
         if not wanted:
             return
         if not added:
             self._flash_status(f"START AUDIT already preparing {label}", "#D4A840")
             return
-        self._audit_start_pending.extend(added)
+        profile = str(profile_id or getattr(self._service.config.audits, "profile", "quick3") or "quick3")
+        self._audit_start_pending.extend((pid, profile) for pid in added)
         if label and label not in self._audit_start_labels:
             self._audit_start_labels.append(str(label))
         queued_total = len(self._audit_start_pending)
@@ -1490,12 +1515,16 @@ QToolTip QLabel {
             return
         if self.task_runner.is_running(self.AUDIT_DISPATCH_KEY):
             return
-        batch = self._audit_start_pending[:6]
-        del self._audit_start_pending[:len(batch)]
+        # One batch, one profile: start_batch applies a single profile to every
+        # project it is given, so a queue holding both a CM press and an A3
+        # press must not be flattened into one call.
+        profile = self._audit_start_pending[0][1]
+        batch = [pid for pid, entry_profile in self._audit_start_pending if entry_profile == profile][:6]
+        remaining = [entry for entry in self._audit_start_pending if entry[0] not in set(batch)]
+        self._audit_start_pending[:] = remaining
         label = ", ".join(self._audit_start_labels[:3]) or f"{len(batch)} projects"
         self._audit_start_labels.clear()
         self._audit_start_inflight = set(batch)
-        profile = getattr(self._service.config.audits, "profile", "quick3") or "quick3"
 
         def _prepare():
             return self._audit_runs.start_batch(batch, profile)

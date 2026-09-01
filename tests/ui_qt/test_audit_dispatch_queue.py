@@ -58,14 +58,14 @@ def test_a_press_while_a_batch_runs_is_queued_not_dropped(window):
     window._pump_audit_start_queue()
     # Lane busy: p2 waits in the pending set instead of racing p1.
     assert batches == [["p1"]]
-    assert window._audit_start_pending == ["p2"]
+    assert [pid for pid, _profile in window._audit_start_pending] == ["p2"]
 
 
 def test_the_same_project_is_never_queued_twice(window):
     window._audit_runs.start_batch = lambda ids, profile: []
     window._start_audit_projects(["p1"], "Project 1")
     window._start_audit_projects(["p1"], "Project 1")
-    assert window._audit_start_pending == ["p1"]
+    assert [pid for pid, _profile in window._audit_start_pending] == ["p1"]
 
 
 def test_batch_is_capped_at_six_lanes(window):
@@ -149,3 +149,46 @@ def test_reopen_surfaces_an_unreachable_bridge():
     result = BridgeService.reopen_closed_browser_workers(service)
     assert result["ok"] is False
     assert "connection refused" in result["error"]
+
+
+def test_a_profile_button_starts_that_profile_in_one_press(window):
+    """Selecting a profile and then pressing START AUDIT is two actions."""
+    batches: list[tuple[list[str], str]] = []
+    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
+    window._selected_project = lambda: window._service.get_project("p1")
+
+    window._on_launch_audit_profile("compress")
+    window._audit_start_debounce.stop()
+    window._pump_audit_start_queue()
+
+    assert batches == [(["p1"], "compress")]
+    assert window._service.config.audits.profile == "compress"
+    assert window.profile_actions["compress"].isChecked() is True
+
+
+def test_two_profiles_queued_together_never_share_one_batch(window):
+    """start_batch applies ONE profile to everything it is handed."""
+    batches: list[tuple[list[str], str]] = []
+    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
+
+    window._start_audit_projects(["p1", "p2"], "pair", profile_id="quick3")
+    window._start_audit_projects(["p3"], "third", profile_id="compress")
+    window._audit_start_debounce.stop()
+    window._pump_audit_start_queue()
+
+    assert batches == [(["p1", "p2"], "quick3")]
+    assert [pid for pid, _profile in window._audit_start_pending] == ["p3"]
+
+    window._pump_audit_start_queue()
+    assert batches[-1] == (["p3"], "compress")
+
+
+def test_a_profile_button_without_a_selection_says_so(window):
+    window._selected_project = lambda: None
+    window._audit_runs.start_batch = lambda ids, profile: []
+    window._on_launch_audit_profile("super10")
+    assert window._audit_start_pending == []
+    # The choice still persists, so the next START AUDIT uses it.
+    assert window._service.config.audits.profile == "super10"
