@@ -34,8 +34,15 @@ class TestHiddenSpawnSites(unittest.TestCase):
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with patch("subprocess.run", return_value=completed) as run_mock:
             widget_mod.detect_installed_browsers()
-            run_mock.assert_called_once()
-            self.assert_hidden(run_mock.call_args)
+            # Assert on THIS spawn, not on the call count: other suites keep
+            # background threads that spawn schtasks, and a stray call landing
+            # inside the patch window is not a defect in this one.
+            powershell_calls = [
+                call for call in run_mock.call_args_list
+                if call.args and call.args[0] and "powershell" in str(call.args[0][0]).lower()
+            ]
+            self.assertEqual(len(powershell_calls), 1, run_mock.call_args_list)
+            self.assert_hidden(powershell_calls[0])
 
     def test_worker_launch_popen_is_hidden(self):
         from audapack.components import widget as widget_mod
