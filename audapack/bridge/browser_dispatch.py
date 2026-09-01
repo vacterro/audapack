@@ -645,7 +645,17 @@ class BrowserDispatcher:
             return False
         if worker.campaign_run_id or self._worker_owns_live_job(worker):
             return True
-        return bool(worker.page_eligible)
+        if not worker.page_eligible:
+            return False
+        if not worker.managed_slot and not worker.clean_for_audit:
+            # A tab in the operator's own browser that is eligible but not
+            # clean can never claim anything, yet it sat on one of the six
+            # lanes forever: observed as act 6 / free 5 with a personal tab
+            # RESERVED on a project it no longer owned, while a managed window
+            # had nowhere to register. A managed slot still holds its lane
+            # while it settles -- that one is the pool.
+            return False
+        return True
 
     @staticmethod
     def worker_widget_is_stale(worker: WorkerRecord) -> bool:

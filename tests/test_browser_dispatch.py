@@ -498,7 +498,10 @@ def test_status_exposes_clean_worker_count_and_classification(tmp_path):
     ))
     st = d.status()
     assert st["clean_workers"] == 1
-    assert st["active_workers"] == 2
+    # An occupied tab in the operator's own browser can never claim, so it
+    # stays visible as foreign but no longer holds one of the six audit lanes.
+    assert st["active_workers"] == 1
+    assert st["foreign_workers"] == 1
     occ = [w for w in d.list_workers() if w.worker_id == "v3_occ"][0]
     assert occ.has_conversation_turns is True
     assert occ.clean_for_audit is False
@@ -1003,17 +1006,17 @@ def test_complete_for_run_rejects_blocked_without_recovery_state(tmp_path):
 
 def supported_worker(wid: str, **overrides) -> dict:
     """A registration payload the dispatcher accepts as a real audit lane."""
-    return worker(
-        wid,
-        widget_version="AUDAPACK_WIDGET/3",
-        is_chromium=True,
-        is_brave=False,
-        page_eligible=True,
-        clean_for_audit=True,
-        has_conversation_turns=False,
-        url_path="/",
-        **overrides,
-    )
+    defaults = {
+        "widget_version": "AUDAPACK_WIDGET/3",
+        "is_chromium": True,
+        "is_brave": False,
+        "page_eligible": True,
+        "clean_for_audit": True,
+        "has_conversation_turns": False,
+        "url_path": "/",
+    }
+    defaults.update(overrides)
+    return worker(wid, **defaults)
 
 
 def test_a_managed_window_takes_its_lane_from_an_idle_personal_tab(tmp_path):
@@ -1466,3 +1469,31 @@ def test_an_unfinished_campaign_leaves_its_lane_alone(tmp_path):
     d.set_campaign_probe(lambda pid, name: {"complete": False})
     assert d.reconcile_finished_campaigns() == 0
     assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+
+def test_a_dirty_personal_tab_does_not_hold_an_audit_lane(tmp_path):
+    """Observed live: act 6 / free 5, with the sixth lane unusable.
+
+    A tab in the operator's own browser, eligible but not clean and owning no
+    run, can never claim anything -- yet it sat on one of the six lanes while a
+    managed window had nowhere to register.
+    """
+    d = dispatcher(tmp_path)
+    for slot in range(1, MAX_ACTIVE_WORKERS):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    d.register_worker(supported_worker("personal", clean_for_audit=False))
+
+    status = d.status()
+    assert status["active_workers"] == MAX_ACTIVE_WORKERS - 1
+    assert status["foreign_workers"] == 1
+
+    # ...so the sixth managed window still has a lane to register into.
+    d.register_worker(supported_worker("managed-6", managed_slot=6, managed_generation=1))
+    assert d.status()["active_workers"] == MAX_ACTIVE_WORKERS
+
+
+def test_a_managed_slot_keeps_its_lane_while_it_settles(tmp_path):
+    """A managed window is the pool; it holds its lane even while dirty."""
+    d = dispatcher(tmp_path)
+    d.register_worker(supported_worker("managed-1", managed_slot=1, managed_generation=1, clean_for_audit=False))
+    assert d.status()["active_workers"] == 1
