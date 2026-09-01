@@ -204,3 +204,47 @@ test('T93: the re-assert carries no campaign_run_id', async () => {
   assert.strictEqual(auditing.length, 1);
   assert.ok(!('campaign_run_id' in auditing[0]), 'a re-assert must not re-send the run id');
 });
+
+test('T94: a window parked on a finished audit chat still takes the new build', async () => {
+  // autoRuntime.runId survives a terminal dispatch, and treating that as
+  // "mid-audit" pinned the window on the old build forever. Observed live:
+  // slot 1 stuck at 0.0.26 while the Bridge required 0.0.28.
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+  api.browserWorkerLease = null;
+  api.autoRuntime = { ...api.emptyAutoRuntime({ enabled: true }), stage: 'complete', runId: 'acb-finished' };
+
+  h.httpResponder = options => {
+    if (String(options.url || '').includes('/v1/browser/poll')) {
+      return {
+        status: 200,
+        responseText: JSON.stringify({
+          ok: true, job: null, owned_job: null,
+          worker_state: 'FREE', worker_widget_stale: true,
+          required_widget_build: '0.0.29', status: {}
+        })
+      };
+    }
+    return { status: 200, responseText: JSON.stringify({ ok: true }) };
+  };
+
+  const before = h.location.reloaded;
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  assert.strictEqual(h.location.reloaded, before + 1, 'a finished chat must not pin the old build');
+});
+
+test('T94: a window the Bridge says still owns a dispatch never reloads', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  api.browserWorkerLease = null;
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  const before = h.location.reloaded;
+  const blocked = api.browserWorkerReloadForStaleBuild('0.0.29', { dispatch_id: 'dsp-0123456789abcdef', state: 'AUDITING' });
+  assert.strictEqual(blocked, false);
+  assert.strictEqual(h.location.reloaded, before, 'an owned run outranks a build update');
+});

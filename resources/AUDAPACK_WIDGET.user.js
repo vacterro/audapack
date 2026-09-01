@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.28
+// @version      0.0.29
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18454,10 +18454,20 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     return browserWorkerStandDown('orphaned-prepared-core');
   }
 
-  function browserWorkerReloadForStaleBuild(requiredBuild) {
+  function browserWorkerReloadForStaleBuild(requiredBuild, ownedJob = null) {
     // Never abandon a run to chase a build. A window mid-audit keeps its stale
     // script; the Bridge lets an owned run finish either way.
-    if (browserWorkerLease?.dispatch_id || autoRuntime?.runId) return false;
+    //
+    // The Bridge is the authority on whether a run is live, not leftover
+    // runtime state. A window parked on a finished audit chat keeps
+    // autoRuntime.runId long after its dispatch is terminal, and treating that
+    // as "mid-audit" pinned the window on the old build forever -- observed
+    // live: slot 1 stuck at 0.0.26 while the Bridge required 0.0.28, never
+    // reloading. An owned job, a lease, or a generation in flight still wins.
+    if (browserWorkerLease?.dispatch_id) return false;
+    if (ownedJob && ownedJob.dispatch_id) return false;
+    try { if (chatGPTIsGenerating()) return false; } catch (_) { return false; }
+    if (!ownedJob && autoRuntime?.runId && String(autoRuntime?.stage || '') === 'running') return false;
     const now = Date.now();
     let last = 0;
     try { last = Number(sessionStorage.getItem(BROWSER_WORKER_STALE_RELOAD_KEY) || 0); } catch (_) { }
@@ -18495,10 +18505,10 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         browserWorkerLease = null;
         persistBrowserWorkerLease();
       }
-      if (result.data?.worker_widget_stale) {
-        browserWorkerReloadForStaleBuild(String(result.data.required_widget_build || ''));
-      }
       const owned = result.data?.owned_job;
+      if (result.data?.worker_widget_stale) {
+        browserWorkerReloadForStaleBuild(String(result.data.required_widget_build || ''), owned);
+      }
       // STARTED -> AUDITING is sent once, immediately after the irreversible
       // Send, and was never retried. One lost response -- the 7s transition
       // timeout is easy to exceed while the shared userscript request queue is
