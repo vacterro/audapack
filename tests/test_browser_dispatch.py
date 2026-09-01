@@ -1295,3 +1295,38 @@ def test_recovery_survives_a_runtime_that_re_derived_its_run_id(tmp_path):
     assert restored.campaign_run_id == "acb-original", "the job's own run id stays authoritative"
     assert restored.meta_run_id_drift == "acb-rederived-by-hydration"
     assert record.meta.get("last_reconcile_error", "") == ""
+
+
+def test_a_finished_campaign_completes_a_run_whose_ack_never_landed(tmp_path):
+    """Durable campaign evidence outranks a missing terminal ACK.
+
+    Observed live: two campaigns complete on disk -- 3/3 waves and a valid
+    canonical handoff -- with their dispatches still reporting AUDITING 0/3
+    and never becoming READY, because reconciliation only ever looked at
+    BLOCKED jobs and these had recovered successfully.
+    """
+    import json as _json
+
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-done", "start_receipt": "receipt"})
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "campaign.json").write_text(_json.dumps({
+        "campaign_run_id": "acb-done",
+        "campaign_status": "COMPLETE",
+        "profile_id": "quick3",
+        "wave_count": 3,
+        "completed_count": 3,
+    }), encoding="utf-8")
+    d._resolved_campaign_path = lambda job: campaign_dir / "campaign.json"
+
+    assert d.reconcile_completed_blocked_runs() == 1
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE

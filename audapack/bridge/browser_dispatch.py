@@ -1209,21 +1209,26 @@ class BrowserDispatcher:
             return freed
 
     def reconcile_completed_blocked_runs(self) -> int:
-        """Complete BLOCKED post-start runs with durable COMPLETE campaign proof.
+        """Complete any live post-start run with durable COMPLETE proof.
 
-        A BLOCKED job with a post-start recovery state may have finished its
-        audit before the lease loss was noticed. When the durable campaign
-        evidence is authoritative -- campaign.json exists and is COMPLETE with
-        all waves done -- the job is reconciled COMPLETE instead of left
-        permanently blocked.
+        A post-start job may finish its audit without the terminal ACK ever
+        landing: the browser writes every wave and the canonical handoff, and
+        the lane keeps saying AUDITING. Observed after a Bridge restart -- two
+        campaigns complete on disk, 3/3 waves and a valid __00_AUDIT_ALL_3.md,
+        with their dispatches still reporting 0/3 and never becoming READY.
+
+        Durable campaign evidence outranks a missing ACK: campaign.json exists,
+        is COMPLETE, and all waves are done. This used to cover only BLOCKED
+        jobs, which left exactly the runs that recovered successfully stuck.
         """
         with self._lock:
             now = _now()
             reconciled = 0
             for job in self._jobs.values():
-                if job.state != JOB_BLOCKED:
-                    continue
-                if job.recovery_state not in POST_START_STATES:
+                if job.state == JOB_BLOCKED:
+                    if job.recovery_state not in POST_START_STATES:
+                        continue
+                elif job.state not in POST_START_STATES:
                     continue
                 if not job.campaign_run_id:
                     continue
