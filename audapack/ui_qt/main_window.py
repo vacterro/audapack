@@ -412,6 +412,38 @@ class ProjectTreeView(QTreeView):
         event.ignore()
 
 
+def bridge_status_text(browser: dict[str, Any]) -> str:
+    """One-line worker/queue readout for the status bar."""
+    stale = int(browser.get("stale_widget_workers", 0) or 0)
+    return (
+        f"BRIDGE ✓ | W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)}  "
+        f"CLEAN {browser.get('clean_workers', 0)}  "
+        + (f"STALE {stale}  " if stale else "")
+        + f"BUSY {browser.get('busy_workers', 0)}  "
+        f"Q {browser.get('queued_jobs', 0)}  "
+        f"RUN {browser.get('active_jobs', 0)}  "
+        f"! {browser.get('blocked_jobs', 0)}"
+    )
+
+
+def bridge_status_warning(browser: dict[str, Any]) -> str:
+    """The one pool condition the operator cannot diagnose by looking.
+
+    A window running an outdated widget build can never claim an audit, and it
+    used to be reported as CLEAN: a healthy-looking idle pool beside a queue
+    that mysteriously never moved. Say it out loud instead.
+    """
+    stale = int(browser.get("stale_widget_workers", 0) or 0)
+    if not stale:
+        return ""
+    build = str(browser.get("required_widget_build", "") or "")
+    suffix = f" (needs {build})" if build else ""
+    return (
+        f"{stale} worker window(s) run an OUTDATED widget{suffix} — "
+        f"reinstall it from Settings ▸ Bridge; audits cannot start until then"
+    )
+
+
 class MainWindow(QMainWindow):
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None):
         super().__init__()
@@ -806,29 +838,10 @@ QToolTip QLabel {
             self._tune_bridge_poll_interval(runs)
             browser = status.get("browser", {}) if isinstance(status, dict) else {}
             if browser:
-                stale = int(browser.get("stale_widget_workers", 0) or 0)
-                if stale:
-                    # A window running an outdated widget build can never claim
-                    # an audit. Reported as CLEAN it looked like a healthy idle
-                    # pool with a queue that mysteriously never moved, which is
-                    # the one thing the status bar must never let happen.
-                    build = str(browser.get("required_widget_build", "") or "")
-                    suffix = f" (needs {build})" if build else ""
-                    self._flash_status(
-                        f"{stale} worker window(s) run an OUTDATED widget{suffix} — "
-                        f"reinstall it from Settings ▸ Bridge; audits cannot start until then",
-                        "#D66464",
-                        duration_ms=10000,
-                    )
-                self.statusBar().showMessage(
-                    f"BRIDGE ✓ | W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)}  "
-                    f"CLEAN {browser.get('clean_workers', 0)}  "
-                    + (f"STALE {stale}  " if stale else "")
-                    + f"BUSY {browser.get('busy_workers', 0)}  "
-                    f"Q {browser.get('queued_jobs', 0)}  "
-                    f"RUN {browser.get('active_jobs', 0)}  "
-                    f"! {browser.get('blocked_jobs', 0)}"
-                )
+                warning = bridge_status_warning(browser)
+                if warning:
+                    self._flash_status(warning, "#D66464", duration_ms=10000)
+                self.statusBar().showMessage(bridge_status_text(browser))
 
         self.task_runner.submit_coalesced("audit-runs:refresh", _load, on_success=_apply)
 

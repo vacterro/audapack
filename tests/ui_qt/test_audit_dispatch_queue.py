@@ -77,3 +77,21 @@ def test_batch_is_capped_at_six_lanes(window):
     window._audit_start_debounce.stop()
     window._pump_audit_start_queue()
     assert len(batches) == 1 and len(batches[0]) == 6
+
+
+def test_stale_widget_pool_is_named_in_the_status_bar():
+    """Six idle windows and a queue that never moves must not look healthy."""
+    from audapack.ui_qt.main_window import bridge_status_text, bridge_status_warning
+
+    healthy = {"active_workers": 6, "max_workers": 6, "clean_workers": 6,
+               "busy_workers": 0, "queued_jobs": 0, "active_jobs": 0, "blocked_jobs": 0}
+    assert "STALE" not in bridge_status_text(healthy)
+    assert bridge_status_warning(healthy) == ""
+
+    stale = {**healthy, "clean_workers": 0, "active_workers": 0,
+             "stale_widget_workers": 6, "required_widget_build": "0.0.25", "queued_jobs": 3}
+    text = bridge_status_text(stale)
+    assert "STALE 6" in text
+    warning = bridge_status_warning(stale)
+    assert "OUTDATED widget" in warning
+    assert "0.0.25" in warning
