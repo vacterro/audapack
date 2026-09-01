@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QStyle,
+    QStyleOptionToolButton,
     QSystemTrayIcon,
     QTabWidget,
     QToolBar,
@@ -413,14 +415,15 @@ class ProjectTreeView(QTreeView):
         event.ignore()
 
 
-#: Breathing room around a toolbar label, in pixels. The style's own minimum
-#: for a QToolButton is ~59px whatever the text, so a two-character label cost
-#: as much as a word and the action row could not fit a 640px window.
-TOOLBAR_LABEL_PADDING = 10
-
-
 def _fit_toolbar_to_text(toolbar) -> int:
-    """Size every toolbar button to its label. Returns the total width used."""
+    """Size every toolbar button to its label. Returns the total width used.
+
+    The style's own minimum for a QToolButton is ~59px whatever the text, so a
+    two-character label cost as much as a word and the action row could not fit
+    a 640px window. The width comes from the style itself rather than a guessed
+    constant: a hand-picked padding was 5px short of the border and padding the
+    stylesheet adds, and every label rendered elided as "P...K".
+    """
     total = 0
     for action in toolbar.actions():
         if not action.text():
@@ -428,10 +431,22 @@ def _fit_toolbar_to_text(toolbar) -> int:
         button = toolbar.widgetForAction(action)
         if button is None:
             continue
-        width = button.fontMetrics().horizontalAdvance(action.text()) + TOOLBAR_LABEL_PADDING
+        # Without this the button is measured before the stylesheet's border
+        # and padding are applied, and every label ends up two pixels short.
+        button.ensurePolished()
+        metrics = button.fontMetrics()
+        option = QStyleOptionToolButton()
+        option.initFrom(button)
+        option.text = action.text()
+        needed = button.style().sizeFromContents(
+            QStyle.ContentsType.CT_ToolButton,
+            option,
+            QSize(metrics.horizontalAdvance(action.text()), metrics.height()),
+            button,
+        ).width()
         button.setMinimumWidth(0)
-        button.setFixedWidth(width)
-        total += width
+        button.setFixedWidth(needed)
+        total += needed
     return total
 
 

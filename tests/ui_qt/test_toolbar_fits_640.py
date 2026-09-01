@@ -48,12 +48,35 @@ def test_every_button_is_sized_to_its_own_label(toolbar):
         )
 
 
+def test_no_label_is_narrow_enough_to_elide(toolbar):
+    """A hand-picked padding was 5px short and every label rendered "P...K"."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtWidgets import QStyle, QStyleOptionToolButton
+
+    _window, bar = toolbar
+    for action in [a for a in bar.actions() if a.text()]:
+        button = bar.widgetForAction(action)
+        metrics = button.fontMetrics()
+        option = QStyleOptionToolButton()
+        option.initFrom(button)
+        option.text = action.text()
+        needed = button.style().sizeFromContents(
+            QStyle.ContentsType.CT_ToolButton,
+            option,
+            QSize(metrics.horizontalAdvance(action.text()), metrics.height()),
+            button,
+        ).width()
+        assert button.width() >= needed, (
+            f"{action.text()} would render elided: {button.width()}px given, {needed}px needed"
+        )
+
+
 def test_the_whole_action_row_fits_640(toolbar):
     _window, bar = toolbar
     actions = [a for a in bar.actions() if a.text()]
     used = sum(bar.widgetForAction(a).width() for a in actions)
     # Toolbar spacing is 2px per item plus its own 2px padding on both sides.
-    used += 2 * len(actions) + 8
+    used += bar.layout().spacing() * len(actions) + 8
     assert used <= TARGET_WIDTH, (
         f"{len(actions)} buttons need {used}px and would wrap at {TARGET_WIDTH}px: "
         + ", ".join(f"{a.text()}={bar.widgetForAction(a).width()}" for a in actions)

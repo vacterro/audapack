@@ -53,14 +53,15 @@ QMainWindow, QDialog, QWidget {{
 QToolBar {{
     background: {cls.surfaceRaised};
     border-bottom: 2px solid {cls.borderDark};
-    spacing: 2px;
+    /* 1px between actions: thirteen buttons must fit 640px in one row. */
+    spacing: 1px;
     padding: 2px;
 }}
 QToolBar QToolButton {{
     /* The action bar must fit one row at 640px: the shared button padding is
        sized for dialog buttons and turned a two-character label into a 74px
        control. */
-    padding: 2px 4px;
+    padding: 2px 2px;
     margin: 0px;
     min-width: 0px;
 }}
