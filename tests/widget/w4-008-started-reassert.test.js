@@ -98,3 +98,55 @@ test('T87: a terminal BLOCKED dispatch is acknowledged instead of throwing', asy
   assert.ok(posted.includes('BLOCKED'), `expected a BLOCKED ack, saw ${JSON.stringify(posted)}`);
   assert.strictEqual(api.browserWorkerLease, null, 'a terminal block must clear the lease');
 });
+
+test('T92: a worker told its build is stale reloads to pick the new one up', async () => {
+  // Tampermonkey injects the installed build at page load, so an already-open
+  // worker window keeps the old script after an update: the Bridge rejects it
+  // as STALE_WIDGET and the lane idles until a human reloads six windows.
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+  api.browserWorkerLease = null;
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  h.httpResponder = options => {
+    if (String(options.url || '').includes('/v1/browser/poll')) {
+      return {
+        status: 200,
+        responseText: JSON.stringify({
+          ok: true,
+          job: null,
+          owned_job: null,
+          worker_state: 'FREE',
+          worker_widget_stale: true,
+          required_widget_build: '0.0.26',
+          status: {}
+        })
+      };
+    }
+    return { status: 200, responseText: JSON.stringify({ ok: true }) };
+  };
+
+  const before = h.location.reloaded;
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  assert.strictEqual(h.location.reloaded, before + 1, 'a stale worker must reload itself');
+});
+
+test('T92: a worker mid-audit never reloads to chase a build', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+  api.browserWorkerLease = {
+    dispatch_id: 'dsp-0123456789abcdef',
+    worker_id: 'audapack-managed-1-1-xyz',
+    lease_id: 'lease-0123456789abcdef'
+  };
+  api.autoRuntime = { ...api.emptyAutoRuntime({ enabled: true }), stage: 'running', runId: 'acb-run-1' };
+
+  const before = h.location.reloaded;
+  assert.strictEqual(api.browserWorkerReloadForStaleBuild('0.0.26'), false);
+  assert.strictEqual(h.location.reloaded, before, 'a run in flight outranks a build update');
+});

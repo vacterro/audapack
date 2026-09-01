@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.25
+// @version      0.0.26
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -17552,6 +17552,15 @@ async function recoverArmedStartSend(options = {}) {
   const BROWSER_WORKER_RECYCLE_SESSION_KEY = 'audapack_worker_recycle_v1';
   const BROWSER_WORKER_RECYCLE_COOLDOWN_MS = 20000;
   const BROWSER_WORKER_RECYCLE_COUNT_KEY = 'audapack_worker_recycle_count_v1';
+  // Tampermonkey injects the installed build at page load, so a worker window
+  // that is already open keeps running the old script after an update: the
+  // Bridge rejects it as STALE_WIDGET and the lane idles until a human reloads
+  // six windows by hand. The Bridge now tells each worker its own build
+  // verdict, and the window reloads itself once per interval to pick the new
+  // script up. Never while it owns a run -- a reload mid-audit would be worse
+  // than a stale build.
+  const BROWSER_WORKER_STALE_RELOAD_KEY = 'audapack_worker_stale_reload_v1';
+  const BROWSER_WORKER_STALE_RELOAD_COOLDOWN_MS = 120000;
   // A time-based cooldown alone cannot stop a recycle loop: if the window is
   // still judged dirty after landing on a fresh root chat it simply navigates
   // again one cooldown later, forever. Live evidence: worker_recycled (poll-idle)
@@ -18365,6 +18374,23 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     return browserWorkerStandDown('orphaned-prepared-core');
   }
 
+  function browserWorkerReloadForStaleBuild(requiredBuild) {
+    // Never abandon a run to chase a build. A window mid-audit keeps its stale
+    // script; the Bridge lets an owned run finish either way.
+    if (browserWorkerLease?.dispatch_id || autoRuntime?.runId) return false;
+    const now = Date.now();
+    let last = 0;
+    try { last = Number(sessionStorage.getItem(BROWSER_WORKER_STALE_RELOAD_KEY) || 0); } catch (_) { }
+    if (last && now - last < BROWSER_WORKER_STALE_RELOAD_COOLDOWN_MS) return false;
+    try { sessionStorage.setItem(BROWSER_WORKER_STALE_RELOAD_KEY, String(now)); } catch (_) { }
+    appendBridgeDiagnostic('worker_stale_build_reload', {
+      severity: 'info',
+      message: `Bridge requires widget build ${requiredBuild || '(unknown)'}; reloading this worker window to pick it up`
+    });
+    try { location.reload(); } catch (_) { return false; }
+    return true;
+  }
+
   async function browserWorkerPollOnce() {
     if (browserWorkerPollInFlight || browserWorkerStopRequested || !state?.bridgeEnabled) return false;
     browserWorkerPollInFlight = true;
@@ -18388,6 +18414,9 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         // which local recovery identity may be destroyed.
         browserWorkerLease = null;
         persistBrowserWorkerLease();
+      }
+      if (result.data?.worker_widget_stale) {
+        browserWorkerReloadForStaleBuild(String(result.data.required_widget_build || ''));
       }
       const owned = result.data?.owned_job;
       // STARTED -> AUDITING is sent once, immediately after the irreversible
@@ -18631,6 +18660,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerHasChromiumCapability,
          browserWorkerPageEligible,
          browserWorkerPollOnce,
+         browserWorkerReloadForStaleBuild,
          browserWorkerReleaseUnclaimableJob,
          browserWorkerDropStaleLease,
          browserWorkerStandDown,

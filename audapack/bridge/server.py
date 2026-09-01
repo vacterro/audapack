@@ -22,6 +22,7 @@ from audapack import __version__
 from audapack.bridge.browser_dispatch import (
     SUPPORTED_BROWSER_WIDGET_VERSION,
     BrowserDispatcher,
+    _get_required_widget_build,
 )
 from audapack.bridge.browser_dispatch import (
     DispatchError as BrowserDispatchError,
@@ -1691,12 +1692,19 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "profile": owned.requested_profile,
                 } if owned else None,
                 "worker_state": worker.state,
+                # A window cannot see its own build verdict, and a stale build
+                # can never claim. Told plainly, it reloads itself and picks the
+                # new script up instead of idling in the pool forever.
+                "worker_widget_stale": dispatcher.worker_widget_is_stale(worker),
+                "required_widget_build": _get_required_widget_build(),
                 "status": dispatcher.status(),
             })
             return
         self.send_json(200, {
             "ok": True,
             "worker_state": worker.state,
+            "worker_widget_stale": dispatcher.worker_widget_is_stale(worker),
+            "required_widget_build": _get_required_widget_build(),
             "status": dispatcher.status(),
             "job": {
                 "dispatch_id": job.dispatch_id,
