@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from PySide6.QtCore import QFileSystemWatcher, QModelIndex, QPoint, QRect, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QModelIndex, QPoint, QRect, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QDrag,
@@ -626,7 +626,7 @@ class MainWindow(QMainWindow):
             "RESET MARKS: clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
         )
 
-        _fit_toolbar_to_text(toolbar)
+        self._action_toolbar = toolbar
 
         # Ctrl+R refreshes everything, from anywhere in the window. It also
         # replaces the REFRESH button outright: one action does not need a
@@ -743,6 +743,12 @@ QToolTip QLabel {
             QToolTip.setStyleSheet(_tooltip_qss)
         except Exception:
             pass
+
+        # Only NOW: the stylesheet adds the border and padding a button needs
+        # room for, and it is applied long after the toolbar is built. Sizing
+        # the buttons before this point measured unstyled widgets and every
+        # label rendered clipped as "P...K".
+        _fit_toolbar_to_text(self._action_toolbar)
         self.statusBar().showMessage("AUDAPACK Ready")
 
         # Comprehensive Shortcuts
@@ -1558,6 +1564,12 @@ QToolTip QLabel {
         )
         self._audit_start_debounce.start()
         self._publish_pending_dispatch_count()
+
+    def changeEvent(self, event):
+        """Re-fit the action row whenever the style changes under it."""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.StyleChange and getattr(self, "_action_toolbar", None) is not None:
+            _fit_toolbar_to_text(self._action_toolbar)
 
     def _publish_pending_dispatch_count(self):
         """Tell the Audit Runs panel how many presses have not dispatched yet."""

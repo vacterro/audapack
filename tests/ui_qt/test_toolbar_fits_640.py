@@ -13,7 +13,6 @@ from PySide6.QtWidgets import QToolBar
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import Project
 from audapack.services.project_service import ProjectService
-from audapack.ui_qt.theme.golden_default import GoldenDefault
 
 TARGET_WIDTH = 640
 
@@ -22,7 +21,10 @@ TARGET_WIDTH = 640
 def toolbar(tmp_path, qapp):
     from audapack.ui_qt.main_window import MainWindow
 
-    qapp.setStyleSheet(GoldenDefault.qss())
+    # Deliberately NOT set on the app: production applies the theme from
+    # inside MainWindow, after the toolbar exists. Pre-styling the app here
+    # is what let the elision bug pass its own regression.
+    qapp.setStyleSheet("")
     config = AppConfig(
         audits=AuditsConfig(root=str(tmp_path / "audits")),
         projects=[
