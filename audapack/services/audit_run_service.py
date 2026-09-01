@@ -793,7 +793,12 @@ class AuditRunCoordinator:
         dispatch_run = str(job.get("campaign_run_id") or "")
         if not dispatch_run:
             return False
-        return dispatch_run == str(audit.campaign_run_id or "")
+        # Same lineage, two ids: ChatGPT route hydration re-derives the widget's
+        # run id, and the Bridge records the id the campaign was actually saved
+        # under when it closes the lane. Without accepting it a finished
+        # campaign reported 0/3 waves next to its own READY handoff.
+        drift_run = str(job.get("meta_run_id_drift") or "")
+        return str(audit.campaign_run_id or "") in {dispatch_run, drift_run} - {""}
 
     @staticmethod
     def _ready_proof(job: dict[str, Any], audit: Optional[AuditSnapshot]) -> tuple[bool, tuple[str, ...], str, str]:

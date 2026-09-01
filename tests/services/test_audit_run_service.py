@@ -932,3 +932,29 @@ def test_the_wait_gives_up_instead_of_blocking_the_batch(tmp_path):
     service.workers = Supervisor()
     assert service.provision_capacity(6)["settled"] == 0
     assert service.start("p1").ok
+
+
+def test_wave_progress_follows_the_same_lineage_across_a_re_derived_run_id(tmp_path):
+    """A finished campaign reported 0/3 waves next to its own READY handoff."""
+    service, _bridge, _audits = coordinator(tmp_path)
+    audit = AuditSnapshot(
+        project_id="p1", project_name="Project p1",
+        campaign_run_id="acb-saved-under-this",
+        completed_waves=3, total_waves=3,
+    )
+    job = {"project_id": "p1", "campaign_run_id": "acb-dispatch-saw-this"}
+
+    assert service.audit_matches_dispatch(job, audit) is False
+    job["meta_run_id_drift"] = "acb-saved-under-this"
+    assert service.audit_matches_dispatch(job, audit) is True
+
+
+def test_wave_progress_never_leaks_from_an_unrelated_campaign(tmp_path):
+    service, _bridge, _audits = coordinator(tmp_path)
+    audit = AuditSnapshot(
+        project_id="p1", project_name="Project p1",
+        campaign_run_id="acb-somebody-elses-run",
+        completed_waves=3, total_waves=3,
+    )
+    job = {"project_id": "p1", "campaign_run_id": "acb-dispatch", "meta_run_id_drift": ""}
+    assert service.audit_matches_dispatch(job, audit) is False

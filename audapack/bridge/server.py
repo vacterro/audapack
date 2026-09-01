@@ -616,6 +616,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "next_retry_at": job.next_retry_at,
                     "last_error_code": job.last_error_code,
                     "recovery_state": job.recovery_state,
+                    # The run id the saved campaign actually carries when the
+                    # widget's runtime re-derived it. Without it in this payload
+                    # the coordinator cannot prove campaign_match, and a
+                    # finished audit never leaves SAVING.
+                    "meta_run_id_drift": job.meta_run_id_drift,
                 } for job in jobs],
             })
         elif parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/artifact"):
