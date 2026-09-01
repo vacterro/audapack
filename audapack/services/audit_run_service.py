@@ -37,6 +37,12 @@ WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT = 2
 #: attempt count over, so two bad launches cost one cooldown instead of
 #: retiring the slot permanently from a six-lane pool.
 WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS = 600.0
+#: How long a batch waits for the windows it just asked for to become
+#: claimable before submitting anyway. Chromium boot plus a ChatGPT load is
+#: tens of seconds and packing is faster, which is how six queued projects
+#: ended up as five concurrent audits and one job waiting for a lane.
+WORKER_POOL_SETTLE_SECONDS = 90.0
+WORKER_POOL_SETTLE_POLL_SECONDS = 3.0
 
 ACTIVE_DISPATCH_STATES = {
     "QUEUED", "RETRYABLE", "LEASED", "ARTIFACT_FETCHED", "ATTACHED",
@@ -303,6 +309,41 @@ class ManagedWorkerSupervisor:
             _atomic_write_json(self.path, doc)
         return {"desired": desired, "registered": len(registered), "launched": launched, "generation": generation}
 
+    def launch_slot(self, slot: int, dispatch: dict[str, Any]) -> dict[str, Any]:
+        """Open exactly one named slot, whatever the rest of the pool looks like.
+
+        The operator relaunch path went through ensure_capacity(demand=slot),
+        which reads `slot` as a COUNT of wanted lanes: reopening slot 2 while
+        five other slots were registered satisfied the demand instantly and
+        launched nothing. Reopening a window the operator closed is a request
+        for that window, not for a lane budget.
+        """
+        slot = max(1, min(MAX_AUDIT_LANES, int(slot)))
+        workers = dispatch.get("workers", []) if isinstance(dispatch, dict) else []
+        now = time.time()
+        with cross_process_lock(self.lock_path):
+            doc = self._load()
+            generation = max(1, int(doc.get("generation", 1)))
+            live = any(
+                int(worker.get("managed_slot", 0) or 0) == slot
+                and int(worker.get("managed_generation", 0) or 0) == generation
+                for worker in workers
+            )
+            if live:
+                return {"slot": slot, "generation": generation, "launched": False, "message": "slot already has a live worker"}
+            ok, message = self.launch_worker(slot, generation)
+            doc["slots"][str(slot)] = {
+                "state": "LAUNCHING" if ok else "LAUNCH_FAILED",
+                "launch_attempts": 1,
+                "launched_at": now,
+                "attempts_expire_at": now + WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS,
+                "cooldown_until": now + (WORKER_LAUNCH_BOOT_GRACE_SECONDS if ok else self.cooldown_seconds),
+                "message": str(message)[:300],
+            }
+            doc["updated_at"] = now
+            _atomic_write_json(self.path, doc)
+        return {"slot": slot, "generation": generation, "launched": bool(ok), "message": str(message)}
+
     def _reset_slot(self, slot: int) -> None:
         """Forget a slot's launch/cooldown accounting so it can be relaunched.
 
@@ -427,6 +468,7 @@ class AuditRunCoordinator:
         self.bridge = bridge_service
         self.audits = audit_service
         self.intents = intent_store or AuditStartIntentStore()
+        self.pool_settle_seconds = WORKER_POOL_SETTLE_SECONDS
         if worker_supervisor is not None:
             self.workers = worker_supervisor
         elif component_manager is not None:
@@ -508,12 +550,44 @@ class AuditRunCoordinator:
         dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
         if self.workers is None:
             return {"desired": 0, "launched": []}
+        wanted = max(1, int(lanes or 0))
         demand = (
             int(dispatch_status.get("queued_jobs", 0) or 0)
             + int(dispatch_status.get("active_jobs", 0) or 0)
-            + max(1, int(lanes or 0))
+            + wanted
         )
-        return self.workers.ensure_capacity(dispatch_status, demand)
+        outcome = self.workers.ensure_capacity(dispatch_status, demand)
+        outcome["settled"] = self._await_free_lanes(wanted)
+        return outcome
+
+    def _await_free_lanes(self, wanted: int, timeout_seconds: Optional[float] = None) -> int:
+        """Wait, briefly, for freshly launched windows to become claimable.
+
+        A launched Chromium window is invisible to the dispatcher until it has
+        booted, loaded ChatGPT and registered -- tens of seconds. Packing six
+        archives is faster than that, so a six-project batch submitted against
+        whatever happened to be clean and the last job simply queued behind
+        lanes that were still starting: six windows on screen, five audits
+        running. Waiting here is what makes "six at once" actually six.
+
+        Never fatal: a job with no window yet is a wait, not a loss, and the
+        Bridge supervisor keeps provisioning either way.
+        """
+        wanted = max(1, min(MAX_AUDIT_LANES, int(wanted)))
+        budget = self.pool_settle_seconds if timeout_seconds is None else timeout_seconds
+        deadline = time.time() + max(0.0, float(budget))
+        free = 0
+        while True:
+            try:
+                status = (self.bridge.runtime_status() or {}).get("browser") or {}
+            except Exception:
+                return free
+            free = int(status.get("free_workers", 0) or 0)
+            if free >= wanted:
+                return free
+            if time.time() >= deadline:
+                return free
+            time.sleep(WORKER_POOL_SETTLE_POLL_SECONDS)
 
     def start(self, project_id: str, profile_id: str = "quick3", provision: bool = True) -> AuditStartResult:
         project = self.projects.get_project(str(project_id))

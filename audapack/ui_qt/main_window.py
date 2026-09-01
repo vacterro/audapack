@@ -531,6 +531,14 @@ class MainWindow(QMainWindow):
         act_audit_group = toolbar.addAction("AUDIT GROUP", self._on_start_audit_group)
         act_audit_group.setToolTip("Queue up to six projects from the selected group")
 
+        act_reopen_workers = toolbar.addAction("WORKERS", self._on_reopen_workers)
+        act_reopen_workers.setToolTip(
+            "Reopen worker windows that are no longer on screen. "
+            "Closing one by accident used to be unrecoverable from here: the Bridge "
+            "only re-provisions while audits are queued, so an idle pool stayed short "
+            "until the next START AUDIT. A window running an audit is left alone."
+        )
+
         act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
         act_pack_all.setToolTip("Pack all configured projects in background")
 
@@ -1344,6 +1352,44 @@ QToolTip QLabel {
                 QSystemTrayIcon.Critical,
                 8000,
             )
+
+    def _on_reopen_workers(self):
+        """Reopen every managed worker window that is no longer on screen."""
+        key = "workers:reopen"
+        if self.task_runner.is_running(key):
+            self._flash_status("Reopening worker windows...", "#D4A840")
+            return
+        self._flash_status("Checking worker windows...", "#D4A840")
+
+        def _work():
+            return self._bridge.reopen_closed_browser_workers()
+
+        def _done(result):
+            if not result.get("ok"):
+                self._flash_status(f"Worker check failed: {result.get('error')}", "#D66464", duration_ms=7000)
+                return
+            reopened = result.get("reopened", [])
+            failed = result.get("failed", [])
+            if not reopened and not failed:
+                self._flash_status("All worker windows are already open", "#D4A840", duration_ms=4000)
+                return
+            slots = ", ".join(str(slot) for slot in reopened)
+            if failed:
+                detail = "; ".join(f"slot {item['slot']}: {item['message']}" for item in failed[:2])
+                self._flash_status(
+                    f"Reopened {len(reopened)} worker window(s){' [' + slots + ']' if slots else ''}, {len(failed)} refused · {detail}",
+                    "#D66464",
+                    duration_ms=8000,
+                )
+            else:
+                self._flash_status(
+                    f"Reopened {len(reopened)} worker window(s) [{slots}]", "#D4A840", duration_ms=5000
+                )
+
+        def _error(error):
+            self._flash_status(f"Reopen workers failed: {error}", "#D66464", duration_ms=7000)
+
+        self.task_runner.submit(key, _work, on_success=_done, on_error=_error)
 
     def _on_send_audit(self):
         proj = self._selected_project()

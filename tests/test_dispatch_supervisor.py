@@ -38,6 +38,7 @@ class FakeWorkerSupervisor:
         self.calls = []
         self.launched = launched
         self.resets = []
+        self.slot_launches = []
 
     def ensure_capacity(self, dispatch, desired):
         self.calls.append((dict(dispatch), desired))
@@ -50,6 +51,18 @@ class FakeWorkerSupervisor:
 
     def _reset_slot(self, slot):
         self.resets.append(int(slot))
+
+    def launch_slot(self, slot, dispatch):
+        # The operator relaunch path targets ONE named slot. Routing it through
+        # ensure_capacity read `slot` as a lane COUNT, so reopening slot 2 with
+        # five other slots registered satisfied the demand and launched nothing.
+        self.slot_launches.append((int(slot), dict(dispatch)))
+        return {
+            "slot": int(slot),
+            "generation": 1,
+            "launched": bool(self.launched),
+            "message": "started" if self.launched else "slot already has a live worker",
+        }
 
 
 class Clock:
@@ -194,8 +207,18 @@ def test_relaunch_resets_unproductive_budget_and_clears_slot():
     assert sup.tick()["launched"]
 
 
+def test_relaunch_targets_the_named_slot_not_a_lane_budget():
+    """Reopening a closed window is a request for THAT window."""
+    workers = FakeWorkerSupervisor()
+    sup = supervisor(FakeDispatcher(active_workers=5, clean_workers=5), workers)
+    result = sup.relaunch_managed_slot(2)
+    assert result["success"] is True
+    assert [slot for slot, _dispatch in workers.slot_launches] == [2]
+    assert workers.calls == [], "the relaunch path must not go through ensure_capacity"
+
+
 def test_relaunch_refuses_out_of_range_slots():
-    sup = supervisor(FakeDispatcher())
+    sup = supervisor(FakeDispatcher(), FakeWorkerSupervisor())
     for bad in (0, 7, -1, 99):
         result = sup.relaunch_managed_slot(bad)
         assert result["slot"] in (1, 6)

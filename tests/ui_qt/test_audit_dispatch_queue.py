@@ -95,3 +95,57 @@ def test_stale_widget_pool_is_named_in_the_status_bar():
     warning = bridge_status_warning(stale)
     assert "OUTDATED widget" in warning
     assert "0.0.25" in warning
+
+
+def test_reopen_closed_workers_only_touches_unregistered_slots(monkeypatch):
+    """Closing a worker window by accident must be recoverable from the GUI.
+
+    The Bridge only re-provisions while audits are queued, so an idle pool
+    stayed one window short until the next START AUDIT.
+    """
+    from audapack.services.bridge_service import BridgeService
+
+    service = BridgeService.__new__(BridgeService)
+    relaunched: list[int] = []
+    service.browser_slots = lambda: {
+        "ok": True,
+        "slots": [
+            {"slot": 1, "registered": True},
+            {"slot": 2, "registered": False},
+            {"slot": 3, "registered": True},
+            {"slot": 4, "registered": False},
+        ],
+    }
+    service.relaunch_browser_slot = lambda slot: (
+        relaunched.append(slot) or {"ok": True, "success": True, "slot": slot}
+    )
+
+    result = BridgeService.reopen_closed_browser_workers(service)
+    assert result["ok"] is True
+    assert relaunched == [2, 4]
+    assert result["reopened"] == [2, 4]
+    assert result["failed"] == []
+
+
+def test_reopen_reports_a_slot_the_bridge_refuses():
+    from audapack.services.bridge_service import BridgeService
+
+    service = BridgeService.__new__(BridgeService)
+    service.browser_slots = lambda: {"ok": True, "slots": [{"slot": 5, "registered": False}]}
+    service.relaunch_browser_slot = lambda slot: {
+        "ok": True, "success": False, "message": "slot already has a live worker",
+    }
+
+    result = BridgeService.reopen_closed_browser_workers(service)
+    assert result["reopened"] == []
+    assert result["failed"] == [{"slot": 5, "message": "slot already has a live worker"}]
+
+
+def test_reopen_surfaces_an_unreachable_bridge():
+    from audapack.services.bridge_service import BridgeService
+
+    service = BridgeService.__new__(BridgeService)
+    service.browser_slots = lambda: {"ok": False, "error": "connection refused"}
+    result = BridgeService.reopen_closed_browser_workers(service)
+    assert result["ok"] is False
+    assert "connection refused" in result["error"]

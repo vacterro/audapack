@@ -163,6 +163,41 @@ class BridgeService:
         jobs = [job for job in response.get("jobs", []) if job.get("state") not in terminal]
         return jobs[-1] if jobs else None
 
+    def browser_slots(self) -> dict[str, Any]:
+        """Per-slot commissioning state for the six managed worker windows."""
+        return _browser_bridge_request(self.config, "GET", "/v1/browser/slots")
+
+    def relaunch_browser_slot(self, slot: int) -> dict[str, Any]:
+        """Reopen one managed worker window that is no longer on screen."""
+        return _browser_bridge_request(
+            self.config, "POST", "/v1/browser/relaunch-slot", {"slot": int(slot)}
+        )
+
+    def reopen_closed_browser_workers(self) -> dict[str, Any]:
+        """Reopen every managed slot that has no live worker behind it.
+
+        Closing a worker window by accident used to be unrecoverable from the
+        GUI: the Bridge only re-provisions when audits are actually queued, so
+        an idle pool stayed one window short until the next START AUDIT.
+        """
+        status = self.browser_slots()
+        if not status.get("ok"):
+            return {"ok": False, "error": status.get("error") or "Bridge did not report worker slots", "reopened": []}
+        reopened: list[int] = []
+        failed: list[dict[str, Any]] = []
+        for entry in status.get("slots", []):
+            if entry.get("registered"):
+                continue
+            slot = int(entry.get("slot", 0) or 0)
+            if not slot:
+                continue
+            result = self.relaunch_browser_slot(slot)
+            if result.get("ok") and result.get("success"):
+                reopened.append(slot)
+            else:
+                failed.append({"slot": slot, "message": str(result.get("message") or result.get("error") or "")})
+        return {"ok": True, "reopened": reopened, "failed": failed, "checked": len(status.get("slots", []))}
+
     def browser_status(self) -> dict[str, Any]:
         return _browser_bridge_request(self.config, "GET", "/v1/browser/status")
 

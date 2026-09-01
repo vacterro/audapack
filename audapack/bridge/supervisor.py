@@ -213,22 +213,16 @@ class DispatchSupervisor:
             return {"slot": slot, "success": False, "message": f"relaunch preparation failed: {exc}"}
         status["workers"] = self._worker_rows()
         try:
-            outcome = self.workers.ensure_capacity(status, max(1, slot))
+            outcome = self.workers.launch_slot(slot, status)
         except Exception as exc:
             logger.warning("could not relaunch slot %s: %s", slot, exc)
             return {"slot": slot, "success": False, "message": f"relaunch failed: {exc}"}
-        launched = [
-            item for item in outcome.get("launched", [])
-            if int(item.get("slot", 0) or 0) == slot
-        ]
         return {
             "slot": slot,
             "generation": outcome.get("generation", 1),
-            "success": bool(launched),
-            "message": "managed worker window relaunched" if launched else (
-                "slot already has a live worker or no window was needed"
-            ),
-            "launched": launched,
+            "success": bool(outcome.get("launched")),
+            "message": str(outcome.get("message") or ""),
+            "launched": [outcome] if outcome.get("launched") else [],
         }
 
     # -- thread lifecycle ------------------------------------------------- #

@@ -140,6 +140,9 @@ def coordinator(tmp_path, projects=None, failures=(), supervisor=None):
         intent_store=AuditStartIntentStore(tmp_path / "audit_start_intents.json"),
         worker_supervisor=supervisor,
     )
+    # Real batches wait for freshly launched windows to register; these
+    # tests drive a fake pool that never will.
+    service.pool_settle_seconds = 0.0
     return service, bridge, audits
 
 
@@ -834,3 +837,98 @@ def test_a_genuinely_rejected_submit_still_fails(tmp_path):
     result = service.start("p1")
     assert not result.ok
     assert "duplicate_dispatch" in result.message
+
+
+def test_launch_slot_opens_the_named_slot_regardless_of_pool_size(tmp_path):
+    """Reopening a closed window is a request for THAT window.
+
+    ensure_capacity reads its argument as a COUNT of wanted lanes, so the
+    operator relaunch path -- which passed the slot NUMBER -- opened nothing
+    whenever that many lanes were already registered.
+    """
+    from audapack.services.audit_run_service import ManagedWorkerSupervisor
+
+    launched: list[int] = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launched.append(slot), (True, "started"))[1],
+        path=tmp_path / "managed_browser_workers.json",
+    )
+    dispatch = {
+        "active_workers": 5,
+        "workers": [
+            {"managed_slot": slot, "managed_generation": 1, "last_seen_at": 1.0}
+            for slot in (1, 3, 4, 5, 6)
+        ],
+    }
+    outcome = supervisor.launch_slot(2, dispatch)
+    assert outcome["launched"] is True
+    assert launched == [2]
+
+
+def test_launch_slot_leaves_a_slot_that_still_has_a_window(tmp_path):
+    from audapack.services.audit_run_service import ManagedWorkerSupervisor
+
+    launched: list[int] = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launched.append(slot), (True, "started"))[1],
+        path=tmp_path / "managed_browser_workers.json",
+    )
+    dispatch = {"workers": [{"managed_slot": 2, "managed_generation": 1, "last_seen_at": 1.0}]}
+    outcome = supervisor.launch_slot(2, dispatch)
+    assert outcome["launched"] is False
+    assert launched == []
+    assert "already" in outcome["message"]
+
+
+def test_a_batch_waits_for_the_lanes_it_just_asked_for(tmp_path):
+    """Six queued projects must not become five concurrent audits.
+
+    A launched Chromium window is invisible to the dispatcher until it has
+    booted and registered -- tens of seconds -- and packing six archives is
+    faster than that. The batch submitted against whatever happened to be
+    clean, and the last job queued behind lanes that were still starting.
+    """
+    projects = [project(f"p{index}") for index in range(1, 7)]
+
+    class Supervisor:
+        def ensure_capacity(self, dispatch, demand):
+            return {"desired": demand, "launched": [], "registered": 0, "generation": 1}
+
+    service, bridge, _audits = coordinator(tmp_path, projects, supervisor=Supervisor())
+    service.pool_settle_seconds = 5.0
+
+    polls = {"count": 0}
+    real_status = bridge.runtime_status
+
+    def slow_pool():
+        polls["count"] += 1
+        status = real_status()
+        # The sixth window registers only on the third look.
+        status["browser"]["free_workers"] = 6 if polls["count"] >= 3 else 5
+        return status
+
+    bridge.runtime_status = slow_pool
+    settled = service.provision_capacity(6)["settled"]
+
+    assert settled == 6
+    assert polls["count"] >= 3
+
+
+def test_the_wait_gives_up_instead_of_blocking_the_batch(tmp_path):
+    """A job with no window yet is a wait, not a loss."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.pool_settle_seconds = 0.2
+
+    def never_ready():
+        status = {"healthy": True, "browser": {"free_workers": 0, "queued_jobs": 0, "active_jobs": 0, "workers": []}}
+        return status
+
+    bridge.runtime_status = never_ready
+
+    class Supervisor:
+        def ensure_capacity(self, dispatch, demand):
+            return {"desired": demand, "launched": [], "registered": 0, "generation": 1}
+
+    service.workers = Supervisor()
+    assert service.provision_capacity(6)["settled"] == 0
+    assert service.start("p1").ok
