@@ -405,3 +405,5 @@
 - 02.09.26 00:30 [E-600] [parent: E-599] [T-86] [agent: opencode] DEC: REVIEW SHIP -- P0/P1 clear, inline state columns in Project Room aligned vertically, no duplicate table
 - 02.09.26 00:31 [E-601] [parent: E-600] [T-86] [agent: opencode] DEC: ticket finished via SAIPEN -- completion (from SHIP)
 - 02.09.26 00:50 [E-602] [parent: E-601] [T-86] [agent: opencode] RUN: BUILD -- operator: state rows still unreadable, long labels (BLOCKED POST / AUDIT READY) overflow columns. Shortened all state tokens to fixed width (PREP/INT/WAIT/RETRY/ATCH/START/AUDIT/SAVE/READY/!PRE/!POST/RECOV/FAIL/CANC; WAIT/ATCH/START/AUDIT/SAVE/!BLOCK), one-column-one-dimension RUN|WAVES|AGE / ZIP|PACK. Commit 66c0f30. 36 ui_qt, 456 pytest, 24/24 widget, ruff clean.
+- 02.09.26 00:55 [E-603] [parent: E-602] [T-86] [agent: opencode] DEC: REVIEW SHIP -- short state tokens, table-aligned columns, no overflow
+- 02.09.26 00:56 [E-604] [parent: E-603] [T-86] [agent: opencode] DEC: ticket finished via SAIPEN -- completion (from SHIP); compact tokens committed 66c0f30
