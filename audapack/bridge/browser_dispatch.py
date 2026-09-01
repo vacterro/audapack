@@ -454,7 +454,6 @@ class BrowserDispatcher:
             elif (
                 wid not in self._workers
                 and len(self._live_managed_slots()) >= MAX_ACTIVE_WORKERS
-                and not self._worker_owns_live_job(self._workers.get(wid))
             ):
                 # Every lane belongs to a managed window the operator asked
                 # for. A ChatGPT tab in their own browser is a fallback worker,
@@ -589,7 +588,13 @@ class BrowserDispatcher:
                     record.meta["last_reconcile_error"] = f"{exc.code}: {exc}"[:200]
             return record
 
-    def _worker_owns_live_job(self, worker: WorkerRecord) -> bool:
+    def _worker_owns_live_job(self, worker: Optional[WorkerRecord]) -> bool:
+        # A worker that is not registered owns nothing. Reading .worker_id off
+        # None raised AttributeError instead -- and only once a job existed, so
+        # every test with an empty queue passed while the live Bridge closed
+        # the connection on any unmanaged registration.
+        if worker is None:
+            return False
         return any(
             job.assigned_worker_id == worker.worker_id
             and job.state not in TERMINAL_STATES | {JOB_BLOCKED}

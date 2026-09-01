@@ -16,6 +16,7 @@ from audapack.bridge.browser_dispatch import (
     JOB_CANCELLED,
     JOB_COMPLETE,
     JOB_FINALIZING,
+    JOB_LEASED,
     JOB_QUEUED,
     JOB_RETRYABLE,
     JOB_START_PREPARED,
@@ -1198,3 +1199,24 @@ def test_a_refused_reconcile_never_unregisters_the_window(tmp_path):
     assert "managed-1" in {w.worker_id for w in d.list_workers()}
     assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
     assert "run_id_conflict" in record.meta.get("last_reconcile_error", "")
+
+
+def test_lane_reservation_refuses_cleanly_while_jobs_exist(tmp_path):
+    """The refusal must be a DispatchError, not a crash.
+
+    The admission check called _worker_owns_live_job on a worker that is by
+    definition not registered yet. With an empty queue the generator never
+    touched the None, so every test passed while the live Bridge raised
+    AttributeError and closed the connection on any unmanaged registration.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    for slot in range(1, MAX_ACTIVE_WORKERS + 1):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    item = d.enqueue_job(job_payload(path))
+    d.claim_job("managed-1")
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+    with pytest.raises(DispatchError) as refused:
+        d.register_worker(supported_worker("personal"))
+    assert refused.value.code == "worker_limit"
