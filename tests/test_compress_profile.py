@@ -8,11 +8,6 @@ directory as quick3.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-import pytest
-
 from audapack.bridge.storage import generate_canonical_campaign, parse_wave
 from audapack.campaign import (
     ARTIFACT_KIND_DIRECT_HANDOFF,
