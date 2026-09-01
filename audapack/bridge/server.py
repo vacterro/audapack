@@ -2019,7 +2019,31 @@ def run_bridge_server(config: AppConfig) -> int:
         print(f"Error starting AUDAPACK Bridge: Port {port} on {host} already in use or unavailable: {exc}", file=sys.stderr)
         return 1
 
-    HandlerWithConfig.set_browser_dispatcher(BrowserDispatcher())
+    dispatcher = BrowserDispatcher()
+    HandlerWithConfig.set_browser_dispatcher(dispatcher)
+
+    def _campaign_probe(project_id: str, project_name: str) -> dict[str, Any]:
+        """Ask the audit index whether this project's campaign is finished.
+
+        The dispatcher cannot answer it: campaign.json lives beside the audit
+        artifacts, not under the dispatch state dir, and the saved run id may
+        differ from the one the dispatch recorded.
+        """
+        from audapack.services.audit_service import AuditService
+
+        snapshot = AuditService(config).refresh_project(str(project_id or ""))
+        if snapshot is None or not snapshot.campaign_complete or not snapshot.final_handoff_ready:
+            return {"complete": False}
+        if snapshot.final_handoff_path is None or not Path(snapshot.final_handoff_path).is_file():
+            return {"complete": False}
+        return {
+            "complete": True,
+            "handoff_path": str(snapshot.final_handoff_path),
+            "handoff_sha256": str(snapshot.final_handoff_sha256 or ""),
+            "campaign_run_id": str(snapshot.campaign_run_id or ""),
+        }
+
+    dispatcher.set_campaign_probe(_campaign_probe)
 
     write_pid()
     print(f"AUDAPACK Bridge listening on http://{host}:{port}")

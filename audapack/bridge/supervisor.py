@@ -136,6 +136,16 @@ class DispatchSupervisor:
             logger.warning("dispatch supervisor could not reconcile completed blocked runs: %s", exc)
 
         try:
+            # The finalization event closes a lane as it happens; this reaches
+            # the same conclusion late, for a run whose campaign was finished
+            # while the Bridge was down or the lane was blocked.
+            reconcile_finished = getattr(self.dispatcher, "reconcile_finished_campaigns", None)
+            if callable(reconcile_finished):
+                result["reconciled_complete"] += int(reconcile_finished() or 0)
+        except Exception as exc:
+            logger.warning("dispatch supervisor could not reconcile finished campaigns: %s", exc)
+
+        try:
             status = dict(self.dispatcher.status())
         except Exception as exc:
             logger.warning("dispatch supervisor could not read status: %s", exc)

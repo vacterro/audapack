@@ -1413,3 +1413,56 @@ def test_completion_binds_a_campaign_run_id_the_dispatch_never_saw(tmp_path):
     assert job.state == JOB_COMPLETE
     assert job.campaign_run_id == "acb-dispatch-saw-this", "the dispatch's own id is never overwritten"
     assert job.meta_run_id_drift == "acb-campaign-was-saved-as"
+
+
+def test_a_campaign_finished_while_the_lane_was_blocked_still_closes(tmp_path):
+    """The same conclusion, reached late.
+
+    Wintage and TERMISAI finished 3/3 waves with valid canonical handoffs on
+    disk while their lanes were blocked by a Bridge restart. The finalization
+    event had already passed, so nothing closed them: the dispatcher cannot
+    resolve campaign.json itself (wrong directory, and a run id the widget may
+    have re-derived), so the Bridge lends it the answer.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_AUDITING
+    job.error = "Bridge restarted after START_PREPARED; same-worker reconciliation required"
+
+    handoff = tmp_path / "WINTAGE__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    d.set_campaign_probe(lambda pid, name: {
+        "complete": True,
+        "handoff_path": str(handoff),
+        "handoff_sha256": "cafebabe",
+        "campaign_run_id": "acb-saved-under-another-id",
+    })
+
+    assert d.reconcile_finished_campaigns() == 1
+    closed = d.get_job(item.dispatch_id)
+    assert closed.state == JOB_COMPLETE
+    assert closed.final_handoff_path == str(handoff)
+    assert closed.meta_run_id_drift == "acb-saved-under-another-id"
+
+
+def test_an_unfinished_campaign_leaves_its_lane_alone(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch", "start_receipt": "receipt"})
+
+    d.set_campaign_probe(lambda pid, name: {"complete": False})
+    assert d.reconcile_finished_campaigns() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING

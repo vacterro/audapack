@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -40,6 +41,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from audapack.config import cross_process_lock, get_state_dir
+
+logger = logging.getLogger(__name__)
 
 MAX_ACTIVE_WORKERS = 6
 WORKER_TTL_SECONDS = 75
@@ -284,6 +287,7 @@ class BrowserDispatcher:
         self._managed_slot_seen: dict[int, float] = {}
         self._jobs: dict[str, DispatchJob] = {}
         self._expired_worker_count = 0
+        self._campaign_probe: Optional[Any] = None
         self._load_jobs()
         try:
             self._generation = int(json.loads(self.generation_file.read_text(encoding="utf-8")).get("generation", 0))
@@ -1207,6 +1211,51 @@ class BrowserDispatcher:
                 self._persist_jobs()
                 self._work_available.notify_all()
             return freed
+
+    def set_campaign_probe(self, probe: Optional[Any]) -> None:
+        """Install the callable that asks the audit index if a project finished.
+
+        The dispatcher cannot resolve campaign.json on its own: it looks under
+        its own state dir while the real one lives beside the audit artifacts,
+        and it keys on a run id the widget may have re-derived. The Bridge can
+        answer both questions, so it lends the answer instead.
+        """
+        self._campaign_probe = probe
+
+    def reconcile_finished_campaigns(self) -> int:
+        """Close post-start lanes whose project has a durable finished campaign.
+
+        The finalization event closes a lane as it happens. This is the same
+        conclusion reached late -- after a Bridge restart, or for a run blocked
+        while its campaign was being written -- so a completed audit never
+        stays on the board as a live lane.
+        """
+        probe = getattr(self, "_campaign_probe", None)
+        if probe is None:
+            return 0
+        with self._lock:
+            candidates = [
+                job for job in self._jobs.values()
+                if job.state in POST_START_STATES
+                or (job.state == JOB_BLOCKED and job.recovery_state in POST_START_STATES)
+            ]
+        closed = 0
+        for job in candidates:
+            try:
+                verdict = probe(job.project_id, job.project_name)
+            except Exception as exc:
+                logger.debug("campaign probe failed for %s: %s", job.project_name, exc)
+                continue
+            if not verdict or not verdict.get("complete"):
+                continue
+            closed += self.complete_runs_for_project(
+                job.project_id,
+                job.project_name,
+                str(verdict.get("handoff_path") or ""),
+                str(verdict.get("handoff_sha256") or ""),
+                str(verdict.get("campaign_run_id") or ""),
+            )
+        return closed
 
     def complete_runs_for_project(self, project_id: str, project_name: str, handoff_path: str, handoff_sha256: str, campaign_run_id: str = "") -> int:
         """Close the lane the moment the durable final handoff is written.
