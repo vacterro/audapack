@@ -137,9 +137,18 @@ def test_ctrl_r_refreshes_everything(toolbar):
     assert called == [True]
 
 
-def test_start_audit_is_not_duplicated_by_the_profile_buttons(toolbar):
-    """A3/A10/CM each start an audit, so a generic START AUDIT is the same act."""
+def test_the_profile_buttons_are_switches_next_to_one_start(toolbar):
+    """A3/A10/CM select; START runs.
+
+    They looked like mode indicators, so firing an audit the moment one was
+    pressed was a surprise -- and an audit is not an undoable thing to be
+    surprised by.
+    """
     _window, bar = toolbar
     labels = [a.text() for a in bar.actions() if a.text()]
-    assert "START AUDIT" not in labels
-    assert {"A3", "A10", "CM"} <= set(labels)
+    assert {"A3", "A10", "CM", "START"} <= set(labels)
+    for name in ("A3", "A10", "CM"):
+        action = next(a for a in bar.actions() if a.text() == name)
+        assert action.isCheckable(), f"{name} must read as a switch"
+    start = next(a for a in bar.actions() if a.text() == "START")
+    assert not start.isCheckable()

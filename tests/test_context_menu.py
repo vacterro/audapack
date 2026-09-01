@@ -257,7 +257,7 @@ class TestSeamlessProjectOperations(unittest.TestCase):
                 for action in bar.actions()
             ]
             # Label shortened to fit a 640px window in one row; the action is the same.
-            self.assertIn("MARKS", toolbar_actions)
+            self.assertIn("MRK", toolbar_actions)
             win._on_reset_project_marks()
             cleared = svc.get_project(p1.id)
             self.assertFalse(cleared.ignored)

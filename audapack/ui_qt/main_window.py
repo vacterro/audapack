@@ -568,10 +568,11 @@ class MainWindow(QMainWindow):
         act_pack = toolbar.addAction("PACK", self._on_pack)
         act_pack.setToolTip("Pack selected project in background")
 
-        # No START AUDIT button: A3/A10/CM each start the selected project with
-        # their own profile, so a separate "start with whatever is selected"
-        # button is the same action under a second name -- and the row action,
-        # the context menu and _on_send_audit still use the persisted default.
+        act_send_audit = toolbar.addAction("START", self._on_send_audit)
+        act_send_audit.setToolTip(
+            "START AUDIT: queue the selected project with the profile A3/A10/CM currently marks"
+        )
+
         act_audit_group = toolbar.addAction("GRP", self._on_start_audit_group)
         act_audit_group.setToolTip("AUDIT GROUP: queue up to six projects from the selected group")
 
@@ -588,10 +589,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 detail = label
             act.setToolTip(
-                f"Start {label} on the selected project right now, "
-                f"and make it the START AUDIT default. {detail}"
+                f"Switch the audit profile to {label}; press START to run it. {detail}"
             )
-            act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_launch_audit_profile(pid))
+            act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
             self.profile_actions[profile_id] = act
         toolbar.addSeparator()
 
@@ -621,7 +621,7 @@ class MainWindow(QMainWindow):
         act_copy_arc = toolbar.addAction("ZIP", self._on_copy_archive)
         act_copy_arc.setToolTip("Copy packed .zip archive file to clipboard")
 
-        act_reset_marks = toolbar.addAction("MARKS", self._on_reset_project_marks)
+        act_reset_marks = toolbar.addAction("MRK", self._on_reset_project_marks)
         act_reset_marks.setToolTip(
             "RESET MARKS: clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
         )
@@ -1431,11 +1431,11 @@ QToolTip QLabel {
             )
 
     def _on_launch_audit_profile(self, profile_id: str):
-        """Start the selected project's audit with THIS profile, in one press.
+        """Switch to a profile and start it in one press.
 
-        Selecting a profile and then pressing START AUDIT is two actions for
-        one intention. These buttons do both: they make the profile the new
-        default and dispatch immediately.
+        Not bound to the toolbar: A3/A10/CM are switches, because a button that
+        looks like a mode indicator must not fire an irreversible audit the
+        moment it is pressed. Kept for callers that genuinely mean both.
         """
         self._on_select_audit_profile(profile_id)
         proj = self._selected_project()

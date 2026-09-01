@@ -151,20 +151,35 @@ def test_reopen_surfaces_an_unreachable_bridge():
     assert "connection refused" in result["error"]
 
 
-def test_a_profile_button_starts_that_profile_in_one_press(window):
-    """Selecting a profile and then pressing START AUDIT is two actions."""
+def test_a_profile_button_only_switches_and_never_starts(window):
+    """They read as mode indicators, so pressing one must not fire an audit."""
     batches: list[tuple[list[str], str]] = []
     window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
     window._selected_project = lambda: window._service.get_project("p1")
 
-    window._on_launch_audit_profile("compress")
+    window.profile_actions["compress"].trigger()
+    window._audit_start_debounce.stop()
+    window._pump_audit_start_queue()
+
+    assert batches == [], "switching a profile must not dispatch anything"
+    assert window._audit_start_pending == []
+    assert window._service.config.audits.profile == "compress"
+    assert window.profile_actions["compress"].isChecked() is True
+
+
+def test_start_then_uses_the_switched_profile(window):
+    batches: list[tuple[list[str], str]] = []
+    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
+    window._selected_project = lambda: window._service.get_project("p1")
+
+    window.profile_actions["compress"].trigger()
+    window._on_send_audit()
     window._audit_start_debounce.stop()
     window._pump_audit_start_queue()
 
     assert batches == [(["p1"], "compress")]
-    assert window._service.config.audits.profile == "compress"
-    assert window.profile_actions["compress"].isChecked() is True
 
 
 def test_two_profiles_queued_together_never_share_one_batch(window):
