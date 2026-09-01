@@ -576,12 +576,30 @@ class AuditRunCoordinator:
                 raise RuntimeError(packed.error_message or "Packing failed")
             self.intents.update(intent_id, status="SUBMITTING", archive_path=str(Path(packed.output_path).resolve()))
             response = self.bridge.submit_browser_audit(project, packed.output_path, profile_id)
-            if not response.get("ok"):
-                raise RuntimeError(str(response.get("error") or "Bridge rejected audit dispatch"))
-            dispatch = response.get("dispatch", {})
+            dispatch = response.get("dispatch", {}) if response.get("ok") else {}
             dispatch_id = str(dispatch.get("dispatch_id") or "")
             if not dispatch_id:
-                raise RuntimeError("Bridge returned no dispatch identity")
+                # A submission whose RESPONSE was lost is not a failed audit.
+                # Observed live during a six-project batch: the POST came back
+                # "Remote end closed connection without response" while the
+                # Bridge had already enqueued the job and a worker was running
+                # it. Reporting FAILED there puts a lane on the board as failed
+                # while its audit is live, and hides the real dispatch from
+                # cancel/recover. Ask the Bridge what actually exists.
+                adopted = self.bridge.active_browser_job(project.id) or {}
+                dispatch_id = str(adopted.get("dispatch_id") or "")
+                if not dispatch_id:
+                    raise RuntimeError(
+                        str(response.get("error") or "Bridge rejected audit dispatch")
+                        if not response.get("ok")
+                        else "Bridge returned no dispatch identity"
+                    )
+                self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id)
+                return AuditStartResult(
+                    True, project.id, intent_id, dispatch_id,
+                    str(adopted.get("state") or "QUEUED"),
+                    "Audit queued (adopted after a lost submit response)",
+                )
             self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id)
             return AuditStartResult(True, project.id, intent_id, dispatch_id, "QUEUED", "Audit queued")
         except Exception as exc:

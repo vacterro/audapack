@@ -797,3 +797,40 @@ def test_managed_lanes_are_not_starved_by_the_operators_own_tabs(tmp_path):
     }
     supervisor.ensure_capacity(dispatch, MAX_AUDIT_LANES)
     assert launched == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_lost_submit_response_adopts_the_dispatch_that_actually_exists(tmp_path):
+    """A dropped response is not a failed audit.
+
+    Observed live in a six-project batch: the submit POST returned "Remote end
+    closed connection without response" while the Bridge had already enqueued
+    the job and a worker was running it. Reporting FAILED there puts a lane on
+    the board as failed while its audit is live, and hides the real dispatch
+    from cancel and recovery.
+    """
+    service, bridge, _audits = coordinator(tmp_path)
+    real_submit = bridge.submit_browser_audit
+
+    def lossy_submit(project, archive_path, profile):
+        real_submit(project, archive_path, profile)  # the Bridge does the work
+        return {"ok": False, "error": "Remote end closed connection without response"}
+
+    bridge.submit_browser_audit = lossy_submit
+    result = service.start("p1")
+
+    assert result.ok, result.message
+    assert result.dispatch_id == bridge.jobs[-1]["dispatch_id"]
+    assert len(bridge.jobs) == 1, "the lost response must not cause a second submission"
+    intent = next(i for i in service.intents.list() if i["intent_id"] == result.intent_id)
+    assert intent["status"] == "QUEUED"
+
+
+def test_a_genuinely_rejected_submit_still_fails(tmp_path):
+    """Adoption must not paper over a real rejection."""
+    service, bridge, _audits = coordinator(tmp_path)
+    bridge.submit_browser_audit = lambda project, archive_path, profile: {
+        "ok": False, "error": "duplicate_dispatch",
+    }
+    result = service.start("p1")
+    assert not result.ok
+    assert "duplicate_dispatch" in result.message
