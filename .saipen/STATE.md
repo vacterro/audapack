@@ -1,16 +1,16 @@
 ---
-phase: BUILD
-task: T-84
-next_action: "PHASE BUILD T-85"
+phase: VERIFY
+task: T-85
+next_action: "PHASE REVIEW T-85"
 blocker: none
-agent: claude
+agent: opencode
 saipen_version: 7
 schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
-transition_from: SCOUT
-last_event: 594
-updated: "2026-09-01T02:10:00Z"
+transition_from: BUILD
+last_event: 595
+updated: "2026-09-01T23:30:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
