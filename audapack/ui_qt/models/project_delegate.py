@@ -251,7 +251,9 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # buttons a row actually has. This fixes the "rows crawling in different
         # directions" visual defect.
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
-        col_w = 230 if compact_rows else 110
+        # Full mode gives the state column room for the aligned sub-columns
+        # (RUN | WAVES | AGE / ZIP | PACK); compact keeps its one wide line.
+        col_w = 230 if compact_rows else 175
         col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
 
         # Data used by the column
@@ -436,7 +438,6 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 pack_display = " [!]"
 
         # Compact mode keeps a single row (22px) -- everything on one line.
-        # Full mode uses the fixed two-line layout so every row aligns.
         if compact_rows:
             single_gap = "  " if zip_text != "\u2014" else ""
             single_line = wave_text + audit_display + copy_display + inaudit_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
@@ -445,38 +446,47 @@ class ProjectItemDelegate(QStyledItemDelegate):
             painter.setPen(wave_color)
             painter.drawText(QRect(col_x, single_y, col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, single_line)
         else:
-            # Two-line, fixed-position column layout. Every row uses the SAME
-            # two-line structure regardless of width, so the eye scans vertically
-            # down the same x positions on every row instead of rows drifting
-            # horizontally depending on the dynamic single-line branch.
-            #
-            #   line 0: WAVE  ·  AGE  ·  ×N  ·  IA
-            #   line 1: ZIP …  ·  [PACK nn%]
+            # Full mode: each state field is a fixed-width column so every row
+            # aligns vertically -- RUN | WAVES | AGE on line 0, ZIP | PACK on
+            # line 1.  No concatenated text, no dynamic x offset.
             painter.setFont(self.font_small)
-            line0_text = wave_text + audit_display + copy_display + inaudit_display
-            painter.setPen(wave_color)
-            painter.drawText(QRect(col_x, _line_top(0), col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line0_text)
-            cur_x1 = painter.fontMetrics().horizontalAdvance(wave_text)
-            if audit_display:
-                painter.setPen(audit_color)
-                painter.drawText(QRect(col_x + cur_x1, _line_top(0), col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, audit_display)
-                cur_x1 += painter.fontMetrics().horizontalAdvance(audit_display)
-            if copy_display:
-                base_w = cur_x1
-                painter.setPen(QColor(PALETTE["borderGolden"]))
-                painter.drawText(QRect(col_x + base_w, _line_top(0), col_w - base_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, copy_display)
-                cur_x1 += painter.fontMetrics().horizontalAdvance(copy_display)
-            if inaudit_display:
-                base2 = cur_x1
-                painter.setPen(inaudit_color)
-                painter.drawText(QRect(col_x + base2, _line_top(0), col_w - base2, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, inaudit_display)
-                cur_x1 += painter.fontMetrics().horizontalAdvance(inaudit_display)
-            # line1 ZIP + pack together (or live progress bar while packing)
-            painter.setFont(self.font_small)
+            # Column boundaries (offsets from col_x)
+            RUN_W = 64
+            WAV_W = 42
+            AGE_W = 62
+            ZIP_W = 100
+            PK_W = 60
+            run_x = col_x
+            wav_x = run_x + RUN_W
+            age_x = wav_x + WAV_W
+            zip_x = col_x
+            pk_x = zip_x + ZIP_W
+
+            def _draw_col(x, w, text, color):
+                painter.setPen(color)
+                painter.drawText(QRect(x, _line_top(0), w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+
+            def _draw_col1(x, w, text, color):
+                painter.setPen(color)
+                painter.drawText(QRect(x, _line_top(1), w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
+
+            # Line 0: RUN state | WAVES | AGE
+            _draw_col(run_x, RUN_W, wave_text, wave_color)
+            wav_label = f"{completed_waves}/{total_waves}"
+            wav_color = QColor(PALETTE["success"]) if all_ready else QColor(PALETTE["warning"] if completed_waves > 0 else PALETTE["textMuted"])
+            _draw_col(wav_x, WAV_W, wav_label, wav_color)
+            if audit_age_str:
+                _draw_col(age_x, AGE_W, audit_age_str, audit_color)
+            else:
+                _draw_col(age_x, AGE_W, "", QColor(PALETTE["textMuted"]))
+            if inaudit_label:
+                _draw_col(age_x + AGE_W, 50, inaudit_label, inaudit_color)
+
+            # Line 1: ZIP | PACK
             if pack_state in ("PACKING", "QUEUED") and isinstance(pack_progress, dict):
                 pct = float(pack_percent) if isinstance(pack_percent, (int, float)) else 0.0
                 pct = max(0.0, min(99.0, pct))
-                bar_rect = QRect(col_x, _line_top(1) + (line_h - 8) // 2, col_w, 8)
+                bar_rect = QRect(zip_x, _line_top(1) + (line_h - 8) // 2, col_w, 8)
                 painter.fillRect(bar_rect, QColor(PALETTE["borderDark"]))
                 fill_w = int(round(bar_rect.width() * pct / 100.0))
                 if fill_w > 0:
@@ -484,13 +494,9 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 painter.setPen(QColor(PALETTE["textPrimary"]))
                 painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, pack_progress_text.strip())
             else:
-                line1_text = zip_text + pack_display
-                painter.setPen(arc_color)
-                painter.drawText(QRect(col_x, _line_top(1), col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line1_text)
-                if pack_display and zip_text != "\u2014":
-                    zip_w = painter.fontMetrics().horizontalAdvance(zip_text)
-                    painter.setPen(pack_color)
-                    painter.drawText(QRect(col_x + zip_w, _line_top(1), col_w - zip_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, pack_display)
+                _draw_col1(zip_x, ZIP_W, zip_text, arc_color)
+                if pack_display:
+                    _draw_col1(pk_x, PK_W, pack_display, pack_color)
 
         # 3. Project Name — fill the left area, vertically centered
         painter.setFont(self.font_bold)
