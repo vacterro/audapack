@@ -74,6 +74,23 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
 #: + 2px margin + 4px gap + 18px info = 142px; round to a safe 150px.
 FIXED_ACTIONS_WIDTH = 150
 
+#: Compact-row state grid: one cell per field, in reading order, at offsets
+#: that do not depend on the value of any other field. Concatenating them into
+#: one string made every field start wherever the previous one happened to end,
+#: so nothing lined up down the list.
+COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 74), ("pack", 32))
+
+
+def compact_state_columns(col_x: int) -> dict[str, tuple[int, int]]:
+    """Return {field: (x, width)} for the compact state grid."""
+    cells: dict[str, tuple[int, int]] = {}
+    cursor = int(col_x)
+    for name, width in COMPACT_STATE_CELL_WIDTHS:
+        cells[name] = (cursor, width)
+        cursor += width
+    return cells
+
+
 
 def compute_info_button_rect(row_rect: QRect, launcher_buttons: list[tuple[Any, QRect]], gg_rect: QRect) -> QRect:
     """Info [ⓘ] button placed 4px left of the leftmost action button.
@@ -433,14 +450,43 @@ class ProjectItemDelegate(QStyledItemDelegate):
             else:
                 pack_display = " [!]"
 
-        # Compact mode keeps a single row (22px) -- everything on one line.
+        # Compact mode keeps a single row (22px), but the fields are still
+        # COLUMNS, not one concatenated string. Concatenation made every field
+        # start wherever the previous one happened to end, so nothing lined up
+        # down the list and the eye had to re-find each value on every row.
         if compact_rows:
-            single_gap = "  " if zip_text != "\u2014" else ""
-            single_line = wave_text + audit_display + copy_display + inaudit_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
             painter.setFont(self.font_small)
             single_y = y + (h - line_h) // 2
-            painter.setPen(wave_color)
-            painter.drawText(QRect(col_x, single_y, col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, single_line)
+
+            def _draw_cell(cell_x, cell_w, text, color):
+                if not text:
+                    return
+                painter.setPen(color)
+                painter.drawText(
+                    QRect(cell_x, single_y, cell_w, line_h),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, cell_w),
+                )
+
+            cells = compact_state_columns(col_x)
+            run_cx, C_RUN = cells["run"]
+            wav_cx, C_WAV = cells["waves"]
+            age_cx, C_AGE = cells["age"]
+            zip_cx, C_ZIP = cells["zip"]
+            pack_cx, C_PACK = cells["pack"]
+
+            _draw_cell(run_cx, C_RUN, wave_text, wave_color)
+            wav_color = QColor(PALETTE["success"]) if all_ready else QColor(
+                PALETTE["warning"] if completed_waves > 0 else PALETTE["textMuted"]
+            )
+            _draw_cell(wav_cx, C_WAV, f"{completed_waves}/{total_waves}" if total_waves else "", wav_color)
+            # The copy counter and the INAUDIT badge share the age cell: both
+            # are rare, and neither earns a permanent column of its own.
+            age_cell = (audit_display or "").strip() or (copy_display or "").strip() or (inaudit_display or "").strip()
+            age_color = audit_color if (audit_display or "").strip() else inaudit_color
+            _draw_cell(age_cx, C_AGE, age_cell, age_color)
+            _draw_cell(zip_cx, C_ZIP, zip_text, arc_color)
+            _draw_cell(pack_cx, C_PACK, (pack_display or "").strip(), pack_color)
         else:
             # Full mode: each state field is a fixed-width column so every row
             # aligns vertically -- RUN | WAVES | AGE on line 0, ZIP | PACK on
