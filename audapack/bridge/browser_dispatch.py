@@ -1274,10 +1274,19 @@ class BrowserDispatcher:
                 str(verdict.get("handoff_path") or ""),
                 str(verdict.get("handoff_sha256") or ""),
                 str(verdict.get("campaign_run_id") or ""),
+                evidence_at=float(verdict.get("handoff_written_at") or 0.0),
             )
         return closed
 
-    def complete_runs_for_project(self, project_id: str, project_name: str, handoff_path: str, handoff_sha256: str, campaign_run_id: str = "") -> int:
+    def complete_runs_for_project(
+        self,
+        project_id: str,
+        project_name: str,
+        handoff_path: str,
+        handoff_sha256: str,
+        campaign_run_id: str = "",
+        evidence_at: float = 0.0,
+    ) -> int:
         """Close the lane the moment the durable final handoff is written.
 
         The dispatch only learns a campaign finished from the worker's terminal
@@ -1292,6 +1301,13 @@ class BrowserDispatcher:
         The Bridge writing that handoff is the authoritative event, and here it
         knows the project, the exact path and the digest. Only post-start jobs
         are closed: nothing before START_PREPARED has an audit to be finished.
+
+        ``evidence_at`` is when that proof came into existence. A dispatch that
+        started AFTER it cannot be what produced it, and closing one against
+        older proof is a silent lie: six fresh audits were observed closing
+        within a minute of START against handoff files nine hours old, so the
+        audits never ran and the board said COMPLETE. Zero means "written just
+        now", which is true of the finalization path that writes the file.
         """
         wanted = {str(project_id or "").strip().lower(), str(project_name or "").strip().lower()} - {""}
         if not wanted:
@@ -1306,6 +1322,8 @@ class BrowserDispatcher:
                     continue
                 names = {str(job.project_id or "").strip().lower(), str(job.project_name or "").strip().lower()}
                 if not (names & wanted):
+                    continue
+                if evidence_at and float(job.created_at or 0.0) > float(evidence_at):
                     continue
                 job.state = JOB_COMPLETE
                 job.result = "audit-complete"

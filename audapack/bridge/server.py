@@ -2062,6 +2062,12 @@ def run_bridge_server(config: AppConfig) -> int:
         The dispatcher cannot answer it: campaign.json lives beside the audit
         artifacts, not under the dispatch state dir, and the saved run id may
         differ from the one the dispatch recorded.
+
+        The answer carries WHEN that handoff was written. Every project audited
+        even once has a complete campaign on disk forever, so "this project has
+        a finished audit" closes any lane at all -- observed live: six fresh
+        dispatches went COMPLETE within a minute of START against handoff files
+        from the previous day, and not one of those audits ever ran.
         """
         from audapack.services.audit_service import AuditService
 
@@ -2070,11 +2076,16 @@ def run_bridge_server(config: AppConfig) -> int:
             return {"complete": False}
         if snapshot.final_handoff_path is None or not Path(snapshot.final_handoff_path).is_file():
             return {"complete": False}
+        try:
+            written_at = float(Path(snapshot.final_handoff_path).stat().st_mtime)
+        except OSError:
+            return {"complete": False}
         return {
             "complete": True,
             "handoff_path": str(snapshot.final_handoff_path),
             "handoff_sha256": str(snapshot.final_handoff_sha256 or ""),
             "campaign_run_id": str(snapshot.campaign_run_id or ""),
+            "handoff_written_at": written_at,
         }
 
     dispatcher.set_campaign_probe(_campaign_probe)

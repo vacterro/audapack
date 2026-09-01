@@ -1518,6 +1518,76 @@ def test_a_campaign_finished_while_the_lane_was_blocked_still_closes(tmp_path):
     assert closed.meta_run_id_drift == "acb-saved-under-another-id"
 
 
+def test_a_campaign_finished_before_this_dispatch_started_closes_nothing(tmp_path):
+    """Every project audited even once keeps a complete campaign on disk.
+
+    "This project has a finished audit" is therefore true forever, and closing
+    a lane on it closes any lane at all. Observed live: six fresh dispatches
+    went COMPLETE within a minute of START against handoff files written the
+    previous day. The audits never ran, and the board said they had.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch", "start_receipt": "receipt"})
+
+    stale = tmp_path / "WINTAGE__00_AUDIT_ALL_3.md"
+    stale.write_text("yesterday's audit", encoding="utf-8")
+    d.set_campaign_probe(lambda pid, name: {
+        "complete": True,
+        "handoff_path": str(stale),
+        "handoff_sha256": "cafebabe",
+        "campaign_run_id": "acb-yesterday",
+        "handoff_written_at": time.time() - 9 * 3600,
+    })
+
+    assert d.reconcile_finished_campaigns() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+
+def test_a_campaign_finished_after_this_dispatch_started_closes_its_lane(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch", "start_receipt": "receipt"})
+
+    fresh = tmp_path / "WINTAGE__00_AUDIT_ALL_3.md"
+    fresh.write_text("this run's audit", encoding="utf-8")
+    d.set_campaign_probe(lambda pid, name: {
+        "complete": True,
+        "handoff_path": str(fresh),
+        "handoff_sha256": "cafebabe",
+        "campaign_run_id": "acb-saved-under-another-id",
+        "handoff_written_at": time.time() + 1,
+    })
+
+    assert d.reconcile_finished_campaigns() == 1
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
+def test_the_finalization_path_closes_without_a_timestamp(tmp_path):
+    """The Bridge writing the handoff IS the freshness proof."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch", "start_receipt": "receipt"})
+
+    assert d.complete_runs_for_project("wintage", "WINTAGE", "/final.md", "abc") == 1
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
 def test_an_unfinished_campaign_leaves_its_lane_alone(tmp_path):
     d = dispatcher(tmp_path)
     path = archive(tmp_path)
