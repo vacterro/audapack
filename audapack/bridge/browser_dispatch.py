@@ -637,10 +637,12 @@ class BrowserDispatcher:
             return True
         if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
             return False
-        if worker.widget_protocol.startswith("AUDAPACK_WIDGET"):
-            required = _get_required_widget_build()
-            if required and worker.widget_build_version and worker.widget_build_version != required:
-                return False
+        # A build difference is reported, never enforced. The protocol is the
+        # real compatibility boundary; the build number is a release marker,
+        # and refusing on it meant every widget release took the whole pool
+        # offline until a human clicked Install in Tampermonkey -- an
+        # unattended machine simply stopped auditing. STALE_WIDGET still says
+        # so, loudly, in status and in the Project Room.
         if not worker.is_chromium or worker.site != "chatgpt":
             return False
         if worker.campaign_run_id or self._worker_owns_live_job(worker):
@@ -702,10 +704,9 @@ class BrowserDispatcher:
         if worker.widget_version.startswith("AUDAPACK_WIDGET"):
             if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
                 return False
-            if worker.widget_protocol.startswith("AUDAPACK_WIDGET"):
-                required = _get_required_widget_build()
-                if required and worker.widget_build_version and worker.widget_build_version != required:
-                    return False
+            # See worker_consumes_lane: the build number warns, the protocol
+            # decides. A pool that refuses to work until someone clicks Install
+            # is a worse failure than running one release behind.
             if not worker.is_chromium or not worker.page_eligible:
                 return False
             if worker.site != "chatgpt" or worker.url_path != "/":

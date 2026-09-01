@@ -1168,8 +1168,11 @@ def test_a_stale_widget_build_is_named_not_reported_clean(tmp_path):
         status = d.status()
         assert status["stale_widget_workers"] == 1
         assert status["required_widget_build"] == "9.9.9"
-        # And it must not be counted as capacity that will ever do work.
-        assert d.worker_free_for_claim(workers["stale"]) is False
+        # Reported, not refused: the protocol is the compatibility boundary, and
+        # a pool that stops working until a human clicks Install in Tampermonkey
+        # is a worse failure than running one release behind.
+        assert d.worker_free_for_claim(workers["stale"]) is True
+        assert d.worker_consumes_lane(workers["stale"]) is True
     finally:
         module._get_required_widget_build = original
 
@@ -1534,3 +1537,35 @@ def test_a_pre_start_job_is_still_cancelled_not_abandoned(tmp_path):
         d.abandon_job(item.dispatch_id, "too early")
     assert refused.value.code == "invalid_transition"
     assert d.cancel_job(item.dispatch_id)
+
+
+def test_an_incompatible_widget_protocol_is_still_refused(tmp_path):
+    """The build warns; the protocol decides."""
+    d = dispatcher(tmp_path)
+    for index, version in enumerate(("AUDAPACK_WIDGET", "AUDAPACK_WIDGET/2")):
+        d.register_worker(supported_worker(f"legacy-{index}", widget_version=version))
+    for worker_record in d.list_workers():
+        assert d.worker_free_for_claim(worker_record) is False
+        assert d.worker_consumes_lane(worker_record) is False
+
+
+def test_a_widget_release_does_not_take_the_pool_offline(tmp_path):
+    """Every build bump used to stop all auditing until someone clicked Install."""
+    import audapack.bridge.browser_dispatch as module
+
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker(
+        "managed-1", managed_slot=1, managed_generation=1,
+        widget_protocol="AUDAPACK_WIDGET/3", widget_build_version="0.0.34",
+    ))
+    item = d.enqueue_job(job_payload(path))
+
+    original = module._get_required_widget_build
+    module._get_required_widget_build = lambda: "0.0.35"
+    try:
+        assert d.status()["stale_widget_workers"] == 1, "the operator must still be told"
+        claimed = d.claim_job("managed-1")
+        assert claimed is not None and claimed.dispatch_id == item.dispatch_id
+    finally:
+        module._get_required_widget_build = original
