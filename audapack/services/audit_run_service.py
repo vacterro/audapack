@@ -33,6 +33,10 @@ WORKER_LAUNCH_BOOT_GRACE_SECONDS = 120.0
 #: window appeared while six were already open, so a slot that has been
 #: launched this many times without ever registering is left alone.
 WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT = 2
+#: ...but the ban expires. A slot whose last launch is this old starts its
+#: attempt count over, so two bad launches cost one cooldown instead of
+#: retiring the slot permanently from a six-lane pool.
+WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS = 600.0
 
 ACTIVE_DISPATCH_STATES = {
     "QUEUED", "RETRYABLE", "LEASED", "ARTIFACT_FETCHED", "ATTACHED",
@@ -233,7 +237,6 @@ class ManagedWorkerSupervisor:
                 and str(worker.get("managed_slot", "")).isdigit()
                 and 1 <= int(worker.get("managed_slot")) <= MAX_AUDIT_LANES
             }
-            active_workers = int(dispatch.get("active_workers", len(workers)) or 0)
             # A window that was launched but has not registered yet still
             # occupies its slot and one lane.
             pending = {
@@ -263,19 +266,34 @@ class ManagedWorkerSupervisor:
                     continue
                 slot_state = doc["slots"].get(str(slot), {})
                 attempts = int(slot_state.get("launch_attempts", 0) or 0)
+                attempts_expire_at = float(slot_state.get("attempts_expire_at", 0.0) or 0.0)
+                if attempts and "attempts_expire_at" not in slot_state:
+                    # Written before the ban had an expiry: a slot recorded by
+                    # an older build could be banned forever. One-time amnesty
+                    # so an upgraded install starts from a six-lane pool.
+                    attempts = 0
+                elif attempts and attempts_expire_at and now >= attempts_expire_at:
+                    # The attempt counter stops a burst of windows for a slot
+                    # that will not register; it must not be a life sentence.
+                    # Without this expiry a slot that failed twice was banned
+                    # for the life of the state file, and a pool that lost two
+                    # slots that way could never reach six lanes again -- which
+                    # is exactly the state a jammed pool was found in.
+                    attempts = 0
                 if attempts >= WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT and str(slot_state.get("state")) != "HEARTBEAT":
                     # Its window is presumably still open and simply not
                     # registering; opening another one only adds clutter.
                     continue
                 if now < float(slot_state.get("cooldown_until", 0.0) or 0.0):
                     continue
-                if active_workers + len(pending) + len(launched) >= MAX_AUDIT_LANES:
+                if len(registered) + len(pending) + len(launched) >= desired:
                     break
                 ok, message = self.launch_worker(slot, generation)
                 doc["slots"][str(slot)] = {
                     "state": "LAUNCHING" if ok else "LAUNCH_FAILED",
                     "launch_attempts": attempts + 1,
                     "launched_at": now,
+                    "attempts_expire_at": now + WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS,
                     "cooldown_until": now + (WORKER_LAUNCH_BOOT_GRACE_SECONDS if ok else self.cooldown_seconds),
                     "message": str(message)[:300],
                 }
@@ -458,7 +476,46 @@ class AuditRunCoordinator:
             self.intents.update(str(intent["intent_id"]), status="CANCELLED")
         return dispatch_id
 
-    def start(self, project_id: str, profile_id: str = "quick3") -> AuditStartResult:
+    def _healthy_bridge_status(self) -> dict[str, Any]:
+        """Return a healthy Bridge status, starting the Bridge only if needed.
+
+        One failed probe is not proof the Bridge is down: /health runs on a
+        1.2s timeout against a server that is simultaneously hashing archives
+        for six dispatches, and a timeout there used to spawn a second Bridge
+        process. Probe again before concluding anything.
+        """
+        health = self.bridge.runtime_status()
+        if health.get("healthy"):
+            return health
+        health = self.bridge.runtime_status()
+        if health.get("healthy"):
+            return health
+        started, message = self.bridge.start()
+        health = self.bridge.runtime_status()
+        if not started or not health.get("healthy"):
+            raise RuntimeError(message or "Bridge is not healthy")
+        return health
+
+    def provision_capacity(self, lanes: int) -> dict[str, Any]:
+        """Open managed worker windows for *lanes* audits, once, up front.
+
+        Called once per operator batch instead of once per project: demand
+        computed inside the per-project loop only ever asked for `+1`, so six
+        queued audits trickled into one or two windows and the rest waited on
+        the supervisor's 45s pacing.
+        """
+        health = self._healthy_bridge_status()
+        dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
+        if self.workers is None:
+            return {"desired": 0, "launched": []}
+        demand = (
+            int(dispatch_status.get("queued_jobs", 0) or 0)
+            + int(dispatch_status.get("active_jobs", 0) or 0)
+            + max(1, int(lanes or 0))
+        )
+        return self.workers.ensure_capacity(dispatch_status, demand)
+
+    def start(self, project_id: str, profile_id: str = "quick3", provision: bool = True) -> AuditStartResult:
         project = self.projects.get_project(str(project_id))
         if project is None or not project.enabled or not project.source_path:
             return AuditStartResult(False, str(project_id), message="Project is missing, disabled, or has no source path")
@@ -504,15 +561,14 @@ class AuditRunCoordinator:
 
         intent_id = str(intent["intent_id"])
         try:
-            health = self.bridge.runtime_status()
-            if not health.get("healthy"):
-                started, message = self.bridge.start()
-                if not started or not self.bridge.runtime_status().get("healthy"):
-                    raise RuntimeError(message or "Bridge is not healthy")
-                health = self.bridge.runtime_status()
-            dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
-            if self.workers is not None:
-                demand = int(dispatch_status.get("queued_jobs", 0) or 0) + int(dispatch_status.get("active_jobs", 0) or 0) + 1
+            health = self._healthy_bridge_status()
+            if provision and self.workers is not None:
+                dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
+                demand = (
+                    int(dispatch_status.get("queued_jobs", 0) or 0)
+                    + int(dispatch_status.get("active_jobs", 0) or 0)
+                    + 1
+                )
                 self.workers.ensure_capacity(dispatch_status, demand)
             self.intents.update(intent_id, status="PACKING")
             packed = self.packing.ensure_fresh_archive(project.id)
@@ -581,7 +637,20 @@ class AuditRunCoordinator:
 
     def start_batch(self, project_ids: Iterable[str], profile_id: str = "quick3") -> list[AuditStartResult]:
         unique = list(dict.fromkeys(str(value) for value in project_ids if str(value)))[:MAX_AUDIT_LANES]
-        return [self.start(project_id, profile_id) for project_id in unique]
+        if not unique:
+            return []
+        # Windows first, for the whole batch, before the first archive is
+        # packed: browser boot and packing then overlap instead of queueing
+        # behind each other. A provisioning failure is never fatal here -- the
+        # Bridge supervisor keeps provisioning, and a queued job with no window
+        # yet is a wait, not a loss.
+        provisioned = False
+        try:
+            self.provision_capacity(len(unique))
+            provisioned = True
+        except Exception:
+            provisioned = False
+        return [self.start(project_id, profile_id, provision=not provisioned) for project_id in unique]
 
     def cancel(self, dispatch_id: str) -> AuditStartResult:
         response = self.bridge.cancel_browser_job(str(dispatch_id))

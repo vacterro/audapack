@@ -1133,3 +1133,35 @@ class BrowserWorkerLaunchNeedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_a_bridge_that_cannot_bind_never_touches_dispatch_state(monkeypatch):
+    """A losing second Bridge process must not rewrite jobs.json on its way out.
+
+    BrowserDispatcher's constructor blocks every live post-START job with
+    "Bridge restarted after START_PREPARED". Building it before claiming the
+    port meant a spare process -- one spawned by a single timed-out /health
+    probe -- destroyed the running instance's in-flight audits and then exited
+    with nothing to show for it.
+    """
+    import socket
+
+    from audapack.bridge import server as server_module
+    from audapack.config import AppConfig
+
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("a Bridge that cannot bind must not open dispatch state")
+
+    monkeypatch.setattr(server_module, "BrowserDispatcher", _forbidden)
+    config = AppConfig()
+    config.bridge.host = "127.0.0.1"
+    config.bridge.port = port
+    try:
+        assert server_module.run_bridge_server(config) == 1
+    finally:
+        holder.close()

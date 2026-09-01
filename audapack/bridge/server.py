@@ -1641,10 +1641,15 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return
         dispatcher = self._dispatcher()
         try:
-            dispatcher.expire_leases()
             worker = dispatcher.register_worker(data)
+            # Registration first, then renewal, then expiry: a worker that is
+            # polling is alive, and its owned run must never be aged out by the
+            # very request that proves it is still there.
+            dispatcher.renew_owner_lease(worker.worker_id)
+            dispatcher.expire_leases()
             job = dispatcher.claim_job(worker.worker_id, data)
             wait_seconds = min(25.0, max(0.0, float(data.get("wait_seconds", 20))))
+            wait_seconds = min(wait_seconds, dispatcher.max_poll_wait_seconds())
             if job is None and wait_seconds:
                 with dispatcher._work_available:
                     deadline = time.monotonic() + wait_seconds
@@ -1927,13 +1932,20 @@ def run_bridge_server(config: AppConfig) -> int:
         pass
 
     HandlerWithConfig.config = config
-    HandlerWithConfig.set_browser_dispatcher(BrowserDispatcher())
 
+    # Claim the port BEFORE touching dispatch state. BrowserDispatcher's
+    # constructor rewrites jobs.json -- every live post-START run becomes
+    # BLOCKED "Bridge restarted after START_PREPARED" -- so a second Bridge
+    # process that was only ever going to lose the bind used to destroy the
+    # running instance's in-flight audits on its way out. A loser now exits
+    # having read and written nothing.
     try:
         server = ThreadingHTTPServer((host, port), HandlerWithConfig)
     except OSError as exc:
         print(f"Error starting AUDAPACK Bridge: Port {port} on {host} already in use or unavailable: {exc}", file=sys.stderr)
         return 1
+
+    HandlerWithConfig.set_browser_dispatcher(BrowserDispatcher())
 
     write_pid()
     print(f"AUDAPACK Bridge listening on http://{host}:{port}")

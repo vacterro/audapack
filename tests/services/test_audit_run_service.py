@@ -700,3 +700,100 @@ def test_a_slot_whose_window_never_registers_is_not_relaunched_forever(tmp_path)
     assert doc["slots"]["1"]["state"] == "HEARTBEAT"
     assert doc["slots"]["1"]["launch_attempts"] == 0
     assert WORKER_LAUNCH_BOOT_GRACE_SECONDS > 0
+
+
+def test_batch_provisions_every_lane_once_before_packing(tmp_path):
+    """Six presses must ask for six windows, not "one more" six times.
+
+    Demand was computed inside the per-project loop as queued+active+1, so a
+    six-project batch trickled lanes open one at a time behind each pack, and
+    the pool never reached six before the Bridge supervisor's own pacing took
+    over.
+    """
+    projects = [project(f"p{index}") for index in range(1, 7)]
+    demands: list[int] = []
+    packs_at_first_provision: list[int] = []
+
+    class RecordingSupervisor:
+        def ensure_capacity(self, dispatch, demand):
+            demands.append(int(demand))
+            packs_at_first_provision.append(len(packing.calls))
+            return {"desired": demand, "launched": [], "registered": 0, "generation": 1}
+
+    service, bridge, _audits = coordinator(tmp_path, projects, supervisor=RecordingSupervisor())
+    packing = service.packing
+    results = service.start_batch([item.id for item in projects])
+
+    assert all(result.ok for result in results)
+    assert demands == [6], demands
+    # Provisioning happens before the first archive is packed.
+    assert packs_at_first_provision == [0]
+    assert len(bridge.jobs) == 6
+
+
+def test_start_retries_health_probe_before_starting_a_second_bridge(tmp_path):
+    """One timed-out /health probe is not proof the Bridge is down."""
+    service, bridge, _audits = coordinator(tmp_path)
+    calls = {"count": 0}
+    real_status = bridge.runtime_status
+
+    def flaky_status():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"healthy": False, "browser": {}}
+        return real_status()
+
+    bridge.runtime_status = flaky_status
+    bridge.start = lambda: (_ for _ in ()).throw(AssertionError("must not start a second Bridge"))
+    assert service.start("p1").ok
+
+
+def test_a_legacy_banned_slot_is_amnestied_after_upgrade(tmp_path):
+    """A slot banned by an older build must not stay banned forever."""
+    import json as _json
+
+    from audapack.services.audit_run_service import (
+        MAX_AUDIT_LANES,
+        WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT,
+        ManagedWorkerSupervisor,
+    )
+
+    path = tmp_path / "managed_browser_workers.json"
+    path.write_text(_json.dumps({
+        "schema_version": 1,
+        "generation": 1,
+        "slots": {
+            "1": {
+                "state": "LAUNCHING",
+                "launch_attempts": WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT,
+                "launched_at": 0.0,
+                "cooldown_until": 0.0,
+            },
+        },
+    }), encoding="utf-8")
+
+    launched: list[int] = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launched.append(slot), (True, "started"))[1],
+        path=path,
+    )
+    supervisor.ensure_capacity({"active_workers": 0, "workers": []}, MAX_AUDIT_LANES)
+    assert 1 in launched
+
+
+def test_managed_lanes_are_not_starved_by_the_operators_own_tabs(tmp_path):
+    """The operator's own ChatGPT tabs must not eat the managed window budget."""
+    from audapack.services.audit_run_service import MAX_AUDIT_LANES, ManagedWorkerSupervisor
+
+    launched: list[int] = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launched.append(slot), (True, "started"))[1],
+        path=tmp_path / "managed_browser_workers.json",
+    )
+    # Four unmanaged workers are registered; none of them carries a slot.
+    dispatch = {
+        "active_workers": 4,
+        "workers": [{"managed_slot": 0, "managed_generation": 0, "last_seen_at": 1.0}] * 4,
+    }
+    supervisor.ensure_capacity(dispatch, MAX_AUDIT_LANES)
+    assert launched == [1, 2, 3, 4, 5, 6]

@@ -238,10 +238,19 @@ CHROMIUM_KEEPALIVE_FLAGS = [
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
-    "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,TabDiscarding,MemorySaverMode",
+    "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,TabDiscarding,MemorySaverMode,ChromeWhatsNewUI",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-session-crashed-bubble",
+    # A worker window must land on ChatGPT and nothing else. Chrome's own
+    # interstitials -- the post-update "What's New" tab, the search engine
+    # choice screen, the profile picker, the first-run flow -- open INSTEAD of
+    # the requested URL, which is how a START AUDIT press produced a window
+    # that flashed up and never became a worker.
+    "--disable-search-engine-choice-screen",
+    "--no-service-autorun",
+    "--disable-fre",
+    "--suppress-message-center-popups",
 ]
 
 # Kept for callers that imported the old name. The flags apply to every

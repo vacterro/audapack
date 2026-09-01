@@ -48,6 +48,10 @@ WORKER_TTL_SECONDS = 75
 #: handed the same job to a second window while the first still had the Core
 #: prepared in its composer. Wait until the job itself has clearly stalled.
 PRE_START_OWNER_GRACE_SECONDS = 45.0
+#: How long a managed slot keeps its claim on a lane after its window's
+#: last heartbeat. Longer than WORKER_TTL_SECONDS so a reload or a single
+#: refused poll never hands the lane to an unmanaged tab.
+MANAGED_SLOT_MEMORY_SECONDS = 150.0
 LEASE_SECONDS = 180
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
@@ -267,6 +271,7 @@ class BrowserDispatcher:
         self._lock = threading.RLock()
         self._work_available = threading.Condition(self._lock)
         self._workers: dict[str, WorkerRecord] = {}
+        self._managed_slot_seen: dict[int, float] = {}
         self._jobs: dict[str, DispatchJob] = {}
         self._expired_worker_count = 0
         self._load_jobs()
@@ -367,6 +372,37 @@ class BrowserDispatcher:
             self._workers.pop(wid, None)
         self._expired_worker_count += len(expired)
 
+    @staticmethod
+    def _incoming_managed_slot(payload: dict[str, Any]) -> int:
+        """The managed slot a registering window claims, or 0 for a plain tab."""
+        try:
+            slot = int(payload.get("managed_slot", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return slot if 1 <= slot <= MAX_ACTIVE_WORKERS else 0
+
+    def _note_managed_slot(self, slot: int) -> None:
+        self._managed_slot_seen[int(slot)] = _now()
+
+    def _live_managed_slots(self) -> set[int]:
+        """Managed slots that have a window behind them right now.
+
+        Remembered slightly beyond one heartbeat TTL on purpose: a managed
+        window that is reloading, or that lost one poll to a refusal, has not
+        stopped being a lane, and letting an unmanaged tab take its place for
+        those few seconds is exactly the rotation this is here to stop.
+        """
+        now = _now()
+        registered = {
+            worker.managed_slot for worker in self._workers.values()
+            if worker.managed_slot and now - worker.last_seen_at <= WORKER_TTL_SECONDS
+        }
+        remembered = {
+            slot for slot, seen in self._managed_slot_seen.items()
+            if now - seen <= MANAGED_SLOT_MEMORY_SECONDS
+        }
+        return registered | remembered
+
     def register_worker(self, payload: dict[str, Any]) -> WorkerRecord:
         with self._lock:
             self._expire_workers()
@@ -385,6 +421,49 @@ class BrowserDispatcher:
                 raise DispatchError(
                     "ineligible_worker_context",
                     "embedded ChatGPT frames cannot register as browser workers",
+                )
+            incoming_slot = self._incoming_managed_slot(payload)
+            if incoming_slot:
+                self._note_managed_slot(incoming_slot)
+                # A reloaded window keeps its slot but takes a fresh worker_id,
+                # so its predecessor sat in the registry until TTL holding a
+                # second lane for one physical window. One slot, one lane.
+                for stale in [
+                    other for other in self._workers.values()
+                    if other.worker_id != wid
+                    and other.managed_slot == incoming_slot
+                    and not other.campaign_run_id
+                    and not self._worker_owns_live_job(other)
+                ]:
+                    self._workers.pop(stale.worker_id, None)
+                if len(self._live_managed_slots()) >= MAX_ACTIVE_WORKERS:
+                    # Every lane is spoken for by a managed window. An idle
+                    # personal tab already holding one is evicted here, not
+                    # merely refused on arrival: refusing newcomers alone left
+                    # whichever tab got in first sitting on a lane forever
+                    # while the sixth managed window rotated in and out.
+                    for tab in [
+                        other for other in self._workers.values()
+                        if not other.managed_slot
+                        and self.worker_consumes_lane(other)
+                        and not other.campaign_run_id
+                        and not self._worker_owns_live_job(other)
+                        and other.state in {WORKER_FREE, WORKER_RESERVED}
+                    ]:
+                        self._workers.pop(tab.worker_id, None)
+            elif (
+                wid not in self._workers
+                and len(self._live_managed_slots()) >= MAX_ACTIVE_WORKERS
+                and not self._worker_owns_live_job(self._workers.get(wid))
+            ):
+                # Every lane belongs to a managed window the operator asked
+                # for. A ChatGPT tab in their own browser is a fallback worker,
+                # not a seventh lane: admitting it here evicted a managed
+                # window, which came back and evicted the tab, and the pool
+                # rotated between five and six forever instead of settling.
+                raise DispatchError(
+                    "worker_limit",
+                    f"all {MAX_ACTIVE_WORKERS} audit lanes belong to managed AUDAPACK windows",
                 )
             lane_workers = [w for w in self._workers.values() if self.worker_consumes_lane(w)]
             if (
@@ -407,6 +486,25 @@ class BrowserDispatcher:
                     and str(payload.get("site") or "chatgpt") == "chatgpt"
                     and str(payload.get("url_path") or "") == "/"
                 )
+                if incoming_supported and self._incoming_managed_slot(payload):
+                    # A managed window is a lane the operator asked for; a
+                    # ChatGPT tab in their own browser is not. Six managed
+                    # windows plus one personal tab is seven candidates for six
+                    # lanes, and the loser rotated on every heartbeat -- slots
+                    # appearing and vanishing while the pool never settled.
+                    # An idle unmanaged tab yields its lane instead.
+                    yielding = [
+                        worker for worker in lane_workers
+                        if not worker.managed_slot
+                        and not worker.campaign_run_id
+                        and not self._worker_owns_live_job(worker)
+                        and worker.state in {WORKER_FREE, WORKER_RESERVED}
+                    ]
+                    if yielding:
+                        stalest = min(yielding, key=lambda item: (item.last_seen_at, item.worker_id))
+                        self._workers.pop(stalest.worker_id, None)
+                        lane_workers = [w for w in self._workers.values() if self.worker_consumes_lane(w)]
+            if wid not in self._workers and len(lane_workers) >= MAX_ACTIVE_WORKERS:
                 replaceable = [
                     worker for worker in lane_workers
                     if worker.widget_version.startswith("AUDAPACK_WIDGET")
@@ -678,6 +776,53 @@ class BrowserDispatcher:
             ]
             return min(jobs, key=lambda item: item.created_at) if jobs else None
 
+    def max_poll_wait_seconds(self) -> float:
+        """Longest a poll may block without starving the other workers.
+
+        Every AUDAPACK window drives its polls through one shared userscript
+        manager, so the browser serializes them: six windows each holding a
+        20s long poll means any one window heartbeats once every two minutes,
+        well past WORKER_TTL_SECONDS. The registry could then never hold more
+        than five of six lanes, and which lane was missing rotated forever.
+        Shrink the block as the pool grows so a full round of polls stays
+        inside half the TTL. A poll with work waiting still returns at once.
+        """
+        with self._lock:
+            pool = max(1, len(self._workers), len(self._live_managed_slots()))
+        return max(2.0, WORKER_TTL_SECONDS / (2.0 * pool))
+
+    def renew_owner_lease(self, worker_id: str) -> Optional[DispatchJob]:
+        """Extend the lease of the job this worker owns, because it just polled.
+
+        A lease exists to notice a worker that died. Only a state transition
+        used to extend one, and a worker in AUDITING has no transition to make
+        for as long as the audit takes -- minutes per wave. Its own lease
+        therefore expired underneath it and ``expire_leases`` blocked a run
+        that was healthy and still producing waves, which is why finished
+        audits kept landing on disk while their dispatch record said
+        ``worker lost after START_PREPARED``. A poll is positive proof the
+        window is alive, so a poll renews.
+
+        Not persisted on purpose: ``lease_expires_at`` is meaningless across a
+        Bridge restart (``_load_jobs`` requeues or blocks every live job
+        anyway), and writing jobs.json on every poll of every worker would be
+        pure disk churn.
+        """
+        with self._lock:
+            renewable = TERMINAL_STATES | {JOB_QUEUED, JOB_BLOCKED}
+            job = next(
+                (
+                    item for item in self._jobs.values()
+                    if item.assigned_worker_id == str(worker_id)
+                    and item.state not in renewable
+                ),
+                None,
+            )
+            if job is None:
+                return None
+            job.lease_expires_at = _now() + LEASE_SECONDS
+            return job
+
     def list_jobs(self) -> list[DispatchJob]:
         with self._lock:
             return sorted(self._jobs.values(), key=lambda j: j.created_at)
@@ -921,6 +1066,15 @@ class BrowserDispatcher:
                     job.updated_at = now
                     requeued += 1
                 elif job.state in POST_START_STATES and now > job.lease_expires_at:
+                    owner = self._workers.get(job.assigned_worker_id)
+                    if owner is not None and now - owner.last_seen_at <= WORKER_TTL_SECONDS:
+                        # The owning window is still registered and heartbeating.
+                        # "worker lost" must mean the worker is actually lost --
+                        # a live window mid-audit has no transition to make and
+                        # must never be blocked for staying quiet. Its heartbeat
+                        # is the renewal, so treat it as one.
+                        job.lease_expires_at = now + LEASE_SECONDS
+                        continue
                     job.recovery_state = job.state
                     job.state = JOB_BLOCKED
                     job.error = "worker lost after START_PREPARED; recovery required"

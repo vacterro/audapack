@@ -57,6 +57,16 @@ def job_payload(path: Path, name="PROJECT") -> dict:
     return {"project_id": name.lower(), "project_name": name, "archive_path": str(path), "archive_filename": path.name}
 
 
+def lose_worker(d: BrowserDispatcher, wid: str) -> None:
+    """Age a worker past its heartbeat TTL: the window is gone, not just quiet.
+
+    A post-START lease expires only when the worker is actually lost. Setting
+    lease_expires_at into the past is not enough on its own -- a registered,
+    heartbeating window mid-audit has no transition to make and keeps its run.
+    """
+    d._workers[wid].last_seen_at = time.time() - (WORKER_TTL_SECONDS + 5)
+
+
 def test_worker_registration_is_idempotent(tmp_path):
     d = dispatcher(tmp_path)
     d.register_worker(worker("w1"))
@@ -231,9 +241,49 @@ def test_post_start_lease_expiry_blocks_without_redispatch(tmp_path):
         d.transition_job(item.dispatch_id, "w1", leased.lease_id, state)
     d.transition_job(item.dispatch_id, "w1", leased.lease_id, JOB_START_PREPARED, {"campaign_run_id": "run", "start_receipt": "receipt-start"})
     leased.lease_expires_at = time.time() - 1
+    lose_worker(d, "w1")
     d.expire_leases()
     assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+    # A replacement window on the same slot must not be handed the blocked run.
+    d.register_worker(worker("w1"))
     assert d.claim_job("w1") is None
+
+
+def test_post_start_lease_does_not_expire_under_a_live_worker(tmp_path):
+    """A window mid-audit keeps its run: silence is not death.
+
+    AUDITING makes no transitions for as long as the audit takes, and only a
+    transition used to extend the lease, so a healthy run was blocked with
+    "worker lost after START_PREPARED" minutes into a wave -- the audit kept
+    running in the browser and finished onto disk while its dispatch record
+    said it had failed.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    leased = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", leased.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.get_job(item.dispatch_id).lease_expires_at = time.time() - 1
+    d.expire_leases()
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+
+def test_owner_poll_renews_its_lease(tmp_path):
+    """Polling is proof of life, so it renews the owned lease."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    leased = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", leased.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.get_job(item.dispatch_id).lease_expires_at = time.time() - 1
+    renewed = d.renew_owner_lease("w1")
+    assert renewed is not None and renewed.dispatch_id == item.dispatch_id
+    assert d.get_job(item.dispatch_id).lease_expires_at > time.time()
+    assert d.renew_owner_lease("nobody") is None
 
 
 def test_stale_lease_and_owner_rejected(tmp_path):
@@ -461,6 +511,7 @@ def test_post_start_expiry_records_recovery_state(tmp_path):
         d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
     job = d.get_job(item.dispatch_id)
     job.lease_expires_at = time.time() - 1
+    lose_worker(d, "w1")
     d.expire_leases()
     job = d.get_job(item.dispatch_id)
     assert job.state == JOB_BLOCKED
@@ -481,6 +532,7 @@ def test_expiry_recovery_reconciles_same_owner(tmp_path):
         d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
     job = d.get_job(item.dispatch_id)
     job.lease_expires_at = time.time() - 1
+    lose_worker(d, "w1")
     d.expire_leases()
     assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
     d.register_worker(worker("w1", state="AUDITING", dispatch_id=item.dispatch_id, lease_id=lease.lease_id, campaign_run_id="run", start_receipt="receipt"))
@@ -943,3 +995,139 @@ def test_complete_for_run_rejects_blocked_without_recovery_state(tmp_path):
     job.state = JOB_BLOCKED
     job.error = "restart recovery"
     assert d.complete_for_run(item.project_id, "run", final, campaign_path=campaign, expected_wave_count=3) is None
+
+
+def supported_worker(wid: str, **overrides) -> dict:
+    """A registration payload the dispatcher accepts as a real audit lane."""
+    return worker(
+        wid,
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        is_brave=False,
+        page_eligible=True,
+        clean_for_audit=True,
+        has_conversation_turns=False,
+        url_path="/",
+        **overrides,
+    )
+
+
+def test_a_managed_window_takes_its_lane_from_an_idle_personal_tab(tmp_path):
+    """Six managed windows plus a personal ChatGPT tab is seven for six lanes.
+
+    The operator asked for six audit windows; a ChatGPT tab they happen to have
+    open in their own browser must not be the reason one of them is refused.
+    Without this the seventh registration lost, then won on the next heartbeat,
+    and the pool thrashed instead of settling at six.
+    """
+    d = dispatcher(tmp_path)
+    d.register_worker(supported_worker("personal"))
+    for slot in range(1, MAX_ACTIVE_WORKERS):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    assert len(d.list_workers()) == MAX_ACTIVE_WORKERS
+
+    d.register_worker(supported_worker("managed-6", managed_slot=6, managed_generation=1))
+    live = {w.worker_id for w in d.list_workers()}
+    assert "managed-6" in live
+    assert "personal" not in live
+    assert len(live) == MAX_ACTIVE_WORKERS
+
+
+def test_a_personal_tab_running_an_audit_keeps_its_lane(tmp_path):
+    """Yielding is for idle tabs only -- never for one mid-run."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("personal"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("personal")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "personal", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+    for slot in range(1, MAX_ACTIVE_WORKERS):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+
+    with pytest.raises(DispatchError) as refused:
+        d.register_worker(supported_worker("managed-6", managed_slot=6, managed_generation=1))
+    assert refused.value.code == "worker_limit"
+    assert "personal" in {w.worker_id for w in d.list_workers()}
+
+
+def test_six_managed_slots_own_every_lane(tmp_path):
+    """With six managed windows live, a personal tab gets no lane at all.
+
+    Admitting it evicted a managed window, which came back and evicted the tab,
+    and the pool oscillated between five and six lanes indefinitely instead of
+    settling -- observed live as managed slots rotating in and out on every
+    heartbeat while offline_workers climbed.
+    """
+    d = dispatcher(tmp_path)
+    for slot in range(1, MAX_ACTIVE_WORKERS + 1):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+
+    with pytest.raises(DispatchError) as refused:
+        d.register_worker(supported_worker("personal"))
+    assert refused.value.code == "worker_limit"
+
+    live = {w.worker_id for w in d.list_workers()}
+    assert live == {f"managed-{slot}" for slot in range(1, MAX_ACTIVE_WORKERS + 1)}
+
+
+def test_a_reloaded_managed_window_replaces_its_own_slot(tmp_path):
+    """One slot is one lane: a reload must not leave two records behind."""
+    d = dispatcher(tmp_path)
+    d.register_worker(supported_worker("audapack-managed-3-1-old", managed_slot=3, managed_generation=1))
+    d.register_worker(supported_worker("audapack-managed-3-1-new", managed_slot=3, managed_generation=1))
+    live = {w.worker_id for w in d.list_workers()}
+    assert live == {"audapack-managed-3-1-new"}
+
+
+def test_a_personal_tab_is_admitted_when_managed_windows_are_gone(tmp_path):
+    """The lane reservation is for live managed windows, not a permanent ban."""
+    import audapack.bridge.browser_dispatch as module
+
+    d = dispatcher(tmp_path)
+    for slot in range(1, MAX_ACTIVE_WORKERS + 1):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    # Every managed window is closed and its memory of the slot has lapsed.
+    d._workers.clear()
+    d._managed_slot_seen = {
+        slot: seen - (module.MANAGED_SLOT_MEMORY_SECONDS + 1)
+        for slot, seen in d._managed_slot_seen.items()
+    }
+    record = d.register_worker(supported_worker("personal"))
+    assert record.worker_id == "personal"
+
+
+def test_an_already_seated_personal_tab_gives_its_lane_back(tmp_path):
+    """The sixth managed window evicts a tab that got in first.
+
+    Refusing newcomers is not enough: a personal tab admitted while only five
+    managed windows had registered kept its lane forever, and the sixth managed
+    window rotated in and out against it heartbeat after heartbeat.
+    """
+    d = dispatcher(tmp_path)
+    for slot in range(1, MAX_ACTIVE_WORKERS):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    d.register_worker(supported_worker("personal"))
+    assert "personal" in {w.worker_id for w in d.list_workers()}
+
+    d.register_worker(supported_worker("managed-6", managed_slot=6, managed_generation=1))
+    live = {w.worker_id for w in d.list_workers()}
+    assert live == {f"managed-{slot}" for slot in range(1, MAX_ACTIVE_WORKERS + 1)}
+
+
+def test_poll_block_shrinks_as_the_worker_pool_grows(tmp_path):
+    """Six windows sharing one serialized poll queue must all stay registered.
+
+    A 20s block per poll times six windows is a two-minute round trip, and a
+    worker that heartbeats every two minutes is dead by WORKER_TTL_SECONDS.
+    """
+    d = dispatcher(tmp_path)
+    d.register_worker(supported_worker("managed-1", managed_slot=1, managed_generation=1))
+    assert d.max_poll_wait_seconds() > 20.0  # one worker: no need to hurry
+
+    for slot in range(2, MAX_ACTIVE_WORKERS + 1):
+        d.register_worker(supported_worker(f"managed-{slot}", managed_slot=slot, managed_generation=1))
+    wait = d.max_poll_wait_seconds()
+    assert wait * MAX_ACTIVE_WORKERS < WORKER_TTL_SECONDS
+    assert wait >= 2.0

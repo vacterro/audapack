@@ -36,6 +36,21 @@ def _post(conn: HTTPConnection, path: str, body: dict, token: str) -> tuple[int,
     return resp.status, json.loads(resp.read().decode("utf-8") or "null")
 
 
+def _live_dispatcher_owning(dispatch_id: str):
+    """The in-memory dispatcher the running test server is actually using.
+
+    ``bridge_server`` serves through a per-fixture handler subclass, and the
+    dispatcher lives on that subclass -- not on the base handler.
+    """
+    from audapack.bridge.server import AudapackBridgeHandler
+
+    for handler in AudapackBridgeHandler.__subclasses__():
+        dispatcher = getattr(handler, "browser_dispatcher", None)
+        if dispatcher is not None and dispatcher.get_job(dispatch_id) is not None:
+            return dispatcher
+    raise AssertionError(f"no live dispatcher owns {dispatch_id}")
+
+
 def _get_with_headers(conn: HTTPConnection, path: str, headers: dict) -> tuple[int, dict, bytes]:
     conn.request("GET", path, headers=headers)
     resp = conn.getresponse()
@@ -272,3 +287,56 @@ def test_relaunch_slot_rejects_unauthenticated_request(bridge_server):
         "slot": 3,
     }, "wrong-token")
     assert status == 403
+
+
+def test_owner_poll_renews_the_lease_of_a_long_running_audit(bridge_server, tmp_path):
+    """A worker that keeps polling keeps its run.
+
+    The poll handler used to expire leases before registering the caller, and
+    only a state transition extended one. An audit sits in AUDITING for minutes
+    with no transition to make, so the owner's own poll aged its run out into
+    "worker lost after START_PREPARED" while the audit was still running.
+    """
+    import time
+
+    config, base_url = bridge_server
+    archive = _archive(tmp_path, "RENEW.zip")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": "RENEW",
+        "project_id": "renew",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 200, payload
+    dispatch_id = payload["dispatch"]["dispatch_id"]
+
+    poll = {"worker_id": "w_renew", "generating": False, "action_in_flight": False,
+            "has_manual_draft": False, "has_attachments": False}
+    status, payload = _post(conn, "/v1/browser/poll", poll, config.bridge.token)
+    assert status == 200, payload
+    lease_id = payload["job"]["lease_id"]
+
+    for to_state in ("ARTIFACT_FETCHED", "ATTACHED", "START_PREPARED", "STARTED", "AUDITING"):
+        status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+            "dispatch_id": dispatch_id,
+            "worker_id": "w_renew",
+            "lease_id": lease_id,
+            "state": to_state,
+            "campaign_run_id": "run-renew",
+            "start_receipt": "receipt-renew",
+        }, config.bridge.token)
+        assert status == 200, (to_state, payload)
+
+    # The audit has produced nothing to report for longer than one lease.
+    dispatcher = _live_dispatcher_owning(dispatch_id)
+    dispatcher.get_job(dispatch_id).lease_expires_at = time.time() - 1
+
+    status, payload = _post(conn, "/v1/browser/poll", poll, config.bridge.token)
+    assert status == 200, payload
+    job = dispatcher.get_job(dispatch_id)
+    assert job.state == "AUDITING"
+    assert job.lease_expires_at > time.time()

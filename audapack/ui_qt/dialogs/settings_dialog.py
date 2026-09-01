@@ -73,11 +73,15 @@ class SettingsWidget(QWidget):
         self.audit_widget = self._build_audit()
         self.bridge_widget = self._build_bridge()
         self.launchers_widget = self._build_launchers()
+        # Bridge is the tab an operator opens Settings for: it carries the
+        # health, worker pool and autostart controls that a stuck START AUDIT
+        # sends them here to check. It leads, and it is selected on open.
+        self.sub_tabs.addTab(self.bridge_widget, "Bridge")
         self.sub_tabs.addTab(self.general_widget, "General")
         self.sub_tabs.addTab(self.packing_widget, "Packing")
         self.sub_tabs.addTab(self.audit_widget, "Audit")
-        self.sub_tabs.addTab(self.bridge_widget, "Bridge")
         self.sub_tabs.addTab(self.launchers_widget, "Launchers")
+        self.sub_tabs.setCurrentWidget(self.bridge_widget)
         layout.addWidget(self.sub_tabs)
 
         btn_row = QWidget(self)

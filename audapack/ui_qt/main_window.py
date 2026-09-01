@@ -443,6 +443,22 @@ class MainWindow(QMainWindow):
         # Background Task Runner for async I/O
         self.task_runner = TaskRunner(max_threads=4, parent=self)
 
+        # START AUDIT is one serialized lane, not one task per press. Six rapid
+        # presses used to run six independent batches that each probed health
+        # and each asked the worker supervisor for "one more lane", so they
+        # raced each other into one or two windows instead of six. Presses now
+        # accumulate into a single pending set, a short debounce collects a
+        # burst into one batch, and batches never overlap.
+        self.AUDIT_DISPATCH_KEY = "dispatch"
+        self.AUDIT_DISPATCH_DEBOUNCE_MS = 450
+        self._audit_start_pending: list[str] = []
+        self._audit_start_labels: list[str] = []
+        self._audit_start_inflight: set[str] = set()
+        self._audit_start_debounce = QTimer(self)
+        self._audit_start_debounce.setSingleShot(True)
+        self._audit_start_debounce.setInterval(self.AUDIT_DISPATCH_DEBOUNCE_MS)
+        self._audit_start_debounce.timeout.connect(self._pump_audit_start_queue)
+
         self.setWindowTitle("AUDAPACK — Project Room")
         self.resize(*service.config.ui.window_size)
         self.setMinimumSize(280, 200)
@@ -1329,16 +1345,56 @@ QToolTip QLabel {
         self._start_audit_projects(projects, group)
 
     def _start_audit_projects(self, project_ids: list[str], label: str):
-        project_ids = list(dict.fromkeys(str(value) for value in project_ids if value))[:6]
-        key = "dispatch:" + ",".join(project_ids)
-        if not project_ids or self.task_runner.is_running(key):
+        """Enqueue projects for the single serialized START AUDIT lane.
+
+        Every entry point (toolbar, row action, context menu, group) funnels
+        here. Nothing is dispatched inline: a press adds to the pending set and
+        restarts a short debounce, so pressing START AUDIT six times in a row
+        produces one batch that provisions six lanes at once.
+        """
+        wanted = [str(value) for value in project_ids if value]
+        added = [
+            pid for pid in dict.fromkeys(wanted)
+            if pid not in self._audit_start_pending and pid not in self._audit_start_inflight
+        ]
+        if not wanted:
+            return
+        if not added:
             self._flash_status(f"START AUDIT already preparing {label}", "#D4A840")
             return
+        self._audit_start_pending.extend(added)
+        if label and label not in self._audit_start_labels:
+            self._audit_start_labels.append(str(label))
+        queued_total = len(self._audit_start_pending)
+        self._flash_status(
+            f"START AUDIT: preparing {label}" if queued_total == 1
+            else f"START AUDIT: preparing {queued_total} projects",
+            "#D4A840",
+        )
+        self._audit_start_debounce.start()
+
+    def _pump_audit_start_queue(self):
+        """Dispatch the next batch if the lane is free, else wait for it."""
+        if not self._audit_start_pending:
+            self._audit_start_labels.clear()
+            return
+        if self.task_runner.is_running(self.AUDIT_DISPATCH_KEY):
+            return
+        batch = self._audit_start_pending[:6]
+        del self._audit_start_pending[:len(batch)]
+        label = ", ".join(self._audit_start_labels[:3]) or f"{len(batch)} projects"
+        self._audit_start_labels.clear()
+        self._audit_start_inflight = set(batch)
         profile = getattr(self._service.config.audits, "profile", "quick3") or "quick3"
-        self._flash_status(f"START AUDIT: preparing {label}", "#D4A840")
 
         def _prepare():
-            return self._audit_runs.start_batch(project_ids, profile)
+            return self._audit_runs.start_batch(batch, profile)
+
+        def _finish():
+            self._audit_start_inflight.clear()
+            self._refresh_audit_runs_async()
+            if self._audit_start_pending:
+                self._audit_start_debounce.start()
 
         def _done(results):
             failed = [result for result in results if not result.ok]
@@ -1354,12 +1410,13 @@ QToolTip QLabel {
             else:
                 suffix = f", {len(duplicates)} already active" if duplicates else ""
                 self._flash_status(f"START AUDIT: {len(queued)} queued{suffix}", "#D4A840", duration_ms=4000)
-            self._refresh_audit_runs_async()
+            _finish()
 
         def _error(error):
-            self._flash_status(f"START AUDIT failed: {error}", "#D66464")
+            self._flash_status(f"START AUDIT failed ({label}): {error}", "#D66464", duration_ms=7000)
+            _finish()
 
-        self.task_runner.submit(key, _prepare, on_success=_done, on_error=_error)
+        self.task_runner.submit(self.AUDIT_DISPATCH_KEY, _prepare, on_success=_done, on_error=_error)
 
     def _ensure_free_browser_worker(self) -> dict[str, Any]:
         """Prepare worker capacity without touching Qt from a worker thread.
