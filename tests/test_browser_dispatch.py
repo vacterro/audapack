@@ -1220,3 +1220,40 @@ def test_lane_reservation_refuses_cleanly_while_jobs_exist(tmp_path):
     with pytest.raises(DispatchError) as refused:
         d.register_worker(supported_worker("personal"))
     assert refused.value.code == "worker_limit"
+
+
+def test_a_lost_auditing_ack_never_blocks_a_finished_audit(tmp_path):
+    """STARTED must be able to finish.
+
+    AUDITING is a progress marker, not a boundary -- the irreversible Send
+    already happened at START_PREPARED. Its ACK is one HTTP call among six
+    windows sharing one serialized userscript request queue, and when it was
+    lost the run was pinned in STARTED, from which FINALIZING and COMPLETE were
+    both illegal. Observed live: four of six dispatches sat STARTED while every
+    worker reported AUDITING in a real conversation.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+    assert d.get_job(item.dispatch_id).state == JOB_STARTED
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_FINALIZING, {"campaign_run_id": "run"})
+    assert d.get_job(item.dispatch_id).state == JOB_FINALIZING
+
+
+def test_a_started_run_can_complete_directly(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {"campaign_run_id": "run"})
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE

@@ -128,6 +128,15 @@ JOB_TRANSITIONS: set[tuple[str, str]] = {
     (JOB_ATTACHED, JOB_START_PREPARED),
     (JOB_START_PREPARED, JOB_STARTED),
     (JOB_STARTED, JOB_AUDITING),
+    # AUDITING is a progress marker, not a boundary: the irreversible Send
+    # already happened at START_PREPARED. Its ACK is one HTTP call among six
+    # windows sharing one serialized userscript request queue, and when it was
+    # lost the run was pinned in STARTED -- from which FINALIZING and COMPLETE
+    # were both illegal. The audit still ran and still landed on disk; its
+    # dispatch simply could never close. A missing intermediate marker must
+    # never invalidate a finished audit.
+    (JOB_STARTED, JOB_FINALIZING),
+    (JOB_STARTED, JOB_COMPLETE),
     (JOB_AUDITING, JOB_FINALIZING),
     (JOB_FINALIZING, JOB_COMPLETE),
     # Kept for wire compatibility with older workers. New workers must use

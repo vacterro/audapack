@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.26
+// @version      0.0.27
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18429,8 +18429,13 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       // Idempotent: STARTED -> AUDITING is legal and AUDITING -> AUDITING is a
       // no-op ACK.
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
-          String(owned.state || '') === 'STARTED' && autoRuntime?.runId) {
-        await browserWorkerTransition('AUDITING', { campaign_run_id: String(autoRuntime.runId || '') });
+          String(owned.state || '') === 'STARTED') {
+        // No campaign_run_id on purpose. The Bridge already owns the run id
+        // from START_PREPARED, and re-sending a runtime value that route
+        // hydration may have re-derived turns a harmless progress marker into
+        // a run_id_conflict rejection. STARTED is written only after the Core
+        // was actually sent, so this window really is auditing.
+        await browserWorkerTransition('AUDITING');
       }
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           !autoRuntime?.runId) {

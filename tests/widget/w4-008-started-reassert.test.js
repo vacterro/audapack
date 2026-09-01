@@ -20,7 +20,9 @@ function pollHarness(overrides = {}) {
   api.autoRuntime = {
     ...api.emptyAutoRuntime({ enabled: true }),
     stage: 'running',
-    runId: 'acb-run-1'
+    // Route hydration re-derives the runtime and can clear or change the run
+    // id; the re-assert must not depend on it.
+    runId: overrides.runId === undefined ? 'acb-run-1' : overrides.runId
   };
 
   const posted = [];
@@ -149,4 +151,56 @@ test('T92: a worker mid-audit never reloads to chase a build', async () => {
   const before = h.location.reloaded;
   assert.strictEqual(api.browserWorkerReloadForStaleBuild('0.0.26'), false);
   assert.strictEqual(h.location.reloaded, before, 'a run in flight outranks a build update');
+});
+
+test('T93: the re-assert survives a runtime that lost its run id', async () => {
+  // Route hydration re-arms A3 from the visible receipt and can leave the
+  // runtime without the original run id. Requiring it, or re-sending it,
+  // turned a harmless progress marker into a permanent STARTED lane.
+  const { h, api, posted } = pollHarness({ runId: '' });
+
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  assert.ok(posted.includes('AUDITING'), `expected an AUDITING re-assert, saw ${JSON.stringify(posted)}`);
+});
+
+test('T93: the re-assert carries no campaign_run_id', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+  api.browserWorkerLease = {
+    dispatch_id: 'dsp-0123456789abcdef',
+    worker_id: 'w', lease_id: 'lease-0123456789abcdef'
+  };
+  api.autoRuntime = { ...api.emptyAutoRuntime({ enabled: true }), stage: 'running', runId: 'acb-drifted' };
+
+  const bodies = [];
+  h.httpResponder = options => {
+    const url = String(options.url || '');
+    if (url.includes('/v1/browser/poll')) {
+      return {
+        status: 200,
+        responseText: JSON.stringify({
+          ok: true, job: null,
+          owned_job: { dispatch_id: 'dsp-0123456789abcdef', state: 'STARTED', lease_id: 'lease-0123456789abcdef' },
+          worker_state: 'AUDITING', status: {}
+        })
+      };
+    }
+    if (url.includes('/state')) {
+      try { bodies.push(JSON.parse(options.data || '{}')); } catch (_) { }
+      return { status: 200, responseText: JSON.stringify({ ok: true }) };
+    }
+    return { status: 200, responseText: JSON.stringify({ ok: true }) };
+  };
+
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  const auditing = bodies.filter(b => b.state === 'AUDITING');
+  assert.strictEqual(auditing.length, 1);
+  assert.ok(!('campaign_run_id' in auditing[0]), 'a re-assert must not re-send the run id');
 });
