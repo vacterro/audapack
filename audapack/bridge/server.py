@@ -1746,7 +1746,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             # Registration first, then renewal, then expiry: a worker that is
             # polling is alive, and its owned run must never be aged out by the
             # very request that proves it is still there.
-            dispatcher.renew_owner_lease(worker.worker_id)
+            dispatcher.renew_owner_lease(worker.worker_id, str(data.get("dispatch_id") or ""))
             dispatcher.expire_leases()
             job = dispatcher.claim_job(worker.worker_id, data)
             wait_seconds = min(25.0, max(0.0, float(data.get("wait_seconds", 20))))

@@ -383,6 +383,64 @@ def test_active_heartbeat_renews_exact_lease(tmp_path):
     assert d.get_job(item.dispatch_id).lease_expires_at > shortened + 60
 
 
+def test_a_silently_dropped_prestart_claim_is_not_renewed_forever(tmp_path):
+    """A widget that claims a job and then drops it reports no lease at all.
+
+    Renewing on worker identity alone kept such a job LEASED forever: the owner
+    stayed registered so `expire_leases` never saw `owner_gone`, and the
+    renewal kept pushing the deadline out. The project sat on a dead lease
+    while clean workers idled beside it.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    d.claim_job("w1")
+
+    # The worker keeps polling, but no longer reports the dispatch.
+    assert d.renew_owner_lease("w1") is None
+    assert d.renew_owner_lease("w1", "dsp-someone-else") is None
+
+    d.get_job(item.dispatch_id).lease_expires_at = time.time() - 1
+    d.expire_leases()
+    assert d.get_job(item.dispatch_id).state == JOB_QUEUED
+    assert d.claim_job("w1") is not None
+
+
+def test_a_worker_still_holding_its_prestart_claim_keeps_the_lease(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    d.claim_job("w1")
+
+    shortened = time.time() + 1
+    d.get_job(item.dispatch_id).lease_expires_at = shortened
+    assert d.renew_owner_lease("w1", item.dispatch_id) is not None
+    assert d.get_job(item.dispatch_id).lease_expires_at > shortened + 60
+    d.expire_leases()
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+
+def test_a_post_start_run_is_renewed_even_without_an_echoed_dispatch(tmp_path):
+    """Recovery must not depend on the widget echoing its lease after START."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(
+            item.dispatch_id, "w1", lease.lease_id, state,
+            {"campaign_run_id": "run", "start_receipt": "receipt"},
+        )
+
+    shortened = time.time() + 1
+    d.get_job(item.dispatch_id).lease_expires_at = shortened
+    assert d.renew_owner_lease("w1") is not None
+    assert d.get_job(item.dispatch_id).lease_expires_at > shortened + 60
+
+
 def test_finalizing_requires_durable_campaign_proof(tmp_path):
     d = dispatcher(tmp_path)
     path = archive(tmp_path)

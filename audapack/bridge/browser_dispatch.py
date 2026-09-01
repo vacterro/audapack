@@ -871,7 +871,7 @@ class BrowserDispatcher:
             pool = max(1, len(self._workers), len(self._live_managed_slots()))
         return max(2.0, WORKER_TTL_SECONDS / (2.0 * pool))
 
-    def renew_owner_lease(self, worker_id: str) -> Optional[DispatchJob]:
+    def renew_owner_lease(self, worker_id: str, dispatch_id: str = "") -> Optional[DispatchJob]:
         """Extend the lease of the job this worker owns, because it just polled.
 
         A lease exists to notice a worker that died. Only a state transition
@@ -899,6 +899,15 @@ class BrowserDispatcher:
                 None,
             )
             if job is None:
+                return None
+            # Renew only the dispatch the worker still says it holds. A widget
+            # that claims a job and then drops it locally reports no lease at
+            # all, and renewing anyway kept a pre-START job LEASED forever:
+            # expire_leases could never requeue it, so the project sat with a
+            # dead lease while clean workers idled beside it. A post-start run
+            # always reports its lease, so recovery is unaffected.
+            declared = str(dispatch_id or "").strip()
+            if job.state in PRE_START_STATES and declared != job.dispatch_id:
                 return None
             job.lease_expires_at = _now() + LEASE_SECONDS
             return job

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.35
+// @version      0.0.36
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18223,12 +18223,24 @@ let browserWorkerBraveConfirmed = false;
     const injectFiles = dependencies?.injectFiles || setNativeFileList;
     const waitForAttachment = dependencies?.waitForAttachment || waitForExactProjectAttachmentWithRetry;
     const startAudit = dependencies?.startAudit || startAuditCoreFromReadyAttachment;
+    const releaseJob = dependencies?.releaseJob || browserWorkerReleaseUnclaimableJob;
     const expectedFilename = String(job.archive_filename || '');
-    if (!expectedFilename || expectedFilename !== expectedFilename.split(/[\\/]/).pop()) {
+    // /v1/browser/poll already moved this job QUEUED -> LEASED before it
+    // answered, so returning here without a word left it leased to a window
+    // that would never touch it -- and because every poll of this same
+    // worker renewed the lease, it never expired either: the job sat LEASED
+    // forever while this window reported itself FREE and clean. Reject it
+    // out loud instead, so the Bridge can hand it to a window that can run it.
+    const rejectJob = async (reason) => {
+      await releaseJob(job, reason);
       return false;
+    };
+    if (!String(job.dispatch_id || '') || !String(job.lease_id || '')) return false;
+    if (!expectedFilename || expectedFilename !== expectedFilename.split(/[\\/]/).pop()) {
+      return rejectJob('archive-filename-not-a-bare-name');
     }
     if (!expectedFilename.toLowerCase().endsWith('.zip')) {
-      return false;
+      return rejectJob('archive-filename-not-a-zip');
     }
     browserWorkerLease = {
       dispatch_id: String(job.dispatch_id || ''),
@@ -18245,7 +18257,6 @@ let browserWorkerBraveConfirmed = false;
     // worker started whatever its own state.auditProfile happened to be, so
     // pressing CM opened a window that ran A3.
     browserWorkerApplyDispatchedProfile(browserWorkerLease.profile);
-if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return false;
     // W3: state-aware resume. The persisted Bridge state decides the resume
     // entry point -- never "start from zero" for every state.
     const resumeState = String(job.state || 'LEASED').toUpperCase();
