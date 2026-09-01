@@ -15,6 +15,7 @@ from audapack.bridge.browser_dispatch import (
     JOB_BLOCKED,
     JOB_CANCELLED,
     JOB_COMPLETE,
+    JOB_FAILED,
     JOB_FINALIZING,
     JOB_LEASED,
     JOB_QUEUED,
@@ -1497,3 +1498,39 @@ def test_a_managed_slot_keeps_its_lane_while_it_settles(tmp_path):
     d = dispatcher(tmp_path)
     d.register_worker(supported_worker("managed-1", managed_slot=1, managed_generation=1, clean_for_audit=False))
     assert d.status()["active_workers"] == 1
+
+
+def test_the_operator_can_abandon_a_live_post_start_run(tmp_path):
+    """A run whose worker window was closed had no escape hatch.
+
+    Cancel refuses a post-start dispatch on principle, and abandon accepted
+    only BLOCKED, so an AUDITING job with nobody behind it could not be
+    cleared and START AUDIT kept answering "already active".
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+
+    abandoned = d.abandon_job(item.dispatch_id, "worker window was closed")
+    assert abandoned.state == JOB_FAILED
+    assert abandoned.campaign_run_id == "run", "post-start lineage is kept, not erased"
+    assert d.claim_job("w1") is None, "an abandoned run is never re-leased"
+
+
+def test_a_pre_start_job_is_still_cancelled_not_abandoned(tmp_path):
+    """Abandon asserts a Core may have been sent; before START that is a lie."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    d.claim_job("w1")
+
+    with pytest.raises(DispatchError) as refused:
+        d.abandon_job(item.dispatch_id, "too early")
+    assert refused.value.code == "invalid_transition"
+    assert d.cancel_job(item.dispatch_id)

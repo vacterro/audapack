@@ -1460,7 +1460,12 @@ class BrowserDispatcher:
             return job
 
     def abandon_job(self, dispatch_id: str, reason: str = "") -> DispatchJob:
-        """Operator escape hatch for a stuck post-start BLOCKED dispatch.
+        """Operator escape hatch for a stuck post-start dispatch.
+
+        Any live post-start state qualifies, not only BLOCKED. A run whose
+        worker window was closed can sit in AUDITING with nobody behind it, and
+        Cancel refuses it on principle -- so the operator had NO way to clear
+        the lane and START AUDIT kept answering "already active".
 
         Cancel deliberately refuses a BLOCKED job that may already own an
         irreversible START, because CANCELLED means "no Core was sent" and
@@ -1477,10 +1482,10 @@ class BrowserDispatcher:
                 raise DispatchError("unknown_job", "dispatch_id is unknown")
             if job.state in TERMINAL_STATES:
                 return job
-            if job.state != JOB_BLOCKED:
+            if job.state not in POST_START_STATES | {JOB_BLOCKED}:
                 raise DispatchError(
                     "invalid_transition",
-                    "only a BLOCKED dispatch can be abandoned; cancel pre-start work instead",
+                    "only a post-start dispatch can be abandoned; cancel pre-start work instead",
                 )
             if self.safe_prestart_cancel(job):
                 raise DispatchError(
@@ -1506,6 +1511,11 @@ class BrowserDispatcher:
     @staticmethod
     def safe_prestart_cancel(job: DispatchJob) -> bool:
         """True only when positive evidence exists that no irreversible START occurred."""
+        if job.state in POST_START_STATES:
+            # Past the boundary by definition. Only BLOCKED used to be checked,
+            # so a live AUDITING run read as safely cancellable and abandon
+            # refused it -- leaving the operator with no way to clear the lane.
+            return False
         if job.state == JOB_BLOCKED:
             if job.recovery_state in POST_START_STATES:
                 return False
