@@ -1208,7 +1208,7 @@ class BrowserDispatcher:
                 self._work_available.notify_all()
             return freed
 
-    def complete_runs_for_project(self, project_id: str, project_name: str, handoff_path: str, handoff_sha256: str) -> int:
+    def complete_runs_for_project(self, project_id: str, project_name: str, handoff_path: str, handoff_sha256: str, campaign_run_id: str = "") -> int:
         """Close the lane the moment the durable final handoff is written.
 
         The dispatch only learns a campaign finished from the worker's terminal
@@ -1243,6 +1243,15 @@ class BrowserDispatcher:
                 job.error = ""
                 job.final_handoff_path = str(handoff_path or job.final_handoff_path)
                 job.final_handoff_sha256 = str(handoff_sha256 or job.final_handoff_sha256)
+                # The saved campaign can carry a run id this dispatch never saw:
+                # ChatGPT route hydration re-arms the widget's runtime and
+                # re-derives it. The Bridge just wrote that campaign for this
+                # project, so it is the one witness that can bind the two ids
+                # together -- without it a finished audit stays SAVING forever,
+                # one failed `campaign_match` away from READY.
+                saved_run = str(campaign_run_id or "").strip()
+                if saved_run and job.campaign_run_id and saved_run != job.campaign_run_id:
+                    job.meta_run_id_drift = saved_run
                 job.completed_at = now
                 job.updated_at = now
                 worker = self._workers.get(job.assigned_worker_id or "")

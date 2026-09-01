@@ -1556,6 +1556,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                                 str(resolved_name or ""),
                                 str(final_handoff_path),
                                 hashlib.sha256(Path(final_handoff_path).read_bytes()).hexdigest(),
+                                str(run_id or ""),
                             )
                     except Exception as exc:
                         logger.warning("could not close dispatch lanes for %s: %s", resolved_name, exc)

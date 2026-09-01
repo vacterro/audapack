@@ -1384,3 +1384,32 @@ def test_completing_a_project_never_touches_another_project(tmp_path):
 
     assert d.complete_runs_for_project("wintage", "Wintage", "/tmp/x.md", "abc") == 0
     assert d.get_job(item.dispatch_id).state == JOB_STARTED
+
+
+def test_completion_binds_a_campaign_run_id_the_dispatch_never_saw(tmp_path):
+    """The Bridge is the one witness that can bind the two run ids.
+
+    ChatGPT route hydration re-derives the widget's run id, so the saved
+    campaign can carry an id the dispatch never saw. Observed live: SAIWORK2
+    finished with a matching handoff digest and stayed SAVING, one failed
+    campaign_match away from READY.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "SAIWORK2"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-dispatch-saw-this", "start_receipt": "receipt"})
+
+    handoff = tmp_path / "SAIWORK2__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    d.complete_runs_for_project(
+        "saiwork2", "SAIWORK2", str(handoff), "abc123", "acb-campaign-was-saved-as",
+    )
+
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_COMPLETE
+    assert job.campaign_run_id == "acb-dispatch-saw-this", "the dispatch's own id is never overwritten"
+    assert job.meta_run_id_drift == "acb-campaign-was-saved-as"
