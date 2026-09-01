@@ -38,6 +38,12 @@
 // @grant        GM_addValueChangeListener
 // @connect      127.0.0.1
 // @connect      localhost
+// Served by the local AUDAPACK Bridge. Without these a widget build bump
+// locked every worker window out of claiming audits until the operator
+// hand-installed the new script: six idle windows next to a queue that
+// never moved. Tampermonkey now picks the update up on its own.
+// @updateURL    http://127.0.0.1:17843/widget.user.js
+// @downloadURL  http://127.0.0.1:17843/widget.user.js
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
