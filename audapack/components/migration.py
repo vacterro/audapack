@@ -20,6 +20,7 @@ from audapack.components.autostart import (
     run_autostart_task,
 )
 from audapack.config import AppConfig, get_user_runtime_dir, load_config, save_config
+from audapack.procutil import run_hidden
 from audapack.projects import ProjectRegistry
 
 LEGACY_TASK_NAME = "ACBBridge"
@@ -61,7 +62,7 @@ def stop_verified_legacy_bridge() -> tuple[bool, str]:
     task_exists, _ = query_task(LEGACY_TASK_NAME)
     if task_exists:
         try:
-            subprocess.run(["schtasks", "/end", "/tn", LEGACY_TASK_NAME], capture_output=True)
+            run_hidden(["schtasks", "/end", "/tn", LEGACY_TASK_NAME], capture_output=True)
         except Exception:
             pass
 
@@ -74,7 +75,7 @@ def stop_verified_legacy_bridge() -> tuple[bool, str]:
 
     # 3. If still running, verify commandline matches acbbridge.py before taskkill
     try:
-        wmic_res = subprocess.run(
+        wmic_res = run_hidden(
             ["wmic", "process", "where", "name like 'python%.exe'", "get", "ProcessId,CommandLine", "/format:list"],
             capture_output=True,
             text=True,
@@ -87,7 +88,7 @@ def stop_verified_legacy_bridge() -> tuple[bool, str]:
                     if line.strip().lower().startswith("processid="):
                         pid = line.split("=", 1)[1].strip()
                         if pid.isdigit():
-                            subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+                            run_hidden(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
     except Exception:
         pass
 

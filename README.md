@@ -40,7 +40,7 @@
 - **🪟 Windows Integration**: Explorer right-click context menu integration (*"Упаковать через AUDAPACK"*) and silent VBScript background launchers.
 - **🎨 Golden Vintage Aesthetic**: Authentic Windows 95 Dark Golden theme with 2px raised/sunken bevels and zero antialiasing for maximum readability.
 - **📥 Durable INAUDIT Inbox**: Filesystem-backed capture store for ChatGPT responses, blocks, or clipboard text; deterministic project classification, verified hardlink/copy assignment to `audit/N.md`, and archive/restore/delete lifecycle.
-- **🧠 Dedicated Chromium Worker**: Launches a Chromium-family browser (Chrome, Edge, Vivaldi, Opera, Brave) in an isolated profile with all throttling disabled; the top-level-only Widget guard rejects embedded ChatGPT sentinel frames.
+- **🧠 Dedicated Chromium Worker**: Launches a Chromium-family browser (Chrome, Edge, Vivaldi, Opera) in an isolated profile with all throttling disabled; the top-level-only Widget guard rejects embedded ChatGPT sentinel frames.
 
 ---
 

@@ -11,21 +11,17 @@ from pathlib import Path
 from typing import Optional
 
 from audapack.config import app_dir, get_user_runtime_dir
+from audapack.procutil import popen_hidden, run_hidden
 
 WIDGET_FILE_NAME = "AUDAPACK_WIDGET.user.js"
 
 # Windows browser detection candidates: (display name, candidate paths).
 # Detected from well-known install locations and portable drives.
+# NOTE: Brave is deliberately not a launch candidate. The AUDAPACK worker is
+# the dedicated isolated Chromium profile only; a running Brave tab is still
+# detected and honestly reported to the Bridge (browser_name/is_brave), but it
+# is never selected to host the worker.
 BROWSER_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("Brave Browser", [
-        r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
-        r"V:\___VAC\__P\__SOFT\_BRAVE\app\brave.exe",
-        r"V:\___VAC\__P\__SOFT\_BRAVE\brave-portable.exe",
-        r"D:\___VAC\__P\__SOFT\_BRAVE\app\brave.exe",
-        r"C:\Brave\brave.exe",
-    ]),
     ("Cent Browser", [
         r"V:\___VAC\__P\_CENT\chrome.exe",
         r"%LOCALAPPDATA%\CentBrowser\Application\chrome.exe",
@@ -106,12 +102,19 @@ def detect_installed_browsers() -> list[dict[str, any]]:
                 'Where-Object { $names -contains $_.ProcessName } | '
                 'Select-Object -ExpandProperty Path -Unique'
             )
-            out = subprocess.check_output(
+            # P0-1: the GUI and the Bridge daemon run without a console. A
+            # bare powershell spawn from them allocates a NEW console -- a
+            # black window that flashes and steals focus on every worker
+            # launch. run_hidden applies CREATE_NO_WINDOW + SW_HIDE.
+            res = run_hidden(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True,
                 text=True,
                 errors="ignore",
                 timeout=3,
             )
+            out = res.stdout or ""
+
             for line in out.strip().splitlines():
                 line = line.strip().strip('"')
                 if line and os.path.exists(line) and line.lower().endswith(".exe"):
@@ -253,15 +256,15 @@ CHROMIUM_KEEPALIVE_FLAGS = [
     "--suppress-message-center-popups",
 ]
 
-# Kept for callers that imported the old name. The flags apply to every
-# Chromium worker now, not only Brave.
-BRAVE_KEEPALIVE_FLAGS = CHROMIUM_KEEPALIVE_FLAGS
+# Kept out: the old BRAVE_KEEPALIVE_FLAGS alias and the Brave launch paths
+# were retired -- the flags apply to every dedicated Chromium worker.
 
 AUDAPACK_WORKER_URL = "https://chatgpt.com/?audapack_worker=1"
 
 
 def _is_brave_exe(exe_path: str) -> bool:
-    """Returns True if the executable path points to a Brave-based browser."""
+    """True for a Brave executable. Brave is detected and REPORTED to the
+    Bridge, but never selected to host the dedicated worker."""
     lower = Path(exe_path).stem.lower()
     return "brave" in lower
 
@@ -284,10 +287,18 @@ def get_dedicated_chromium_profile_dir() -> Path:
 
 
 def select_dedicated_chromium(browser_exe: Optional[str] = None) -> Optional[str]:
-    """Choose a stable installed Chromium, preferring non-Brave browsers."""
+    """Select the browser for the dedicated worker.
+
+    The worker is the dedicated isolated Chromium profile only. Brave is
+    never selected -- not as an explicit choice, not via preferred_browser,
+    not as a detected candidate -- even though a running Brave tab stays
+    visible to the Bridge through the worker protocol.
+    """
     if browser_exe:
         candidate = Path(browser_exe)
-        return str(candidate.resolve()) if candidate.is_file() and _is_chromium_exe(str(candidate)) else None
+        if candidate.is_file() and _is_chromium_exe(str(candidate)) and not _is_brave_exe(str(candidate)):
+            return str(candidate.resolve())
+        return None
 
     cfg = None
     try:
@@ -296,7 +307,7 @@ def select_dedicated_chromium(browser_exe: Optional[str] = None) -> Optional[str
         preferred = str(getattr(cfg.ui, "preferred_browser", "") or "")
         if preferred:
             candidate = Path(preferred)
-            if candidate.is_file() and _is_chromium_exe(str(candidate)):
+            if candidate.is_file() and _is_chromium_exe(str(candidate)) and not _is_brave_exe(str(candidate)):
                 return str(candidate.resolve())
     except Exception:
         pass
@@ -307,11 +318,11 @@ def select_dedicated_chromium(browser_exe: Optional[str] = None) -> Optional[str
         "Microsoft Edge": 2,
         "Vivaldi": 3,
         "Opera": 4,
-        "Brave Browser": 5,
     }
     candidates = [
         item for item in detect_installed_browsers()
         if _is_chromium_exe(str(item.get("exe") or ""))
+        and not _is_brave_exe(str(item.get("exe") or ""))
         and "ms-playwright" not in str(item.get("exe") or "").lower()
     ]
     candidates.sort(key=lambda item: (
@@ -352,7 +363,10 @@ def _launch_dedicated_chromium(
     try:
         command = dedicated_chromium_command(selected, profile, target)
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
-        subprocess.Popen(
+        # popen_hidden ORs in CREATE_NO_WINDOW: a portable launcher that is
+        # itself a console program must not flash a black window over the
+        # worker it is opening.
+        popen_hidden(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -438,7 +452,7 @@ def open_widget_in_browser(browser_exe: Optional[str] = None, use_bridge: bool =
             if _is_chromium_exe(browser_exe):
                 args.extend(CHROMIUM_KEEPALIVE_FLAGS)
             args.append(target)
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            popen_hidden(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception:
             return False

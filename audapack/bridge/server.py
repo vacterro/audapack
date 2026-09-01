@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import secrets
-import subprocess
 import sys
 import threading
 import time
@@ -63,6 +62,7 @@ from audapack.config import (
 )
 from audapack.inaudit_capture import InauditCaptureError, store_for_config
 from audapack.packing import find_archive_for_project, resolve_output_dir
+from audapack.procutil import run_hidden
 from audapack.projects import ProjectRegistry, RegistrySaveError
 
 logger = logging.getLogger("audapack.bridge")
@@ -77,15 +77,38 @@ BROWSER_WORKER_PROTOCOL_VERSION = SUPPORTED_BROWSER_WIDGET_VERSION
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+_BUILD_IDENTITY: Optional[tuple[str, str]] = None
+_BUILD_IDENTITY_LOCK = threading.Lock()
+
+
 def _get_build_identity() -> tuple[str, str]:
-    """Return (build_id, source_revision) from git or fallback."""
+    """Return (build_id, source_revision) from git or fallback.
+
+    Computed once per process. It is the identity of the RUNNING build, which
+    cannot change without restarting this daemon, and it was being recomputed
+    on every /health and /v1/status request: two `git` spawns each, four per
+    poll cycle, against a GUI that polls every 4s while an audit is unsettled.
+    On Windows that is a console window flashing on the operator's screen
+    roughly twice a second for the length of every audit -- the "endless
+    windows" complaint -- plus a pointless process storm underneath it.
+    """
+    global _BUILD_IDENTITY
+    if _BUILD_IDENTITY is not None:
+        return _BUILD_IDENTITY
+    with _BUILD_IDENTITY_LOCK:
+        if _BUILD_IDENTITY is None:
+            _BUILD_IDENTITY = _read_build_identity()
+        return _BUILD_IDENTITY
+
+
+def _read_build_identity() -> tuple[str, str]:
     try:
-        rev = subprocess.run(
+        rev = run_hidden(
             ["git", "rev-parse", "--short=12", "HEAD"],
             capture_output=True, text=True, timeout=5,
             cwd=_REPO_ROOT,
         ).stdout.strip()
-        dirty = subprocess.run(
+        dirty = run_hidden(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, timeout=5,
             cwd=_REPO_ROOT,
@@ -102,12 +125,27 @@ def _get_build_identity() -> tuple[str, str]:
     return build_id, source_revision
 
 
+_WIDGET_BUNDLE_CACHE: dict[tuple[str, int, int], tuple[str, str]] = {}
+
+
 def _get_widget_bundle_info() -> tuple[str, str]:
-    """Return (widget_bundle_version, widget_bundle_sha256_prefix16)."""
+    """Return (widget_bundle_version, widget_bundle_sha256_prefix16).
+
+    Keyed on the bundled file's (path, mtime, size): re-hashing 800 KB on every
+    /health and /v1/status request bought nothing, and those endpoints are
+    polled every few seconds while an audit runs.
+    """
     path = get_bundled_widget_path()
     widget_version = ""
     sha256 = ""
     if path and path.exists():
+        try:
+            stat = path.stat()
+            key = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        if key is not None and key in _WIDGET_BUNDLE_CACHE:
+            return _WIDGET_BUNDLE_CACHE[key]
         data = path.read_bytes()
         sha256 = hashlib.sha256(data).hexdigest()[:16]
         for line in data.decode("utf-8", errors="replace").splitlines():
@@ -117,6 +155,9 @@ def _get_widget_bundle_info() -> tuple[str, str]:
                 if len(parts) >= 3:
                     widget_version = parts[2]
                 break
+        if key is not None:
+            _WIDGET_BUNDLE_CACHE.clear()
+            _WIDGET_BUNDLE_CACHE[key] = (widget_version, sha256)
     return widget_version, sha256
 
 # Global callback for notifying UI of new audits or auto-registered projects

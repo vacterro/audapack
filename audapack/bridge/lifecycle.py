@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from audapack.config import AppConfig, app_dir, get_bridge_runtime_dir, load_config
+from audapack.procutil import run_hidden
 
 PID_FILE_NAME = "bridge.pid"
 INSTANCE_NONCE = uuid.uuid4().hex
@@ -183,7 +184,7 @@ def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
             return False, "Refusing fallback kill: PID/Bridge identity cannot be verified."
         try:
             if sys.platform == "win32":
-                result = subprocess.run(
+                result = run_hidden(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True,

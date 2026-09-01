@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-09-01
+
+### Fixed
+- Launching a Chromium worker no longer flashes a black console window that steals focus: `detect_installed_browsers()` ran bare `powershell` on every launch, and each windowless AUDAPACK process (pythonw GUI, Bridge daemon) made Windows allocate a new console. All console-tool spawns (powershell, schtasks, wmic, taskkill, git, browser Popen) now go through `audapack/procutil.py` (`CREATE_NO_WINDOW` + `STARTF_USESHOWWINDOW/SW_HIDE`), extending the P0-1 autostart pattern to the whole worker-launch chain.
+- The Bridge no longer spawns a process storm behind its own status endpoints: `/health` and `/v1/status` recomputed the git build identity on every request (two `git` spawns each, four per GUI poll cycle, roughly twice a second while an audit is unsettled) and re-hashed the 800 KB widget bundle alongside it. Build identity is now computed once per process and the bundle digest is cached on (mtime, size). This was the actual source of the endless flashing windows during an audit; hiding the console only hid the symptom.
+- Managed Chromium workers no longer land or work inside ChatGPT's new **Work** surface (widget 0.0.28): the Work composer ("Work on anything") is detected, `clean_for_audit` is refused while it is active (`worker-in-work-mode` claim block), and the 30 s housekeeping watchdog clicks the exact Chat control to return the window to the normal chat on its own, logging `worker_work_mode_switched` / `worker_work_mode_blocked` diagnostics. A window owning a dispatch is never touched.
+
 ## [0.2.2] - 2026-08-31
 
 ### Fixed

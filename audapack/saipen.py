@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 from audapack.models import SaipenInfo
+from audapack.procutil import run_hidden
 
 
 def detect_saipen_root(project_path: str | Path) -> Optional[Path]:
@@ -72,35 +72,32 @@ def inspect_git_status(project_path: Path) -> dict[str, Any]:
 
     try:
         # Branch
-        proc_br = subprocess.run(
+        proc_br = run_hidden(
             ["git", "-C", str(project_path), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
             timeout=2,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
         if proc_br.returncode == 0:
             result["git_available"] = True
             result["branch"] = proc_br.stdout.strip()
 
         # HEAD commit
-        proc_head = subprocess.run(
+        proc_head = run_hidden(
             ["git", "-C", str(project_path), "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
             timeout=2,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
         if proc_head.returncode == 0:
             result["head"] = proc_head.stdout.strip()
 
         # Status
-        proc_st = subprocess.run(
+        proc_st = run_hidden(
             ["git", "-C", str(project_path), "status", "--porcelain=v1"],
             capture_output=True,
             text=True,
             timeout=3,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
         if proc_st.returncode == 0:
             lines = proc_st.stdout.splitlines()

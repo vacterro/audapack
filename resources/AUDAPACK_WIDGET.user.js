@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.27
+// @version      0.0.28
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -9514,6 +9514,54 @@ ordinal/name of the entrypoint file.`;
     );
   }
 
+  function chatGPTWorkSurfaceActive() {
+    // ChatGPT's Work surface replaced the plain chat landing on `/` for some
+    // accounts: the composer greets with "Work on anything" instead of the
+    // chat placeholder. A managed worker parked there looks CLEAN (no turns,
+    // empty composer) but every send would burn Work usage instead of running
+    // the audit, so the composer must be switched back to Chat first.
+    if (detectSite().key !== 'chatgpt' || location.pathname !== '/') return false;
+    const input = rawChatGPTComposerInput();
+    if (input) {
+      const markers = [
+        input.getAttribute('placeholder'),
+        input.getAttribute('data-placeholder'),
+        input.getAttribute('aria-label')
+      ];
+      if (markers.some(value => /^work\b/i.test(String(value || '').trim()))) return true;
+    }
+    const pageText = cleanTurnText(String(document.body?.innerText || '')).slice(0, 7000);
+    return /meet chatgpt work/i.test(pageText);
+  }
+
+  function chatGPTWorkModeSwitchControl() {
+    // The Chat option of the Chat/Work toggle. Named controls only: a button
+    // that merely CONTAINS the word "chat" (e.g. "New chat" in the sidebar)
+    // must never be clicked -- only an exact accessible name qualifies.
+    const scope = chatGPTComposerRoot() || document.body;
+    const candidates = scope.querySelectorAll(
+      '[role="radio"], [role="tab"], [role="menuitemradio"], [role="option"], [role="switch"], button, a'
+    );
+    for (const node of candidates) {
+      if (!isVisible(node)) continue;
+      if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+      const raw = String(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
+      const name = cleanTurnText(raw).replace(/\s+(mode|режим)$/i, '').trim().toLowerCase();
+      if (name !== 'chat' && name !== 'чат') continue;
+      return node;
+    }
+    return null;
+  }
+
+  function chatGPTEnsureChatMode() {
+    if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'already-chat' };
+    const control = chatGPTWorkModeSwitchControl();
+    if (!control) return { ok: false, action: 'no-switch-control' };
+    dispatchElementClick(control);
+    if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'switched' };
+    return { ok: false, action: 'switch-refused' };
+  }
+
   function rememberStableConversationKey(key) {
     if (!/^c:[^:]+/i.test(String(key || ''))) return false;
     try {
@@ -17531,6 +17579,7 @@ async function recoverArmedStartSend(options = {}) {
       // a window whose polling stopped is exactly the window that ends up
       // pinned DIRTY with an abandoned prompt and never recovers.
       setInterval(() => {
+        try { browserWorkerEnsureChatModeHousekeeping(); } catch (_) { }
         try { browserWorkerRecycleWatchdog(); } catch (_) { }
       }, 30000);
     }
@@ -17720,7 +17769,8 @@ let browserWorkerBraveConfirmed = false;
     const turns = getChatGPTTurns ? getChatGPTTurns() : [];
     const hasConversationTurns = Boolean(turns && turns.length > 0);
     const managedIdentity = browserWorkerManagedIdentity();
-    const cleanForAudit = pageEligible && !hasConversationTurns && !Boolean(draft.trim()) &&
+    const workSurface = chatGPTWorkSurfaceActive();
+    const cleanForAudit = pageEligible && !workSurface && !hasConversationTurns && !Boolean(draft.trim()) &&
       !Boolean(attachment?.count) && !chatGPTIsGenerating() &&
       !auditStartIsLive() && !auditActionIsLive() && !active &&
       !Boolean(autoRuntime?.runId) && !Boolean(lease);
@@ -17741,6 +17791,7 @@ let browserWorkerBraveConfirmed = false;
       is_chromium: isChromium,
       brave_confirmed: browserWorkerBraveConfirmed,
       page_eligible: pageEligible,
+      work_surface: workSurface,
       project_name: String(autoRuntime?.projectName || lease?.project_name || ''),
       profile: String(autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3'),
       campaign_run_id: String(autoRuntime?.runId || lease?.campaign_run_id || ''),
@@ -17765,6 +17816,7 @@ let browserWorkerBraveConfirmed = false;
     const snap = browserWorkerSnapshot();
     if (!snap.is_chromium) return 'worker-not-chromium';
     if (!snap.page_eligible) return 'worker-not-on-root-chat';
+    if (snap.work_surface) return 'worker-in-work-mode';
     if (detectSite().key !== 'chatgpt') return 'worker-not-on-chatgpt';
     if (snap.generating) return 'worker-generating';
     if (snap.has_conversation_turns) return 'worker-has-conversation';
@@ -17780,7 +17832,8 @@ let browserWorkerBraveConfirmed = false;
 
   function browserWorkerCanClaim() {
     const snap = browserWorkerSnapshot();
-    return snap.is_chromium && snap.page_eligible && detectSite().key === 'chatgpt' &&
+    return snap.is_chromium && snap.page_eligible && !snap.work_surface &&
+      detectSite().key === 'chatgpt' &&
       !snap.generating && !snap.has_manual_draft && !snap.has_attachments &&
       !snap.audit_start_in_flight && !snap.action_in_flight &&
       !snap.campaign_run_id && snap.state === 'FREE' &&
@@ -18228,6 +18281,33 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     return true;
   }
 
+  let browserWorkerWorkModeReportedAt = 0;
+
+  function browserWorkerEnsureChatModeHousekeeping() {
+    // Self-heal the Work landing: a managed window whose composer came up in
+    // Work mode must return to the normal chat on its own. While it owns a
+    // dispatch its composer is never touched.
+    if (!browserWorkerManagedIdentity()?.slot) return false;
+    if (browserWorkerLease?.dispatch_id) return false;
+    if (!chatGPTWorkSurfaceActive()) return false;
+    const outcome = chatGPTEnsureChatMode();
+    const now = Date.now();
+    if (outcome.ok) {
+      browserWorkerWorkModeReportedAt = 0;
+      appendBridgeDiagnostic('worker_work_mode_switched', {
+        severity: 'info',
+        message: `ChatGPT Work composer was active; returned the worker to the normal chat (${String(outcome.action || 'switched')})`
+      });
+    } else if (now - browserWorkerWorkModeReportedAt > 300000) {
+      browserWorkerWorkModeReportedAt = now;
+      appendBridgeDiagnostic('worker_work_mode_blocked', {
+        severity: 'info',
+        message: `worker is on the ChatGPT Work surface and could not switch back to chat (${String(outcome.action || 'unknown')}); the lane stays OCCUPIED until the composer is switched to Chat manually`
+      });
+    }
+    return outcome.ok;
+  }
+
   function browserWorkerRecycleWatchdog() {
     // Every soft block reason is individually defensible and collectively they
     // were able to pin a window as permanently DIRTY: the operator saw a clean
@@ -18672,6 +18752,9 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerStandDownIfOrphanedStart,
          browserWorkerRecycleWatchdog,
          browserWorkerClearAbandonedDraft,
+         chatGPTWorkSurfaceActive,
+         chatGPTEnsureChatMode,
+         browserWorkerEnsureChatModeHousekeeping,
          composerStateOwnedBySameWrite,
          setBrowserWorkerDirtySinceForTest: value => { browserWorkerDirtySince = Number(value || 0); },
          browserWorkerClaimBlockReason,

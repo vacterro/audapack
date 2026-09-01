@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from audapack.config import app_dir
+from audapack.procutil import run_hidden
 
 TASK_NAME = "AUDAPACK Bridge"
 
@@ -26,13 +27,7 @@ def _run_hidden(args: list[str], **kw) -> subprocess.CompletedProcess:
     kwargs.setdefault("text", True)
     kwargs.setdefault("encoding", "utf-8")
     kwargs.setdefault("errors", "replace")
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs["startupinfo"] = si
-        kwargs["creationflags"] = _HIDDEN
-    return subprocess.run(args, **kwargs)
+    return run_hidden(args, **kwargs)
 
 
 def get_pythonw_executable() -> Path:
