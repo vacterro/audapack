@@ -240,6 +240,66 @@ def test_state_mapping_keeps_wave_progress_visible(tmp_path):
     assert run.summary == "AUDIT 1/3"
 
 
+def test_old_campaign_progress_never_leaks_into_new_queued_run(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    audits.snapshots["p1"] = AuditSnapshot(
+        project_id="p1", project_name="Project p1", campaign_run_id="old-run",
+        completed_waves=3, total_waves=3, campaign_complete=True,
+    )
+    service.start("p1")
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "WAITING"
+    assert run.completed_waves == 0, "new run must not inherit old 3/3"
+    assert run.summary == "WAITING FOR WORKER · 0/3"
+
+
+def test_old_campaign_progress_never_leaks_into_new_auditing_run(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    audits.snapshots["p1"] = AuditSnapshot(
+        project_id="p1", project_name="Project p1", campaign_run_id="old-run",
+        completed_waves=3, total_waves=3, campaign_complete=True,
+    )
+    service.start("p1")
+    bridge.jobs[0].update({"state": "AUDITING", "campaign_run_id": "new-run"})
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "AUDITING"
+    assert run.completed_waves == 0, "new-run progress must be 0 until its own waves save"
+    assert run.summary == "AUDIT 0/3"
+
+
+def test_first_matching_new_wave_saved_advances_progress(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1")
+    bridge.jobs[0].update({"state": "AUDITING", "campaign_run_id": "new-run"})
+    audits.snapshots["p1"] = AuditSnapshot(
+        project_id="p1", project_name="Project p1", campaign_run_id="new-run",
+        completed_waves=1, total_waves=3,
+    )
+    run = service.refresh_runs()[0]
+    assert run.completed_waves == 1
+    assert run.summary == "AUDIT 1/3"
+
+
+def test_ready_proof_still_requires_matching_campaign(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    handoff = tmp_path / "final.md"
+    handoff.write_text("durable", encoding="utf-8")
+    digest = hashlib.sha256(handoff.read_bytes()).hexdigest()
+    service.start("p1")
+    bridge.jobs[0].update({
+        "state": "COMPLETE", "campaign_run_id": "new-run",
+        "final_handoff_path": str(handoff), "final_handoff_sha256": digest,
+    })
+    audits.snapshots["p1"] = AuditSnapshot(
+        project_id="p1", project_name="Project p1", campaign_run_id="old-run",
+        completed_waves=3, total_waves=3, campaign_complete=True,
+        final_handoff_ready=True, final_handoff_path=handoff, final_handoff_sha256=digest,
+    )
+    run = service.refresh_runs()[0]
+    assert not run.ready, "old-run result must never satisfy new-run READY proof"
+    assert run.operator_state == "SAVING"
+
+
 def test_prestart_cancel_and_poststart_refusal_are_honest(tmp_path):
     service, bridge, _audits = coordinator(tmp_path)
     started = service.start("p1")
@@ -352,7 +412,7 @@ def test_duplicate_double_start_returns_same_dispatch_and_intent(tmp_path):
 def test_wave_progress_never_increments_on_bridge_persistence_failure(tmp_path):
     service, bridge, audits = coordinator(tmp_path)
     service.start("p1")
-    bridge.jobs[0].update({"state": "AUDITING"})
+    bridge.jobs[0].update({"state": "AUDITING", "campaign_run_id": "run-1"})
     audits.snapshots["p1"] = AuditSnapshot(
         project_id="p1", project_name="Project p1", campaign_run_id="run-1",
         completed_waves=2, total_waves=3,
@@ -427,3 +487,216 @@ def test_abandon_refusal_is_reported_honestly(tmp_path):
     assert not refused.ok and refused.state == "BLOCKED"
     assert "bridge offline" in refused.message
     assert bridge.jobs[0]["state"] == "BLOCKED", "a refused abandon must not mutate the run"
+
+
+def test_pre_start_block_frees_the_project_lane_for_the_next_start(tmp_path):
+    """A pre-start BLOCKED run must never jam the project forever.
+
+    Live evidence: three intents sat at status=RUNNING with
+    error=canonical-start-rejected while their dispatch was BLOCKED, so the
+    Project Room showed `BLOCKED PRE 0/3 1d21h` and every later START was
+    refused as a duplicate.
+    """
+    service, bridge, _audits = coordinator(tmp_path)
+    first = service.start("p1")
+    assert first.ok and first.state == "QUEUED"
+
+    job = next(item for item in bridge.jobs if item["dispatch_id"] == first.dispatch_id)
+    job["state"] = "BLOCKED"
+    job["error"] = "canonical-start-rejected: START AUDITING is not ready"
+
+    runs = service.refresh_runs(["p1"])
+    assert runs[0].operator_state == "BLOCKED_PRE_START"
+    saved = json.loads((tmp_path / "audit_start_intents.json").read_text(encoding="utf-8"))
+    assert saved["intents"][0]["status"] == "BLOCKED"
+
+    second = service.start("p1")
+    assert second.ok and not second.duplicate
+    assert second.state == "QUEUED"
+    assert second.dispatch_id != first.dispatch_id
+    assert bridge.submits == 2
+    assert job["state"] == "CANCELLED"
+
+
+def test_post_start_block_still_belongs_to_the_operator(tmp_path):
+    """A block that already committed a START receipt is never auto-swept."""
+    service, bridge, _audits = coordinator(tmp_path)
+    first = service.start("p1")
+    job = next(item for item in bridge.jobs if item["dispatch_id"] == first.dispatch_id)
+    job["state"] = "BLOCKED"
+    job["error"] = "clean-state-lost"
+    job["start_receipt"] = "startcore-abc123"
+    job["campaign_run_id"] = "run-abc123"
+
+    runs = service.refresh_runs(["p1"])
+    assert runs[0].operator_state == "BLOCKED_POST_START"
+    saved = json.loads((tmp_path / "audit_start_intents.json").read_text(encoding="utf-8"))
+    assert saved["intents"][0]["status"] == "RECOVERY_NEEDED"
+
+    second = service.start("p1")
+    assert second.duplicate
+    assert bridge.submits == 1
+    assert job["state"] == "BLOCKED"
+
+
+def test_blocked_summary_always_carries_a_next_step(tmp_path):
+    from audapack.services.audit_run_service import blocked_guidance
+
+    service, bridge, _audits = coordinator(tmp_path)
+    started = service.start("p1")
+    job = next(item for item in bridge.jobs if item["dispatch_id"] == started.dispatch_id)
+    job["state"] = "BLOCKED"
+    job["error"] = "pre-start retries exhausted: artifact-http-400:missing_archive"
+
+    run = service.refresh_runs(["p1"])[0]
+    assert run.operator_state == "BLOCKED_PRE_START"
+    assert "NEXT:" in run.summary
+    assert "PACK the project again" in run.summary
+
+    why, action = blocked_guidance("clean-state-lost", True)
+    assert "stopped being clean" in why
+    assert "FORCE UNBLOCK" in action
+
+    unknown_why, unknown_action = blocked_guidance("", False)
+    assert unknown_why
+    assert "START AUDIT" in unknown_action
+
+
+def test_repeated_starts_never_open_more_windows_than_lanes(tmp_path):
+    """A launched window is invisible until it registers.
+
+    Counting only registered workers is how repeated START presses opened a 7th
+    and 8th Chromium window while the dispatcher still reported free capacity.
+    """
+    from audapack.services.audit_run_service import MAX_AUDIT_LANES
+
+    launches = []
+
+    def launch(slot, generation):
+        launches.append((slot, generation))
+        return True, f"started slot {slot}"
+
+    supervisor = ManagedWorkerSupervisor(
+        launch,
+        path=tmp_path / "managed_browser_workers.json",
+        cooldown_seconds=1.0,
+    )
+
+    # Nothing ever registers: every pass sees active_workers 0.
+    dispatch = {"active_workers": 0, "workers": []}
+    for _ in range(12):
+        supervisor.ensure_capacity(dispatch, MAX_AUDIT_LANES)
+
+    assert len(launches) == MAX_AUDIT_LANES, launches
+    assert sorted(slot for slot, _ in launches) == list(range(1, MAX_AUDIT_LANES + 1))
+
+
+def test_a_pending_window_is_not_relaunched_while_it_boots(tmp_path):
+    launches = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append(slot), (True, "started"))[1],
+        path=tmp_path / "managed_browser_workers.json",
+        cooldown_seconds=1.0,
+    )
+    dispatch = {"active_workers": 0, "workers": []}
+
+    supervisor.ensure_capacity(dispatch, 1)
+    assert launches == [1]
+
+    # The cooldown is short, but the window is still booting.
+    supervisor.ensure_capacity(dispatch, 1)
+    supervisor.ensure_capacity(dispatch, 1)
+    assert launches == [1]
+
+    saved = json.loads((tmp_path / "managed_browser_workers.json").read_text(encoding="utf-8"))
+    assert saved["slots"]["1"]["state"] == "LAUNCHING"
+
+
+def test_reset_all_clears_a_jammed_board_in_one_action(tmp_path):
+    """Resetting lane by lane is busywork, and Cancel refuses a BLOCKED run."""
+    projects = [project("p1"), project("p2"), project("p3")]
+    service, bridge, _audits = coordinator(tmp_path, projects=projects)
+
+    queued = service.start("p1")
+    pre_blocked = service.start("p2")
+    post_blocked = service.start("p3")
+
+    pre_job = next(j for j in bridge.jobs if j["dispatch_id"] == pre_blocked.dispatch_id)
+    pre_job["state"] = "BLOCKED"
+    pre_job["error"] = "canonical-start-rejected"
+
+    post_job = next(j for j in bridge.jobs if j["dispatch_id"] == post_blocked.dispatch_id)
+    post_job["state"] = "BLOCKED"
+    post_job["error"] = "clean-state-lost"
+    post_job["start_receipt"] = "startcore-live"
+    post_job["campaign_run_id"] = "run-live"
+
+    result = service.reset_all()
+
+    assert result["failed"] == []
+    assert result["total"] == 3
+    assert sorted(result["cancelled"]) == ["Project p1", "Project p2"]
+    assert result["unblocked"] == ["Project p3"]
+
+    states = {job["dispatch_id"]: job["state"] for job in bridge.jobs}
+    assert states[queued.dispatch_id] == "CANCELLED"
+    assert states[pre_blocked.dispatch_id] == "CANCELLED"
+    assert states[post_blocked.dispatch_id] == "FAILED"
+
+    # Every project is free for a fresh START immediately afterwards.
+    again = service.start("p3")
+    assert again.ok and not again.duplicate
+
+
+def test_reset_all_leaves_finished_runs_alone(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = service.start("p1")
+    job = next(j for j in bridge.jobs if j["dispatch_id"] == started.dispatch_id)
+    job["state"] = "CANCELLED"
+
+    result = service.reset_all()
+    assert result["total"] == 0
+    assert job["state"] == "CANCELLED"
+
+
+def test_a_slot_whose_window_never_registers_is_not_relaunched_forever(tmp_path):
+    """A window that never registers is still a real window on screen.
+
+    Relaunching its slot once the boot grace lapsed is how a 7th window appeared
+    while six were already open.
+    """
+    from audapack.services.audit_run_service import (
+        MAX_AUDIT_LANES,
+        WORKER_LAUNCH_BOOT_GRACE_SECONDS,
+        WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT,
+    )
+
+    launches = []
+    path = tmp_path / "managed_browser_workers.json"
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append(slot), (True, "started"))[1],
+        path=path,
+        cooldown_seconds=1.0,
+    )
+    dispatch = {"active_workers": 0, "workers": []}
+
+    # Nothing ever registers. Age the slots past the boot grace between passes.
+    for _ in range(6):
+        supervisor.ensure_capacity(dispatch, MAX_AUDIT_LANES)
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        for slot_state in doc["slots"].values():
+            slot_state["launched_at"] = 0.0
+            slot_state["cooldown_until"] = 0.0
+        path.write_text(json.dumps(doc), encoding="utf-8")
+
+    assert len(launches) <= MAX_AUDIT_LANES * WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT
+    per_slot = {slot: launches.count(slot) for slot in set(launches)}
+    assert max(per_slot.values()) <= WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT, per_slot
+
+    # And once a slot registers, its budget is honestly restored.
+    workers = [{"managed_slot": 1, "managed_generation": 1, "last_seen_at": 123.0}]
+    supervisor.ensure_capacity({"active_workers": 1, "workers": workers}, 1)
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["slots"]["1"]["state"] == "HEARTBEAT"
+    assert doc["slots"]["1"]["launch_attempts"] == 0
+    assert WORKER_LAUNCH_BOOT_GRACE_SECONDS > 0

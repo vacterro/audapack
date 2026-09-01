@@ -692,7 +692,19 @@ class ProjectItemDelegate(QStyledItemDelegate):
             if dispatch_state:
                 lines.append(f"  State: {dispatch_state}")
             if dispatch_error:
-                lines.append(f"  <font color='#FF8866'>Error: {dispatch_error[:120]}</font>")
+                lines.append(f"  <font color='#FF8866'>Error: {dispatch_error[:160]}</font>")
+            if dispatch_state == "BLOCKED":
+                # A BLOCKED run with no readable next step is the whole
+                # complaint: the operator sees a red badge and nothing else.
+                from audapack.services.audit_run_service import blocked_guidance
+                post_start = bool(
+                    str(dispatch.get("recovery_state") or "") in {"START_PREPARED", "STARTED", "AUDITING", "FINALIZING"}
+                    or dispatch.get("start_receipt")
+                    or dispatch.get("campaign_run_id")
+                )
+                why, action = blocked_guidance(dispatch_error, post_start)
+                lines.append(f"  <font color='#D4C89A'>Why: {why}</font>")
+                lines.append(f"  <font color='#FFD700'>Next: {action}</font>")
             if dispatch_updated:
                 try:
                     from datetime import datetime as _dt

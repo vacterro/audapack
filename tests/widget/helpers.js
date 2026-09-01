@@ -2,8 +2,8 @@
 
 const { createHarness, FakeEvent } = require('./harness');
 
-function setup() {
-  const h = createHarness();
+function setup(options = {}) {
+  const h = createHarness(options);
   const api = h.load();
   if (h.loadError) throw h.loadError;
   return { h, api };

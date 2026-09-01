@@ -614,7 +614,7 @@ class FakeTimers {
 // Harness factory
 // ---------------------------------------------------------------------------
 
-function createHarness() {
+function createHarness(options = {}) {
   Object.assign(counters, { rectReads: 0, cdp: 0, qsa: 0, innerTextReads: 0, gmGet: 0, gmSet: 0 });
   const timers = new FakeTimers();
   const gmStore = new Map();
@@ -623,7 +623,20 @@ function createHarness() {
   const observers = new Set();
 
   const document = new FakeDocument(null);
-  const location = { hostname: 'chatgpt.com', host: 'chatgpt.com', href: 'https://chatgpt.com/c/abc123', pathname: '/c/abc123', search: '', protocol: 'https:' };
+  const location = {
+    hostname: 'chatgpt.com',
+    host: 'chatgpt.com',
+    href: 'https://chatgpt.com/c/abc123',
+    pathname: '/c/abc123',
+    search: '',
+    protocol: 'https:',
+    origin: 'https://chatgpt.com',
+    assigned: [],
+    reloaded: 0,
+    assign(url) { this.assigned.push(String(url)); },
+    reload() { this.reloaded += 1; },
+    ...(options.location || {})
+  };
 
   const windowObj = {
     _listeners: new Map(),
@@ -679,7 +692,7 @@ function createHarness() {
     platform: 'test',
     brave: { isBrave: () => Promise.resolve(true) }
   };
-  const harness = { timers, gmStore, sessionStore, localStore, _observers: observers, api: null, dom: document, location, navigator: navigatorObj, counters, window: windowObj };
+  const harness = { httpRequests: [], httpResponder: null, timers, gmStore, sessionStore, localStore, _observers: observers, api: null, dom: document, location, navigator: navigatorObj, counters, window: windowObj };
   document._harness = harness;
 
   const sandbox = {
@@ -725,6 +738,18 @@ function createHarness() {
     GM_unregisterMenuCommand: () => {},
     GM_openInTab: () => {},
     GM_notification: () => {},
+    GM_xmlhttpRequest: options => {
+      harness.httpRequests.push(options);
+      const respond = harness.httpResponder
+        ? harness.httpResponder(options)
+        : { status: 200, responseText: JSON.stringify({ ok: true }) };
+      timers.setTimeout(() => {
+        if (respond && respond.error && options.onerror) return options.onerror(respond);
+        if (respond && respond.timeout && options.ontimeout) return options.ontimeout(respond);
+        if (options.onload) options.onload(respond);
+      }, 0);
+      return { abort() {} };
+    },
     sessionStorage: {
       getItem: key => (sessionStore.has(key) ? sessionStore.get(key) : null),
       setItem: (key, value) => { sessionStore.set(key, String(value)); },

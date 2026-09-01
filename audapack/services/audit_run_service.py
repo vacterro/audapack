@@ -23,6 +23,16 @@ from audapack.models import AuditSnapshot
 MAX_AUDIT_LANES = 6
 RUN_HISTORY_BOUND = 100
 WORKER_LAUNCH_COOLDOWN_SECONDS = 20.0
+#: A launched Chromium window needs this long to boot, load ChatGPT and
+#: register. Until it does it is invisible to the dispatcher, and counting
+#: only registered workers is how repeated START presses opened a 7th and 8th
+#: window: every call saw the same "free" capacity and launched again.
+WORKER_LAUNCH_BOOT_GRACE_SECONDS = 120.0
+#: A window that never registers is still a real window on the operator's
+#: screen. Relaunching its slot once the boot grace lapsed is how a 7th
+#: window appeared while six were already open, so a slot that has been
+#: launched this many times without ever registering is left alone.
+WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT = 2
 
 ACTIVE_DISPATCH_STATES = {
     "QUEUED", "RETRYABLE", "LEASED", "ARTIFACT_FETCHED", "ATTACHED",
@@ -224,11 +234,22 @@ class ManagedWorkerSupervisor:
                 and 1 <= int(worker.get("managed_slot")) <= MAX_AUDIT_LANES
             }
             active_workers = int(dispatch.get("active_workers", len(workers)) or 0)
+            # A window that was launched but has not registered yet still
+            # occupies its slot and one lane.
+            pending = {
+                int(slot_id)
+                for slot_id, slot_state in doc["slots"].items()
+                if str(slot_id).isdigit()
+                and int(slot_id) not in registered
+                and str(slot_state.get("state")) == "LAUNCHING"
+                and now - float(slot_state.get("launched_at", 0.0) or 0.0) < WORKER_LAUNCH_BOOT_GRACE_SECONDS
+            }
             launched: list[dict[str, Any]] = []
             for slot in range(1, desired + 1):
                 if slot in registered:
                     doc["slots"][str(slot)] = {
                         "state": "HEARTBEAT",
+                        "launch_attempts": 0,
                         "last_seen_at": max(
                             float(worker.get("last_seen_at", 0.0) or 0.0)
                             for worker in workers
@@ -238,16 +259,24 @@ class ManagedWorkerSupervisor:
                         "cooldown_until": 0.0,
                     }
                     continue
+                if slot in pending:
+                    continue
                 slot_state = doc["slots"].get(str(slot), {})
+                attempts = int(slot_state.get("launch_attempts", 0) or 0)
+                if attempts >= WORKER_LAUNCH_MAX_ATTEMPTS_PER_SLOT and str(slot_state.get("state")) != "HEARTBEAT":
+                    # Its window is presumably still open and simply not
+                    # registering; opening another one only adds clutter.
+                    continue
                 if now < float(slot_state.get("cooldown_until", 0.0) or 0.0):
                     continue
-                if active_workers + len(launched) >= MAX_AUDIT_LANES:
+                if active_workers + len(pending) + len(launched) >= MAX_AUDIT_LANES:
                     break
                 ok, message = self.launch_worker(slot, generation)
                 doc["slots"][str(slot)] = {
                     "state": "LAUNCHING" if ok else "LAUNCH_FAILED",
+                    "launch_attempts": attempts + 1,
                     "launched_at": now,
-                    "cooldown_until": now + self.cooldown_seconds,
+                    "cooldown_until": now + (WORKER_LAUNCH_BOOT_GRACE_SECONDS if ok else self.cooldown_seconds),
                     "message": str(message)[:300],
                 }
                 launched.append({"slot": slot, "ok": bool(ok), "message": str(message)})
@@ -255,6 +284,78 @@ class ManagedWorkerSupervisor:
             doc["updated_at"] = now
             _atomic_write_json(self.path, doc)
         return {"desired": desired, "registered": len(registered), "launched": launched, "generation": generation}
+
+
+BLOCKED_REASONS: dict[str, tuple[str, str]] = {
+    "missing_archive": (
+        "The packed project ZIP is gone from disk.",
+        "PACK the project again, then press START AUDIT.",
+    ),
+    "changed_archive": (
+        "The packed ZIP changed after the run was queued, so its pinned size/SHA-256 no longer match.",
+        "Press START AUDIT again to bind a fresh run to the current archive.",
+    ),
+    "invalid_transition": (
+        "The worker asked for the ZIP after START was already prepared.",
+        "Press START AUDIT again; the stale run is released automatically.",
+    ),
+    "artifact-request-timeout": (
+        "The worker could not download the ZIP from the Bridge in time.",
+        "Check that the Bridge is running, then press START AUDIT again.",
+    ),
+    "file-injection-rejected": (
+        "ChatGPT refused the injected ZIP in the composer.",
+        "Open a fresh root ChatGPT tab in the AUDAPACK worker window, then press START AUDIT again.",
+    ),
+    "attachment-not-ready": (
+        "ChatGPT never finished uploading the ZIP. Very large archives are the usual cause.",
+        "Reduce the packed size or retry on a faster connection, then press START AUDIT again.",
+    ),
+    "canonical-start-rejected": (
+        "The widget attached the ZIP but its start engine refused to commit the START receipt.",
+        "Press START AUDIT again; the exact engine reason is appended to this error.",
+    ),
+    "clean-state-lost": (
+        "The ChatGPT tab stopped being clean right before Send, so the widget refused to overwrite it.",
+        "Leave the AUDAPACK worker window alone while it works, then press START AUDIT again.",
+    ),
+    "bridge-marked-blocked": (
+        "The Bridge marked this dispatch blocked during reconciliation.",
+        "Press START AUDIT again; use FORCE UNBLOCK if the run already sent its START.",
+    ),
+}
+
+
+def blocked_guidance(error: str, post_start: bool) -> tuple[str, str]:
+    """Turn a raw dispatch error into (what happened, what to do next).
+
+    Worker errors carry their detail inline (`artifact-http-400:missing_archive`,
+    `canonical-start-rejected: <engine reason>`), so both halves of the string
+    are tried before falling back to a generic answer. A BLOCKED run with no
+    readable next step is the exact complaint this exists to remove.
+    """
+    code = str(error or "").strip()
+    # Codes nest: `pre-start retries exhausted: artifact-http-400:missing_archive`
+    # carries the real cause in its last segment. Try every segment, most
+    # specific first, so wrapping never costs the operator the explanation.
+    segments = [part.strip() for part in code.split(":") if part.strip()]
+    aliases = [code, *reversed(segments)]
+    for alias in aliases:
+        if alias in BLOCKED_REASONS:
+            why, action = BLOCKED_REASONS[alias]
+            break
+    else:
+        why = code or "The Bridge returned BLOCKED without a reason code."
+        action = (
+            "Use FORCE UNBLOCK, then press START AUDIT again."
+            if post_start
+            else "Press START AUDIT again; the stale pre-start run is released automatically."
+        )
+    if post_start:
+        action = "This run may already own a real audit chat. " + (
+            "Use RECOVER to adopt it, or FORCE UNBLOCK to abandon it."
+        )
+    return why, action
 
 
 def _actions_for(operator_state: str) -> tuple[str, ...]:
@@ -305,21 +406,53 @@ class AuditRunCoordinator:
         else:
             self.workers = None
 
+    @staticmethod
+    def _is_post_start_block(job: dict[str, Any]) -> bool:
+        """True when a dispatch already committed something irreversible."""
+        return bool(
+            str(job.get("recovery_state") or "") in {"START_PREPARED", "STARTED", "AUDITING", "FINALIZING"}
+            or job.get("start_receipt")
+            or job.get("campaign_run_id")
+        )
+
+    def _release_pre_start_block(self, project_id: str) -> str:
+        """Free a project lane jammed by a pre-start BLOCKED dispatch.
+
+        A pre-start block committed nothing: no START receipt, no campaign id,
+        no audit turn in any chat. Leaving it non-terminal jams the project in
+        two places at once -- enqueue_job() answers `duplicate_dispatch` and
+        intents.begin() keeps the intent in RUNNING -- which is how a project
+        sits at `BLOCKED PRE-START` for days with no way forward but manual
+        Cancel. Sweep it to CANCELLED so the next START simply works.
+
+        A post-start block is never swept: that one may own a real audit in a
+        real chat and stays with the operator (RECOVER / ABANDON).
+        """
+        active = self.bridge.active_browser_job(str(project_id))
+        if not active or str(active.get("state")) != "BLOCKED":
+            return ""
+        if self._is_post_start_block(active):
+            return ""
+        dispatch_id = str(active.get("dispatch_id") or "")
+        if not dispatch_id:
+            return ""
+        if not self.bridge.cancel_browser_job(dispatch_id).get("ok"):
+            return ""
+        intent = self.intents.find_for_dispatch(dispatch_id)
+        if intent:
+            self.intents.update(str(intent["intent_id"]), status="CANCELLED")
+        return dispatch_id
+
     def start(self, project_id: str, profile_id: str = "quick3") -> AuditStartResult:
         project = self.projects.get_project(str(project_id))
         if project is None or not project.enabled or not project.source_path:
             return AuditStartResult(False, str(project_id), message="Project is missing, disabled, or has no source path")
+        self._release_pre_start_block(project.id)
         intent, created = self.intents.begin(project.id, project.display_name, profile_id)
         if not created:
             active = self.bridge.active_browser_job(project.id)
             if active:
-                recovery_state = str(active.get("recovery_state") or "")
-                post_start = bool(
-                    recovery_state in {"START_PREPARED", "STARTED", "AUDITING", "FINALIZING"}
-                    or active.get("start_receipt")
-                    or active.get("campaign_run_id")
-                )
-                if str(active.get("state")) == "BLOCKED" and not post_start:
+                if str(active.get("state")) == "BLOCKED" and not self._is_post_start_block(active):
                     cancelled = self.bridge.cancel_browser_job(str(active.get("dispatch_id") or ""))
                     if cancelled.get("ok"):
                         self.intents.update(str(intent["intent_id"]), status="CANCELLED")
@@ -384,6 +517,53 @@ class AuditRunCoordinator:
             self.intents.update(intent_id, status="FAILED", error=str(exc)[:500])
             return AuditStartResult(False, project.id, intent_id, state="FAILED", message=str(exc))
 
+    RESET_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED"})
+
+    def reset_all(self, project_ids: Optional[Iterable[str]] = None) -> dict[str, Any]:
+        """Clear every non-terminal run in one operator action.
+
+        Resetting a jammed board one lane at a time is busywork, and a pre-start
+        BLOCKED run refuses Cancel, so the operator had to know which button each
+        lane needed. This picks per lane: Cancel where cancellation is legal,
+        FORCE UNBLOCK where it is not.
+        """
+        cancelled: list[str] = []
+        unblocked: list[str] = []
+        failed: list[str] = []
+
+        for snapshot in self.refresh_runs(project_ids):
+            if snapshot.operator_state in self.RESET_SETTLED_STATES:
+                continue
+            label = snapshot.project_name or snapshot.project_id
+
+            if not snapshot.dispatch_id:
+                # An intent that never reached the Bridge is cleared directly.
+                if snapshot.intent_id:
+                    self.intents.update(snapshot.intent_id, status="CANCELLED")
+                    cancelled.append(label)
+                continue
+
+            post_start = snapshot.operator_state in {"BLOCKED_POST_START", "RECOVERY"}
+            if post_start:
+                result = self.abandon(snapshot.dispatch_id, "operator reset all audit runs")
+                (unblocked if result.ok else failed).append(label)
+                continue
+
+            result = self.cancel(snapshot.dispatch_id)
+            if result.ok:
+                cancelled.append(label)
+                continue
+            # Cancel refuses a BLOCKED dispatch; force it terminal instead.
+            forced = self.abandon(snapshot.dispatch_id, "operator reset all audit runs")
+            (unblocked if forced.ok else failed).append(label)
+
+        return {
+            "cancelled": cancelled,
+            "unblocked": unblocked,
+            "failed": failed,
+            "total": len(cancelled) + len(unblocked) + len(failed),
+        }
+
     def start_batch(self, project_ids: Iterable[str], profile_id: str = "quick3") -> list[AuditStartResult]:
         unique = list(dict.fromkeys(str(value) for value in project_ids if str(value)))[:MAX_AUDIT_LANES]
         return [self.start(project_id, profile_id) for project_id in unique]
@@ -421,6 +601,23 @@ class AuditRunCoordinator:
         if isinstance(error, dict):
             error = error.get("message") or error.get("code") or "Bridge refused abandon"
         return AuditStartResult(False, project_id, intent_id, str(dispatch_id), "BLOCKED", str(error))
+
+    @staticmethod
+    def audit_matches_dispatch(job: dict[str, Any], audit: Optional[AuditSnapshot]) -> bool:
+        """True only when the durable audit snapshot belongs to this dispatch lineage.
+
+        A new run must never display wave progress inherited from a previous
+        campaign_run_id. Before the dispatch establishes its own campaign
+        identity, no historical snapshot counts as current progress.
+        """
+        if audit is None:
+            return False
+        if str(audit.project_id) != str(job.get("project_id")):
+            return False
+        dispatch_run = str(job.get("campaign_run_id") or "")
+        if not dispatch_run:
+            return False
+        return dispatch_run == str(audit.campaign_run_id or "")
 
     @staticmethod
     def _ready_proof(job: dict[str, Any], audit: Optional[AuditSnapshot]) -> tuple[bool, tuple[str, ...], str, str]:
@@ -466,8 +663,9 @@ class AuditRunCoordinator:
     ) -> AuditRunSnapshot:
         state = str(job.get("state") or "")
         ready, proof, handoff_path, handoff_hash = self._ready_proof(job, audit)
-        completed = int(getattr(audit, "completed_waves", 0) or 0) if audit else 0
-        total = int(getattr(audit, "total_waves", 3) or 3) if audit else 3
+        matching = self.audit_matches_dispatch(job, audit)
+        completed = int(getattr(audit, "completed_waves", 0) or 0) if matching else 0
+        total = int(getattr(audit, "total_waves", 3) or 3) if matching and audit else 3
         mapping = {
             "QUEUED": "WAITING", "RETRYABLE": "RETRYING",
             "LEASED": "ATTACHING", "ARTIFACT_FETCHED": "ATTACHING", "ATTACHED": "ATTACHING",
@@ -498,7 +696,8 @@ class AuditRunCoordinator:
             summary = f"SAVING · {completed}/{total}"
         elif operator in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START"}:
             label = "BLOCKED PRE-START" if operator == "BLOCKED_PRE_START" else ("BLOCKED POST-START" if operator == "BLOCKED_POST_START" else "FAILED")
-            summary = f"{label}: {error or 'details required'}"
+            _why, _action = blocked_guidance(error, operator == "BLOCKED_POST_START")
+            summary = f"{label}: {error or 'no reason code'} · NEXT: {_action}"
         else:
             summary = f"{operator} · {completed}/{total}"
         intent_id = str((intent or {}).get("intent_id") or "")
@@ -606,6 +805,15 @@ class AuditRunCoordinator:
                     )
                 )
                 if intent_state == "RECOVERY":
+                    intent_state = "RECOVERY_NEEDED"
+                # A BLOCKED dispatch used to land here as "RUNNING" because
+                # BLOCKED is an ACTIVE_DISPATCH_STATE. The intent then stayed in
+                # ACTIVE_INTENT_STATES forever, so intents.begin() refused every
+                # later START for that project and the lane read as a live run
+                # that would never finish. Split the two real cases instead.
+                if snapshot.operator_state == "BLOCKED_PRE_START":
+                    intent_state = "BLOCKED"
+                elif snapshot.operator_state == "BLOCKED_POST_START":
                     intent_state = "RECOVERY_NEEDED"
                 self.intents.update(
                     str(intent["intent_id"]), status=intent_state,

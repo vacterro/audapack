@@ -545,6 +545,7 @@ class MainWindow(QMainWindow):
         self.audit_runs_widget.start_requested.connect(self._on_start_audit_project_id)
         self.audit_runs_widget.cancel_requested.connect(self._on_cancel_audit_dispatch_id)
         self.audit_runs_widget.abandon_requested.connect(self._on_abandon_audit_dispatch_id)
+        self.audit_runs_widget.reset_all_requested.connect(self._on_reset_all_audit_runs)
         self.audit_runs_widget.open_requested.connect(self._on_open_audit_result)
         self.audit_runs_widget.diagnostics_requested.connect(self._on_copy_audit_diagnostics)
 
@@ -673,8 +674,13 @@ QToolTip QLabel {
         self._generation_debounce.setInterval(100)
         self._generation_debounce.timeout.connect(self._on_check_bridge_generation)
         self._generation_watch_paths()
+        # While a run is live the operator must see it move. A flat 30 s poll
+        # made a working chain look dead: the state had already changed in the
+        # Bridge and the panel simply had not asked yet.
+        self.BRIDGE_POLL_ACTIVE_MS = 4000
+        self.BRIDGE_POLL_IDLE_MS = 30000
         self.bridge_timer = QTimer(self)
-        self.bridge_timer.setInterval(30000)
+        self.bridge_timer.setInterval(self.BRIDGE_POLL_IDLE_MS)
         self.bridge_timer.timeout.connect(self._on_check_bridge_generation)
         self.bridge_timer.timeout.connect(self._refresh_audit_runs_async)
         self.bridge_timer.start()
@@ -748,6 +754,19 @@ QToolTip QLabel {
         """Compatibility alias for the composite audit-run refresh."""
         self._refresh_audit_runs_async()
 
+    RUN_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED", "BLOCKED_PRE_START", "BLOCKED_POST_START"})
+
+    def _tune_bridge_poll_interval(self, runs) -> int:
+        """Poll fast while anything is actually moving, slowly when idle."""
+        live = any(
+            str(getattr(run, "operator_state", "")) not in self.RUN_SETTLED_STATES
+            for run in runs
+        )
+        target = self.BRIDGE_POLL_ACTIVE_MS if live else self.BRIDGE_POLL_IDLE_MS
+        if self.bridge_timer.interval() != target:
+            self.bridge_timer.setInterval(target)
+        return target
+
     def _refresh_audit_runs_async(self):
         """Refresh composite run state without blocking the Qt thread."""
         def _load():
@@ -768,6 +787,7 @@ QToolTip QLabel {
             for proj in self._service.list_projects():
                 self.model.update_audit_run_snapshot(proj.id, latest.get(proj.id))
             self.audit_runs_widget.set_runs(runs)
+            self._tune_bridge_poll_interval(runs)
             browser = status.get("browser", {}) if isinstance(status, dict) else {}
             if browser:
                 self.statusBar().showMessage(
@@ -1390,6 +1410,49 @@ QToolTip QLabel {
             self._flash_status(f"Cancel error: {err}", "#D66464")
 
         self.task_runner.submit(key, _cancel, on_success=_on_cancelled, on_error=_on_cancel_error)
+
+    def _on_reset_all_audit_runs(self):
+        """Clear every unfinished lane in one action after one confirmation."""
+        pending = [
+            snapshot for snapshot in self.audit_runs_widget._runs
+            if snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
+        ]
+        if not pending:
+            self._flash_status("No unfinished audit runs to reset.", "#D4A840")
+            return
+
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Reset all audit runs")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText(f"Clear {len(pending)} unfinished audit run(s)?")
+        confirm.setInformativeText(
+            "Runs that can be cancelled are cancelled; runs that refuse Cancel are "
+            "force-unblocked and marked terminally FAILED.",
+        )
+        confirm.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes)
+        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        self._flash_status("Resetting all audit runs...", "#D4A840")
+
+        def _reset():
+            return self._audit_runs.reset_all()
+
+        def _done(result):
+            cancelled = len(result.get("cancelled", []))
+            unblocked = len(result.get("unblocked", []))
+            failed = result.get("failed", [])
+            message = f"Audit runs reset: {cancelled} cancelled, {unblocked} force-unblocked"
+            if failed:
+                message += f", {len(failed)} could not be cleared ({', '.join(failed[:3])})"
+            self._flash_status(message, "#D66464" if failed else "#4A7A20")
+            self._refresh_audit_runs_async()
+
+        def _error(err):
+            self._flash_status(f"Reset all failed: {err}", "#D66464")
+
+        self.task_runner.submit("audit-runs-reset-all", _reset, on_success=_done, on_error=_error)
 
     def _on_abandon_audit_dispatch_id(self, dispatch_id: str):
         """Force a stuck BLOCKED run terminal after explicit operator confirmation."""

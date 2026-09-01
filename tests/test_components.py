@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from audapack.components.manager import ComponentManager
 from audapack.components.widget import get_bundled_widget_path, read_bundled_widget_metadata
@@ -82,8 +83,10 @@ class TestComponents(unittest.TestCase):
         ok, _message = launch_dedicated_chromium_worker(managed_slot=2, managed_generation=5)
         self.assertTrue(ok)
         target = launch.call_args.args[0]
-        self.assertIn("audapack_worker_slot=2", target)
-        self.assertIn("audapack_worker_generation=5", target)
+        query = parse_qs(urlsplit(target).query)
+        self.assertEqual(query["audapack_worker"], ["1"])
+        self.assertEqual(query["audapack_worker_slot"], ["2"])
+        self.assertEqual(query["audapack_worker_generation"], ["5"])
 
     @patch("audapack.components.manager.open_widget_in_dedicated_chromium")
     @patch("audapack.components.manager.is_bridge_healthy", return_value=True)

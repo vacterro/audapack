@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.05
+// @version      0.0.24
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -2354,6 +2354,28 @@ ordinal/name of the entrypoint file.`;
   let fileInput = null;
   let pendingAction = null;
   let actionInFlight = false;
+  let actionInFlightSince = 0;
+  // A start/action flag that never comes down makes this tab report
+  // audit_start_in_flight/action_in_flight forever: the Bridge then sees the
+  // worker as permanently busy and recoverArmedStartSend() refuses to retry.
+  // Nothing legitimate holds either flag this long, so past the deadline the
+  // flag is treated as stale rather than trusted.
+  const IN_FLIGHT_STALE_MS = 180000;
+
+  function inFlightIsLive(active, since) {
+    if (!active) return false;
+    const started = Number(since || 0);
+    if (!started) return true;
+    return Date.now() - started < IN_FLIGHT_STALE_MS;
+  }
+
+  function auditStartIsLive() {
+    return inFlightIsLive(auditStartInFlight, auditStartInFlightSince);
+  }
+
+  function auditActionIsLive() {
+    return inFlightIsLive(actionInFlight, actionInFlightSince);
+  }
   let viewportSyncFrame = 0;
   let dragFrame = 0;
   let autoAuditObserver = null;
@@ -2388,6 +2410,7 @@ ordinal/name of the entrypoint file.`;
   let copiedAuditTimer = 0;
 
   let auditStartInFlight = false;
+  let auditStartInFlightSince = 0;
   let manualAuditSyncInFlight = false;
   let manualAuditSyncFeedback = '';
   let manualAuditSyncFeedbackUntil = 0;
@@ -2411,6 +2434,9 @@ ordinal/name of the entrypoint file.`;
   let widgetBootstrapObserver = null;
   let widgetBootstrapTimers = [];
   let composerFileCaptureInstalled = false;
+  let preparedStartSendGuardInstalled = false;
+  let managedWorkerHousekeepingInstalled = false;
+  let lastStatusMessage = { text: '', kind: 'info', at: 0 };
 
   // v0.0.26: Mini START must never render on every ChatGPT DOM mutation.
   // Keep a cheap attachment signature and only repaint when the actual
@@ -2422,7 +2448,45 @@ ordinal/name of the entrypoint file.`;
   let autoBoundConversationKey = '';
   let autoRuntimeCorruptKey = '';
   let autoLeaseTimer = 0;
+  function managedWorkerIdentityFromLocation() {
+    try {
+      const params = new URLSearchParams(String(location.search || ''));
+      const slot = Number(params.get('audapack_worker_slot') || 0);
+      const generation = Number(params.get('audapack_worker_generation') || 0);
+      if (Number.isInteger(slot) && slot >= 1 && slot <= 6 && Number.isInteger(generation) && generation >= 1) {
+        return { slot, generation };
+      }
+    } catch (_) { }
+    return null;
+  }
+
   const autoTabId = (() => {
+    const managedIdentity = managedWorkerIdentityFromLocation();
+    if (managedIdentity) {
+      // The slot/generation prefix is what the worker supervisor reads, but it
+      // must NOT be the whole identity: a slot can be launched more than once
+      // (cooldown re-launch, desktop START and the Bridge supervisor racing),
+      // and two windows sharing one worker_id made the dispatcher flip between
+      // them -- one window owned a running audit while the other reported the
+      // same id as clean and idle, so every queued job saw `free_workers 0`
+      // and the whole queue starved. Give each window session its own suffix.
+      const managedPrefix = `audapack-managed-${managedIdentity.slot}-${managedIdentity.generation}`;
+      try {
+        const existing = sessionStorage.getItem(AUTO_TAB_SESSION_KEY);
+        // A reload of THIS window must keep its identity so lease recovery works.
+        if (existing && existing.startsWith(`${managedPrefix}-`)) return existing;
+      } catch (_) { }
+      // Mix an independent random component in: a deterministic UUID source
+      // (or two launches inside the same millisecond) must never hand two
+      // windows the same managed identity.
+      const managedEntropy = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID().slice(0, 8)
+        : Date.now().toString(36);
+      const managedSuffix = `${managedEntropy}${Math.random().toString(36).slice(2, 8)}`;
+      const managedId = `${managedPrefix}-${managedSuffix}`;
+      try { sessionStorage.setItem(AUTO_TAB_SESSION_KEY, managedId); } catch (_) { }
+      return managedId;
+    }
     try {
       const existing = sessionStorage.getItem(AUTO_TAB_SESSION_KEY);
       if (existing) return existing;
@@ -3229,8 +3293,8 @@ ordinal/name of the entrypoint file.`;
     const prepared = readStartAuditHandoff();
     if (startHandoffIsPrepared(prepared) && startHandoffComposerStillPrepared(prepared)) {
       return {
-        available: !auditStartInFlight && !actionInFlight && !chatGPTIsGenerating(),
-        busy: auditStartInFlight || actionInFlight,
+        available: !auditStartIsLive() && !auditActionIsLive() && !chatGPTIsGenerating(),
+        busy: auditStartIsLive() || auditActionIsLive(),
         attachment: chatGPTReadyAttachmentSummary(),
         retryPrepared: true
       };
@@ -3244,8 +3308,8 @@ ordinal/name of the entrypoint file.`;
     if (autoRuntime && autoRuntime.stage !== 'idle') {
       if (autoRuntime.stage === 'complete' && hasAnyAttachment) {
         return {
-          available: !auditStartInFlight && !actionInFlight && !chatGPTIsGenerating(),
-          busy: auditStartInFlight || actionInFlight,
+          available: !auditStartIsLive() && !auditActionIsLive() && !chatGPTIsGenerating(),
+          busy: auditStartIsLive() || auditActionIsLive(),
           attachment,
           retryPrepared: false,
           isNewAudit: true
@@ -3253,7 +3317,7 @@ ordinal/name of the entrypoint file.`;
       }
       return { available: false, busy: false, attachment: null, retryPrepared: false };
     }
-    if (auditStartInFlight || actionInFlight) {
+    if (auditStartIsLive() || auditActionIsLive()) {
       return { available: false, busy: true, attachment, retryPrepared: false };
     }
     if (chatGPTIsGenerating()) return { available: false, busy: false, attachment: null, retryPrepared: false };
@@ -3949,6 +4013,10 @@ ordinal/name of the entrypoint file.`;
   }
 
   function setStatus(message, kind = 'info') {
+    // Every START rejection already writes its exact reason here. Recording it
+    // is what lets a browser worker report `canonical-start-rejected: <reason>`
+    // instead of a bare code the operator cannot act on.
+    lastStatusMessage = { text: String(message || ''), kind: String(kind || 'info'), at: Date.now() };
     if (!panel) return;
     const status = panel.querySelector('#acb-status-text');
     if (!status) return;
@@ -4597,7 +4665,7 @@ ordinal/name of the entrypoint file.`;
   }
 
   async function executePreset(preset, mode, options = {}) {
-    if (actionInFlight) {
+    if (auditActionIsLive()) {
       if (!options.quietBusy) {
         setStatus('A command action is already running. Wait for that action to finish before triggering another one.', 'warning');
       }
@@ -4605,6 +4673,7 @@ ordinal/name of the entrypoint file.`;
     }
 
     actionInFlight = true;
+    actionInFlightSince = Date.now();
     try {
       const site = detectSite();
       const siteLabel = site.label;
@@ -4807,6 +4876,7 @@ ordinal/name of the entrypoint file.`;
       return { ok: false, sent: false, reason: 'exception', error };
     } finally {
       actionInFlight = false;
+      actionInFlightSince = 0;
     }
   }
 
@@ -6037,11 +6107,36 @@ ordinal/name of the entrypoint file.`;
         entries.push(entry);
       }
       GM_setValue(BRIDGE_DIAGNOSTIC_LOG_KEY, JSON.stringify(entries.slice(-BRIDGE_DIAGNOSTIC_LOG_MAX)));
+      mirrorDiagnosticToBridge(entry);
       return true;
     } catch (_) {
       // Diagnostics must never interfere with queue persistence or delivery.
       return false;
     }
+  }
+
+  let widgetDiagnosticMirrorTimer = 0;
+  let widgetDiagnosticMirrorQueue = [];
+
+  function mirrorDiagnosticToBridge(entry) {
+    // The widget log lives in browser storage, unreadable from outside the
+    // browser, which made the operator the courier for every debug round trip.
+    // Mirror it into the Bridge runtime directory instead. Best effort only:
+    // diagnostics must never interfere with audit delivery.
+    if (!state?.bridgeEnabled || !bridgeToken() || !normalizedBridgeUrl()) return;
+    widgetDiagnosticMirrorQueue.push(entry);
+    if (widgetDiagnosticMirrorQueue.length > 100) widgetDiagnosticMirrorQueue.shift();
+    if (widgetDiagnosticMirrorTimer) return;
+    widgetDiagnosticMirrorTimer = setTimeout(() => {
+      widgetDiagnosticMirrorTimer = 0;
+      const batch = widgetDiagnosticMirrorQueue.splice(0, widgetDiagnosticMirrorQueue.length);
+      if (!batch.length) return;
+      bridgeRequest('POST', '/v1/widget/diagnostics', {
+        worker_id: String(autoTabId || ''),
+        url_path: String(location.pathname || ''),
+        entries: batch
+      }, { timeout: 7000 }).catch(() => { });
+    }, 2000);
   }
 
   function clearBridgeDiagnosticLog() {
@@ -6059,9 +6154,17 @@ ordinal/name of the entrypoint file.`;
 
   function formatBrowserWorkerBlockedMessage(reason, extra) {
     const code = String(reason || '').trim() || 'unknown';
+    // Worker error strings carry their detail inline: `artifact-http-400:missing_archive`
+    // and `canonical-start-rejected: <exact reason>`. Look up the full string first,
+    // then either half, so a detailed code still gets its human explanation.
+    const codeAliases = [code];
+    if (code.includes(':')) {
+      codeAliases.push(code.slice(0, code.indexOf(':')).trim());
+      codeAliases.push(code.slice(code.indexOf(':') + 1).trim());
+    }
     const detail = String(extra?.detail || extra?.message || '').trim();
     const project = String(extra?.project || '').trim();
-    const base = {
+    const catalogue = {
       'clean-state-lost': {
         headline: 'Audit blocked: ChatGPT tab stopped being clean before Send.',
         why: 'The widget found a fresh root ChatGPT tab, claimed a START AUDIT job, attached the project ZIP, then re-validated the tab right before the irreversible Send. Something changed in the meantime — a conversation turn appeared, a draft was typed, an attachment showed up, or ChatGPT started generating. The widget refuses to overwrite that human activity.',
@@ -6089,6 +6192,33 @@ ordinal/name of the entrypoint file.`;
           '3. Click START AUDIT again from the Project Room.'
         ]
       },
+      'missing_archive': {
+        headline: 'Audit blocked: the packed project ZIP is gone from disk.',
+        why: 'The Bridge recorded an exact archive path when the job was queued and refuses to send anything else. That file has since been moved, renamed or deleted, so the worker can never fetch it. Retrying cannot fix this.',
+        next: [
+          '1. In the AUDAPACK Project Room, PACK the project again to produce a fresh archive.',
+          '2. Cancel or FORCE UNBLOCK the stuck run for that project.',
+          '3. Click START AUDIT again — the new run binds to the new archive.'
+        ]
+      },
+      'changed_archive': {
+        headline: 'Audit blocked: the packed project ZIP changed after the job was queued.',
+        why: 'The Bridge pinned the archive size and SHA-256 at queue time so a worker can never upload different bytes than the ones the run was created for. The file on disk no longer matches, which usually means the project was re-packed while the run was waiting. Retrying cannot fix this.',
+        next: [
+          '1. Cancel or FORCE UNBLOCK the stuck run for that project.',
+          '2. Click START AUDIT again so the run binds to the current archive.',
+          '3. Avoid re-packing a project while its audit run is still waiting for a worker.'
+        ]
+      },
+      'invalid_transition': {
+        headline: 'Audit blocked: the worker asked for the ZIP too late in the run.',
+        why: 'The archive is downloadable only before START_PREPARED. This job had already passed that point, so the Bridge refused the fetch to keep exactly-once START honest.',
+        next: [
+          '1. Use FORCE UNBLOCK on the run so the project lane is released.',
+          '2. Open a fresh root ChatGPT tab (no conversation, no draft, no attachments).',
+          '3. Click START AUDIT again from the Project Room.'
+        ]
+      },
       'worker_limit': {
         headline: 'Audit blocked: all six browser workers are busy.',
         why: 'AUDAPACK allows at most six active workers in the browser. They are all currently working on other jobs. New audit work has to wait for one to finish.',
@@ -6098,7 +6228,8 @@ ordinal/name of the entrypoint file.`;
           '3. Click START AUDIT again from the Project Room.'
         ]
       }
-    }[code] || {
+    };
+    const base = codeAliases.map(alias => catalogue[alias]).find(Boolean) || {
       headline: 'Audit blocked.',
       why: detail || 'The Bridge returned BLOCKED with an unrecognized reason.',
       next: [
@@ -6862,6 +6993,25 @@ ordinal/name of the entrypoint file.`;
       bridgeMessage = 'Bridge is reachable, but the token is invalid or missing.';
       markBridgeJobPermanent(activeJob, { ...response, errorCode: 'invalid_auth', retriable: false });
       return false;
+    }
+    if (response.errorCode === 'completed_wave_immutable') {
+      // Not a failure. The wave is already durably complete in the canonical
+      // run, which is exactly the end state this job wanted. A forced SAVE of
+      // an already-finished campaign hit this three times in a row and left
+      // the widget showing a red `failed 3` for audits that were saved to disk
+      // minutes earlier -- the operator reasonably read that as data loss.
+      appendBridgeDiagnostic('job_already_complete', {
+        severity: 'info',
+        job: activeJob,
+        code: response.errorCode,
+        message: response.message || 'Wave is already complete in the canonical run; nothing to re-save.'
+      });
+      patchAuditResult(activeJob.wave, record => {
+        record.bridgeError = '';
+        record.saveError = '';
+      }, activeJob.conversationKey, { expectedRunId: String(activeJob.sourceRunId || activeJob.runId || '') });
+      deleteBridgeJob(activeJob.jobId);
+      return true;
     }
     if (response.status === 409 || response.errorCode === 'receipt_conflict') {
       bridgeState = 'error';
@@ -8800,7 +8950,7 @@ ordinal/name of the entrypoint file.`;
         const startStillOwnsTransaction =
           parsed.tabId === autoTabId &&
           ['preparing', 'armed'].includes(parsed.phase) &&
-          (auditStartInFlight || actionInFlight);
+          (auditStartIsLive() || auditActionIsLive());
 
         if (!startStillOwnsTransaction) {
           sessionStorage.removeItem(AUTO_START_HANDOFF_SESSION_KEY);
@@ -9072,7 +9222,7 @@ ordinal/name of the entrypoint file.`;
       handoff.sourceKey === previousKey ||
       handoff.destinationKey === previousKey;
 
-    if ((auditStartInFlight || actionInFlight) && followsKnownSource) {
+    if ((auditStartIsLive() || auditActionIsLive()) && followsKnownSource) {
       if (exactStartTurnVisible()) return true;
       if (
         routeProven &&
@@ -9968,7 +10118,7 @@ ordinal/name of the entrypoint file.`;
     // to that START lineage; an unrelated chat must never inherit route immunity.
     if (
       startHandoff &&
-      (auditStartInFlight || actionInFlight) &&
+      (auditStartIsLive() || auditActionIsLive()) &&
       (
         [startHandoff.sourceKey, startHandoff.lastKey, startHandoff.destinationKey].includes(key) ||
         (!startHandoff.destinationKey && String(startHandoff.sourceKey || '').startsWith('draft:') && String(key).startsWith('c:'))
@@ -10056,6 +10206,7 @@ ordinal/name of the entrypoint file.`;
       autoRuntime.conversationKey = key;
       autoRuntime = forceCommittedStartEnabledForKey(key, autoRuntime);
       adoptA3IntentForConversation(key);
+      enforceStartReceiptA3Ownership(key);
     }
 
     renderAutoAuditState();
@@ -11228,10 +11379,60 @@ ordinal/name of the entrypoint file.`;
     return true;
   }
 
+  const COMPOSER_BLOCK_TAGS = /^(P|DIV|LI|UL|OL|H[1-6]|PRE|BLOCKQUOTE|SECTION|ARTICLE|TR)$/;
+
+  function composerBlockText(node) {
+    // ChatGPT's ProseMirror composer keeps every prompt line in its own block
+    // element. `textContent` concatenates those blocks with NO separator, so a
+    // multi-line canonical Core prompt reads back as one glued line. Every
+    // line-anchored check downstream then reads the wrong thing:
+    // classifyAuditMessage() only trusts the first meaningful LINE, so
+    // startHandoffComposerStillPrepared() answered false for a perfectly
+    // prepared Core -- which is why START could prepare the audit and then
+    // never retry the Send, and why a manual Send did not preserve A3.
+    const parts = [];
+    const pushBreak = () => {
+      if (parts.length && !/\n$/.test(parts[parts.length - 1])) parts.push('\n');
+    };
+    const walk = element => {
+      const kids = element?.childNodes || element?.children || [];
+      if (!kids.length) {
+        // A leaf block carries its text directly. Real DOM exposes that as a
+        // child text node; other DOM implementations expose only textContent.
+        parts.push(String(element?.textContent || ''));
+        return;
+      }
+      for (const child of Array.from(kids)) {
+        if (!child) continue;
+        if (child.nodeType === 3) {
+          parts.push(String(child.textContent ?? child.nodeValue ?? ''));
+          continue;
+        }
+        if (child.nodeType !== 1) continue;
+        const tag = String(child.tagName || '').toUpperCase();
+        if (tag === 'BR') {
+          parts.push('\n');
+          continue;
+        }
+        if (COMPOSER_BLOCK_TAGS.test(tag)) {
+          pushBreak();
+          walk(child);
+          pushBreak();
+          continue;
+        }
+        walk(child);
+      }
+    };
+    walk(node);
+    return parts.join('');
+  }
+
   function composerPlainText(input) {
     if (!input) return '';
     if ('value' in input) return String(input.value || '');
-    return String(input.textContent || '').replace(/\u200b/g, '');
+    const blocks = composerBlockText(input);
+    const text = blocks.trim() ? blocks : String(input.textContent || '');
+    return String(text || '').replace(/\u200b/g, '');
   }
 
   function chatGPTComposerStateSnapshot() {
@@ -11262,6 +11463,22 @@ ordinal/name of the entrypoint file.`;
   // right before execution; every async boundary (browser yield, attachment
   // registration, send-ready wait) re-verifies that the composer still holds
   // exactly the Auto3-owned content and that the lease token is still current.
+  function composerStateOwnedBySameWrite(left, right) {
+    // The ownership guard exists to catch FOREIGN activity in the composer, not
+    // the benign churn of our own upload. ChatGPT rewrites an attachment tile's
+    // aria-label while the file registers (progress -> final name) and can swap
+    // the composer subtree, and comparing those made the guard veto a perfectly
+    // correct Send with `ownership-lost`. Live evidence:
+    //   start_send_unverified reason=ownership-lost button=found disabled=false
+    //   generating=false tiles=1 composerPrepared=true
+    // Text and attachment COUNT still have to match exactly, so a foreign draft
+    // or a second attachment is still refused.
+    if (!left || !right) return false;
+    if (Boolean(left.generating) !== Boolean(right.generating)) return false;
+    if (cleanTurnText(left.text) !== cleanTurnText(right.text)) return false;
+    return left.tiles.length === right.tiles.length;
+  }
+
   function createAutoSendOwnershipGuard(token, initialSnapshot, options = {}) {
     const initial = initialSnapshot || chatGPTComposerStateSnapshot();
     const allowInitialAttachments = options.allowInitialAttachments === true;
@@ -11277,7 +11494,7 @@ ordinal/name of the entrypoint file.`;
           if (!sameComposerState(initial, current) || cleanTurnText(current.text)) return false;
           return allowInitialAttachments || !current.tiles.length;
         }
-        return sameComposerState(afterWrite, current);
+        return composerStateOwnedBySameWrite(afterWrite, current);
       },
       captureWrite() {
         afterWrite = chatGPTComposerStateSnapshot();
@@ -11959,6 +12176,27 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     );
   }
 
+  function preservePreparedStartBeforeManualSend(target) {
+    const send = target?.closest?.('button') || target;
+    if (!isChatGPTSend(send)) return false;
+
+    const handoff = readStartAuditHandoff();
+    if (!startHandoffIsPrepared(handoff) || !startHandoffComposerStillPrepared(handoff)) return false;
+
+    bindAutoRuntimeToCurrentConversation({ claim: false });
+    const clicking = markStartAuditHandoffClicking(handoff);
+    if (!clicking) return false;
+
+    if (autoRuntime && !autoRuntime.enabled) {
+      autoRuntime.enabled = true;
+      autoRuntime.conversationKey = autoBoundConversationKey || currentConversationKey();
+      saveAutoRuntime({ pauseOnFailure: false });
+    }
+    writeA3Intent(true, autoRuntime?.conversationKey || currentConversationKey(), { startTransaction: true });
+    renderAutoAuditState();
+    return true;
+  }
+
   function scheduleArmedStartRecovery(delayMs = 250) {
     if (armedStartRecoveryTimer) return false;
     const handoff = readStartAuditHandoff();
@@ -11970,7 +12208,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
       const current = readStartAuditHandoff();
       if (!startHandoffIsPrepared(current) || String(current.receipt || '') !== receipt) return;
 
-      if (auditStartInFlight || actionInFlight) {
+      if (auditStartIsLive() || auditActionIsLive()) {
         scheduleArmedStartRecovery(300);
         return;
       }
@@ -11987,7 +12225,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
   }
 
 async function recoverArmedStartSend(options = {}) {
-    if (auditStartInFlight || actionInFlight) {
+    if (auditStartIsLive() || auditActionIsLive()) {
       if (options.reschedule !== false) scheduleArmedStartRecovery(300);
       return false;
     }
@@ -12100,7 +12338,7 @@ async function recoverArmedStartSend(options = {}) {
   }
 
   async function startAuditCoreFromReadyAttachment(options = {}) {
-    if (auditStartInFlight || actionInFlight) {
+    if (auditStartIsLive() || auditActionIsLive()) {
       setStatus('START AUDITING is already preparing/sending Audit Core.', 'info');
       return false;
     }
@@ -12241,6 +12479,7 @@ async function recoverArmedStartSend(options = {}) {
     const ownership = createAutoSendOwnershipGuard(token, initialSnapshot, { allowInitialAttachments: true });
 
     auditStartInFlight = true;
+    auditStartInFlightSince = Date.now();
     renderAutoAuditState();
     try {
       const startPreset = {
@@ -12259,6 +12498,22 @@ async function recoverArmedStartSend(options = {}) {
       });
 
       if (!result?.sent) {
+        // The single fact this chain never recorded: what actually happened at
+        // the irreversible Send. Everything downstream is recovery guesswork
+        // without it.
+        const sendSnapshot = chatGPTComposerStateSnapshot();
+        const sendButton = getChatGPTSend();
+        appendBridgeDiagnostic('start_send_unverified', {
+          severity: 'info',
+          message: `START prepared but Send unverified: reason=${String(result?.reason || 'none')} ` +
+            `mode=${String(result?.mode || 'none')} ` +
+            `button=${sendButton ? 'found' : 'missing'} ` +
+            `disabled=${sendButton ? String(Boolean(sendButton.disabled)) : 'n/a'} ` +
+            `aria=${sendButton ? String(sendButton.getAttribute('aria-disabled')) : 'n/a'} ` +
+            `generating=${String(chatGPTIsGenerating())} ` +
+            `tiles=${String(sendSnapshot?.tiles?.length ?? -1)} ` +
+            `composerPrepared=${String(startHandoffComposerStillPrepared())}`
+        });
         const pending = readStartAuditHandoff();
         if (startHandoffComposerStillPrepared(pending)) {
           setStatus(`START AUDITING prepared Core but Send is not positively verified yet (${result?.reason || 'not ready'}). The exact receipt is preserved for lease-fenced retry.`, 'warning');
@@ -12295,6 +12550,7 @@ async function recoverArmedStartSend(options = {}) {
       return true;
     } finally {
       auditStartInFlight = false;
+      auditStartInFlightSince = 0;
       const pending = readStartAuditHandoff();
       if (pending && !startHandoffIsCommitted(pending) && !startHandoffIsPrepared(pending)) clearStartAuditHandoff();
       renderAutoAuditState();
@@ -12865,8 +13121,146 @@ async function recoverArmedStartSend(options = {}) {
     return 'AUTO';
   }
 
+  function machineAuthoredAuditTurn(turns = getChatGPTTurns()) {
+    // `ACB_CHAIN_RECEIPT: ` is written by this widget and by nothing else -- a
+    // human never types it. A user turn that carries one and classifies as an
+    // audit wave is therefore hard proof that this conversation is an AUDAPACK
+    // run, independent of any session handoff (which is deliberately cleared
+    // once the Core turn is adopted).
+    const needle = `${AUTO_SEND_RECEIPT_PREFIX}: `;
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const turn = turns[i];
+      if (turnRole(turn) !== 'user') continue;
+      const text = `${getTurnText(turn)}\n${readableNodeText(turn)}\n${String(turn.textContent || '')}`;
+      if (!text.includes(needle)) continue;
+      if (!classifyAuditTurn(turn)) continue;
+      return turn;
+    }
+    return null;
+  }
+
+  function visibleCampaignAlreadyFinished(turns = getChatGPTTurns()) {
+    const waves = getActiveProfile()?.waves || [];
+    const last = waves.length ? String(waves[waves.length - 1].id || '') : '';
+    if (!last) return false;
+    return Boolean(visibleAuditLineage(turns, { respectResetBarrier: false })?.[last]);
+  }
+
+  let a3OwnershipEnforcementInFlight = false;
+  let a3OwnershipReportedReceipt = '';
+
+  let a3MachineReceiptReportedKey = '';
+
+  function reassertA3FromMachineReceipt(key, turns = null) {
+    // No live handoff left. A conversation that holds a machine-authored audit
+    // turn is still an AUDAPACK run, and a run whose runtime came back blank is
+    // route hydration losing state -- never an operator decision.
+    //
+    // The distinction matters: unchecking A3 by hand PERSISTS a runtime with
+    // enabled=false, so that record is respected and never overridden here.
+    // Only a key with nothing persisted at all is repaired.
+    if (a3OwnershipEnforcementInFlight) return false;
+    if (!key || !autoRuntime || autoRuntime.storageCorrupt) return false;
+    if (autoRuntime.enabled) return false;
+    if (!runtimeIsBlankDisabled(autoRuntime)) return false;
+
+    a3OwnershipEnforcementInFlight = true;
+    try {
+      const stored = readStoredRuntime(key);
+      if (stored.corrupt || stored.runtime) return false;
+
+      const liveTurns = turns || getChatGPTTurns();
+      const authored = machineAuthoredAuditTurn(liveTurns);
+      if (!authored) return false;
+      if (visibleCampaignAlreadyFinished(liveTurns)) {
+        // A finished campaign is allowed to sit idle; do not resurrect it.
+        return false;
+      }
+
+      autoRuntime.enabled = true;
+      autoRuntime.conversationKey = key;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        autoRuntime.enabled = false;
+        if (a3MachineReceiptReportedKey !== key) {
+          a3MachineReceiptReportedKey = key;
+          appendBridgeDiagnostic('a3_reassert_not_persisted', {
+            message: `A3 could not be re-armed in ${key}: durable runtime write was rejected`
+          });
+        }
+        return false;
+      }
+      writeA3Intent(true, key, { startTransaction: false });
+      appendBridgeDiagnostic('a3_reasserted_from_machine_receipt', {
+        severity: 'info',
+        message: `A3 re-armed in ${key} from a machine-authored audit turn after the START handoff was already cleared`
+      });
+      a3MachineReceiptReportedKey = '';
+      return true;
+    } finally {
+      a3OwnershipEnforcementInFlight = false;
+    }
+  }
+
+  function enforceStartReceiptA3Ownership(key = autoBoundConversationKey || currentConversationKey(), turns = null) {
+    // Last-resort invariant. If this conversation visibly contains the exact
+    // canonical START receipt that THIS tab wrote, then A3 owns this chat --
+    // full stop. The layered route/lineage predicates in front of this are
+    // each individually defensible, but every one of them is another chance to
+    // disarm a live audit right after a real, successful send. The receipt is
+    // proof, so it outranks the chain. It can never arm an unrelated chat:
+    // that chat does not contain this receipt.
+    if (a3OwnershipEnforcementInFlight) return false;
+    if (!key || !autoRuntime || autoRuntime.storageCorrupt) return false;
+    if (autoRuntime.enabled) return false;
+    const handoff = readStartAuditHandoff();
+    if (!startHandoffOwnsA3Intent(handoff)) {
+      // The handoff is deliberately cleared once the Core turn is adopted, so
+      // most real disarms are observed with no handoff left at all. Fall back
+      // to the machine receipt in the conversation itself.
+      return reassertA3FromMachineReceipt(key, turns);
+    }
+
+    a3OwnershipEnforcementInFlight = true;
+    try {
+      const receipt = String(handoff.receipt || '');
+      const visible = exactReceiptUserTurn(receipt, turns || getChatGPTTurns());
+      if (!visible) {
+        // Not proof yet -- but record the moment once so a disarm that happens
+        // for some other reason is diagnosable instead of invisible.
+        if (a3OwnershipReportedReceipt !== receipt) {
+          a3OwnershipReportedReceipt = receipt;
+          appendBridgeDiagnostic('a3_disarmed_with_live_start', {
+            message: `A3 is off in ${key} while START handoff phase=${handoff.phase} still owns the intent; ` +
+              `receipt turn not visible (source=${handoff.sourceKey || '-'}, last=${handoff.lastKey || '-'}, ` +
+              `destination=${handoff.destinationKey || '-'}, turns=${(turns || getChatGPTTurns()).length})`
+          });
+        }
+        return false;
+      }
+
+      autoRuntime.enabled = true;
+      autoRuntime.conversationKey = key;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        autoRuntime.enabled = false;
+        return false;
+      }
+      writeA3Intent(true, key, { startTransaction: true });
+      appendBridgeDiagnostic('a3_reasserted_from_receipt', {
+        severity: 'info',
+        message: `A3 re-armed in ${key} from the visible canonical START receipt (phase=${handoff.phase})`
+      });
+      a3OwnershipReportedReceipt = '';
+      return true;
+    } finally {
+      a3OwnershipEnforcementInFlight = false;
+    }
+  }
+
   function renderAutoAuditState() {
     if (!panel || !state) return;
+    // Cheap sessionStorage probe first: this only does real work while a START
+    // handoff still owns the A3 intent and the checkbox would paint OFF.
+    if (!autoRuntime?.enabled) enforceStartReceiptA3Ownership();
 
     const enabled = panel.querySelector('#acb-auto-enabled');
     const superEnabled = panel.querySelector('#acb-super-enabled');
@@ -13627,7 +14021,17 @@ async function recoverArmedStartSend(options = {}) {
   function userTurnContainsReceipt(turn, receipt) {
     if (!turn || !receipt || turnRole(turn) !== 'user') return false;
     const needle = `${AUTO_SEND_RECEIPT_PREFIX}: ${receipt}`;
-    return getTurnText(turn).includes(needle) || readableNodeText(turn).includes(needle);
+    // ChatGPT clamps a long user bubble behind "Show more". innerText then
+    // returns only the visible lines, and the canonical receipt sits at the END
+    // of the Core prompt -- so the exact-receipt proof failed on precisely the
+    // turns START cares about. startHandoffCanFollowRoute() then refused to
+    // migrate the runtime into the new /c/<id> route and A3 disarmed itself
+    // right after a real, successful send. Check every readable representation,
+    // raw textContent included.
+    if (getTurnText(turn).includes(needle)) return true;
+    if (readableNodeText(turn).includes(needle)) return true;
+    if (String(turn.textContent || '').includes(needle)) return true;
+    return userTurnTextCandidates(turn).some(text => text.includes(needle));
   }
 
   function findPendingSentAuditTurn(expectedKind, turns = getChatGPTTurns()) {
@@ -16156,6 +16560,7 @@ async function recoverArmedStartSend(options = {}) {
         startAuditCoreFromReadyAttachment().catch(error => {
           setStatus(`START AUDITING failed: ${error?.message || 'unexpected Core launch error'}.`, 'error');
           auditStartInFlight = false;
+          auditStartInFlightSince = 0;
           renderAutoAuditState();
         });
         return;
@@ -17108,6 +17513,21 @@ async function recoverArmedStartSend(options = {}) {
         setTimeout(() => renderAutoAuditState(), 0);
       }, true);
     }
+    if (!preparedStartSendGuardInstalled) {
+      preparedStartSendGuardInstalled = true;
+      document.addEventListener('click', event => {
+        preservePreparedStartBeforeManualSend(event?.target);
+      }, true);
+    }
+    if (!managedWorkerHousekeepingInstalled && browserWorkerManagedIdentity()?.slot) {
+      managedWorkerHousekeepingInstalled = true;
+      // Housekeeping must not depend on the worker poll loop being healthy:
+      // a window whose polling stopped is exactly the window that ends up
+      // pinned DIRTY with an abandoned prompt and never recovers.
+      setInterval(() => {
+        try { browserWorkerRecycleWatchdog(); } catch (_) { }
+      }, 30000);
+    }
     armWidgetBootstrap();
     ensureInauditCaptureObserver();
     scheduleInauditCaptureFlush(2000);
@@ -17122,14 +17542,42 @@ async function recoverArmedStartSend(options = {}) {
   let browserWorkerConsecutivePollFailures = 0;
   const BROWSER_WORKER_LEASE_SESSION_KEY = 'audapack_browser_worker_lease_v1';
   const BROWSER_WORKER_MANAGED_SESSION_KEY = 'audapack_managed_worker_v1';
+  const BROWSER_WORKER_MANAGED_PROFILE_KEY = 'audapack_managed_worker_profile_v1';
+  const BROWSER_WORKER_RECYCLE_SESSION_KEY = 'audapack_worker_recycle_v1';
+  const BROWSER_WORKER_RECYCLE_COOLDOWN_MS = 20000;
+  const BROWSER_WORKER_RECYCLE_COUNT_KEY = 'audapack_worker_recycle_count_v1';
+  // A time-based cooldown alone cannot stop a recycle loop: if the window is
+  // still judged dirty after landing on a fresh root chat it simply navigates
+  // again one cooldown later, forever. Live evidence: worker_recycled (poll-idle)
+  // every 20 s, the window never becoming CLEAN, and the supervisor opening four
+  // windows for one audit because clean_workers stayed 0. Cap the attempts.
+  const BROWSER_WORKER_RECYCLE_MAX_ATTEMPTS = 3;
+  // A managed window that stays unusable this long is a stuck lane, whatever
+  // the soft reason was. Nothing irreversible can be lost past this point: a
+  // live lease, a prepared START and an actual generation are still respected.
+  const BROWSER_WORKER_DIRTY_WATCHDOG_MS = 180000;
+  let browserWorkerDirtySince = 0;
+  let browserWorkerReportedBlockReason = '';
+
+  function rememberManagedWorkerProfile() {
+    // Managed workers are always launched into the dedicated AUDAPACK Chromium
+    // profile, so this marker can never appear in the operator's own browser.
+    // It survives ChatGPT dropping the ?audapack_worker_slot query params on
+    // hydration -- without it a recycled window silently stops being
+    // recognisable as a managed worker and occupies a lane forever.
+    try { GM_setValue(BROWSER_WORKER_MANAGED_PROFILE_KEY, '1'); } catch (_) { }
+  }
+
+  function browserWorkerIsManagedProfile() {
+    if (browserWorkerManagedIdentity()?.slot) return true;
+    try { return String(GM_getValue(BROWSER_WORKER_MANAGED_PROFILE_KEY, '') || '') === '1'; } catch (_) { return false; }
+  }
 
   function browserWorkerManagedIdentity() {
     try {
-      const params = new URLSearchParams(String(location.search || ''));
-      const slot = Number(params.get('audapack_worker_slot') || 0);
-      const generation = Number(params.get('audapack_worker_generation') || 0);
-      if (Number.isInteger(slot) && slot >= 1 && slot <= 6 && Number.isInteger(generation) && generation >= 1) {
-        const identity = { slot, generation };
+      const identity = managedWorkerIdentityFromLocation();
+      if (identity) {
+        rememberManagedWorkerProfile();
         sessionStorage.setItem(BROWSER_WORKER_MANAGED_SESSION_KEY, JSON.stringify(identity));
         return identity;
       }
@@ -17259,7 +17707,7 @@ let browserWorkerBraveConfirmed = false;
     const managedIdentity = browserWorkerManagedIdentity();
     const cleanForAudit = pageEligible && !hasConversationTurns && !Boolean(draft.trim()) &&
       !Boolean(attachment?.count) && !chatGPTIsGenerating() &&
-      !auditStartInFlight && !actionInFlight && !active &&
+      !auditStartIsLive() && !auditActionIsLive() && !active &&
       !Boolean(autoRuntime?.runId) && !Boolean(lease);
     return {
       worker_id: String(autoTabId || ''),
@@ -17286,12 +17734,31 @@ let browserWorkerBraveConfirmed = false;
       generating: Boolean(chatGPTIsGenerating()),
       has_manual_draft: Boolean(draft.trim()),
       has_attachments: Boolean(attachment?.count),
-      audit_start_in_flight: Boolean(auditStartInFlight),
-      action_in_flight: Boolean(actionInFlight),
+      audit_start_in_flight: auditStartIsLive(),
+      action_in_flight: auditActionIsLive(),
       has_conversation_turns: hasConversationTurns,
       clean_for_audit: cleanForAudit,
-      worker_class: hasConversationTurns ? 'OCCUPIED' : (Boolean(draft.trim()) || Boolean(attachment?.count) ? 'DIRTY' : (chatGPTIsGenerating() || auditStartInFlight || actionInFlight ? 'BUSY' : (cleanForAudit ? 'CLEAN' : 'OCCUPIED')))
+      worker_class: hasConversationTurns ? 'OCCUPIED' : (Boolean(draft.trim()) || Boolean(attachment?.count) ? 'DIRTY' : (chatGPTIsGenerating() || auditStartIsLive() || auditActionIsLive() ? 'BUSY' : (cleanForAudit ? 'CLEAN' : 'OCCUPIED')))
     };
+  }
+
+  function browserWorkerClaimBlockReason() {
+    // Named reasons only: a job handed back with `worker-not-claimable` and
+    // nothing else is exactly as undiagnosable as the silent drop it replaced.
+    const snap = browserWorkerSnapshot();
+    if (!snap.is_chromium) return 'worker-not-chromium';
+    if (!snap.page_eligible) return 'worker-not-on-root-chat';
+    if (detectSite().key !== 'chatgpt') return 'worker-not-on-chatgpt';
+    if (snap.generating) return 'worker-generating';
+    if (snap.has_conversation_turns) return 'worker-has-conversation';
+    if (snap.has_manual_draft) return 'worker-has-draft';
+    if (snap.has_attachments) return 'worker-has-attachment';
+    if (snap.audit_start_in_flight || snap.action_in_flight) return 'worker-busy';
+    if (snap.campaign_run_id) return 'worker-owns-campaign';
+    if (snap.state !== 'FREE') return `worker-state-${String(snap.state || 'unknown').toLowerCase()}`;
+    if (!snap.clean_for_audit) return 'worker-not-clean';
+    if (autoRuntime?.runId) return 'worker-owns-run';
+    return 'worker-not-claimable';
   }
 
   function browserWorkerCanClaim() {
@@ -17321,6 +17788,51 @@ let browserWorkerBraveConfirmed = false;
     }, { timeout: 7000 }).then(result => result);
   }
 
+  function decodeArtifactBytes(raw) {
+    // `instanceof ArrayBuffer` is unreliable here: GM_xmlhttpRequest hands the
+    // response back from a different realm than the userscript sandbox, so the
+    // constructor identity does not match and the buffer would silently decode
+    // to an empty string. Detect the shape instead of the constructor.
+    const bytes = (raw && typeof raw.byteLength === 'number' && typeof raw.length !== 'number')
+      ? new Uint8Array(raw)
+      : raw;
+    if (!bytes || typeof bytes.length !== 'number') return '';
+    // TextDecoder is present in every supported browser, but this widget also
+    // runs inside a bare userscript sandbox and under the Node regression
+    // harness. A missing global must never turn a readable Bridge error code
+    // into an empty one, so fall back to a byte-wise decode of the ASCII JSON.
+    if (typeof TextDecoder === 'function') {
+      try { return new TextDecoder('utf-8').decode(bytes); } catch (_) { }
+    }
+    let out = '';
+    for (let offset = 0; offset < bytes.length; offset += 8192) {
+      out += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, offset, offset + 8192));
+    }
+    return out;
+  }
+
+  function decodeArtifactErrorBody(raw) {
+    const empty = { code: '', message: '', retriable: null };
+    if (!raw) return empty;
+    try {
+      const text = typeof raw === 'string'
+        ? raw
+        : decodeArtifactBytes(raw);
+      if (!text.trim()) return empty;
+      const parsed = JSON.parse(text);
+      const error = parsed?.error;
+      if (typeof error === 'string') return { code: '', message: error.slice(0, 240), retriable: null };
+      if (!error || typeof error !== 'object') return empty;
+      return {
+        code: String(error.code || '').slice(0, 64),
+        message: String(error.message || '').slice(0, 240),
+        retriable: typeof error.retriable === 'boolean' ? error.retriable : null
+      };
+    } catch (_) {
+      return empty;
+    }
+  }
+
   function browserWorkerFetchArtifact(job) {
     return new Promise(resolve => {
       const base = normalizedBridgeUrl();
@@ -17343,7 +17855,21 @@ let browserWorkerBraveConfirmed = false;
         onload(response) {
           const status = Number(response.status) || 0;
           if (status < 200 || status >= 300 || !response.response) {
-            resolve({ ok: false, reason: `artifact-http-${status}` });
+            // The Bridge answers a rejected artifact fetch with a JSON error
+            // body carrying the exact code (missing_archive / changed_archive /
+            // invalid_transition / not_leased_owner) and whether a retry can
+            // ever succeed. Dropping that body was why a job could burn every
+            // pre-start retry and end as an unreadable
+            // `pre-start retries exhausted: artifact-http-400`.
+            const detail = decodeArtifactErrorBody(response.response);
+            resolve({
+              ok: false,
+              reason: detail.code ? `artifact-http-${status}:${detail.code}` : `artifact-http-${status}`,
+              status,
+              code: detail.code,
+              message: detail.message,
+              retriable: detail.retriable === null ? status >= 500 : detail.retriable
+            });
             return;
           }
           const bytes = response.response instanceof ArrayBuffer ? response.response : response.response.buffer;
@@ -17358,6 +17884,46 @@ let browserWorkerBraveConfirmed = false;
         ontimeout() { resolve({ ok: false, reason: 'artifact-request-timeout' }); }
       });
     });
+  }
+
+  function browserWorkerArtifactTransition(transition, artifact) {
+    // A non-retriable Bridge rejection (missing_archive / changed_archive /
+    // invalid_transition / not_leased_owner) can never succeed on retry.
+    // Spending the whole pre-start retry budget on it only buried the reason
+    // under `pre-start retries exhausted: artifact-http-400`. Report BLOCKED
+    // once, with the exact code, so the operator sees something actionable.
+    const reason = String(artifact?.reason || 'artifact-unavailable');
+    if (artifact?.retriable === false) {
+      showBrowserWorkerBlocked(reason, { detail: String(artifact?.message || '') });
+      return transition('BLOCKED', { error: reason });
+    }
+    return transition('RETRYABLE', { error: reason });
+  }
+
+  function browserWorkerStandDown(reason = 'lease-revoked') {
+    // The Bridge refused this window's START. That means another window owns
+    // the dispatch now, or the lease is gone. Keeping the prepared Core armed
+    // made the window retry the exact same irreversible Send forever -- two
+    // windows sitting on the same prompt, neither able to commit it. Stand
+    // down completely and let the recycle put this window back in the pool.
+    if (armedStartRecoveryTimer) {
+      clearTimeout(armedStartRecoveryTimer);
+      armedStartRecoveryTimer = 0;
+    }
+    clearStartAuditHandoff();
+    clearA3Intent();
+    resetAutoAuditRuntime({ silent: true });
+    browserWorkerLease = null;
+    persistBrowserWorkerLease();
+    appendBridgeDiagnostic('worker_stood_down', {
+      severity: 'info',
+      message: `stood down and released the prepared Core: ${String(reason || 'lease-revoked')}`
+    });
+    renderAutoAuditState();
+    // The composer still holds the prepared prompt and the ZIP; recycling is
+    // the only safe way to clear both without DOM surgery on ChatGPT.
+    browserWorkerRecycleToCleanChat(`stand-down:${String(reason || 'lease-revoked')}`);
+    return true;
   }
 
   async function browserWorkerConsume(job, dependencies = null) {
@@ -17402,7 +17968,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       } else {
         artifact = await fetchArtifact(job);
         if (!artifact.ok) {
-          const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+          const acknowledged = await browserWorkerArtifactTransition(transition, artifact);
           if (acknowledged.ok) {
             browserWorkerLease = null;
             persistBrowserWorkerLease();
@@ -17426,7 +17992,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       // immutable artifact and continue. Do NOT regress to LEASED.
       artifact = await fetchArtifact(job);
       if (!artifact.ok) {
-        const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+        const acknowledged = await browserWorkerArtifactTransition(transition, artifact);
         if (acknowledged.ok) {
           browserWorkerLease = null;
           persistBrowserWorkerLease();
@@ -17450,7 +18016,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       // job. Re-acknowledging LEASED here is an illegal LEASED -> LEASED edge.
       artifact = await fetchArtifact(job);
       if (!artifact.ok) {
-        const acknowledged = await transition('RETRYABLE', { error: artifact.reason });
+        const acknowledged = await browserWorkerArtifactTransition(transition, artifact);
         if (acknowledged.ok) {
           browserWorkerLease = null;
           persistBrowserWorkerLease();
@@ -17497,7 +18063,13 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         const snap = browserWorkerSnapshot();
         const hasLease = Boolean(browserWorkerLease?.dispatch_id && browserWorkerLease?.lease_id);
         const sameDispatch = String(snap.dispatch_id || '') === String(browserWorkerLease?.dispatch_id || '');
-        const foreignActivity = snap.generating || snap.has_manual_draft ||
+        const handoff = readStartAuditHandoff();
+        const ownsCanonicalDraft = Boolean(
+          startHandoffIsPrepared(handoff) &&
+          String(handoff.receipt || '') === String(receipt || '') &&
+          startHandoffComposerStillPrepared(handoff)
+        );
+        const foreignActivity = snap.generating || (snap.has_manual_draft && !ownsCanonicalDraft) ||
           (snap.has_attachments && !(ready?.ok)) || snap.has_conversation_turns;
         if (!hasLease || !sameDispatch || foreignActivity) {
           await transition('BLOCKED', { error: 'clean-state-lost' });
@@ -17513,6 +18085,13 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           campaign_run_id: String(campaignRunId || autoRuntime?.runId || ''),
           start_receipt: String(receipt || '')
         });
+        if (!ack.ok && ack.error?.retriable !== true) {
+          // Not a transient failure: this window no longer owns the dispatch.
+          // Retrying the same irreversible Send forever is how two windows
+          // ended up parked on one identical Core prompt.
+          browserWorkerStandDown(String(ack.error?.code || 'start-ack-rejected'));
+          return false;
+        }
         return Boolean(ack.ok);
       }
     });
@@ -17521,8 +18100,15 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       if (preserved && (startHandoffIsPrepared(preserved) || startHandoffIsCommitted(preserved))) {
         return false;
       }
-      const acknowledged = await transition('BLOCKED', { error: 'canonical-start-rejected' });
-      showBrowserWorkerBlocked('canonical-start-rejected');
+      // START refused before it could arm the receipt. The engine already wrote
+      // the exact reason to the status line; carry it into the Bridge error so
+      // the desktop lane shows why instead of an opaque code.
+      const rejection = String(lastStatusMessage?.text || '').trim().slice(0, 200);
+      const rejectionError = rejection
+        ? `canonical-start-rejected: ${rejection}`
+        : 'canonical-start-rejected';
+      const acknowledged = await transition('BLOCKED', { error: rejectionError });
+      showBrowserWorkerBlocked(rejectionError, { detail: rejection });
       if (acknowledged.ok) {
         browserWorkerLease = null;
         persistBrowserWorkerLease();
@@ -17532,6 +18118,243 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     if (!(await transition('STARTED', { campaign_run_id: String(autoRuntime?.runId || ''), conversation_id: String(autoRuntime?.conversationKey || '') })).ok) return false;
     if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
     return true;
+  }
+
+  let browserWorkerRecycleExhaustedReported = false;
+
+  function browserWorkerRecycleAttempts() {
+    try { return Math.max(0, Number(sessionStorage.getItem(BROWSER_WORKER_RECYCLE_COUNT_KEY) || 0)); } catch (_) { return 0; }
+  }
+
+  function browserWorkerRecordRecycleAttempt() {
+    try { sessionStorage.setItem(BROWSER_WORKER_RECYCLE_COUNT_KEY, String(browserWorkerRecycleAttempts() + 1)); } catch (_) { }
+  }
+
+  function browserWorkerClearRecycleAttempts() {
+    browserWorkerRecycleExhaustedReported = false;
+    try { sessionStorage.removeItem(BROWSER_WORKER_RECYCLE_COUNT_KEY); } catch (_) { }
+  }
+
+  function browserWorkerRecycleUrl() {
+    // The slot/generation identity lives in the URL, and autoTabId is derived
+    // from it. Navigating to a bare `/` would make this window register as a
+    // brand-new random worker, so the supervisor would believe the slot died
+    // and launch yet another window. Carry the identity across the recycle.
+    try {
+      const identity = browserWorkerManagedIdentity();
+      if (!identity?.slot) {
+        return browserWorkerIsManagedProfile() ? `${location.origin}/?audapack_worker=1` : '';
+      }
+      const params = new URLSearchParams();
+      params.set('audapack_worker', '1');
+      params.set('audapack_worker_slot', String(identity.slot));
+      params.set('audapack_worker_generation', String(identity.generation));
+      return `${location.origin}/?${params.toString()}`;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function browserWorkerRecycleBlockReason() {
+    // Every one of these is a reason a recycle would destroy real work.
+    if (!browserWorkerIsManagedProfile()) return 'not-a-managed-worker';
+    if (browserWorkerLease?.dispatch_id) return 'lease-still-owned';
+    const handoff = readStartAuditHandoff();
+    if (startHandoffIsPrepared(handoff) || startHandoffIsCommitted(handoff)) return 'start-handoff-live';
+    if (chatGPTIsGenerating()) return 'chatgpt-generating';
+    if (auditStartIsLive() || auditActionIsLive()) return 'action-in-flight';
+    const stage = String(autoRuntime?.stage || 'idle');
+    if (autoRuntime?.enabled && !['idle', 'complete'].includes(stage)) return 'audit-still-running';
+    if (bridgeQueueStats().pending > 0) return 'bridge-delivery-pending';
+    return '';
+  }
+
+  function browserWorkerNeedsRecycle() {
+    const snap = browserWorkerSnapshot();
+    // A parked conversation or a non-root path jams the lane no matter how the
+    // window was identified. A leftover draft/attachment is only ever cleaned
+    // up when the slot identity is certain, so a human tab that merely shares
+    // the profile marker can never lose typed text.
+    if (snap.has_conversation_turns || !snap.page_eligible) return true;
+    if (!browserWorkerManagedIdentity()?.slot) return false;
+    return Boolean(snap.has_manual_draft || snap.has_attachments);
+  }
+
+  function browserWorkerClearAbandonedDraft() {
+    // A managed window whose composer still holds a machine-authored audit
+    // prompt is DIRTY forever: worker_free_for_claim rejects it, clean_workers
+    // stays 0, and the queued audit never gets picked up. Clearing the draft in
+    // place beats navigating, because navigation is what turned into a loop.
+    // Only OUR OWN prompt is ever cleared -- a human's text is never touched.
+    if (!browserWorkerManagedIdentity()?.slot) return false;
+    if (browserWorkerLease?.dispatch_id) return false;
+    if (autoRuntime?.runId) return false;
+    if (startHandoffIsPrepared(readStartAuditHandoff())) return false;
+    if (chatGPTIsGenerating()) return false;
+
+    const input = getChatGPTInput();
+    if (!input) return false;
+    const draft = cleanTurnText(composerPlainText(input));
+    if (!draft) return false;
+    // Machine-authored proof: an audit command, or our receipt marker.
+    const authored = Boolean(classifyAuditMessage(draft)) ||
+      draft.includes(`${AUTO_SEND_RECEIPT_PREFIX}: `);
+    if (!authored) return false;
+
+    if (!smartSet(input, '')) return false;
+    if (cleanTurnText(composerPlainText(input))) return false;
+    appendBridgeDiagnostic('worker_draft_cleared', {
+      severity: 'info',
+      message: 'cleared an abandoned machine-authored audit prompt from the composer'
+    });
+    renderAutoAuditState();
+    return true;
+  }
+
+  function browserWorkerRecycleWatchdog() {
+    // Every soft block reason is individually defensible and collectively they
+    // were able to pin a window as permanently DIRTY: the operator saw a clean
+    // looking window that never took work and never cleaned itself.
+    // Clearing our own abandoned prompt is cheaper and safer than navigating.
+    if (browserWorkerClearAbandonedDraft() && !browserWorkerNeedsRecycle()) {
+      browserWorkerDirtySince = 0;
+      browserWorkerReportedBlockReason = '';
+      browserWorkerClearRecycleAttempts();
+      return false;
+    }
+    if (!browserWorkerNeedsRecycle()) {
+      browserWorkerDirtySince = 0;
+      browserWorkerReportedBlockReason = '';
+      // The window reached a usable state, so the recycle budget is honestly
+      // spent and can be restored.
+      browserWorkerClearRecycleAttempts();
+      return false;
+    }
+    const blocked = browserWorkerRecycleBlockReason();
+    if (!blocked) return browserWorkerRecycleToCleanChat('poll-idle');
+
+    const now = Date.now();
+    if (!browserWorkerDirtySince) browserWorkerDirtySince = now;
+    if (browserWorkerReportedBlockReason !== blocked) {
+      browserWorkerReportedBlockReason = blocked;
+      appendBridgeDiagnostic('worker_recycle_blocked', {
+        severity: 'info',
+        message: `managed worker stayed dirty; recycle blocked by ${blocked}`
+      });
+    }
+
+    // Never override the reasons that could destroy real work.
+    const irreversible = ['not-a-managed-worker', 'lease-still-owned', 'start-handoff-live', 'chatgpt-generating'];
+    if (irreversible.includes(blocked)) return false;
+    if (now - browserWorkerDirtySince < BROWSER_WORKER_DIRTY_WATCHDOG_MS) return false;
+
+    appendBridgeDiagnostic('worker_recycle_forced', {
+      severity: 'info',
+      message: `managed worker was dirty for ${Math.round((now - browserWorkerDirtySince) / 1000)}s behind ${blocked}; forcing a clean chat`
+    });
+    browserWorkerDirtySince = 0;
+    return browserWorkerRecycleToCleanChat(`watchdog:${blocked}`, { force: true });
+  }
+
+  function browserWorkerRecycleToCleanChat(reason = 'terminal', options = {}) {
+    // A managed AUDAPACK window that finished (or was blocked on) a job is left
+    // parked on /c/<id> with conversation turns. worker_free_for_claim() then
+    // rejects it forever: that is exactly how six managed windows become
+    // "CLEAN 0 / BUSY 5" and every queued audit stalls with no error anywhere.
+    // Only a managed window recycles; a human ChatGPT tab is never navigated.
+    if (!browserWorkerNeedsRecycle()) return false;
+    const blocked = browserWorkerRecycleBlockReason();
+    if (blocked && !options.force) return false;
+
+    const attempts = browserWorkerRecycleAttempts();
+    if (attempts >= BROWSER_WORKER_RECYCLE_MAX_ATTEMPTS) {
+      if (!browserWorkerRecycleExhaustedReported) {
+        browserWorkerRecycleExhaustedReported = true;
+        appendBridgeDiagnostic('worker_recycle_exhausted', {
+          severity: 'info',
+          message: `recycled ${attempts} times without becoming claimable (${String(reason || '')}); standing still instead of looping`
+        });
+      }
+      return false;
+    }
+    const now = Date.now();
+    try {
+      const last = Number(sessionStorage.getItem(BROWSER_WORKER_RECYCLE_SESSION_KEY) || 0);
+      if (last && now - last < BROWSER_WORKER_RECYCLE_COOLDOWN_MS) return false;
+      sessionStorage.setItem(BROWSER_WORKER_RECYCLE_SESSION_KEY, String(now));
+    } catch (_) { }
+
+    const target = browserWorkerRecycleUrl();
+    if (!target) return false;
+    appendBridgeDiagnostic('worker_recycled', {
+      severity: 'info',
+      message: `managed worker slot recycled to a clean chat (${String(reason || 'terminal')})`
+    });
+    browserWorkerRecordRecycleAttempt();
+    resetAutoAuditRuntime({ silent: true });
+    try {
+      location.assign(target);
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
+  function browserWorkerReleaseUnclaimableJob(job, reason = 'worker-not-claimable') {
+    // /v1/browser/poll moves a job QUEUED -> LEASED atomically before it
+    // answers, so by the time the widget sees it the Bridge already believes
+    // this worker owns it. Silently skipping it left the job leased to a
+    // window that would never touch it: untouchable for the whole 180 s lease,
+    // then requeued, leased to the same stuck window, and dropped again.
+    // Hand it back immediately instead, using the job's own lease.
+    const dispatchId = String(job?.dispatch_id || '');
+    const leaseId = String(job?.lease_id || '');
+    if (!dispatchId || !leaseId) return Promise.resolve({ ok: false });
+    appendBridgeDiagnostic('worker_released_job', {
+      severity: 'info',
+      message: `released ${dispatchId} back to the queue: ${reason}`
+    });
+    return bridgeRequest('POST', browserWorkerStatePath(dispatchId), {
+      dispatch_id: dispatchId,
+      worker_id: String(autoTabId || ''),
+      lease_id: leaseId,
+      state: 'RETRYABLE',
+      error: String(reason || 'worker-not-claimable')
+    }, { timeout: 7000 });
+  }
+
+  function browserWorkerDropStaleLease(ownedJob) {
+    // A local lease with no matching job on the Bridge is stale bookkeeping,
+    // and it is poisonous: browserWorkerCanClaim() stays false, so this window
+    // refuses every job it is handed while looking perfectly clean.
+    if (!browserWorkerLease?.dispatch_id) return false;
+    if (ownedJob?.dispatch_id) return false;
+    if (autoRuntime?.runId) return false;
+    const handoff = readStartAuditHandoff();
+    if (startHandoffIsPrepared(handoff) || startHandoffIsCommitted(handoff)) return false;
+    appendBridgeDiagnostic('worker_lease_cleared', {
+      severity: 'info',
+      message: `dropped stale local lease ${browserWorkerLease.dispatch_id}; the Bridge owns no job for this worker`
+    });
+    browserWorkerLease = null;
+    persistBrowserWorkerLease();
+    return true;
+  }
+
+  function browserWorkerStandDownIfOrphanedStart(ownedJob) {
+    // A prepared Core with no job behind it is the state that produced two
+    // windows sitting on one identical prompt: the first window prepared, lost
+    // the lease, the job was handed to a second window, and the first kept its
+    // armed receipt forever. If the Bridge owns no job for this worker and no
+    // audit is actually running here, the prepared Core is garbage.
+    if (ownedJob?.dispatch_id) return false;
+    if (autoRuntime?.runId) return false;
+    if (auditStartIsLive() || auditActionIsLive()) return false;
+    if (chatGPTIsGenerating()) return false;
+    const handoff = readStartAuditHandoff();
+    if (!startHandoffIsPrepared(handoff)) return false;
+    if (!startHandoffComposerStillPrepared(handoff)) return false;
+    return browserWorkerStandDown('orphaned-prepared-core');
   }
 
   async function browserWorkerPollOnce() {
@@ -17568,6 +18391,21 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           browserWorkerLease = null;
           persistBrowserWorkerLease();
         } else if (ownedState === 'BLOCKED') {
+          const recoveryState = String(owned.recovery_state || '');
+          const reconcilable = ['START_PREPARED', 'STARTED', 'AUDITING', 'FINALIZING'].includes(recoveryState);
+          if (reconcilable && browserWorkerLease?.lease_id) {
+            // A Bridge restart blocks a live post-START run pending same-worker
+            // reconciliation, and reconciliation is keyed on THIS lease. Dropping
+            // it here made the restart permanently unrecoverable: the audit kept
+            // running in the browser while its lane sat BLOCKED forever. Keep the
+            // lease; the next registration carries dispatch_id + lease_id and the
+            // Bridge reconciles on its own.
+            appendBridgeDiagnostic('worker_awaiting_reconcile', {
+              severity: 'info',
+              message: `Bridge blocked ${browserWorkerLease.dispatch_id} pending same-worker reconciliation from ${recoveryState}; keeping the lease`
+            });
+            return true;
+          }
           // Bridge marked this dispatch terminal BLOCKED (post-START, restart
           // reconciliation, or same-worker failure). Surface the real reason.
           await transition('BLOCKED', { error: String(owned.error || owned.lastError || 'bridge-marked-blocked') });
@@ -17583,7 +18421,20 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
           await browserWorkerConsume(owned);
         }
       }
-      if (result.data?.job && browserWorkerCanClaim()) await browserWorkerConsume(result.data.job);
+      if (result.data?.job) {
+        if (browserWorkerCanClaim()) {
+          await browserWorkerConsume(result.data.job);
+        } else {
+          await browserWorkerReleaseUnclaimableJob(result.data.job, browserWorkerClaimBlockReason());
+        }
+      } else {
+        browserWorkerDropStaleLease(result.data?.owned_job);
+        browserWorkerStandDownIfOrphanedStart(result.data?.owned_job);
+      }
+      // Nothing claimable and nothing owned: if this managed window is dirty
+      // from a finished run, put it back into the CLEAN pool instead of
+      // silently occupying one of the six lanes forever.
+      if (!browserWorkerLease?.dispatch_id) browserWorkerRecycleWatchdog();
       return true;
     } finally {
       browserWorkerPollInFlight = false;
@@ -17611,6 +18462,9 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     restoreBrowserWorkerLease();
     const recoveringOwnedAudit = Boolean(browserWorkerLease?.dispatch_id || autoRuntime?.runId);
     if (!browserWorkerHasChromiumCapability() || (!browserWorkerPageEligible() && !recoveringOwnedAudit)) {
+      // A managed window parked on /c/<id> after a run used to stop being a
+      // worker permanently. Recycle it back to a clean root chat first.
+      if (!recoveringOwnedAudit && browserWorkerRecycleToCleanChat('page-ineligible')) return true;
       stopBrowserWorker();
       return false;
     }
@@ -17744,6 +18598,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          copyBridgeDiagnostics,
          clearBridgeDiagnosticLog,
          formatBrowserWorkerBlockedMessage,
+         decodeArtifactErrorBody,
          showBrowserWorkerBlocked,
          hideBrowserWorkerBlocked,
          browserWorkerSnapshot,
@@ -17752,6 +18607,34 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerHasChromiumCapability,
          browserWorkerPageEligible,
          browserWorkerPollOnce,
+         browserWorkerReleaseUnclaimableJob,
+         browserWorkerDropStaleLease,
+         browserWorkerStandDown,
+         browserWorkerStandDownIfOrphanedStart,
+         browserWorkerRecycleWatchdog,
+         browserWorkerClearAbandonedDraft,
+         composerStateOwnedBySameWrite,
+         setBrowserWorkerDirtySinceForTest: value => { browserWorkerDirtySince = Number(value || 0); },
+         browserWorkerClaimBlockReason,
+         browserWorkerRecycleToCleanChat,
+         browserWorkerRecycleBlockReason,
+         browserWorkerNeedsRecycle,
+         browserWorkerRecycleUrl,
+         browserWorkerIsManagedProfile,
+         enforceStartReceiptA3Ownership,
+         reassertA3FromMachineReceipt,
+         machineAuthoredAuditTurn,
+         visibleCampaignAlreadyFinished,
+         setAuditStartInFlightForTest: (value, since) => {
+           auditStartInFlight = Boolean(value);
+           auditStartInFlightSince = Number(since || 0);
+         },
+         auditStartIsLive,
+         auditActionIsLive,
+         composerBlockText,
+         userTurnContainsReceipt,
+         userTurnTextCandidates,
+         browserWorkerManagedIdentity,
          browserWorkerConsume,
          browserWorkerTransition,
          startBrowserWorker,
@@ -17836,6 +18719,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
         waitForExactProjectAttachment,
         waitForExactProjectAttachmentWithRetry,
         startHandoffComposerStillPrepared,
+        preservePreparedStartBeforeManualSend,
         recoverArmedStartSend,
         readStartAuditHandoff,
         beginStartAuditHandoff,

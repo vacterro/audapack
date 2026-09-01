@@ -28,6 +28,7 @@ class AuditRunsWidget(QWidget):
     abandon_requested = Signal(str)
     open_requested = Signal(str)
     diagnostics_requested = Signal(object)
+    reset_all_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,12 +68,19 @@ class AuditRunsWidget(QWidget):
         )
         self.open_button = QPushButton("OPEN RESULT", self)
         self.details_button = QPushButton("COPY DETAILS", self)
+        self.reset_all_button = QPushButton("RESET ALL", self)
+        self.reset_all_button.setToolTip(
+            "Clear every unfinished lane in one action. Cancels what can be "
+            "cancelled and force-unblocks what cannot, so a jammed board does "
+            "not have to be reset lane by lane."
+        )
         self.retry_button.clicked.connect(self._start_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
         self.abandon_button.clicked.connect(self._abandon_selected)
         self.open_button.clicked.connect(self._open_selected)
         self.details_button.clicked.connect(self._details_selected)
-        for button in (self.retry_button, self.cancel_button, self.abandon_button, self.open_button, self.details_button):
+        self.reset_all_button.clicked.connect(self.reset_all_requested.emit)
+        for button in (self.retry_button, self.cancel_button, self.abandon_button, self.open_button, self.details_button, self.reset_all_button):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -102,6 +110,13 @@ class AuditRunsWidget(QWidget):
             return "—"
 
     def set_runs(self, runs: list[AuditRunSnapshot]) -> None:
+        # A 4 s refresh that silently drops the operator's selection makes the
+        # action buttons unusable: you aim at a lane and the panel repaints under
+        # your cursor. Remember the selected project and restore it.
+        selected_project = ""
+        current_row = self.lanes.currentRow()
+        if 0 <= current_row < len(self._lane_runs):
+            selected_project = str(self._lane_runs[current_row].project_id)
         self._runs = list(runs)
         latest: list[AuditRunSnapshot] = []
         seen: set[str] = set()
@@ -117,6 +132,7 @@ class AuditRunsWidget(QWidget):
         attention = sum(run.operator_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"} for run in latest)
         self.summary.setText(f"AUDIT RUNS · {active} active · {ready} ready · {attention} attention · max {MAX_AUDIT_LANES}")
 
+        self.lanes.blockSignals(True)
         self.lanes.clearContents()
         for row in range(MAX_AUDIT_LANES):
             run = latest[row] if row < len(latest) else None
@@ -133,6 +149,18 @@ class AuditRunsWidget(QWidget):
                 if column in {0, 3, 5}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.lanes.setItem(row, column, item)
+
+        restored_row = next(
+            (index for index, snapshot in enumerate(latest) if str(snapshot.project_id) == selected_project),
+            -1,
+        ) if selected_project else -1
+        self.lanes.blockSignals(False)
+        if restored_row >= 0:
+            if self.lanes.currentRow() != restored_row:
+                self.lanes.selectRow(restored_row)
+        elif selected_project:
+            # The lane genuinely disappeared; do not leave a stale highlight.
+            self.lanes.clearSelection()
 
         terminal = [
             run for run in self._runs
@@ -164,6 +192,12 @@ class AuditRunsWidget(QWidget):
         self.abandon_button.setEnabled(bool(run and "ABANDON" in actions and run.dispatch_id))
         self.open_button.setEnabled(bool(run and "OPEN" in actions and run.handoff_path))
         self.details_button.setEnabled(bool(run))
+        # RESET ALL never depends on a selection: it exists precisely for the
+        # board state where nothing is usefully selectable.
+        self.reset_all_button.setEnabled(any(
+            snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
+            for snapshot in self._runs
+        ))
 
     def _abandon_selected(self) -> None:
         run = self._selected()

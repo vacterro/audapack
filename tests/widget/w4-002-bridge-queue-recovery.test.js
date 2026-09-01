@@ -103,3 +103,49 @@ test('W4-002: manual Retry rebuilds compacted permanent job while automatic reco
   assert.strictEqual(rebuilt.waveCount, 3);
   assert.strictEqual(rebuilt.errorCode, '');
 });
+
+test('T83: a wave that is already complete in the canonical run is not a failure', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+
+  const job = {
+    jobId: 'job-already-complete',
+    receipt: 'performance-m-abc-123',
+    wave: 'performance',
+    project: 'VACZEN Calendar (CalendarTask)',
+    conversationKey: 'c:vaczen',
+    runId: 'acb-mat-abc-123',
+    sourceRunId: 'acb-mat-abc-123',
+    materialize: true,
+    content: 'audit body',
+    attempts: 0,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  assert.ok(api.saveBridgeJob(job));
+
+  h.httpResponder = () => ({
+    status: 409,
+    responseText: JSON.stringify({
+      ok: false,
+      error: {
+        code: 'completed_wave_immutable',
+        message: "Wave 'performance' is already complete in run acb-real; start a fresh run for replacement",
+        retriable: false
+      }
+    })
+  });
+
+  const pending = api.deliverBridgeJob(job);
+  await h.settle();
+  const handled = await pending;
+
+  // The end state the job wanted already exists on disk, so the job is done.
+  assert.strictEqual(handled, true);
+  assert.strictEqual(api.readBridgeJob('job-already-complete'), null);
+
+  const log = api.readBridgeDiagnosticLog();
+  assert.ok(log.some(entry => entry.event === 'job_already_complete'), JSON.stringify(log));
+  assert.strictEqual(log.some(entry => entry.event === 'job_failed'), false);
+});

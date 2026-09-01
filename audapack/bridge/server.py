@@ -51,7 +51,13 @@ from audapack.campaign import (
     save_live_campaign_index,
 )
 from audapack.components.widget import get_bundled_widget_path
-from audapack.config import AppConfig, legacy_token_acceptance_revoked, load_config, normalize_bridge_host
+from audapack.config import (
+    AppConfig,
+    get_user_runtime_dir,
+    legacy_token_acceptance_revoked,
+    load_config,
+    normalize_bridge_host,
+)
 from audapack.inaudit_capture import InauditCaptureError, store_for_config
 from audapack.packing import find_archive_for_project, resolve_output_dir
 from audapack.projects import ProjectRegistry, RegistrySaveError
@@ -448,6 +454,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
+        if parsed.path == "/v1/widget/diagnostics":
+            self._handle_widget_diagnostics()
+            return
         if parsed.path == "/v1/shutdown":
             self.send_json(200, {"ok": True, "message": "Shutting down bridge"})
             threading.Thread(target=self.server.shutdown).start()
@@ -1492,6 +1501,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "owned_job": {
                     "dispatch_id": owned.dispatch_id,
                     "state": owned.state,
+                    # A restart marks a live post-START run BLOCKED pending
+                    # same-worker reconciliation. The worker must be able to
+                    # tell that apart from a terminal block, or it drops the
+                    # very lease identity reconciliation needs.
+                    "recovery_state": owned.recovery_state,
                     "campaign_run_id": owned.campaign_run_id,
                     "lease_id": owned.lease_id,
                     "project_id": owned.project_id,
@@ -1664,6 +1678,37 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _handle_widget_diagnostics(self) -> None:
+        """Persist widget diagnostics so nobody has to copy/paste them by hand.
+
+        The widget's own log lives in browser storage, which is unreadable from
+        outside the browser. Mirroring it into the Bridge runtime directory is
+        what turns "please send me the log" into a file anyone can read.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        entries = data.get("entries")
+        if not isinstance(entries, list):
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_request", "message": "entries must be a list", "retriable": False}})
+            return
+        try:
+            log_dir = Path(self.get_custom_base_dir() or get_user_runtime_dir()) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / "widget_diagnostics.log"
+            if path.exists() and path.stat().st_size > 2_000_000:
+                path.replace(path.with_suffix(".log.1"))
+            with path.open("a", encoding="utf-8") as stream:
+                for entry in entries[:200]:
+                    if not isinstance(entry, dict):
+                        continue
+                    stream.write(json.dumps(entry, ensure_ascii=False)[:4000])
+                    stream.write(chr(10))
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "log_unwritable", "message": str(exc), "retriable": True}})
+            return
+        self.send_json(200, {"ok": True, "written": min(len(entries), 200)})
+
     def _serve_artifact(self, path: str) -> None:
         parts = [p for p in path.split("/") if p]
         if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "artifact":
@@ -1727,6 +1772,17 @@ def run_bridge_server(config: AppConfig) -> int:
 
     write_pid()
     print(f"AUDAPACK Bridge listening on http://{host}:{port}")
+    # Queued audit work used to move only while a browser was polling and
+    # only while the desktop app was open. The Bridge outlives both, so it
+    # owns lease expiry and managed-worker provisioning from here on.
+    supervisor = None
+    try:
+        from audapack.bridge.supervisor import DispatchSupervisor
+
+        supervisor = DispatchSupervisor(HandlerWithConfig.browser_dispatcher)
+        supervisor.start()
+    except Exception as exc:
+        logger.warning("dispatch supervisor did not start: %s", exc)
     # W2-011: prune expired history on startup (best-effort, non-blocking).
     try:
         from audapack.bridge.storage import prune_audit_history
@@ -1740,6 +1796,8 @@ def run_bridge_server(config: AppConfig) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if supervisor is not None:
+            supervisor.stop()
         server.server_close()
         remove_pid(expected_pid=os.getpid(), expected_nonce=INSTANCE_NONCE)
     return 0

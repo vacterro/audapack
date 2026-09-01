@@ -168,3 +168,261 @@ test('P0-10: leased consume performs one exact attach and one irreversible START
     'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
   ]);
 });
+
+test('T54: real worker START treats its canonical Core draft as owned and clicks Send', async () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=11',
+      pathname: '/',
+      search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=11'
+    }
+  });
+  const { form, input, send } = composerFixture(h);
+  api.state.bridgeEnabled = true;
+  api.state.auditProfile = 'quick3';
+  api.state.chatgptPromptDelivery = 'text';
+  addAttachmentTile(h, form, 'TERMISAI_01.09.26-T00-00-00.zip');
+
+  const transitions = [];
+  const archiveFile = { name: 'TERMISAI_01.09.26-T00-00-00.zip', size: 1234 };
+  const promise = api.browserWorkerConsume({
+    dispatch_id: 'dsp-fedcba9876543210',
+    worker_id: 'audapack-managed-1-11',
+    lease_id: 'lease-real-start',
+    project_id: 'termisai',
+    project_name: 'TERMISAI',
+    campaign_run_id: '',
+    archive_filename: archiveFile.name,
+    archive_size: archiveFile.size
+  }, {
+    transition: async (state, payload = {}) => {
+      transitions.push({ state, payload });
+      return { ok: true };
+    },
+    fetchArtifact: async () => ({ ok: true, file: archiveFile }),
+    uploadInput: () => input,
+    composerRoot: () => form,
+    injectFiles: () => true,
+    waitForAttachment: async () => ({
+      ok: true,
+      reason: 'exact-match',
+      observedNames: [archiveFile.name]
+    })
+  });
+
+  await h.settle();
+  const ok = await promise;
+
+  assert.strictEqual(ok, true, JSON.stringify(transitions));
+  assert.strictEqual(send._clicked, true, 'managed START must click Send without operator help');
+  assert.strictEqual(api.autoRuntime.enabled, true, 'managed START must retain A3 ownership');
+  assert.deepStrictEqual(transitions.map(item => item.state), [
+    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
+  ]);
+});
+
+test('T55: a non-retriable artifact rejection blocks once with its exact Bridge code', async () => {
+  const { h, api } = setup();
+  const { input, root } = composerFixture(h);
+  api.state.bridgeEnabled = true;
+
+  const transitions = [];
+  const ok = await api.browserWorkerConsume({
+    dispatch_id: 'dsp-artifact-gone',
+    worker_id: 'worker-1',
+    lease_id: 'lease-1',
+    project_id: 'saipenview',
+    project_name: 'saipenview',
+    archive_filename: 'saipenview_01.09.26-T00-00-00.zip',
+    archive_size: 1024
+  }, {
+    transition: async (state, payload = {}) => {
+      transitions.push({ state, payload });
+      return { ok: true };
+    },
+    fetchArtifact: async () => ({
+      ok: false,
+      reason: 'artifact-http-400:missing_archive',
+      status: 400,
+      code: 'missing_archive',
+      message: 'the recorded archive no longer exists',
+      retriable: false
+    }),
+    uploadInput: () => input,
+    composerRoot: () => root,
+    injectFiles: () => true,
+    waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [] }),
+    startAudit: async () => true
+  });
+
+  assert.strictEqual(ok, false);
+  assert.deepStrictEqual(transitions.map(item => item.state), ['BLOCKED']);
+  assert.strictEqual(transitions[0].payload.error, 'artifact-http-400:missing_archive');
+});
+
+test('T55: a retriable artifact failure still uses the pre-start retry budget', async () => {
+  const { h, api } = setup();
+  const { input, root } = composerFixture(h);
+  api.state.bridgeEnabled = true;
+
+  const transitions = [];
+  const ok = await api.browserWorkerConsume({
+    dispatch_id: 'dsp-artifact-flaky',
+    worker_id: 'worker-1',
+    lease_id: 'lease-1',
+    project_id: 'saipenview',
+    project_name: 'saipenview',
+    archive_filename: 'saipenview_01.09.26-T00-00-00.zip',
+    archive_size: 1024
+  }, {
+    transition: async (state, payload = {}) => {
+      transitions.push({ state, payload });
+      return { ok: true };
+    },
+    fetchArtifact: async () => ({
+      ok: false,
+      reason: 'artifact-request-timeout',
+      retriable: true
+    }),
+    uploadInput: () => input,
+    composerRoot: () => root,
+    injectFiles: () => true,
+    waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [] }),
+    startAudit: async () => true
+  });
+
+  assert.strictEqual(ok, false);
+  assert.deepStrictEqual(transitions.map(item => item.state), ['RETRYABLE']);
+  assert.strictEqual(transitions[0].payload.error, 'artifact-request-timeout');
+});
+
+test('T55: decodeArtifactErrorBody recovers the Bridge error code from the response body', () => {
+  const { api } = setup();
+  const body = new TextEncoder().encode(JSON.stringify({
+    ok: false,
+    error: { code: 'changed_archive', message: 'the recorded archive digest changed', retriable: false }
+  })).buffer;
+
+  const decoded = api.decodeArtifactErrorBody(body);
+  assert.strictEqual(decoded.code, 'changed_archive');
+  assert.strictEqual(decoded.retriable, false);
+  assert.match(decoded.message, /digest changed/);
+
+  const empty = api.decodeArtifactErrorBody(null);
+  assert.strictEqual(empty.code, '');
+  assert.strictEqual(empty.retriable, null);
+});
+
+test('T55: a detailed worker code still resolves a human blocked explanation', () => {
+  const { api } = setup();
+
+  const missing = api.formatBrowserWorkerBlockedMessage('artifact-http-400:missing_archive');
+  assert.match(missing.headline, /packed project ZIP is gone/);
+
+  const rejected = api.formatBrowserWorkerBlockedMessage('canonical-start-rejected: START AUDITING is not ready: composer busy');
+  assert.match(rejected.headline, /canonical START receipt/);
+});
+
+test('T68: a job the worker cannot consume is handed straight back, never dropped', async () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1',
+      pathname: '/',
+      search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1'
+    }
+  });
+  api.state.bridgeEnabled = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+
+
+  const pending = api.browserWorkerReleaseUnclaimableJob(
+    { dispatch_id: 'dsp-unclaimable', lease_id: 'lease-unclaimable' },
+    'worker-has-conversation'
+  );
+  await h.settle();
+  await pending;
+
+  const sent = h.httpRequests.find(item => /\/v1\/browser\/jobs\/dsp-unclaimable\/state$/.test(String(item.url || '')));
+  assert.ok(sent, JSON.stringify(h.httpRequests.map(item => item.url)));
+  assert.strictEqual(sent.method, 'POST');
+  const body = JSON.parse(sent.data);
+  assert.strictEqual(body.state, 'RETRYABLE');
+  assert.strictEqual(body.lease_id, 'lease-unclaimable');
+  assert.strictEqual(body.error, 'worker-has-conversation');
+});
+
+test('T68: a local lease the Bridge no longer knows about is dropped', () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1',
+      pathname: '/',
+      search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1'
+    }
+  });
+  api.state.bridgeEnabled = true;
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+  api.browserWorkerLease = { dispatch_id: 'dsp-ghost', worker_id: 'w', lease_id: 'l' };
+
+  // The Bridge still owns a job for this worker: keep the lease.
+  assert.strictEqual(api.browserWorkerDropStaleLease({ dispatch_id: 'dsp-ghost' }), false);
+  assert.ok(api.browserWorkerLease);
+
+  // The Bridge owns nothing: the lease is stale bookkeeping that would keep
+  // browserWorkerCanClaim() false forever.
+  assert.strictEqual(api.browserWorkerDropStaleLease(null), true);
+  assert.strictEqual(api.browserWorkerLease, null);
+});
+
+test('T70: a revoked START makes the window stand down instead of looping forever', async () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1',
+      pathname: '/',
+      search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=1'
+    }
+  });
+  const { form, input } = composerFixture(h);
+  api.state.bridgeEnabled = true;
+  api.state.auditProfile = 'quick3';
+  api.state.chatgptPromptDelivery = 'text';
+  const archiveFile = { name: 'SAITALK_31.08.26-T14-52-02.zip', size: 777477 };
+  addAttachmentTile(h, form, archiveFile.name);
+
+  const transitions = [];
+  const promise = api.browserWorkerConsume({
+    dispatch_id: 'dsp-revoked',
+    worker_id: 'audapack-managed-1-1',
+    lease_id: 'lease-revoked',
+    project_id: 'saitalk',
+    project_name: 'SAITALK',
+    archive_filename: archiveFile.name,
+    archive_size: archiveFile.size
+  }, {
+    transition: async (state, payload = {}) => {
+      transitions.push(state);
+      if (state === 'START_PREPARED') {
+        // Another window owns this dispatch now.
+        return { ok: false, error: { code: 'not_leased_owner', message: 'lease is not owned', retriable: false } };
+      }
+      return { ok: true };
+    },
+    fetchArtifact: async () => ({ ok: true, file: archiveFile }),
+    uploadInput: () => input,
+    composerRoot: () => form,
+    injectFiles: () => true,
+    waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [archiveFile.name] })
+  });
+
+  await h.settle();
+  const ok = await promise;
+
+  assert.strictEqual(ok, false);
+  assert.ok(transitions.includes('START_PREPARED'), transitions.join(','));
+  // No prepared receipt may survive: that is what made two windows sit on one
+  // identical Core prompt, each retrying the same irreversible Send.
+  assert.strictEqual(api.readStartAuditHandoff(), null);
+  assert.strictEqual(api.browserWorkerLease, null);
+
+  const log = api.readBridgeDiagnosticLog();
+  assert.ok(log.some(entry => entry.event === 'worker_stood_down'), JSON.stringify(log));
+});

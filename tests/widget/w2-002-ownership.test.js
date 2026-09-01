@@ -191,3 +191,40 @@ test('W2-002: triggerSend without fence still clicks', async () => {
   assert.strictEqual(result.mode, 'button');
   assert.strictEqual(send._clicked, true);
 });
+test('T79: the ownership guard survives ChatGPT relabelling our own attachment', () => {
+  const { h, api } = setup();
+  const prepared = {
+    rootId: 'composer-a',
+    text: 'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    tiles: ['uploading project.zip'],
+    generating: false
+  };
+
+  // ChatGPT finishes the upload and rewrites the tile label, and can swap the
+  // composer subtree. Neither is foreign activity.
+  const settled = {
+    rootId: 'composer-b',
+    text: 'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    tiles: ['project.zip'],
+    generating: false
+  };
+  assert.strictEqual(api.composerStateOwnedBySameWrite(prepared, settled), true);
+
+  // A foreign draft is still refused.
+  assert.strictEqual(api.composerStateOwnedBySameWrite(prepared, {
+    ...settled,
+    text: 'AUDIT CORE — wave 1/3 of Quick 3 Waves. and a human typed here'
+  }), false);
+
+  // A second attachment appearing is still refused.
+  assert.strictEqual(api.composerStateOwnedBySameWrite(prepared, {
+    ...settled,
+    tiles: ['project.zip', 'someone-elses.pdf']
+  }), false);
+
+  // Generation starting is still refused.
+  assert.strictEqual(api.composerStateOwnedBySameWrite(prepared, {
+    ...settled,
+    generating: true
+  }), false);
+});

@@ -43,6 +43,11 @@ from audapack.config import cross_process_lock, get_state_dir
 
 MAX_ACTIVE_WORKERS = 6
 WORKER_TTL_SECONDS = 75
+#: A worker id is per window session, so a reload or a hard navigation can
+#: retire one id and register another. Requeuing the instant an id vanishes
+#: handed the same job to a second window while the first still had the Core
+#: prepared in its composer. Wait until the job itself has clearly stalled.
+PRE_START_OWNER_GRACE_SECONDS = 45.0
 LEASE_SECONDS = 180
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
@@ -358,7 +363,20 @@ class BrowserDispatcher:
                     "ineligible_worker_context",
                     "embedded ChatGPT frames cannot register as browser workers",
                 )
-            if wid not in self._workers and len(self._workers) >= MAX_ACTIVE_WORKERS:
+            lane_workers = [w for w in self._workers.values() if self.worker_consumes_lane(w)]
+            if (
+                wid not in self._workers
+                and len(lane_workers) < MAX_ACTIVE_WORKERS
+                and len(self._workers) >= MAX_ACTIVE_WORKERS
+            ):
+                # Lanes are free but the registry is full of tabs that can
+                # never do audit work. Drop the stalest of those instead of
+                # refusing a worker that could actually run the queue.
+                spare = [w for w in self._workers.values() if not self.worker_consumes_lane(w)]
+                if spare:
+                    stalest = min(spare, key=lambda item: (item.last_seen_at, item.worker_id))
+                    self._workers.pop(stalest.worker_id, None)
+            if wid not in self._workers and len(lane_workers) >= MAX_ACTIVE_WORKERS:
                 incoming_supported = (
                     str(payload.get("widget_version") or "") == SUPPORTED_BROWSER_WIDGET_VERSION
                     and bool(payload.get("is_chromium", payload.get("is_brave", False)))
@@ -367,10 +385,11 @@ class BrowserDispatcher:
                     and str(payload.get("url_path") or "") == "/"
                 )
                 replaceable = [
-                    worker for worker in self._workers.values()
+                    worker for worker in lane_workers
                     if worker.widget_version.startswith("AUDAPACK_WIDGET")
                     and not self.worker_free_for_claim(worker)
                     and not worker.campaign_run_id
+                    and not self._worker_owns_live_job(worker)
                     and worker.state in {WORKER_FREE, WORKER_RESERVED}
                 ]
                 if incoming_supported and replaceable:
@@ -431,6 +450,39 @@ class BrowserDispatcher:
                     self.renew_lease(dispatch_id, wid, lease_id)
             return record
 
+    def _worker_owns_live_job(self, worker: WorkerRecord) -> bool:
+        return any(
+            job.assigned_worker_id == worker.worker_id
+            and job.state not in TERMINAL_STATES | {JOB_BLOCKED}
+            for job in self._jobs.values()
+        )
+
+    def worker_consumes_lane(self, worker: WorkerRecord) -> bool:
+        """True when a worker occupies one of the MAX_ACTIVE_WORKERS audit lanes.
+
+        Every registered ChatGPT tab running the Widget used to consume a lane,
+        including tabs that can never claim anything: legacy-widget builds and
+        the operator's own parked conversations. Six such tabs filled the whole
+        dispatcher while real queued audits starved and no managed window could
+        be launched -- the Bridge reported `W 6/6 CLEAN 0` with nothing running.
+
+        A worker occupies a lane only when it could actually do audit work: it
+        already owns a run or a job, or it is a live claim candidate. Everything
+        else stays visible in status but stops blocking capacity.
+        """
+        if worker.widget_version in INCOMPATIBLE_WIDGET_VERSIONS:
+            return False
+        if not worker.widget_version.startswith("AUDAPACK_WIDGET"):
+            # Legacy/test registrations keep the historical behaviour.
+            return True
+        if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
+            return False
+        if not worker.is_chromium or worker.site != "chatgpt":
+            return False
+        if worker.campaign_run_id or self._worker_owns_live_job(worker):
+            return True
+        return bool(worker.page_eligible)
+
     def worker_free_for_claim(self, worker: WorkerRecord) -> bool:
         """FREE + CLEAN must both be true to claim a new audit.
 
@@ -461,11 +513,7 @@ class BrowserDispatcher:
             return False
         if worker.campaign_run_id:
             return False
-        if any(
-            job.assigned_worker_id == worker.worker_id
-            and job.state not in TERMINAL_STATES | {JOB_BLOCKED}
-            for job in self._jobs.values()
-        ):
+        if self._worker_owns_live_job(worker):
             return False
         return True
 
@@ -814,7 +862,19 @@ class BrowserDispatcher:
             now = _now()
             requeued = 0
             for job in self._jobs.values():
-                if job.state in (JOB_LEASED, JOB_ARTIFACT_FETCHED, JOB_ATTACHED) and now > job.lease_expires_at:
+                pre_start = job.state in (JOB_LEASED, JOB_ARTIFACT_FETCHED, JOB_ATTACHED)
+                # A worker expires after WORKER_TTL_SECONDS but its lease runs for
+                # LEASE_SECONDS, so a job leased to a window that vanished used to
+                # sit untouchable for the difference -- pure dead time with clean
+                # workers idle beside it. Nothing before START_PREPARED is
+                # irreversible, so a job whose owner is no longer registered goes
+                # straight back into the queue.
+                owner_gone = (
+                    bool(job.assigned_worker_id)
+                    and job.assigned_worker_id not in self._workers
+                    and now - job.updated_at > PRE_START_OWNER_GRACE_SECONDS
+                )
+                if pre_start and (now > job.lease_expires_at or owner_gone):
                     job.state = JOB_QUEUED
                     job.assigned_worker_id = ""
                     job.lease_id = ""
@@ -837,6 +897,58 @@ class BrowserDispatcher:
             if requeued:
                 self._work_available.notify_all()
             return requeued
+
+    def reconcile_abandoned_runs(self, grace_seconds: float = 90.0) -> int:
+        """Free a lane whose assigned worker demonstrably no longer owns the run.
+
+        A post-START job pins its worker, and the worker pins the lane. When the
+        window that actually ran the audit is gone -- a duplicate window that
+        shared its worker id, a closed tab that came back clean, a hard reload
+        that lost the lease -- the Bridge kept believing the run was live while
+        the worker reported itself CLEAN and idle on the root page. The result
+        was `clean_workers > 0` and `free_workers 0` at the same time, with
+        every queued audit starving behind a run nobody was running.
+
+        Only a positively contradictory report counts: the worker is alive,
+        reports the clean root state, carries no campaign, and has been seen
+        well after the job last progressed.
+        """
+        grace = max(1.0, float(grace_seconds))
+        with self._lock:
+            now = _now()
+            freed = 0
+            for job in self._jobs.values():
+                if job.state not in POST_START_STATES:
+                    continue
+                worker = self._workers.get(job.assigned_worker_id or "")
+                if worker is None:
+                    continue
+                if now - worker.last_seen_at > WORKER_TTL_SECONDS:
+                    continue
+                if worker.last_seen_at <= job.updated_at + grace:
+                    continue
+                contradicts = (
+                    worker.clean_for_audit
+                    and worker.url_path == "/"
+                    and not worker.campaign_run_id
+                    and not worker.has_conversation_turns
+                    and not worker.generating
+                )
+                if not contradicts:
+                    continue
+                job.recovery_state = job.state
+                job.state = JOB_BLOCKED
+                job.error = "assigned worker no longer owns this run; recovery required"
+                job.assigned_worker_id = ""
+                job.lease_id = ""
+                job.lease_expires_at = 0.0
+                job.updated_at = now
+                freed += 1
+            if freed:
+                self._generation_context = {"dispatch_id": "", "project_id": "", "state": ""}
+                self._persist_jobs()
+                self._work_available.notify_all()
+            return freed
 
     def complete_for_run(
         self,
@@ -1024,7 +1136,11 @@ class BrowserDispatcher:
             now = _now()
             workers = list(self._workers.values())
             live = [w for w in workers if now - w.last_seen_at <= WORKER_TTL_SECONDS]
-            active = [w for w in live if w.state in WORKER_ACTIVE_STATES]
+            eligible = [w for w in live if w.state in WORKER_ACTIVE_STATES]
+            # Capacity decisions must see audit lanes, not every ChatGPT tab
+            # that happens to run the Widget.
+            active = [w for w in eligible if self.worker_consumes_lane(w)]
+            foreign = [w for w in eligible if w not in active]
             free = [w for w in active if w.state == WORKER_FREE and self.worker_free_for_claim(w)]
             busy = [w for w in active if w not in free]
             jobs = list(self._jobs.values())
@@ -1035,6 +1151,7 @@ class BrowserDispatcher:
                 "clean_workers": sum(1 for w in active if w.clean_for_audit),
                 "busy_workers": len(busy),
                 "offline_workers": self._expired_worker_count + len(workers) - len(live),
+                "foreign_workers": len(foreign),
                 "queued_jobs": sum(1 for j in jobs if j.state in (JOB_QUEUED, JOB_RETRYABLE)),
                 "active_jobs": sum(1 for j in jobs if j.state in POST_START_STATES | {JOB_LEASED, JOB_ARTIFACT_FETCHED, JOB_ATTACHED}),
                 "finalizing_jobs": sum(1 for j in jobs if j.state == JOB_FINALIZING),

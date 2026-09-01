@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { setup, mainEl, composerFixture, runtimeFixture } = require('./helpers');
+const { setup, mainEl, composerFixture, runtimeFixture, userTurn, addTurns } = require('./helpers');
 
 function cacheCompletedWaves(api, kinds, runId = 'run-complete') {
   api.autoRuntime.runId = runId;
@@ -163,6 +163,34 @@ test('W3-002: pre-click checkpoint preserves A3 across draft-to-chat hydration',
   assert.strictEqual(api.committedStartOwnsConversationKey(handoff, 'c:new-chat'), true);
 });
 
+test('T54: manual Send of a prepared canonical Core checkpoints A3 before route hydration', () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=12',
+      pathname: '/',
+      search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=12'
+    }
+  });
+  const { input, send } = composerFixture(h);
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  api.autoRuntime.enabled = true;
+  assert.strictEqual(api.saveAutoRuntime({ pauseOnFailure: false }), true);
+
+  const handoff = api.beginStartAuditHandoff();
+  assert.ok(handoff?.receipt);
+  assert.ok(api.armStartAuditHandoffForSend(handoff));
+  input.textContent = `AUDIT CORE — wave 1/3 of Quick 3 Waves.\n\nACB_CHAIN_RECEIPT: ${handoff.receipt}`;
+
+  assert.strictEqual(api.preservePreparedStartBeforeManualSend(send), true);
+  assert.strictEqual(api.readStartAuditHandoff().phase, 'clicking');
+  assert.strictEqual(api.readA3Intent().startTransaction, true);
+
+  h.location.pathname = '/c/manual-start-route';
+  h.location.href = 'https://chatgpt.com/c/manual-start-route';
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  assert.strictEqual(api.autoRuntime.enabled, true, 'A3 must stay enabled during manual Send route hydration');
+});
+
 test('W3-002: auditHandoffIntegrity rejects mismatched ticket count', () => {
   const { api } = setup();
   
@@ -192,4 +220,175 @@ SECOND_WAVE_DONE_WHEN: All issues resolved.
   assert.strictEqual(integrity.reason, 'ticket-count-mismatch');
   assert.strictEqual(integrity.declared, 25);
   assert.strictEqual(integrity.found, 2);
+});
+
+test('T58: the exact START receipt is still proven when ChatGPT clamps the user bubble', () => {
+  const { h, api } = setup();
+  const receipt = 'startcore-clamped-1';
+  const full = [
+    'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    '',
+    'ROLE',
+    'You are the auditor.',
+    'CAMPAIGN_RUN_ID: run-clamped',
+    '',
+    `ACB_CHAIN_RECEIPT: ${receipt}`
+  ].join('\n');
+
+  const turn = userTurn(h, 'core-clamped', full);
+  addTurns(h, [turn]);
+
+  // A long Core prompt is collapsed behind "Show more": innerText stops at the
+  // fold, so the receipt on the last line is invisible to the visual read.
+  Object.defineProperty(turn, 'innerText', {
+    configurable: true,
+    get() { return full.split('\n').slice(0, 3).join('\n'); }
+  });
+
+  assert.strictEqual(turn.innerText.includes(receipt), false, 'fixture must actually clamp');
+  assert.strictEqual(turn.textContent.includes(receipt), true);
+  assert.strictEqual(api.classifyAuditTurn(turn), 'core');
+
+  // The receipt proof drives startHandoffCanFollowRoute(); losing it is what
+  // disarmed A3 right after a successful send.
+  assert.strictEqual(api.userTurnContainsReceipt(turn, receipt), true);
+  assert.strictEqual(api.userTurnContainsReceipt(turn, 'startcore-other'), false);
+});
+
+test('T62: a chat that visibly holds the START receipt keeps A3 armed no matter what', () => {
+  const { h, api } = setup({
+    location: {
+      href: 'https://chatgpt.com/c/6a96148c-e5ec-83eb',
+      pathname: '/c/6a96148c-e5ec-83eb',
+      search: ''
+    }
+  });
+  composerFixture(h);
+  const receipt = 'startcore-invariant-1';
+  const full = [
+    'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    '',
+    'CAMPAIGN_RUN_ID: run-invariant',
+    `ACB_CHAIN_RECEIPT: ${receipt}`
+  ].join('\n');
+  const turn = userTurn(h, 'core-invariant', full);
+  addTurns(h, [turn]);
+
+  // The bubble is clamped, exactly as ChatGPT renders a long Core prompt.
+  Object.defineProperty(turn, 'innerText', {
+    configurable: true,
+    get() { return full.split('\n').slice(0, 2).join('\n'); }
+  });
+
+  // A live START handoff still owns the A3 intent for this tab...
+  const now = Date.now();
+  h.sessionStore.set('ai_chatbuttons_auto_start_handoff_v1', JSON.stringify({
+    version: 1,
+    tabId: h.sessionStore.get('ai_chatbuttons_auto_tab_id_v1'),
+    sourceKey: 'draft:x:y',
+    lastKey: 'draft:x:y',
+    destinationKey: '',
+    phase: 'sent',
+    startedAt: now,
+    sentAt: now,
+    armedAt: now,
+    receipt,
+    expiresAt: now + 300000,
+    runtime: null
+  }));
+
+  // ...but the runtime for this route came back disabled.
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  api.autoRuntime.enabled = false;
+
+  assert.strictEqual(api.readStartAuditHandoff()?.receipt, receipt, 'handoff fixture must load');
+  assert.strictEqual(api.enforceStartReceiptA3Ownership(), true);
+  assert.strictEqual(api.autoRuntime.enabled, true);
+});
+
+test('T62: the receipt invariant never arms A3 in an unrelated chat', () => {
+  const { h, api } = setup({
+    location: { href: 'https://chatgpt.com/c/someone-elses', pathname: '/c/someone-elses', search: '' }
+  });
+  composerFixture(h);
+  addTurns(h, [userTurn(h, 'other-1', 'just a normal question about cats')]);
+
+  const now = Date.now();
+  h.sessionStore.set('ai_chatbuttons_auto_start_handoff_v1', JSON.stringify({
+    version: 1,
+    tabId: h.sessionStore.get('ai_chatbuttons_auto_tab_id_v1'),
+    sourceKey: 'draft:x:y',
+    lastKey: 'draft:x:y',
+    destinationKey: '',
+    phase: 'sent',
+    startedAt: now,
+    sentAt: now,
+    armedAt: now,
+    receipt: 'startcore-not-here',
+    expiresAt: now + 300000,
+    runtime: null
+  }));
+
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  api.autoRuntime.enabled = false;
+
+  assert.strictEqual(api.enforceStartReceiptA3Ownership(), false);
+  assert.strictEqual(api.autoRuntime.enabled, false);
+
+  // The disarm is still recorded so it can never be invisible again.
+  const log = api.readBridgeDiagnosticLog();
+  assert.ok(log.some(entry => entry.event === 'a3_disarmed_with_live_start'), JSON.stringify(log));
+});
+
+test('T63: A3 survives a lost runtime even after the START handoff is cleared', () => {
+  const { h, api } = setup({
+    location: { href: 'https://chatgpt.com/c/6a96148c-e5ec', pathname: '/c/6a96148c-e5ec', search: '' }
+  });
+  composerFixture(h);
+  const full = [
+    'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    '',
+    'CAMPAIGN_RUN_ID: run-adopted',
+    'ACB_CHAIN_RECEIPT: startcore-adopted-1'
+  ].join('\n');
+  const turn = userTurn(h, 'core-adopted', full);
+  addTurns(h, [turn]);
+  Object.defineProperty(turn, 'innerText', {
+    configurable: true,
+    get() { return full.split('\n').slice(0, 2).join('\n'); }
+  });
+
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+  api.autoRuntime.conversationKey = 'c:6a96148c-e5ec';
+
+  // No handoff at all: it is cleared as soon as the Core turn is adopted.
+  assert.strictEqual(api.readStartAuditHandoff(), null);
+  assert.ok(api.machineAuthoredAuditTurn(), 'the machine receipt must be recognised');
+  assert.strictEqual(api.enforceStartReceiptA3Ownership('c:6a96148c-e5ec'), true);
+  assert.strictEqual(api.autoRuntime.enabled, true);
+
+  const log = api.readBridgeDiagnosticLog();
+  assert.ok(log.some(entry => entry.event === 'a3_reasserted_from_machine_receipt'), JSON.stringify(log));
+});
+
+test('T63: an operator who unchecks A3 by hand is never overridden', () => {
+  const { h, api } = setup({
+    location: { href: 'https://chatgpt.com/c/manual-off', pathname: '/c/manual-off', search: '' }
+  });
+  composerFixture(h);
+  const full = [
+    'AUDIT CORE — wave 1/3 of Quick 3 Waves.',
+    'ACB_CHAIN_RECEIPT: startcore-manual-off'
+  ].join('\n');
+  addTurns(h, [userTurn(h, 'core-manual', full)]);
+
+  api.bindAutoRuntimeToCurrentConversation({ claim: false });
+  // Unchecking A3 persists a runtime with enabled=false. That record is a
+  // decision, not lost state, and must survive every later render.
+  api.setAutoAuditEnabled(false);
+  assert.strictEqual(api.autoRuntime.enabled, false);
+
+  assert.strictEqual(api.enforceStartReceiptA3Ownership('c:manual-off'), false);
+  assert.strictEqual(api.autoRuntime.enabled, false);
 });

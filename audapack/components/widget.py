@@ -370,7 +370,7 @@ def launch_dedicated_chromium_worker(
     if managed_slot is not None and managed_generation is not None:
         slot = max(1, min(6, int(managed_slot)))
         generation = max(1, int(managed_generation))
-        target = f"{AUDAPACK_WORKER_URL}?audapack_worker_slot={slot}&audapack_worker_generation={generation}"
+        target = f"{AUDAPACK_WORKER_URL}&audapack_worker_slot={slot}&audapack_worker_generation={generation}"
     ok, error, selected, profile = _launch_dedicated_chromium(target, browser_exe)
     if not ok or not selected:
         return False, error

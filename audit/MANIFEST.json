@@ -1,0 +1,38 @@
+{
+  "roadmap": "AUDAPACK live six-worker/save recovery",
+  "generated_at_utc": "2026-09-01T05:31:51.271428+00:00",
+  "source_snapshot": "_AUDAPACK_01.09.26-T08-21-56.zip",
+  "source_sha256": "2513a13222b266528e022cd4cd510e125b5cc10fa3e8bd694cc5b0904d5063bd",
+  "git_head": "d46fae828997aeb69ea5e2260322a76e8951478c",
+  "app_version": "0.2.2",
+  "bundled_widget_version": "0.0.24",
+  "live_user_reported_widget_version": "0.0.22",
+  "observed_widget_tests": {
+    "passed": 190,
+    "failed": 0
+  },
+  "observed_python": {
+    "passed": 129,
+    "real_failures": 1,
+    "environment_failures": 3,
+    "real_failure": "diagnostics path redaction",
+    "environment": "PySide6 unavailable"
+  },
+  "verified_runtime_defect": "BrowserDispatcher.complete_for_run returns None for exact durable BLOCKED post-start lineage",
+  "tickets": [
+    "T01_RUNTIME_BUILD_IDENTITY.md",
+    "T02_WIDGET_BUILD_HANDSHAKE.md",
+    "T03_WIDGET_UPDATE_PATH.md",
+    "T04_SERVER_SEMANTIC_DUPLICATE_SAVE.md",
+    "T05_CLIENT_T83_CLEANUP_AND_MIGRATION.md",
+    "T06_BLOCKED_TO_COMPLETE_DURABLE_RECONCILIATION.md",
+    "T07_SLOT_COMMISSIONING_STATUS.md",
+    "T08_SUPERVISOR_COMMISSIONING_LIVENESS.md",
+    "T09_RECONCILE_OLD_BLOCKED_LANES_BEFORE_NEW_BATCH.md",
+    "T10_SAVE_PIPELINE_SIMPLIFICATION.md",
+    "T11_RUNTIME_PREFLIGHT_BEFORE_START_6.md",
+    "T12_DIAGNOSTICS_SEPARATE_HEALTH_FROM_HISTORY.md",
+    "T13_WINDOWS_6_WINDOW_SAVE_CHAOS_GATE.md",
+    "T14_RELEASE_VERSION_AND_MIGRATION.md"
+  ]
+}

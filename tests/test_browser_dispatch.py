@@ -593,3 +593,302 @@ def test_abandoned_run_is_never_reclaimed_by_a_worker(tmp_path):
     d.abandon_job(item.dispatch_id)
     d.register_worker(worker("w-fresh"))
     assert d.claim_job("w-fresh") is None, "an abandoned run must never produce a second Core"
+
+
+def test_parked_operator_tabs_do_not_consume_audit_lanes(tmp_path):
+    """Six ordinary ChatGPT tabs must never starve a real queued audit.
+
+    Live evidence: the Bridge reported `W 6/6 CLEAN 0` with two queued audits
+    and nothing running, because every lane was held by a legacy-widget build or
+    a parked conversation that could never claim anything.
+    """
+    d = dispatcher(tmp_path)
+    for i in range(3):
+        d.register_worker(worker(
+            f"legacy{i}",
+            widget_version="AUDAPACK_WIDGET",
+            is_chromium=False,
+            page_eligible=False,
+            url_path=f"/c/old-{i}",
+        ))
+    for i in range(3):
+        d.register_worker(worker(
+            f"parked{i}",
+            widget_version="AUDAPACK_WIDGET/3",
+            is_chromium=True,
+            page_eligible=False,
+            url_path=f"/c/human-{i}",
+            has_conversation_turns=True,
+        ))
+
+    status = d.status()
+    assert status["active_workers"] == 0, status
+    assert status["foreign_workers"] == 6
+
+    # A real managed window can still register even though the registry is full.
+    d.register_worker(worker(
+        "audapack-managed-1-1",
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=True,
+        url_path="/",
+        clean_for_audit=True,
+        managed_slot=1,
+        managed_generation=1,
+    ))
+    live = {item.worker_id for item in d.list_workers()}
+    assert "audapack-managed-1-1" in live
+    assert len(live) <= MAX_ACTIVE_WORKERS
+
+    status = d.status()
+    assert status["active_workers"] == 1
+    assert status["clean_workers"] == 1
+
+
+def test_a_worker_running_a_job_still_holds_its_lane(tmp_path):
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(worker(
+        "audapack-managed-1-1",
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=True,
+        url_path="/",
+        clean_for_audit=True,
+    ))
+    job = d.enqueue_job(job_payload(archive))
+    claimed = d.claim_job("audapack-managed-1-1", worker(
+        "audapack-managed-1-1",
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=True,
+        url_path="/",
+        clean_for_audit=True,
+    ))
+    assert claimed is not None and claimed.dispatch_id == job.dispatch_id
+
+    # Mid-run the window leaves the root path; it must keep its lane.
+    d.register_worker(worker(
+        "audapack-managed-1-1",
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=False,
+        url_path="/c/live-run",
+        clean_for_audit=False,
+    ))
+    status = d.status()
+    assert status["active_workers"] == 1
+    assert status["clean_workers"] == 0
+
+
+def _clean_root_worker(wid: str) -> dict:
+    return worker(
+        wid,
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=True,
+        url_path="/",
+        clean_for_audit=True,
+        has_conversation_turns=False,
+    )
+
+
+def test_a_worker_that_came_back_clean_releases_its_abandoned_run(tmp_path, monkeypatch):
+    """clean_workers > 0 with free_workers 0 is a deadlock, not a busy pool.
+
+    Live evidence: __SAITULS sat in STARTED and _AUDAPACK in AUDITING, both
+    assigned to managed workers that reported themselves CLEAN on the root page,
+    so three queued audits never got claimed.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(_clean_root_worker("audapack-managed-2-1-aaaa"))
+    job = d.enqueue_job(job_payload(archive))
+    d.claim_job("audapack-managed-2-1-aaaa", _clean_root_worker("audapack-managed-2-1-aaaa"))
+    d.transition_job(job.dispatch_id, "audapack-managed-2-1-aaaa", job.lease_id, "ARTIFACT_FETCHED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-2-1-aaaa", job.lease_id, "ATTACHED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-2-1-aaaa", job.lease_id, "START_PREPARED", {"campaign_run_id": "run-1", "start_receipt": "startcore-1"})
+    d.transition_job(job.dispatch_id, "audapack-managed-2-1-aaaa", job.lease_id, "STARTED", {})
+    assert d._jobs[job.dispatch_id].state == "STARTED"
+
+    # Inside the grace window nothing is touched.
+    assert d.reconcile_abandoned_runs(grace_seconds=90.0) == 0
+
+    # The window comes back clean on the root page well after the run stalled.
+    now = bd._now()
+    d._jobs[job.dispatch_id].updated_at = now - 600
+    d.register_worker(_clean_root_worker("audapack-managed-2-1-aaaa"))
+
+    assert d.reconcile_abandoned_runs(grace_seconds=90.0) == 1
+    stuck = d._jobs[job.dispatch_id]
+    assert stuck.state == "BLOCKED"
+    assert stuck.recovery_state == "STARTED"
+    assert stuck.assigned_worker_id == ""
+    assert "no longer owns this run" in stuck.error
+
+    # The lane is free again, so the next queued audit can actually be claimed.
+    assert d.worker_free_for_claim(d._workers["audapack-managed-2-1-aaaa"]) is True
+
+
+def test_a_worker_still_running_its_audit_is_never_reconciled_away(tmp_path):
+    import audapack.bridge.browser_dispatch as bd
+
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(_clean_root_worker("audapack-managed-5-1-bbbb"))
+    job = d.enqueue_job(job_payload(archive))
+    d.claim_job("audapack-managed-5-1-bbbb", _clean_root_worker("audapack-managed-5-1-bbbb"))
+    d.transition_job(job.dispatch_id, "audapack-managed-5-1-bbbb", job.lease_id, "ARTIFACT_FETCHED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-5-1-bbbb", job.lease_id, "ATTACHED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-5-1-bbbb", job.lease_id, "START_PREPARED", {"campaign_run_id": "run-2", "start_receipt": "startcore-2"})
+    d.transition_job(job.dispatch_id, "audapack-managed-5-1-bbbb", job.lease_id, "STARTED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-5-1-bbbb", job.lease_id, "AUDITING", {})
+
+    # The window is where it should be: inside the run, on the conversation.
+    d.register_worker(worker(
+        "audapack-managed-5-1-bbbb",
+        widget_version="AUDAPACK_WIDGET/3",
+        is_chromium=True,
+        page_eligible=False,
+        url_path="/c/live-run",
+        clean_for_audit=False,
+        has_conversation_turns=True,
+        campaign_run_id="run-2",
+    ))
+    d._jobs[job.dispatch_id].updated_at = bd._now() - 600
+
+    assert d.reconcile_abandoned_runs(grace_seconds=90.0) == 0
+    assert d._jobs[job.dispatch_id].state == "AUDITING"
+
+
+def test_a_pre_start_job_is_requeued_once_its_worker_is_gone_for_good(tmp_path):
+    """A worker expires at 75 s but its lease runs 180 s.
+
+    A job leased to a window that vanished sat untouchable for the difference
+    while clean workers idled beside it, which is most of the "it picks up a
+    minute later" feeling. Nothing before START_PREPARED is irreversible.
+    """
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(_clean_root_worker("gone-worker"))
+    job = d.enqueue_job(job_payload(archive))
+    leased = d.claim_job("gone-worker", _clean_root_worker("gone-worker"))
+    assert leased is not None and leased.state == "LEASED"
+    assert leased.lease_expires_at > 0
+
+    # The lease is still valid; only the worker is gone.
+    d._workers.pop("gone-worker")
+    assert d.expire_leases() == 0
+
+    # A worker id is per window session, so a brief disappearance is not proof
+    # of abandonment. Once the job itself has clearly stalled it goes back to
+    # the queue without waiting out the remaining lease.
+    import audapack.bridge.browser_dispatch as bd
+
+    d._jobs[job.dispatch_id].updated_at = bd._now() - (bd.PRE_START_OWNER_GRACE_SECONDS + 5)
+    assert d.expire_leases() == 1
+    assert d._jobs[job.dispatch_id].state == "QUEUED"
+    assert d._jobs[job.dispatch_id].assigned_worker_id == ""
+
+
+def test_a_live_worker_keeps_its_pre_start_lease(tmp_path):
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(_clean_root_worker("live-worker"))
+    job = d.enqueue_job(job_payload(archive))
+    d.claim_job("live-worker", _clean_root_worker("live-worker"))
+
+    assert d.expire_leases() == 0
+    assert d._jobs[job.dispatch_id].state == "LEASED"
+    assert d._jobs[job.dispatch_id].assigned_worker_id == "live-worker"
+
+
+def test_re_acking_the_same_start_receipt_is_a_no_op_not_an_error(tmp_path):
+    """A first Send that is not positively verified retries through recovery.
+
+    The retry re-acks START_PREPARED with the identical receipt. Rejecting that
+    made the worker stand down and abandon a perfectly prepared Core, leaving
+    the job START_PREPARED forever with nothing able to re-lease it.
+    """
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    d = dispatcher(tmp_path)
+    d.register_worker(_clean_root_worker("audapack-managed-1-1-aaaa"))
+    job = d.enqueue_job(job_payload(archive))
+    d.claim_job("audapack-managed-1-1-aaaa", _clean_root_worker("audapack-managed-1-1-aaaa"))
+    lease = d._jobs[job.dispatch_id].lease_id
+    d.transition_job(job.dispatch_id, "audapack-managed-1-1-aaaa", lease, "ARTIFACT_FETCHED", {})
+    d.transition_job(job.dispatch_id, "audapack-managed-1-1-aaaa", lease, "ATTACHED", {})
+    d.transition_job(
+        job.dispatch_id, "audapack-managed-1-1-aaaa", lease, "START_PREPARED",
+        {"campaign_run_id": "run-1", "start_receipt": "startcore-1"},
+    )
+
+    again = d.transition_job(
+        job.dispatch_id, "audapack-managed-1-1-aaaa", lease, "START_PREPARED",
+        {"campaign_run_id": "run-1", "start_receipt": "startcore-1"},
+    )
+    assert again.state == "START_PREPARED"
+    assert again.start_receipt == "startcore-1"
+
+    # Exactly-once is untouched: a different receipt is still refused.
+    try:
+        d.transition_job(
+            job.dispatch_id, "audapack-managed-1-1-aaaa", lease, "START_PREPARED",
+            {"campaign_run_id": "run-1", "start_receipt": "startcore-SECOND"},
+        )
+    except DispatchError as exc:
+        assert exc.code == "start_receipt_conflict"
+    else:
+        raise AssertionError("a second distinct START receipt must never be accepted")
+
+
+def test_a_bridge_restart_does_not_kill_a_live_audit(tmp_path):
+    """A restart blocks a post-START run pending same-worker reconciliation.
+
+    The audit keeps running in the browser, so the lane must be recoverable by
+    the exact worker that owns it -- not stranded BLOCKED forever.
+    """
+    archive = tmp_path / "PROJECT.zip"
+    archive.write_bytes(b"zip")
+    state_dir = tmp_path / "dispatch"
+    d = BrowserDispatcher(state_dir=state_dir)
+    d.register_worker(_clean_root_worker("audapack-managed-1-1-live"))
+    job = d.enqueue_job(job_payload(archive))
+    d.claim_job("audapack-managed-1-1-live", _clean_root_worker("audapack-managed-1-1-live"))
+    lease = d._jobs[job.dispatch_id].lease_id
+    for state, payload in (
+        ("ARTIFACT_FETCHED", {}),
+        ("ATTACHED", {}),
+        ("START_PREPARED", {"campaign_run_id": "run-live", "start_receipt": "startcore-live"}),
+        ("STARTED", {}),
+        ("AUDITING", {}),
+    ):
+        d.transition_job(job.dispatch_id, "audapack-managed-1-1-live", lease, state, payload)
+
+    # Bridge restarts: same state directory, fresh dispatcher.
+    restarted = BrowserDispatcher(state_dir=state_dir)
+    blocked = restarted._jobs[job.dispatch_id]
+    assert blocked.state == "BLOCKED"
+    assert blocked.recovery_state == "AUDITING"
+    assert blocked.assigned_worker_id == "audapack-managed-1-1-live"
+    assert blocked.lease_id == lease
+
+    # The owning worker comes back with its lease and the run resumes.
+    payload = _clean_root_worker("audapack-managed-1-1-live")
+    payload.update({
+        "dispatch_id": job.dispatch_id,
+        "lease_id": lease,
+        "campaign_run_id": "run-live",
+        "start_receipt": "startcore-live",
+    })
+    restarted.register_worker(payload)
+    assert restarted._jobs[job.dispatch_id].state == "AUDITING"
+    assert restarted._jobs[job.dispatch_id].error == ""

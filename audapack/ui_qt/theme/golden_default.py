@@ -116,6 +116,36 @@ QTreeView::item:selected {{
     background: {cls.selection};
     color: {cls.borderHighlight};
 }}
+QTableView, QListView {{
+    background: {cls.surface};
+    alternate-background-color: {cls.surfaceRaised};
+    color: {cls.textPrimary};
+    gridline-color: {cls.borderMuted};
+    border-top: 2px solid {cls.borderDark};
+    border-left: 2px solid {cls.borderDark};
+    border-right: 2px solid {cls.bevelLight};
+    border-bottom: 2px solid {cls.bevelLight};
+    selection-background-color: {cls.selection};
+    selection-color: {cls.borderHighlight};
+    outline: none;
+    font-family: "{cls.FONT_FAMILY}";
+    font-size: 11px;
+}}
+QTableView::item, QListView::item {{
+    border: none;
+    padding: 2px 4px;
+}}
+QTableView::item:selected, QListView::item:selected {{
+    background: {cls.selection};
+    color: {cls.borderHighlight};
+}}
+QTableCornerButton::section {{
+    background: {cls.surfaceRaised};
+    border-top: 2px solid {cls.bevelLight};
+    border-left: 2px solid {cls.bevelLight};
+    border-right: 2px solid {cls.borderDark};
+    border-bottom: 2px solid {cls.borderDark};
+}}
 QHeaderView::section {{
     background: {cls.surfaceRaised};
     color: {cls.textPrimary};
