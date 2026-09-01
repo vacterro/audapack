@@ -23,6 +23,7 @@ from audapack.bridge.browser_dispatch import (
     JOB_START_PREPARED,
     JOB_STARTED,
     MAX_ACTIVE_WORKERS,
+    POST_START_RECOVERY_GRACE_SECONDS,
     WORKER_AUDITING,
     WORKER_TTL_SECONDS,
     BrowserDispatcher,
@@ -1544,12 +1545,43 @@ def test_a_run_whose_window_never_returns_stops_claiming_to_be_recoverable(tmp_p
     assert d.expire_unrecoverable_runs() == 0
     assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
 
-    job.updated_at = time.time() - 601
+    job.updated_at = time.time() - (POST_START_RECOVERY_GRACE_SECONDS + 1)
     assert d.expire_unrecoverable_runs() == 1
     closed = d.get_job(item.dispatch_id)
     assert closed.state == JOB_FAILED
     assert closed.last_error_code == "worker_window_gone"
     assert closed.recovery_state == ""
+
+
+def test_an_absent_worker_is_not_proof_the_run_is_dead(tmp_path):
+    """The browser keeps auditing while the Bridge cannot see its worker.
+
+    Observed live: SAIPET blocked at 02:06 with an empty managed slot and wrote
+    its finished 3-wave handoff at 02:40. A grace shorter than an audit would
+    have stamped FAILED on a run that succeeded -- the same lie as closing a
+    lane against yesterday's artifact, pointed the other way.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "SAIPET"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_STARTED
+    d._workers.pop("w1", None)
+
+    # 34 minutes with no worker in sight -- exactly the live SAIPET window.
+    job.updated_at = time.time() - 34 * 60
+    assert d.expire_unrecoverable_runs() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
+    # An hour: still shorter than a super10 campaign.
+    job.updated_at = time.time() - 3600
+    assert d.expire_unrecoverable_runs() == 0
+    assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
 
 
 def test_a_blocked_run_whose_window_is_still_registered_keeps_waiting(tmp_path):

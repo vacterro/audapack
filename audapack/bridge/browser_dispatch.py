@@ -59,9 +59,14 @@ LEASE_SECONDS = 180
 #: How long a post-START run waits for its own window to come back before the
 #: Bridge stops calling it recoverable. A managed worker id lives in that
 #: window's sessionStorage, so a window that closes takes its identity with it
-#: and no relaunch can ever adopt the run. Long enough to survive a reload, a
-#: crashed tab that reopens, and a long ChatGPT generation.
-POST_START_RECOVERY_GRACE_SECONDS = 600.0
+#: and no relaunch can ever adopt the run.
+#:
+#: A worker missing from the registry is NOT proof its run is dead: the browser
+#: keeps auditing while its poll is broken, its id has rotated, or the tab is
+#: busy generating. Observed live: SAIPET blocked at 02:06 with an empty slot
+#: and wrote its finished 3-wave handoff at 02:40. So this must outlast the
+#: longest plausible audit, or it fabricates a FAILED for a run that succeeds.
+POST_START_RECOVERY_GRACE_SECONDS = 7200.0
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
 PRE_START_MAX_RETRIES = 5
@@ -1373,6 +1378,9 @@ class BrowserDispatcher:
         finished is closed as COMPLETE rather than failed here. This only
         stops the lie -- it never re-runs an audit, because START_PREPARED is
         the exactly-once boundary and re-crossing it is the operator's call.
+
+        The grace outlasts the longest plausible audit on purpose: an absent
+        worker means the Bridge cannot see the run, not that the run is dead.
         """
         grace = max(1.0, float(grace_seconds))
         with self._lock:
