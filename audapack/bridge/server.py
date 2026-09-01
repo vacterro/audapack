@@ -1545,6 +1545,20 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     final_handoff_path = _get_final_handoff_path(prof, state)
                     canonical_campaign_path = _get_canonical_path(prof, state)
                     finalization_ok = True
+                    # The lane learns a campaign finished only from the worker's
+                    # terminal ACK, and that ACK is one HTTP call that can fail
+                    # to arrive. Writing the durable handoff IS the finish, and
+                    # here the project, path and digest are all known exactly.
+                    try:
+                        if final_handoff_path:
+                            self._dispatcher().complete_runs_for_project(
+                                str(project_id or ""),
+                                str(resolved_name or ""),
+                                str(final_handoff_path),
+                                hashlib.sha256(Path(final_handoff_path).read_bytes()).hexdigest(),
+                            )
+                    except Exception as exc:
+                        logger.warning("could not close dispatch lanes for %s: %s", resolved_name, exc)
                 except Exception as exc:
                     restore_file_snapshots(snapshots)
                     self.send_json(503, {

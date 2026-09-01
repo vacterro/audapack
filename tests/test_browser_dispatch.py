@@ -1330,3 +1330,57 @@ def test_a_finished_campaign_completes_a_run_whose_ack_never_landed(tmp_path):
 
     assert d.reconcile_completed_blocked_runs() == 1
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
+def test_writing_the_final_handoff_closes_the_lane(tmp_path):
+    """The durable handoff IS the finish, ACK or no ACK.
+
+    Two campaigns were observed complete on disk -- 3/3 waves and a valid
+    canonical handoff -- with their lanes still reporting AUDITING and never
+    becoming READY, because the terminal ACK never arrived.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "TERMISAI"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+
+    handoff = tmp_path / "TERMISAI__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    closed = d.complete_runs_for_project("termisai", "TERMISAI", str(handoff), "deadbeef")
+
+    assert closed == 1
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_COMPLETE
+    assert job.final_handoff_path == str(handoff)
+    assert job.final_handoff_sha256 == "deadbeef"
+
+
+def test_completing_a_project_never_touches_a_pre_start_job(tmp_path):
+    """Nothing before START_PREPARED has an audit to be finished."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "TERMISAI"))
+    d.claim_job("w1")
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+    assert d.complete_runs_for_project("termisai", "TERMISAI", "/tmp/x.md", "abc") == 0
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+
+def test_completing_a_project_never_touches_another_project(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "TERMISAI"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+
+    assert d.complete_runs_for_project("wintage", "Wintage", "/tmp/x.md", "abc") == 0
+    assert d.get_job(item.dispatch_id).state == JOB_STARTED

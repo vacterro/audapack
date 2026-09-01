@@ -806,27 +806,43 @@ class AuditRunCoordinator:
         proof.append("project_match")
         dispatch_run = str(job.get("campaign_run_id") or "")
         audit_run = str(audit.campaign_run_id or "")
-        if not dispatch_run or dispatch_run != audit_run:
+        # ChatGPT route hydration re-arms the widget's runtime and re-derives
+        # the campaign run id, so a finished campaign can be saved under an id
+        # the dispatch never saw. The Bridge records that drift when it
+        # reconciles, and it is the same run: without this a completed audit --
+        # 3/3 waves and a valid canonical handoff on disk -- could never become
+        # READY, which is the whole point of the lane.
+        drift_run = str(job.get("meta_run_id_drift") or "")
+        if not dispatch_run or audit_run not in {dispatch_run, drift_run} or not audit_run:
             return False, tuple(proof), "", ""
-        proof.append("campaign_match")
+        proof.append("campaign_match" if audit_run == dispatch_run else "campaign_match_via_drift")
         if not audit.campaign_complete or audit.completed_waves != audit.total_waves or audit.total_waves <= 0:
             return False, tuple(proof), "", ""
         proof.append("waves_complete")
         if not audit.final_handoff_ready or audit.final_handoff_path is None:
             return False, tuple(proof), "", ""
         audit_path = Path(audit.final_handoff_path)
-        job_path = Path(str(job.get("final_handoff_path") or ""))
+        recorded_path = str(job.get("final_handoff_path") or "")
         try:
-            if not audit_path.is_file() or not job_path.is_file() or audit_path.resolve() != job_path.resolve():
+            if not audit_path.is_file():
+                return False, tuple(proof), "", ""
+            # The dispatch only learns the handoff path and digest from the
+            # terminal ACK. When that ACK never landed the record is blank, and
+            # demanding it made a durable, verified artifact unreachable. Where
+            # the dispatch DOES carry them they must still agree exactly.
+            if recorded_path and Path(recorded_path).resolve() != audit_path.resolve():
                 return False, tuple(proof), "", ""
             digest = _sha256_file(audit_path)
         except OSError:
             return False, tuple(proof), "", ""
         expected = str(audit.final_handoff_sha256 or "").lower()
         dispatch_digest = str(job.get("final_handoff_sha256") or "").lower()
-        if not expected or digest != expected or digest != dispatch_digest:
+        if not expected or digest != expected:
             return False, tuple(proof), "", ""
-        proof.extend(("handoff_durable", "handoff_hash_match"))
+        if dispatch_digest and digest != dispatch_digest:
+            return False, tuple(proof), "", ""
+        proof.append("handoff_durable")
+        proof.append("handoff_hash_match" if dispatch_digest else "handoff_hash_index_only")
         return True, tuple(proof), str(audit_path), digest
 
     def _snapshot(

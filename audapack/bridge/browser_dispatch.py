@@ -1208,6 +1208,54 @@ class BrowserDispatcher:
                 self._work_available.notify_all()
             return freed
 
+    def complete_runs_for_project(self, project_id: str, project_name: str, handoff_path: str, handoff_sha256: str) -> int:
+        """Close the lane the moment the durable final handoff is written.
+
+        The dispatch only learns a campaign finished from the worker's terminal
+        ACK, and that ACK is one HTTP call that can simply not arrive. Two
+        campaigns were observed complete on disk -- 3/3 waves and a valid
+        canonical handoff -- with their lanes still reporting AUDITING and
+        never becoming READY. reconcile_completed_blocked_runs could not help:
+        it looks for campaign.json under the dispatch state dir, while the real
+        one lives beside the audit artifacts, and it keys on a run id the
+        widget may have re-derived.
+
+        The Bridge writing that handoff is the authoritative event, and here it
+        knows the project, the exact path and the digest. Only post-start jobs
+        are closed: nothing before START_PREPARED has an audit to be finished.
+        """
+        wanted = {str(project_id or "").strip().lower(), str(project_name or "").strip().lower()} - {""}
+        if not wanted:
+            return 0
+        with self._lock:
+            now = _now()
+            closed = 0
+            for job in self._jobs.values():
+                if job.state not in POST_START_STATES and not (
+                    job.state == JOB_BLOCKED and job.recovery_state in POST_START_STATES
+                ):
+                    continue
+                names = {str(job.project_id or "").strip().lower(), str(job.project_name or "").strip().lower()}
+                if not (names & wanted):
+                    continue
+                job.state = JOB_COMPLETE
+                job.result = "audit-complete"
+                job.error = ""
+                job.final_handoff_path = str(handoff_path or job.final_handoff_path)
+                job.final_handoff_sha256 = str(handoff_sha256 or job.final_handoff_sha256)
+                job.completed_at = now
+                job.updated_at = now
+                worker = self._workers.get(job.assigned_worker_id or "")
+                if worker:
+                    worker.campaign_run_id = ""
+                    worker.state = WORKER_FREE
+                closed += 1
+            if closed:
+                self._generation_context = {"dispatch_id": "", "project_id": "", "state": JOB_COMPLETE}
+                self._persist_jobs()
+                self._work_available.notify_all()
+            return closed
+
     def reconcile_completed_blocked_runs(self) -> int:
         """Complete any live post-start run with durable COMPLETE proof.
 
