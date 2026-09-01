@@ -1,7 +1,7 @@
 ---
 phase: SHIP
-task: T-109
-next_action: "operator installs widget 0.0.34, then a clean CM run must produce __00_COMPRESS_AUDIT.md"
+task: T-110
+next_action: "verify the clean CM run produces __00_COMPRESS_AUDIT.md and reads READY"
 blocker: none
 agent: claude
 saipen_version: 7
@@ -9,8 +9,8 @@ schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
 transition_from: REVIEW
-last_event: 623
-updated: "2026-09-01T22:20:00Z"
+last_event: 624
+updated: "2026-09-01T22:55:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
