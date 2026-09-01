@@ -38,6 +38,10 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
 
     GG button removed as obsolete. Info [ⓘ] placed left of launchers.
     Returns (launcher_buttons, _unused_gg_rect) for compat.
+
+    Buttons always hug the FIXED right edge so the state column stays at the
+    same x for every row -- a varying launcher count used to shift the column
+    start and made the rows visually drift out of alignment.
     """
     # GG removed — keep dummy rect for compat but zero size
     gg_rect = QRect(row_rect.right() - 2, row_rect.top() + 2, 0, 20)
@@ -64,8 +68,19 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
     return result_buttons, gg_rect
 
 
+#: Fixed width reserved on the right edge for the launcher/info button block,
+#: so the state column left edge is identical on every row regardless of how
+#: many launcher buttons a row actually has. Max 6 buttons * 18px + 5 * 2px gap
+#: + 2px margin + 4px gap + 18px info = 142px; round to a safe 150px.
+FIXED_ACTIONS_WIDTH = 150
+
+
 def compute_info_button_rect(row_rect: QRect, launcher_buttons: list[tuple[Any, QRect]], gg_rect: QRect) -> QRect:
-    """Info [ⓘ] button placed 4px left of the leftmost action button."""
+    """Info [ⓘ] button placed 4px left of the leftmost action button.
+
+    The button block is anchored at the FIXED right edge so the state column
+    does not shift when the launcher count differs between projects.
+    """
     gap = 4
     info_w = 18
     if launcher_buttons:
@@ -220,7 +235,6 @@ class ProjectItemDelegate(QStyledItemDelegate):
         launchers = getattr(self._config, "launchers", None) if self._config else None
         launcher_buttons, gg_rect = compute_row_button_rects(rect, launchers)
         info_rect = compute_info_button_rect(rect, launcher_buttons, gg_rect)
-        buttons_start_x = info_rect.left()
 
         total_waves = index.data(Qt.ItemDataRole.UserRole + 15) or 3
         prof_label = index.data(Qt.ItemDataRole.UserRole + 19) or ("A10" if total_waves == 10 else "A3")
@@ -232,9 +246,13 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # ── Vertical indicator column (fixed width, stacked top→bottom) ────────
         # Every project row uses the SAME column layout: consistent order and
         # alignment, so the eye scans down one column instead of hunting badges.
+        # The column is anchored at a fixed distance from the right edge so the
+        # left edge is identical on every row regardless of how many launcher
+        # buttons a row actually has. This fixes the "rows crawling in different
+        # directions" visual defect.
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
         col_w = 230 if compact_rows else 110
-        col_x = buttons_start_x - 4 - col_w
+        col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
 
         # Data used by the column
         arc_data = index.data(Qt.ItemDataRole.UserRole + 18)
@@ -417,53 +435,42 @@ class ProjectItemDelegate(QStyledItemDelegate):
             else:
                 pack_display = " [!]"
 
-        # Try single-line layout if wave+age+copy+IA+ZIP+pack fits in col_w
-        painter.setFont(self.font_small)
-        single_gap = "  " if zip_text != "\u2014" else ""
-        single_line = wave_text + audit_display + copy_display + inaudit_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
-        single_w = painter.fontMetrics().horizontalAdvance(single_line)
-        if compact_rows or (zip_text != "\u2014" and single_w <= col_w):
+        # Compact mode keeps a single row (22px) -- everything on one line.
+        # Full mode uses the fixed two-line layout so every row aligns.
+        if compact_rows:
+            single_gap = "  " if zip_text != "\u2014" else ""
+            single_line = wave_text + audit_display + copy_display + inaudit_display + (single_gap + zip_text if zip_text != "\u2014" else "") + pack_display
+            painter.setFont(self.font_small)
             single_y = y + (h - line_h) // 2
             painter.setPen(wave_color)
-            painter.drawText(QRect(col_x, single_y, col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, wave_text)
+            painter.drawText(QRect(col_x, single_y, col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, single_line)
+        else:
+            # Two-line, fixed-position column layout. Every row uses the SAME
+            # two-line structure regardless of width, so the eye scans vertically
+            # down the same x positions on every row instead of rows drifting
+            # horizontally depending on the dynamic single-line branch.
+            #
+            #   line 0: WAVE  ·  AGE  ·  ×N  ·  IA
+            #   line 1: ZIP …  ·  [PACK nn%]
+            painter.setFont(self.font_small)
+            line0_text = wave_text + audit_display + copy_display + inaudit_display
+            painter.setPen(wave_color)
+            painter.drawText(QRect(col_x, _line_top(0), col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line0_text)
             cur_x1 = painter.fontMetrics().horizontalAdvance(wave_text)
             if audit_display:
                 painter.setPen(audit_color)
-                painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, audit_display)
+                painter.drawText(QRect(col_x + cur_x1, _line_top(0), col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, audit_display)
                 cur_x1 += painter.fontMetrics().horizontalAdvance(audit_display)
             if copy_display:
-                painter.setPen(QColor(PALETTE["borderGolden"]))
-                painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, copy_display)
-                cur_x1 += painter.fontMetrics().horizontalAdvance(copy_display)
-            if inaudit_display:
-                painter.setPen(inaudit_color)
-                painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, inaudit_display)
-                cur_x1 += painter.fontMetrics().horizontalAdvance(inaudit_display)
-            if single_gap:
-                gap_w = painter.fontMetrics().horizontalAdvance(single_gap)
-                painter.setPen(arc_color)
-                painter.drawText(QRect(col_x + cur_x1 + gap_w, single_y, col_w - cur_x1 - gap_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, zip_text)
-                cur_x1 += gap_w + painter.fontMetrics().horizontalAdvance(zip_text)
-            if pack_display:
-                painter.setPen(pack_color)
-                painter.drawText(QRect(col_x + cur_x1, single_y, col_w - cur_x1, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, pack_display)
-        else:
-            full_line1 = wave_text + audit_display + copy_display + inaudit_display
-            painter.setFont(self.font_small)
-            painter.setPen(wave_color)
-            painter.drawText(QRect(col_x, _line_top(0), col_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, full_line1)
-            if audit_display:
-                w_w = painter.fontMetrics().horizontalAdvance(wave_text)
-                painter.setPen(audit_color)
-                painter.drawText(QRect(col_x + w_w, _line_top(0), col_w - w_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, audit_display)
-            if copy_display:
-                base_w = painter.fontMetrics().horizontalAdvance(wave_text + audit_display)
+                base_w = cur_x1
                 painter.setPen(QColor(PALETTE["borderGolden"]))
                 painter.drawText(QRect(col_x + base_w, _line_top(0), col_w - base_w, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, copy_display)
+                cur_x1 += painter.fontMetrics().horizontalAdvance(copy_display)
             if inaudit_display:
-                base2 = painter.fontMetrics().horizontalAdvance(wave_text + audit_display + copy_display)
+                base2 = cur_x1
                 painter.setPen(inaudit_color)
                 painter.drawText(QRect(col_x + base2, _line_top(0), col_w - base2, line_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, inaudit_display)
+                cur_x1 += painter.fontMetrics().horizontalAdvance(inaudit_display)
             # line1 ZIP + pack together (or live progress bar while packing)
             painter.setFont(self.font_small)
             if pack_state in ("PACKING", "QUEUED") and isinstance(pack_progress, dict):
