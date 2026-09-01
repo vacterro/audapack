@@ -50,3 +50,25 @@ test('W11: a window with no composer and no login offer is not guessed at', () =
   assert.strictEqual(api.chatGPTSignedOut(), false);
   assert.strictEqual(api.browserWorkerUnusableReason(), 'no-composer');
 });
+
+test('W11: a dispatched run arms the audit engine', () => {
+  // The Bridge sends the Core and moves the lane to AUDITING, but harvesting
+  // the response and committing the wave is the widget's own auto engine, and
+  // a worker window's engine is off by default: a CM audit ran for 11m34s,
+  // produced a valid terminal handoff in the chat, and nothing was saved.
+  const { h, api } = managedWindow();
+  composerFixture(h);
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+  assert.strictEqual(Boolean(api.autoRuntime.enabled), false);
+
+  api.browserWorkerArmAuditEngine();
+  assert.strictEqual(Boolean(api.autoRuntime.enabled), true);
+});
+
+test('W11: arming an engine that is already on is a no-op', () => {
+  const { h, api } = managedWindow();
+  composerFixture(h);
+  api.autoRuntime = { ...api.emptyAutoRuntime({ enabled: true }), runId: 'acb-live' };
+  assert.strictEqual(api.browserWorkerArmAuditEngine(), true);
+  assert.strictEqual(api.autoRuntime.runId, 'acb-live', 'an armed run must not be disturbed');
+});

@@ -51,8 +51,15 @@ class TestHiddenSpawnSites(unittest.TestCase):
              patch("subprocess.Popen") as popen_mock:
             ok, _msg = widget_mod.launch_dedicated_chromium_worker()
             self.assertTrue(ok)
-            popen_mock.assert_called_once()
-            self.assert_hidden(popen_mock.call_args)
+            # Assert on THIS spawn, not on the call count: other suites keep
+            # background threads that spawn processes, and a stray call landing
+            # inside the patch window is not a defect in this one.
+            browser_calls = [
+                call for call in popen_mock.call_args_list
+                if call.args and call.args[0] and "chrome.exe" in str(call.args[0][0]).lower()
+            ]
+            self.assertEqual(len(browser_calls), 1, popen_mock.call_args_list)
+            self.assert_hidden(browser_calls[0])
 
     def test_migration_taskkill_is_hidden(self):
         from audapack.components import migration as migration_mod

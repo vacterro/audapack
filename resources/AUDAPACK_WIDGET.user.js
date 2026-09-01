@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.33
+// @version      0.0.34
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18148,6 +18148,27 @@ let browserWorkerBraveConfirmed = false;
     return true;
   }
 
+  function browserWorkerArmAuditEngine() {
+    // A dispatched run is not a human toggling A3: the operator already asked
+    // for this audit from the desktop, so the engine that harvests and commits
+    // its waves has to be on.
+    try {
+      if (autoRuntime?.enabled) return true;
+      const armed = setAutoAuditEnabled(true);
+      appendBridgeDiagnostic('worker_engine_armed', {
+        severity: 'info',
+        message: `audit engine armed for the dispatched run (${String(autoRuntime?.runId || 'no run id yet')})`
+      });
+      return armed !== false;
+    } catch (error) {
+      appendBridgeDiagnostic('worker_engine_arm_failed', {
+        severity: 'error',
+        message: `could not arm the audit engine: ${String(error && error.message || error)}`
+      });
+      return false;
+    }
+  }
+
   function browserWorkerApplyDispatchedProfile(profileId) {
     // The Bridge job names the campaign profile the operator chose. A worker
     // window must run THAT one, never the profile this window happens to be
@@ -18360,6 +18381,13 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       }
       return false;
     }
+    // Arm the audit engine for this run. The Bridge sends the Core and moves
+    // the lane to AUDITING, but harvesting the response and committing the
+    // wave is the widget's own auto engine, and a worker window's engine is
+    // off by default: the CM audit ran for 11m34s, produced a valid terminal
+    // handoff in the chat, and nothing was ever saved. Only after the send,
+    // so it binds to the conversation the Core actually created.
+    browserWorkerArmAuditEngine();
     if (!(await transition('STARTED', { campaign_run_id: String(autoRuntime?.runId || ''), conversation_id: String(autoRuntime?.conversationKey || '') })).ok) return false;
     if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
     return true;
@@ -18989,6 +19017,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerUnusableReason,
          chatGPTSignedOut,
          browserWorkerApplyDispatchedProfile,
+         browserWorkerArmAuditEngine,
          loadState,
          profileShortLabel,
          nextAuditProfileId,
