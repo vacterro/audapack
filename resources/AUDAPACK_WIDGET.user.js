@@ -17761,6 +17761,17 @@ async function recoverArmedStartSend(options = {}) {
   // than a stale build.
   const BROWSER_WORKER_STALE_RELOAD_KEY = 'audapack_worker_stale_reload_v1';
   const BROWSER_WORKER_STALE_RELOAD_COOLDOWN_MS = 120000;
+
+  function widgetBuildVersion() {
+    // The userscript manager's own @version for this script -- the thing the
+    // Bridge compares against required_widget_build.
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+        return String(GM_info.script.version);
+      }
+    } catch (_) { }
+    return '';
+  }
   // A time-based cooldown alone cannot stop a recycle loop: if the window is
   // still judged dirty after landing on a fresh root chat it simply navigates
   // again one cooldown later, forever. Live evidence: worker_recycled (poll-idle)
@@ -17932,7 +17943,7 @@ let browserWorkerBraveConfirmed = false;
       managed_generation: managedIdentity.generation,
       widget_version: BROWSER_WORKER_PROTOCOL_VERSION,
       widget_protocol: BROWSER_WORKER_PROTOCOL_VERSION,
-      widget_build_version: (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? String(GM_info.script.version) : '',
+      widget_build_version: widgetBuildVersion(),
       bridge_api_version: String(BRIDGE_API_VERSION || 3),
       site: detectSite().key,
       conversation_key: String(autoBoundConversationKey || currentConversationKey() || ''),
@@ -18710,14 +18721,31 @@ let browserWorkerBraveConfirmed = false;
     if (ownedJob && ownedJob.dispatch_id) return false;
     try { if (chatGPTIsGenerating()) return false; } catch (_) { return false; }
     if (!ownedJob && autoRuntime?.runId && String(autoRuntime?.stage || '') === 'running') return false;
+    // A reload only re-runs the script the userscript manager already holds.
+    // If it has nothing newer to hand us, coming back stale is the answer, not
+    // a reason to ask again: reloading every cooldown churned three idle
+    // worker windows forever without ever changing the build. Try each
+    // required build once, then say so and let the operator install it.
+    const wanted = String(requiredBuild || '');
     const now = Date.now();
-    let last = 0;
-    try { last = Number(sessionStorage.getItem(BROWSER_WORKER_STALE_RELOAD_KEY) || 0); } catch (_) { }
-    if (last && now - last < BROWSER_WORKER_STALE_RELOAD_COOLDOWN_MS) return false;
-    try { sessionStorage.setItem(BROWSER_WORKER_STALE_RELOAD_KEY, String(now)); } catch (_) { }
+    let seen = null;
+    try { seen = JSON.parse(sessionStorage.getItem(BROWSER_WORKER_STALE_RELOAD_KEY) || 'null'); } catch (_) { seen = null; }
+    if (seen && typeof seen === 'object' && String(seen.build || '') === wanted) {
+      if (!seen.reported) {
+        try { sessionStorage.setItem(BROWSER_WORKER_STALE_RELOAD_KEY, JSON.stringify({ ...seen, reported: true })); } catch (_) { }
+        appendBridgeDiagnostic('worker_stale_build_stuck', {
+          severity: 'warn',
+          message: `Reloaded for widget build ${wanted || '(unknown)'} and came back on ${widgetBuildVersion() || '(unknown)'}; this window needs the widget installed by hand`
+        });
+      }
+      return false;
+    }
+    // A legacy timestamp from an older build of this script.
+    if (typeof seen === 'number' && seen && now - seen < BROWSER_WORKER_STALE_RELOAD_COOLDOWN_MS) return false;
+    try { sessionStorage.setItem(BROWSER_WORKER_STALE_RELOAD_KEY, JSON.stringify({ build: wanted, at: now, reported: false })); } catch (_) { }
     appendBridgeDiagnostic('worker_stale_build_reload', {
       severity: 'info',
-      message: `Bridge requires widget build ${requiredBuild || '(unknown)'}; reloading this worker window to pick it up`
+      message: `Bridge requires widget build ${wanted || '(unknown)'}; reloading this worker window to pick it up`
     });
     try { location.reload(); } catch (_) { return false; }
     return true;
@@ -19047,6 +19075,7 @@ let browserWorkerBraveConfirmed = false;
          browserWorkerPageEligible,
          browserWorkerPollOnce,
          browserWorkerReloadForStaleBuild,
+         widgetBuildVersion,
          browserWorkerReleaseUnclaimableJob,
          browserWorkerDropStaleLease,
          browserWorkerStandDown,
