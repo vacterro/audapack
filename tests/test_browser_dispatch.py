@@ -1131,3 +1131,36 @@ def test_poll_block_shrinks_as_the_worker_pool_grows(tmp_path):
     wait = d.max_poll_wait_seconds()
     assert wait * MAX_ACTIVE_WORKERS < WORKER_TTL_SECONDS
     assert wait >= 2.0
+
+
+def test_a_stale_widget_build_is_named_not_reported_clean(tmp_path):
+    """A window that cannot claim must say why.
+
+    The build gate is silent in the claim path, so six windows running an
+    outdated widget sat there reporting CLEAN while every audit stayed QUEUED
+    and nothing anywhere told the operator to update the widget.
+    """
+    import audapack.bridge.browser_dispatch as module
+
+    d = dispatcher(tmp_path)
+    d.register_worker(supported_worker(
+        "fresh", widget_protocol="AUDAPACK_WIDGET/3", widget_build_version="9.9.9",
+    ))
+    d.register_worker(supported_worker(
+        "stale", widget_protocol="AUDAPACK_WIDGET/3", widget_build_version="0.0.1",
+    ))
+
+    original = module._get_required_widget_build
+    module._get_required_widget_build = lambda: "9.9.9"
+    try:
+        workers = {w.worker_id: w for w in d.list_workers()}
+        assert d.worker_widget_is_stale(workers["stale"]) is True
+        assert d.worker_widget_is_stale(workers["fresh"]) is False
+        assert d.stale_widget_workers() == 1
+        status = d.status()
+        assert status["stale_widget_workers"] == 1
+        assert status["required_widget_build"] == "9.9.9"
+        # And it must not be counted as capacity that will ever do work.
+        assert d.worker_free_for_claim(workers["stale"]) is False
+    finally:
+        module._get_required_widget_build = original

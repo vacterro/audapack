@@ -616,6 +616,35 @@ class BrowserDispatcher:
             return True
         return bool(worker.page_eligible)
 
+    @staticmethod
+    def worker_widget_is_stale(worker: WorkerRecord) -> bool:
+        """True when this window runs a widget build that cannot claim audits.
+
+        The build gate is silent by design in the claim path, which made it the
+        worst possible failure: six windows sat there reporting CLEAN, every
+        audit stayed QUEUED, and nothing anywhere said the widget needed
+        updating. Status has to be able to name this.
+        """
+        if worker.widget_version in INCOMPATIBLE_WIDGET_VERSIONS:
+            return True
+        if not worker.widget_version.startswith("AUDAPACK_WIDGET"):
+            return False
+        if worker.widget_version != SUPPORTED_BROWSER_WIDGET_VERSION:
+            return True
+        if not worker.widget_protocol.startswith("AUDAPACK_WIDGET"):
+            return False
+        required = _get_required_widget_build()
+        return bool(required and worker.widget_build_version and worker.widget_build_version != required)
+
+    def stale_widget_workers(self) -> int:
+        with self._lock:
+            now = _now()
+            return sum(
+                1 for worker in self._workers.values()
+                if now - worker.last_seen_at <= WORKER_TTL_SECONDS
+                and self.worker_widget_is_stale(worker)
+            )
+
     def worker_free_for_claim(self, worker: WorkerRecord) -> bool:
         """FREE + CLEAN must both be true to claim a new audit.
 
@@ -1409,6 +1438,10 @@ class BrowserDispatcher:
                 "busy_workers": len(busy),
                 "offline_workers": self._expired_worker_count + len(workers) - len(live),
                 "foreign_workers": len(foreign),
+                # Named so the operator is told to update the widget instead
+                # of watching six "clean" windows claim nothing.
+                "stale_widget_workers": sum(1 for w in live if self.worker_widget_is_stale(w)),
+                "required_widget_build": _get_required_widget_build(),
                 "queued_jobs": sum(1 for j in jobs if j.state in (JOB_QUEUED, JOB_RETRYABLE)),
                 "active_jobs": sum(1 for j in jobs if j.state in POST_START_STATES | {JOB_LEASED, JOB_ARTIFACT_FETCHED, JOB_ATTACHED}),
                 "finalizing_jobs": sum(1 for j in jobs if j.state == JOB_FINALIZING),

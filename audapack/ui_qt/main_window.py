@@ -806,10 +806,25 @@ QToolTip QLabel {
             self._tune_bridge_poll_interval(runs)
             browser = status.get("browser", {}) if isinstance(status, dict) else {}
             if browser:
+                stale = int(browser.get("stale_widget_workers", 0) or 0)
+                if stale:
+                    # A window running an outdated widget build can never claim
+                    # an audit. Reported as CLEAN it looked like a healthy idle
+                    # pool with a queue that mysteriously never moved, which is
+                    # the one thing the status bar must never let happen.
+                    build = str(browser.get("required_widget_build", "") or "")
+                    suffix = f" (needs {build})" if build else ""
+                    self._flash_status(
+                        f"{stale} worker window(s) run an OUTDATED widget{suffix} — "
+                        f"reinstall it from Settings ▸ Bridge; audits cannot start until then",
+                        "#D66464",
+                        duration_ms=10000,
+                    )
                 self.statusBar().showMessage(
                     f"BRIDGE ✓ | W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)}  "
                     f"CLEAN {browser.get('clean_workers', 0)}  "
-                    f"BUSY {browser.get('busy_workers', 0)}  "
+                    + (f"STALE {stale}  " if stale else "")
+                    + f"BUSY {browser.get('busy_workers', 0)}  "
                     f"Q {browser.get('queued_jobs', 0)}  "
                     f"RUN {browser.get('active_jobs', 0)}  "
                     f"! {browser.get('blocked_jobs', 0)}"

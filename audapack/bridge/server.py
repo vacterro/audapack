@@ -525,11 +525,16 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "clean_for_audit": worker.clean_for_audit,
                 "managed_slot": worker.managed_slot,
                 "managed_generation": worker.managed_generation,
-                "worker_class": "CLEAN" if worker.clean_for_audit else (
+                "widget_build_version": worker.widget_build_version,
+                # A stale build can never claim, so reporting it as CLEAN is a
+                # lie the operator cannot act on. Name it first.
+                "worker_class": "STALE_WIDGET" if self._dispatcher().worker_widget_is_stale(worker) else (
+                    "CLEAN" if worker.clean_for_audit else (
                     "OCCUPIED" if worker.has_conversation_turns else (
                         "DIRTY" if (worker.has_manual_draft or worker.has_attachments) else (
                             "BUSY" if (worker.generating or worker.audit_start_in_flight or worker.action_in_flight) else "OCCUPIED"
                         )
+                    )
                     )
                 ),
             } for worker in self._dispatcher().list_workers()]
