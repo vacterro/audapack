@@ -18,6 +18,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from audapack.audits import format_age_str
+from audapack.campaign import get_profile, profile_short_label
 from audapack.models import AuditTemperature
 from audapack.ui_qt.theme.golden_default import PALETTE
 
@@ -654,7 +655,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # Audit section — structured but compact
         if snap:
             prof = getattr(snap, "audit_profile_id", "quick3") or "quick3"
-            prof_label = "A10 / Super10" if prof == "super10" else "A3 / Quick3"
+            prof_label = f"{profile_short_label(prof)} / {get_profile(prof).display_name}" if prof else "A3 / Quick 3 Waves"
             waves = getattr(snap, "completed_waves", 0)
             total = getattr(snap, "total_waves", 3)
             temp = getattr(snap, "temperature", AuditTemperature.NONE)

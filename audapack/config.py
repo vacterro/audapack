@@ -403,10 +403,34 @@ class PackingConfig:
 @dataclass
 class AuditsConfig:
     root: str = DEFAULT_AUDIT_ROOT
+    #: Which canonical audit profile START AUDIT launches. Persisted rather
+    #: than inferred: the launch path used to fall back to "quick3" with no way
+    #: for the operator to pick anything else from the desktop.
+    profile: str = "quick3"
     hot_seconds: int = 6 * 3600           # <= 6 hours
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
     cold_seconds: int = 7 * 86400         # <= 7 days
+
+
+def _normalized_audit_profile(value: Any) -> str:
+    """Keep the persisted profile inside the canonical registry.
+
+    An unknown id would send START AUDIT at a profile that does not exist, so
+    an unreadable or retired value falls back to the default rather than
+    failing the whole config load.
+    """
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return "quick3"
+    try:
+        from audapack.campaign import load_profiles
+
+        if candidate in load_profiles():
+            return candidate
+    except Exception:
+        pass
+    return "quick3"
 
 
 _LOOPBACK_HOST_ALIASES = {"127.0.0.1", "::1", "localhost"}
@@ -966,6 +990,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         warm_seconds=int(audits_raw.get("warm_seconds", 24 * 3600)),
         cool_seconds=int(audits_raw.get("cool_seconds", 72 * 3600)),
         cold_seconds=int(audits_raw.get("cold_seconds", 7 * 86400)),
+        profile=_normalized_audit_profile(audits_raw.get("profile")),
     )
 
     bridge_raw = data.get("bridge", {})

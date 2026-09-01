@@ -45,6 +45,8 @@ from audapack.bridge.storage import (
     restore_file_snapshots,
 )
 from audapack.campaign import (
+    ARTIFACT_KIND_DIRECT_HANDOFF,
+    ARTIFACT_KIND_QUICK3_COMBINED,
     STATUS_CAMPAIGN_COMPLETE,
     STATUS_CAMPAIGN_READY_FOR_WAVE,
     get_canonical_manifest_hash,
@@ -176,7 +178,8 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
     written before the canonical latest so a partial failure never leaves the
     authoritative file mutated without durable state agreeing.
     """
-    if prof.profile_id == "quick3":
+    kind = prof.canonical_artifact_kind
+    if kind == ARTIFACT_KIND_QUICK3_COMBINED:
         all3_content = synth_result.get("all3", "")
         all3_latest = target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
         all3_hist = history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md"
@@ -184,6 +187,19 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
         atomic_write(all3_latest, all3_content)
         state["all3_complete"] = True
         state["all3_path"] = str(all3_latest)
+    elif kind == ARTIFACT_KIND_DIRECT_HANDOFF:
+        # A single-wave profile has nothing to synthesise: the validated
+        # terminal wave IS the handoff. Writing SUPER_AUDIT_ALL/FINAL/INDEX for
+        # it would invent nine waves that never ran.
+        handoff_content = synth_result.get("handoff", "")
+        basename = prof.canonical_artifact_basename
+        handoff_latest = target_dir / f"{resolved_name}{basename}.md"
+        handoff_hist = history_dir / f"{resolved_name}{basename}__{dt_str}.md"
+        atomic_write(handoff_hist, handoff_content)
+        atomic_write(handoff_latest, handoff_content)
+        state["campaign_complete"] = True
+        state["final_handoff_path"] = str(handoff_latest)
+        state["canonical_campaign_path"] = str(handoff_latest)
     else:
         super_all = synth_result.get("super_all", "")
         super_final = synth_result.get("super_final", "")
@@ -206,13 +222,13 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
 
 
 def _get_final_handoff_path(prof, state) -> Optional[Path]:
-    if prof.profile_id == "quick3":
+    if prof.canonical_artifact_kind == ARTIFACT_KIND_QUICK3_COMBINED:
         return Path(state["all3_path"]) if state.get("all3_path") else None
     return Path(state["final_handoff_path"]) if state.get("final_handoff_path") else None
 
 
 def _get_canonical_path(prof, state) -> Optional[Path]:
-    if prof.profile_id == "quick3":
+    if prof.canonical_artifact_kind == ARTIFACT_KIND_QUICK3_COMBINED:
         return Path(state["all3_path"]) if state.get("all3_path") else None
     return Path(state["canonical_campaign_path"]) if state.get("canonical_campaign_path") else None
 

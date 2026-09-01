@@ -29,6 +29,7 @@ from PySide6.QtCore import (
 )
 
 from audapack.audits import calculate_temperature, format_age_str, format_created_str
+from audapack.campaign import profile_short_label
 from audapack.config import app_dir
 from audapack.inaudit import get_inaudit_selected, list_inaudit_layers
 from audapack.inaudit_capture import InauditCaptureStore
@@ -571,7 +572,9 @@ class ProjectRoomModel(QAbstractItemModel):
             return self.get_archive_info(proj)
         if role == self.ROLES["audit_profile_id"]:
             prof = run.profile_id if run is not None else (getattr(snap, "audit_profile_id", "quick3") if snap else "quick3")
-            return "A10" if prof == "super10" else "A3"
+            # Metadata, not a binary guess: `"A10" if super10 else "A3"` labels
+            # every future profile A3, so a CM run would read as a Quick3 one.
+            return profile_short_label(prof)
         if role == self.ROLES["archive_sync_status"]:
             return self.get_archive_sync_status(proj, snap)
         if role == self.ROLES["archive_temperature"]:

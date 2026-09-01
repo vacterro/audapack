@@ -421,12 +421,26 @@ class AuditIndexer:
                     total_tickets=cached_snap.total_tickets,
                 )
 
-        # Detect profile from directory contents
-        has_super10_markers = any(
-            "AUDIT_ARCHITECTURE" in f or "AUDIT_CORRECTNESS" in f or "SUPER_AUDIT" in f
-            for f in current_sigs.keys()
-        )
-        profile_id = "super10" if has_super10_markers else "quick3"
+        # Profile detection: prefer the registry over legacy heuristics. Every
+        # non-super10 directory used to be read as quick3, which is wrong the
+        # moment a third profile exists. A profile is claimed by its own wave
+        # slugs and canonical artifact name; the old marker test stays as the
+        # fallback for historical A3/A10 directories that predate this.
+        profile_id = ""
+        for candidate_id, candidate in self._profiles.items():
+            if candidate_id in {"quick3", "super10"}:
+                continue
+            markers = {w.slug for w in candidate.waves if w.slug}
+            markers.add(candidate.canonical_artifact_basename.lstrip("_"))
+            if any(marker and marker in f for marker in markers for f in current_sigs.keys()):
+                profile_id = candidate_id
+                break
+        if not profile_id:
+            has_super10_markers = any(
+                "AUDIT_ARCHITECTURE" in f or "AUDIT_CORRECTNESS" in f or "SUPER_AUDIT" in f
+                for f in current_sigs.keys()
+            )
+            profile_id = "super10" if has_super10_markers else "quick3"
         profile = self._profiles.get(profile_id) or get_default_profile()
 
         # CORE-002: load live campaign index as authority when present.

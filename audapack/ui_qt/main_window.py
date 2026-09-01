@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from audapack.bridge.state import get_generation_file_path, get_generation_info
+from audapack.campaign import get_profile, profile_choices
 from audapack.components.manager import ComponentManager
 from audapack.config import app_dir, save_config
 from audapack.inaudit import (
@@ -530,6 +531,22 @@ class MainWindow(QMainWindow):
 
         act_audit_group = toolbar.addAction("AUDIT GROUP", self._on_start_audit_group)
         act_audit_group.setToolTip("Queue up to six projects from the selected group")
+
+        # Audit profile selector: A3 | A10 | CM as peers. START AUDIT used to
+        # fall back to quick3 with no way to choose anything else from here.
+        self.profile_actions: dict[str, Any] = {}
+        active_profile = str(getattr(self._service.config.audits, "profile", "quick3") or "quick3")
+        for profile_id, label in profile_choices():
+            act = toolbar.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(profile_id == active_profile)
+            try:
+                act.setToolTip(get_profile(profile_id).description or get_profile(profile_id).display_name)
+            except Exception:
+                act.setToolTip(label)
+            act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
+            self.profile_actions[profile_id] = act
+        toolbar.addSeparator()
 
         act_reopen_workers = toolbar.addAction("WORKERS", self._on_reopen_workers)
         act_reopen_workers.setToolTip(
@@ -1352,6 +1369,25 @@ QToolTip QLabel {
                 QSystemTrayIcon.Critical,
                 8000,
             )
+
+    def _on_select_audit_profile(self, profile_id: str):
+        """Pick which canonical profile START AUDIT launches."""
+        chosen = str(profile_id or "quick3")
+        for pid, action in self.profile_actions.items():
+            action.setChecked(pid == chosen)
+        if str(getattr(self._service.config.audits, "profile", "")) == chosen:
+            return
+        self._service.config.audits.profile = chosen
+        try:
+            save_config(self._service.config)
+        except Exception as exc:
+            self._flash_status(f"Could not save audit profile: {exc}", "#D66464", duration_ms=6000)
+            return
+        try:
+            name = get_profile(chosen).display_name
+        except Exception:
+            name = chosen
+        self._flash_status(f"START AUDIT profile: {name}", "#D4A840", duration_ms=4000)
 
     def _on_reopen_workers(self):
         """Reopen every managed worker window that is no longer on screen."""

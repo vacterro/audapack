@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from audapack.campaign import (
+    ARTIFACT_KIND_DIRECT_HANDOFF,
+    ARTIFACT_KIND_QUICK3_COMBINED,
     CampaignProfile,
     get_canonical_manifest_hash,
     get_default_profile,
@@ -514,6 +516,42 @@ def generate_canonical_all3(
     return "\n".join(lines)
 
 
+def generate_direct_handoff(
+    profile: CampaignProfile,
+    run_id: str,
+    parsed_waves: dict[str, dict[str, Any]],
+    project_name: str,
+) -> str:
+    """Canonical handoff for a single-wave profile.
+
+    There is nothing to synthesise: the validated terminal wave IS the
+    implementation handoff. It only needs the canonical campaign identity
+    above it so the artifact stands alone for whoever picks it up.
+    """
+    wave = profile.get_wave_by_id(profile.finalizer_wave_id) or (profile.waves[-1] if profile.waves else None)
+    meta = parsed_waves.get(wave.id, {}) if wave else {}
+    manifest_hash = profile.manifest_hash or get_canonical_manifest_hash()
+    header = [
+        f"# {project_name} — {profile.display_name}",
+        "",
+        f"CAMPAIGN_PROFILE: {profile.profile_id}",
+        f"CAMPAIGN_PROFILE_VERSION: {profile.profile_version}",
+        f"CAMPAIGN_MANIFEST_SHA256: {manifest_hash}",
+        f"CAMPAIGN_RUN_ID: {run_id}",
+        f"GENERATED_AT: {datetime.now().isoformat()}",
+        f"PROJECT_NAME: {meta.get('project_name', project_name)}",
+        f"TARGET: {meta.get('target', '')}",
+        f"BASELINE: {meta.get('baseline', '')}",
+        f"TOTAL_TICKETS: {int(meta.get('tickets', 0) or 0)}",
+        "HANDOFF: IMPLEMENTATION_AGENT",
+        "",
+        "---",
+        "",
+    ]
+    body = str(meta.get("full_text", "")).strip()
+    return chr(10).join(header) + body + chr(10)
+
+
 def generate_canonical_campaign(
     profile: CampaignProfile,
     run_id: str,
@@ -526,9 +564,13 @@ def generate_canonical_campaign(
     - quick3: {'all3': '...'}
     - super10 / N-wave: {'super_all': '...', 'super_final': '...', 'super_index': '...'}
     """
-    if profile.profile_id == "quick3":
+    kind = profile.canonical_artifact_kind
+    if kind == ARTIFACT_KIND_QUICK3_COMBINED:
         all3_text = generate_canonical_all3(project_name, run_id, parsed_waves)
         return {"all3": all3_text}
+
+    if kind == ARTIFACT_KIND_DIRECT_HANDOFF:
+        return {"handoff": generate_direct_handoff(profile, run_id, parsed_waves, project_name)}
 
     # N-wave / SUPER10 synthesis
     first_wave = profile.waves[0] if profile.waves else None

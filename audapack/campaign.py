@@ -125,6 +125,7 @@ class CampaignProfile:
     manifest_hash: str = ""
     artifact_kind: str = ""
     final_artifact_basename: str = ""
+    short_label: str = ""
 
     @property
     def canonical_artifact_kind(self) -> str:
@@ -207,6 +208,7 @@ class CampaignProfile:
             "manifest_hash": self.manifest_hash,
             "artifact_kind": self.canonical_artifact_kind,
             "final_artifact_basename": self.canonical_artifact_basename,
+            "short_label": self.short_label,
             "waves": [w.to_dict() for w in self.waves],
         }
 
@@ -224,6 +226,7 @@ class CampaignProfile:
             manifest_hash=manifest_hash,
             artifact_kind=str(data.get("artifact_kind", "")).strip().lower(),
             final_artifact_basename=str(data.get("final_artifact_basename", "")).strip(),
+            short_label=str(data.get("short_label", "")).strip(),
         )
 
 
@@ -488,6 +491,31 @@ def get_profile(profile_id: str, manifest_path: Optional[Path] = None) -> Campai
         return profiles[norm]
     profile_keys = list(profiles.keys())
     raise KeyError(f"Profile '{profile_id}' not found in canonical profiles: {profile_keys}")
+
+
+#: Compact UI label per profile. Read from the manifest's `short_label` when a
+#: profile declares one; the two historical labels stay pinned so A3 and A10
+#: never move. Labels used to be `"A10" if prof == "super10" else "A3"`, which
+#: renders every future profile as A3.
+_FALLBACK_SHORT_LABELS = {"quick3": "A3", "super10": "A10"}
+
+
+def profile_short_label(profile_id: str) -> str:
+    """Compact label for a profile id, for row/status surfaces."""
+    pid = str(profile_id or "").strip().lower()
+    if not pid:
+        return _FALLBACK_SHORT_LABELS["quick3"]
+    try:
+        profile = get_profile(pid)
+    except Exception:
+        return _FALLBACK_SHORT_LABELS.get(pid, pid.upper()[:4])
+    declared = str(getattr(profile, "short_label", "") or "").strip()
+    return declared or _FALLBACK_SHORT_LABELS.get(pid, pid.upper()[:4])
+
+
+def profile_choices() -> list[tuple[str, str]]:
+    """(profile_id, short label) for every canonical profile, in manifest order."""
+    return [(pid, profile_short_label(pid)) for pid in load_profiles()]
 
 
 def get_default_profile() -> CampaignProfile:
@@ -1018,14 +1046,12 @@ def resolve_audit_campaign_entrypoint(
     final_handoff_file: Optional[Path] = None
 
     if all_required_done:
-        if profile.profile_id == "quick3":
-            final_candidate = campaign_root / f"{project_name}__00_AUDIT_ALL_3.md"
-            if not final_candidate.exists():
-                final_candidate = campaign_root / "__00_AUDIT_ALL_3.md"
-        else:
-            final_candidate = campaign_root / f"{project_name}__00_SUPER_AUDIT_FINAL.md"
-            if not final_candidate.exists():
-                final_candidate = campaign_root / "__00_SUPER_AUDIT_FINAL.md"
+        # Profile metadata, not a profile-id branch: `if quick3 else SUPER10`
+        # silently made every new profile a Super10 campaign.
+        basename = profile.canonical_artifact_basename
+        final_candidate = campaign_root / f"{project_name}{basename}.md"
+        if not final_candidate.exists():
+            final_candidate = campaign_root / f"{basename}.md"
         final_handoff_file = final_candidate if final_candidate.exists() else None
         if final_handoff_file:
             campaign_status = STATUS_CAMPAIGN_COMPLETE
