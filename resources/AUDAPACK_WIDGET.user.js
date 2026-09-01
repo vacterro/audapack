@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.30
+// @version      0.0.31
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -762,6 +762,35 @@
       }
     }
     return 'quick3';
+  }
+
+  const PROFILE_FALLBACK_LABELS = { quick3: 'A3', super10: 'A10' };
+
+  function auditProfileIds() {
+    // The canonical registry, not a two-profile assumption. `['super10',
+    // 'quick3']` and `super10 ? quick3 : super10` silently made every new
+    // profile unselectable and unpersistable.
+    return Object.keys(EMBEDDED_AUDIT_PROFILES?.profiles || {});
+  }
+
+  function profileShortLabel(profileId) {
+    const id = String(profileId || '').trim().toLowerCase();
+    const prof = (EMBEDDED_AUDIT_PROFILES?.profiles || {})[id];
+    const declared = String(prof?.short_label || '').trim();
+    if (declared) return declared;
+    return PROFILE_FALLBACK_LABELS[id] || (id ? id.toUpperCase().slice(0, 4) : 'A3');
+  }
+
+  function profileDisplayName(profileId) {
+    const prof = (EMBEDDED_AUDIT_PROFILES?.profiles || {})[String(profileId || '')];
+    return String(prof?.display_name || profileId || '');
+  }
+
+  function nextAuditProfileId(currentId) {
+    const ids = auditProfileIds();
+    if (!ids.length) return String(currentId || 'quick3');
+    const index = ids.indexOf(String(currentId || ''));
+    return ids[(index + 1) % ids.length];
   }
 
   function getActiveProfile() {
@@ -3971,7 +4000,7 @@ ordinal/name of the entrypoint file.`;
       panelSize: Object.prototype.hasOwnProperty.call(PANEL_SIZES, String(data.panelSize || ''))
         ? String(data.panelSize)
         : 'normal',
-      auditProfile: ['super10', 'quick3'].includes(String(data.auditProfile || ''))
+      auditProfile: auditProfileIds().includes(String(data.auditProfile || ''))
         ? String(data.auditProfile)
         : 'super10',
       autoAuditEnabled: false, // legacy field retained for compatibility; per-chat runtime owns enablement
@@ -13500,11 +13529,11 @@ async function recoverArmedStartSend(options = {}) {
     const superProfileToggle = panel.querySelector('#acb-super-profile-toggle');
     const profileSelect = panel.querySelector('#acb-audit-profile');
     if (profileToggle) {
-      profileToggle.textContent = prof.profile_id === 'super10' ? 'A10' : 'A3';
+      profileToggle.textContent = profileShortLabel(prof.profile_id);
       profileToggle.title = `Active profile: ${prof.display_name}. Click to switch profile.`;
     }
     if (superProfileToggle) {
-      superProfileToggle.textContent = prof.profile_id === 'super10' ? 'A10' : 'A3';
+      superProfileToggle.textContent = profileShortLabel(prof.profile_id);
       superProfileToggle.title = `Active profile: ${prof.display_name}. Click to switch profile.`;
     }
     if (profileSelect && document.activeElement !== profileSelect) {
@@ -16703,9 +16732,10 @@ async function recoverArmedStartSend(options = {}) {
     });
 
     const toggleAuditProfile = () => {
+      // Cycles the whole registry: A3 -> A10 -> CM -> A3. A binary flip made
+      // every profile beyond the second unreachable from the compact button.
       const currentProf = getActiveProfile();
-      const nextProfId = currentProf.profile_id === 'super10' ? 'quick3' : 'super10';
-      setAuditProfile(nextProfId, 'profile toggle');
+      setAuditProfile(nextAuditProfileId(currentProf?.profile_id), 'profile toggle');
     };
 
     const profileToggle = panel.querySelector('#acb-profile-toggle');
@@ -17484,9 +17514,8 @@ async function recoverArmedStartSend(options = {}) {
             <div id="acb-auto-config">
               <div class="acb-auto-field">
                 <label for="acb-audit-profile">Campaign profile</label>
-                <select id="acb-audit-profile" title="Select audit campaign profile: Super10 (10 waves) or Quick3 (3 waves).">
-                  <option value="super10">Super10 (10 waves · Red Team)</option>
-                  <option value="quick3">Quick3 (3 waves · Classic)</option>
+                <select id="acb-audit-profile" title="Select the audit campaign profile.">
+                  ${auditProfileIds().map(pid => `<option value="${pid}">${profileShortLabel(pid)} — ${profileDisplayName(pid)}</option>`).join('')}
                 </select>
               </div>
               <div class="acb-auto-field">
@@ -18887,6 +18916,10 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          chatGPTWorkSurfaceActive,
          chatGPTEnsureChatMode,
          chatGPTWorkModeControlNames,
+         auditProfileIds,
+         loadState,
+         profileShortLabel,
+         nextAuditProfileId,
          chatGPTWorkModeSwitchControl,
          chatGPTNewChatControl,
          browserWorkerEnsureChatModeHousekeeping,
