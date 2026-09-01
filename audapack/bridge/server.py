@@ -568,6 +568,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "managed_slot": worker.managed_slot,
                 "managed_generation": worker.managed_generation,
                 "widget_build_version": worker.widget_build_version,
+                # A refused reconcile is why a post-restart run can sit BLOCKED
+                # with its original worker present and heartbeating. Invisible,
+                # it looks like the recovery path simply never runs.
+                "last_reconcile_error": worker.meta.get("last_reconcile_error", ""),
+                "reports_lease": bool(worker.meta.get("reports_lease")),
                 # A stale build can never claim, so reporting it as CLEAN is a
                 # lie the operator cannot act on. Name it first.
                 "worker_class": "STALE_WIDGET" if self._dispatcher().worker_widget_is_stale(worker) else (

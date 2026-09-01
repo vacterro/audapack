@@ -373,10 +373,13 @@ def test_active_heartbeat_renews_exact_lease(tmp_path):
     d.register_worker(worker("w1"))
     item = d.enqueue_job(job_payload(path))
     lease = d.claim_job("w1")
-    before = lease.lease_expires_at
-    lease.lease_expires_at = time.time() + 1
+    # Compare against the SHORTENED deadline, not the original one: two
+    # `now + LEASE_SECONDS` values computed inside one clock tick are equal on
+    # Windows, and a strict `>` against the original made this test flaky.
+    shortened = time.time() + 1
+    lease.lease_expires_at = shortened
     d.register_worker(worker("w1", state="AUDITING", dispatch_id=item.dispatch_id, lease_id=lease.lease_id))
-    assert d.get_job(item.dispatch_id).lease_expires_at > before
+    assert d.get_job(item.dispatch_id).lease_expires_at > shortened + 60
 
 
 def test_finalizing_requires_durable_campaign_proof(tmp_path):
@@ -1190,15 +1193,17 @@ def test_a_refused_reconcile_never_unregisters_the_window(tmp_path):
     job.recovery_state = JOB_STARTED
     job.error = "Bridge restarted after START_PREPARED; same-worker reconciliation required"
 
-    # The window comes back but its runtime lost the campaign run id.
+    # The window comes back carrying a START receipt that is not this run's:
+    # a genuine irreversibility conflict, and the one thing reconcile refuses.
     record = d.register_worker(supported_worker(
         "managed-1", managed_slot=1, managed_generation=1,
-        dispatch_id=item.dispatch_id, lease_id=lease.lease_id, campaign_run_id="",
+        dispatch_id=item.dispatch_id, lease_id=lease.lease_id,
+        campaign_run_id="run-real", start_receipt="receipt-from-another-run",
     ))
     assert record.worker_id == "managed-1"
     assert "managed-1" in {w.worker_id for w in d.list_workers()}
     assert d.get_job(item.dispatch_id).state == JOB_BLOCKED
-    assert "run_id_conflict" in record.meta.get("last_reconcile_error", "")
+    assert "start_receipt_conflict" in record.meta.get("last_reconcile_error", "")
 
 
 def test_lane_reservation_refuses_cleanly_while_jobs_exist(tmp_path):
@@ -1257,3 +1262,36 @@ def test_a_started_run_can_complete_directly(tmp_path):
                          {"campaign_run_id": "run", "start_receipt": "receipt"})
     d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {"campaign_run_id": "run"})
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
+def test_recovery_survives_a_runtime_that_re_derived_its_run_id(tmp_path):
+    """The lease is the ownership proof, not an echoed campaign run id.
+
+    ChatGPT route hydration re-arms the widget's runtime and re-derives the
+    run id. Demanding the worker echo the original back refused recovery
+    permanently: observed on five concurrent runs at once, every one refused
+    with run_id_conflict while the audit kept going in the browser.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("managed-1", managed_slot=1, managed_generation=1))
+    item = d.enqueue_job(job_payload(path))
+    lease = d.claim_job("managed-1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "managed-1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-original", "start_receipt": "receipt-1"})
+    job = d.get_job(item.dispatch_id)
+    job.state = JOB_BLOCKED
+    job.recovery_state = JOB_AUDITING
+    job.error = "Bridge restarted after START_PREPARED; same-worker reconciliation required"
+
+    record = d.register_worker(supported_worker(
+        "managed-1", managed_slot=1, managed_generation=1,
+        dispatch_id=item.dispatch_id, lease_id=lease.lease_id,
+        campaign_run_id="acb-rederived-by-hydration", start_receipt="receipt-1",
+    ))
+    restored = d.get_job(item.dispatch_id)
+    assert restored.state == JOB_AUDITING
+    assert restored.campaign_run_id == "acb-original", "the job's own run id stays authoritative"
+    assert restored.meta_run_id_drift == "acb-rederived-by-hydration"
+    assert record.meta.get("last_reconcile_error", "") == ""

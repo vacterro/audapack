@@ -236,6 +236,7 @@ class DispatchJob:
     final_handoff_sha256: str = ""
     completed_at: float = 0.0
     recovery_state: str = ""
+    meta_run_id_drift: str = ""
     retry_count: int = 0
     next_retry_at: float = 0.0
     last_error_code: str = ""
@@ -577,6 +578,7 @@ class BrowserDispatcher:
 
             dispatch_id = str(payload.get("dispatch_id") or "").strip()
             lease_id = str(payload.get("lease_id") or "").strip()
+            record.meta["reports_lease"] = bool(dispatch_id and lease_id)
             if dispatch_id or lease_id:
                 if not (dispatch_id and lease_id):
                     raise DispatchError("invalid_lease", "dispatch_id and lease_id must be reported together")
@@ -586,6 +588,7 @@ class BrowserDispatcher:
                         self.reconcile_job(dispatch_id, wid, lease_id, payload)
                     else:
                         self.renew_lease(dispatch_id, wid, lease_id)
+                    record.meta.pop("last_reconcile_error", None)
                 except DispatchError as exc:
                     # Registration must never depend on one job's recovery
                     # outcome. A refused reconcile (run id or receipt conflict,
@@ -740,9 +743,18 @@ class BrowserDispatcher:
                 raise DispatchError("stale_owner", "only the original worker may reconcile this dispatch")
             run_id = str(payload.get("campaign_run_id") or "").strip()
             receipt = str(payload.get("start_receipt") or "").strip()
-            if not run_id or run_id != job.campaign_run_id:
-                raise DispatchError("run_id_conflict", "recovery campaign_run_id does not match dispatch")
-            if job.start_receipt and receipt != job.start_receipt:
+            # worker_id + lease_id is already proof of the original owner: the
+            # lease is a server-minted secret bound to this dispatch and cannot
+            # be fabricated. Demanding that the worker ALSO echo the campaign
+            # run id back permanently stranded live audits, because ChatGPT
+            # route hydration re-arms the widget's runtime and re-derives that
+            # id -- observed on five concurrent runs at once, every one of them
+            # refused with run_id_conflict while the audit kept going in the
+            # browser. The job's own id stays authoritative and is never
+            # overwritten here; a mismatch is recorded, not fatal.
+            if run_id and job.campaign_run_id and run_id != job.campaign_run_id:
+                job.meta_run_id_drift = run_id
+            if job.start_receipt and receipt and receipt != job.start_receipt:
                 raise DispatchError("start_receipt_conflict", "recovery START receipt does not match dispatch")
             job.state = job.recovery_state or JOB_AUDITING
             job.error = ""
