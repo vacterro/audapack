@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from PySide6.QtCore import QFileSystemWatcher, QModelIndex, QPoint, QRect, Qt, QTimer, QUrl
+from PySide6.QtCore import QFileSystemWatcher, QModelIndex, QPoint, QRect, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QDrag,
@@ -413,6 +413,28 @@ class ProjectTreeView(QTreeView):
         event.ignore()
 
 
+#: Breathing room around a toolbar label, in pixels. The style's own minimum
+#: for a QToolButton is ~59px whatever the text, so a two-character label cost
+#: as much as a word and the action row could not fit a 640px window.
+TOOLBAR_LABEL_PADDING = 10
+
+
+def _fit_toolbar_to_text(toolbar) -> int:
+    """Size every toolbar button to its label. Returns the total width used."""
+    total = 0
+    for action in toolbar.actions():
+        if not action.text():
+            continue
+        button = toolbar.widgetForAction(action)
+        if button is None:
+            continue
+        width = button.fontMetrics().horizontalAdvance(action.text()) + TOOLBAR_LABEL_PADDING
+        button.setMinimumWidth(0)
+        button.setFixedWidth(width)
+        total += width
+    return total
+
+
 def bridge_status_text(browser: dict[str, Any]) -> str:
     """One-line worker/queue readout for the status bar."""
     stale = int(browser.get("stale_widget_workers", 0) or 0)
@@ -521,16 +543,22 @@ class MainWindow(QMainWindow):
         # PASTE AUDIT redundant when bridge auto-saves + Ctrl+V works everywhere.
         toolbar = QToolBar("Actions", self)
         toolbar.setMovable(False)
+        # Text-only, with no icon box reserved: the default icon size padded a
+        # two-character label out to 63px and the action row could not fit a
+        # 640px window in one line.
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        toolbar.setIconSize(QSize(0, 0))
         self.addToolBar(Qt.BottomToolBarArea, toolbar)
 
         act_pack = toolbar.addAction("PACK", self._on_pack)
         act_pack.setToolTip("Pack selected project in background")
 
-        act_send_audit = toolbar.addAction("START AUDIT", self._on_send_audit)
-        act_send_audit.setToolTip("Queue selected project for a free Chromium/ChatGPT audit worker")
-
-        act_audit_group = toolbar.addAction("AUDIT GROUP", self._on_start_audit_group)
-        act_audit_group.setToolTip("Queue up to six projects from the selected group")
+        # No START AUDIT button: A3/A10/CM each start the selected project with
+        # their own profile, so a separate "start with whatever is selected"
+        # button is the same action under a second name -- and the row action,
+        # the context menu and _on_send_audit still use the persisted default.
+        act_audit_group = toolbar.addAction("GRP", self._on_start_audit_group)
+        act_audit_group.setToolTip("AUDIT GROUP: queue up to six projects from the selected group")
 
         # Audit profile selector: A3 | A10 | CM as peers. START AUDIT used to
         # fall back to quick3 with no way to choose anything else from here.
@@ -552,9 +580,9 @@ class MainWindow(QMainWindow):
             self.profile_actions[profile_id] = act
         toolbar.addSeparator()
 
-        act_reopen_workers = toolbar.addAction("WORKERS", self._on_reopen_workers)
+        act_reopen_workers = toolbar.addAction("WRK", self._on_reopen_workers)
         act_reopen_workers.setToolTip(
-            "Reopen worker windows that are no longer on screen. "
+            "WORKERS: reopen worker windows that are no longer on screen. "
             "Closing one by accident used to be unrecoverable from here: the Bridge "
             "only re-provisions while audits are queued, so an idle pool stayed short "
             "until the next START AUDIT. A window running an audit is left alone."
@@ -563,8 +591,8 @@ class MainWindow(QMainWindow):
         act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
         act_pack_all.setToolTip("Pack all configured projects in background")
 
-        act_copy = toolbar.addAction("AUDIT", self._on_copy_audit)
-        act_copy.setToolTip("Copy verified audit to clipboard")
+        act_copy = toolbar.addAction("COPY", self._on_copy_audit)
+        act_copy.setToolTip("COPY: copy the verified audit to the clipboard")
 
         act_copy_gg = toolbar.addAction("GG", self._on_copy_audit_file_path)
         act_copy_gg.setToolTip("Copy /saipen gg audit path to clipboard (Ctrl+C)")
@@ -578,12 +606,19 @@ class MainWindow(QMainWindow):
         act_copy_arc = toolbar.addAction("ZIP", self._on_copy_archive)
         act_copy_arc.setToolTip("Copy packed .zip archive file to clipboard")
 
-        toolbar.addAction("REFRESH", self._on_refresh_all)
-
-        act_reset_marks = toolbar.addAction("RESET MARKS", self._on_reset_project_marks)
+        act_reset_marks = toolbar.addAction("MARKS", self._on_reset_project_marks)
         act_reset_marks.setToolTip(
-            "Clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
+            "RESET MARKS: clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
         )
+
+        _fit_toolbar_to_text(toolbar)
+
+        # Ctrl+R refreshes everything, from anywhere in the window. It also
+        # replaces the REFRESH button outright: one action does not need a
+        # permanent slot in a row that has to fit 640px.
+        refresh_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        refresh_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        refresh_shortcut.activated.connect(self._on_refresh_all)
 
         # Central Tabs: [Project Room] [Instances] [Settings]
         self.tabs = QTabWidget(self)
@@ -1507,6 +1542,13 @@ QToolTip QLabel {
             "#D4A840",
         )
         self._audit_start_debounce.start()
+        self._publish_pending_dispatch_count()
+
+    def _publish_pending_dispatch_count(self):
+        """Tell the Audit Runs panel how many presses have not dispatched yet."""
+        widget = getattr(self, "audit_runs_widget", None)
+        if widget is not None and hasattr(widget, "set_pending_dispatch_count"):
+            widget.set_pending_dispatch_count(len(self._audit_start_pending))
 
     def _pump_audit_start_queue(self):
         """Dispatch the next batch if the lane is free, else wait for it."""
@@ -1525,6 +1567,7 @@ QToolTip QLabel {
         label = ", ".join(self._audit_start_labels[:3]) or f"{len(batch)} projects"
         self._audit_start_labels.clear()
         self._audit_start_inflight = set(batch)
+        self._publish_pending_dispatch_count()
 
         def _prepare():
             return self._audit_runs.start_batch(batch, profile)
@@ -1613,14 +1656,21 @@ QToolTip QLabel {
             snapshot for snapshot in self.audit_runs_widget._runs
             if snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
         ]
-        if not pending:
+        # A press that is still sitting in the debounce queue has no dispatch
+        # and no run snapshot yet, so RESET ALL could not see it and the audit
+        # the operator just changed their mind about started anyway.
+        queued = list(self._audit_start_pending)
+        if not pending and not queued:
             self._flash_status("No unfinished audit runs to reset.", "#D4A840")
             return
 
         confirm = QMessageBox(self)
         confirm.setWindowTitle("Reset all audit runs")
         confirm.setIcon(QMessageBox.Icon.Warning)
-        confirm.setText(f"Clear {len(pending)} unfinished audit run(s)?")
+        confirm.setText(
+            f"Clear {len(pending)} unfinished audit run(s)"
+            + (f" and {len(queued)} not yet dispatched?" if queued else "?")
+        )
         confirm.setInformativeText(
             "Runs that can be cancelled are cancelled; runs that refuse Cancel are "
             "force-unblocked and marked terminally FAILED.",
@@ -1630,16 +1680,26 @@ QToolTip QLabel {
         if confirm.exec() != QMessageBox.StandardButton.Yes:
             return
 
+        self._audit_start_debounce.stop()
+        dropped = len(self._audit_start_pending)
+        self._audit_start_pending.clear()
+        self._audit_start_labels.clear()
+        self._publish_pending_dispatch_count()
         self._flash_status("Resetting all audit runs...", "#D4A840")
 
         def _reset():
-            return self._audit_runs.reset_all()
+            result = self._audit_runs.reset_all()
+            result["dropped_from_queue"] = dropped
+            return result
 
         def _done(result):
             cancelled = len(result.get("cancelled", []))
             unblocked = len(result.get("unblocked", []))
             failed = result.get("failed", [])
+            dropped = int(result.get("dropped_from_queue", 0) or 0)
             message = f"Audit runs reset: {cancelled} cancelled, {unblocked} force-unblocked"
+            if dropped:
+                message += f", {dropped} dropped before dispatch"
             if failed:
                 message += f", {len(failed)} could not be cleared ({', '.join(failed[:3])})"
             self._flash_status(message, "#D66464" if failed else "#4A7A20")

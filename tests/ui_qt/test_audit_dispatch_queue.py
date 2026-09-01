@@ -192,3 +192,49 @@ def test_a_profile_button_without_a_selection_says_so(window):
     assert window._audit_start_pending == []
     # The choice still persists, so the next START AUDIT uses it.
     assert window._service.config.audits.profile == "super10"
+
+
+def test_reset_all_drops_presses_that_have_not_dispatched_yet(window, monkeypatch):
+    """"I changed my mind" must reach a press still sitting in the debounce.
+
+    A queued press has no dispatch and no run snapshot, so RESET ALL could not
+    see it and the audit started anyway.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    batches: list[list[str]] = []
+    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.reset_all = lambda: {"cancelled": [], "unblocked": [], "failed": [], "total": 0}
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
+
+    window._start_audit_projects(["p1", "p2"], "pair")
+    assert len(window._audit_start_pending) == 2
+
+    window._on_reset_all_audit_runs()
+    assert window._audit_start_pending == []
+    assert window._audit_start_debounce.isActive() is False
+
+    window._pump_audit_start_queue()
+    assert batches == [], "a reset press must never dispatch afterwards"
+
+
+def test_reset_all_button_lights_up_for_a_queued_press(window):
+    """The panel enables RESET ALL from run snapshots alone."""
+    panel = window.audit_runs_widget
+    panel.set_runs([])
+    assert panel.reset_all_button.isEnabled() is False
+
+    window._start_audit_projects(["p1"], "Project 1")
+    assert panel.reset_all_button.isEnabled() is True
+
+
+def test_reset_all_says_nothing_to_do_when_the_queue_is_empty(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    calls = []
+    window._audit_runs.reset_all = lambda: calls.append(True) or {}
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
+    window.audit_runs_widget.set_runs([])
+
+    window._on_reset_all_audit_runs()
+    assert calls == []

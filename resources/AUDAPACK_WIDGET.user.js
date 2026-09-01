@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.31
+// @version      0.0.32
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -17830,7 +17830,8 @@ async function recoverArmedStartSend(options = {}) {
         project_id: String(value.project_id || ''),
         project_name: String(value.project_name || ''),
         campaign_run_id: String(value.campaign_run_id || ''),
-        start_receipt: String(value.start_receipt || '')
+        start_receipt: String(value.start_receipt || ''),
+        profile: String(value.profile || '')
       };
       return browserWorkerLease;
     } catch (_) {
@@ -18147,6 +18148,24 @@ let browserWorkerBraveConfirmed = false;
     return true;
   }
 
+  function browserWorkerApplyDispatchedProfile(profileId) {
+    // The Bridge job names the campaign profile the operator chose. A worker
+    // window must run THAT one, never the profile this window happens to be
+    // set to. Refuses only when a run is already live in this window, which
+    // setAuditProfile already guards.
+    const wanted = String(profileId || '').trim();
+    if (!wanted) return false;
+    const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
+    if (!profiles[wanted]) return false;
+    if (String(getActiveProfile()?.profile_id || '') === wanted) return true;
+    const applied = setAuditProfile(wanted, 'bridge dispatch');
+    appendBridgeDiagnostic(applied ? 'worker_profile_applied' : 'worker_profile_refused', {
+      severity: 'info',
+      message: `dispatch requested profile ${wanted}; ${applied ? 'applied' : 'refused, this window is mid-run'}`
+    });
+    return applied;
+  }
+
   async function browserWorkerConsume(job, dependencies = null) {
     const transition = dependencies?.transition || browserWorkerTransition;
     const fetchArtifact = dependencies?.fetchArtifact || browserWorkerFetchArtifact;
@@ -18169,9 +18188,14 @@ let browserWorkerBraveConfirmed = false;
       project_id: String(job.project_id || ''),
       project_name: String(job.project_name || ''),
       campaign_run_id: String(job.campaign_run_id || ''),
-      start_receipt: String(job.start_receipt || '')
+      start_receipt: String(job.start_receipt || ''),
+      profile: String(job.profile || '')
     };
     persistBrowserWorkerLease();
+    // The desktop dispatched a PROFILE, not just a project. Without this the
+    // worker started whatever its own state.auditProfile happened to be, so
+    // pressing CM opened a window that ran A3.
+    browserWorkerApplyDispatchedProfile(browserWorkerLease.profile);
 if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return false;
     // W3: state-aware resume. The persisted Bridge state decides the resume
     // entry point -- never "start from zero" for every state.
@@ -18917,6 +18941,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          chatGPTEnsureChatMode,
          chatGPTWorkModeControlNames,
          auditProfileIds,
+         browserWorkerApplyDispatchedProfile,
          loadState,
          profileShortLabel,
          nextAuditProfileId,

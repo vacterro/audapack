@@ -56,6 +56,14 @@ QToolBar {{
     spacing: 2px;
     padding: 2px;
 }}
+QToolBar QToolButton {{
+    /* The action bar must fit one row at 640px: the shared button padding is
+       sized for dialog buttons and turned a two-character label into a 74px
+       control. */
+    padding: 2px 4px;
+    margin: 0px;
+    min-width: 0px;
+}}
 QToolBarExtension {{
     background: {cls.surfaceRaised};
     border-top: 2px solid {cls.bevelLight};

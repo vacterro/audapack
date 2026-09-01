@@ -256,7 +256,8 @@ class TestSeamlessProjectOperations(unittest.TestCase):
                 for bar in win.findChildren(QToolBar)
                 for action in bar.actions()
             ]
-            self.assertIn("RESET MARKS", toolbar_actions)
+            # Label shortened to fit a 640px window in one row; the action is the same.
+            self.assertIn("MARKS", toolbar_actions)
             win._on_reset_project_marks()
             cleared = svc.get_project(p1.id)
             self.assertFalse(cleared.ignored)

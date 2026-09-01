@@ -94,3 +94,33 @@ test('W10: a one-wave campaign has no next wave to expect', () => {
   assert.strictEqual(compress.finalizer_wave_id, 'compress');
   assert.strictEqual(compress.waves[0].finalizer, true);
 });
+
+test('W10: a dispatched job runs ITS profile, not the window default', () => {
+  // The lease never carried the job's profile, so a worker started whatever
+  // state.auditProfile happened to be: pressing CM opened a window that ran A3.
+  const { api } = setup();
+  api.state.auditProfile = 'quick3';
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  assert.strictEqual(api.getActiveProfile().profile_id, 'quick3');
+  assert.strictEqual(api.browserWorkerApplyDispatchedProfile('compress'), true);
+  assert.strictEqual(api.getActiveProfile().profile_id, 'compress');
+});
+
+test('W10: an unknown or empty dispatched profile changes nothing', () => {
+  const { api } = setup();
+  api.state.auditProfile = 'quick3';
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  assert.strictEqual(api.browserWorkerApplyDispatchedProfile(''), false);
+  assert.strictEqual(api.browserWorkerApplyDispatchedProfile('retired-profile'), false);
+  assert.strictEqual(api.getActiveProfile().profile_id, 'quick3');
+});
+
+test('W10: applying the profile already in use is a no-op success', () => {
+  const { api } = setup();
+  api.state.auditProfile = 'compress';
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+  assert.strictEqual(api.browserWorkerApplyDispatchedProfile('compress'), true);
+  assert.strictEqual(api.getActiveProfile().profile_id, 'compress');
+});

@@ -80,6 +80,7 @@ class AuditRunsWidget(QWidget):
         self.open_button.clicked.connect(self._open_selected)
         self.details_button.clicked.connect(self._details_selected)
         self.reset_all_button.clicked.connect(self.reset_all_requested.emit)
+        self._pending_dispatch_count = 0
         for button in (self.retry_button, self.cancel_button, self.abandon_button, self.open_button, self.details_button, self.reset_all_button):
             actions.addWidget(button)
         actions.addStretch(1)
@@ -193,11 +194,22 @@ class AuditRunsWidget(QWidget):
         self.open_button.setEnabled(bool(run and "OPEN" in actions and run.handoff_path))
         self.details_button.setEnabled(bool(run))
         # RESET ALL never depends on a selection: it exists precisely for the
-        # board state where nothing is usefully selectable.
-        self.reset_all_button.setEnabled(any(
-            snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
-            for snapshot in self._runs
-        ))
+        # board state where nothing is usefully selectable. It also stays live
+        # while presses are still queued in the desktop's dispatch debounce --
+        # those have no run snapshot yet and are exactly what "I changed my
+        # mind" needs to cancel.
+        self.reset_all_button.setEnabled(
+            any(
+                snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
+                for snapshot in self._runs
+            )
+            or bool(self._pending_dispatch_count)
+        )
+
+    def set_pending_dispatch_count(self, count: int) -> None:
+        """Presses queued in the desktop but not dispatched to the Bridge yet."""
+        self._pending_dispatch_count = max(0, int(count or 0))
+        self._sync_actions()
 
     def _abandon_selected(self) -> None:
         run = self._selected()
