@@ -31,15 +31,15 @@ HANDOFF: IMPLEMENTATION_AGENT
   } else {
     for (let i = 1; i <= ticketsCount; i += 1) {
       const numStr = String(i).padStart(3, '0');
+      // Manifest-driven: a fixed literal ticket body only ever matched the
+      // waves that existed when it was written, and silently failed the next
+      // profile added to the manifest.
+      const fields = (waveDef.ticket_fields && waveDef.ticket_fields.length)
+        ? waveDef.ticket_fields
+        : ['EVIDENCE', 'DEFECT', 'REPAIR', 'VERIFY'];
       body += `
 [P1] [${pfx}-${numStr}] Sample defect issue title
-EVIDENCE: Verified in codebase.
-DEFECT: Sample defect explanation.
-REPAIR: Proposed fix.
-OPTIMIZE: Proposed optimization.
-ISSUE: Sample performance issue.
-GUARDRAIL: Safety guard.
-VERIFY: Run tests.
+${fields.map(field => `${field}: sample ${field.toLowerCase()}.`).join(String.fromCharCode(10))}
 `;
     }
   }

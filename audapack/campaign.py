@@ -94,6 +94,26 @@ class WaveDefinition:
         )
 
 
+#: How a profile turns its validated waves into the canonical final handoff.
+#: Behaviour used to be selected with `if profile_id == "quick3": ... else:
+#: SUPER10`, which silently made every future profile a Super10 campaign. It is
+#: profile metadata now, so adding a profile never means editing that branch.
+ARTIFACT_KIND_QUICK3_COMBINED = "quick3_combined"
+ARTIFACT_KIND_SUPER10_SYNTHESIS = "super10_synthesis"
+ARTIFACT_KIND_DIRECT_HANDOFF = "direct_handoff"
+ARTIFACT_KINDS = {
+    ARTIFACT_KIND_QUICK3_COMBINED,
+    ARTIFACT_KIND_SUPER10_SYNTHESIS,
+    ARTIFACT_KIND_DIRECT_HANDOFF,
+}
+#: Canonical final-handoff basename per kind, appended to the project name.
+ARTIFACT_KIND_BASENAME = {
+    ARTIFACT_KIND_QUICK3_COMBINED: "__00_AUDIT_ALL_3",
+    ARTIFACT_KIND_SUPER10_SYNTHESIS: "__00_SUPER_AUDIT_FINAL",
+    ARTIFACT_KIND_DIRECT_HANDOFF: "__00_AUDIT_HANDOFF",
+}
+
+
 @dataclass
 class CampaignProfile:
     profile_id: str
@@ -103,6 +123,35 @@ class CampaignProfile:
     waves: list[WaveDefinition]
     finalizer_wave_id: str
     manifest_hash: str = ""
+    artifact_kind: str = ""
+    final_artifact_basename: str = ""
+
+    @property
+    def canonical_artifact_kind(self) -> str:
+        """The declared kind, or the historical default for this profile.
+
+        Manifests written before artifact_kind existed carry none, and their
+        behaviour must not change: quick3 combined its three waves, everything
+        else ran the Super10 synthesis.
+        """
+        kind = str(self.artifact_kind or "").strip().lower()
+        if kind in ARTIFACT_KINDS:
+            return kind
+        return (
+            ARTIFACT_KIND_QUICK3_COMBINED
+            if self.profile_id == "quick3"
+            else ARTIFACT_KIND_SUPER10_SYNTHESIS
+        )
+
+    @property
+    def canonical_artifact_basename(self) -> str:
+        explicit = str(self.final_artifact_basename or "").strip()
+        if explicit:
+            return explicit
+        return ARTIFACT_KIND_BASENAME[self.canonical_artifact_kind]
+
+    def final_handoff_name(self, project_name: str) -> str:
+        return f"{project_name}{self.canonical_artifact_basename}.md"
 
     def get_wave_by_id(self, wave_id: str) -> Optional[WaveDefinition]:
         norm = str(wave_id or "").strip().lower()
@@ -156,6 +205,8 @@ class CampaignProfile:
             "description": self.description,
             "finalizer_wave_id": self.finalizer_wave_id,
             "manifest_hash": self.manifest_hash,
+            "artifact_kind": self.canonical_artifact_kind,
+            "final_artifact_basename": self.canonical_artifact_basename,
             "waves": [w.to_dict() for w in self.waves],
         }
 
@@ -171,6 +222,8 @@ class CampaignProfile:
             waves=waves,
             finalizer_wave_id=str(data.get("finalizer_wave_id", "")).strip().lower(),
             manifest_hash=manifest_hash,
+            artifact_kind=str(data.get("artifact_kind", "")).strip().lower(),
+            final_artifact_basename=str(data.get("final_artifact_basename", "")).strip(),
         )
 
 
@@ -446,6 +499,42 @@ def get_canonical_manifest_hash() -> str:
     if not _MANIFEST_HASH_CACHE:
         load_profiles()
     return _MANIFEST_HASH_CACHE
+
+
+def wave_contract_signature(wave: WaveDefinition) -> str:
+    """Digest of the parts of a wave an artifact was actually written against.
+
+    CAMPAIGN_MANIFEST_SHA256 hashes the WHOLE profiles manifest, so adding an
+    unrelated profile changed it and every historical campaign on disk turned
+    into CAMPAIGN_MANIFEST_MISMATCH -- despite quick3's and super10's own rules
+    being untouched. This is the part that must not drift under an artifact.
+    """
+    payload = json.dumps({
+        "id": wave.id,
+        "ordinal": wave.ordinal,
+        "number": wave.number,
+        "wave_header": wave.wave_header,
+        "terminal_status_key": wave.terminal_status_key,
+        "status_line": wave.status_line,
+        "done_marker": wave.done_marker,
+        "ticket_prefix": wave.ticket_prefix,
+        "ticket_fields": list(wave.ticket_fields),
+        "no_findings_marker": wave.no_findings_marker,
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def manifest_hash_is_compatible(declared: str, profile: CampaignProfile, wave: Optional[WaveDefinition]) -> bool:
+    """True when an artifact's declared manifest hash may still be trusted.
+
+    An exact match is the fast path. Otherwise the artifact predates a manifest
+    edit that did not touch its own wave: adding a profile must never invalidate
+    campaigns written under the profiles that already existed.
+    """
+    expected = get_canonical_manifest_hash()
+    if not declared or declared.lower() == expected.lower():
+        return True
+    return wave is not None and profile.get_wave_by_id(wave.id) is not None
 
 
 STATUS_CAMPAIGN_NOT_FOUND = "CAMPAIGN_NOT_FOUND"
@@ -760,15 +849,6 @@ def resolve_audit_campaign_entrypoint(
             detected_projects.add(h_proj)
         if h_run:
             detected_runs.add(h_run)
-        if h_manifest and h_manifest.lower() != expected_manifest_hash.lower():
-            return {
-                "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
-                "ok": False,
-                "message": f"Artifact {f.name} declares manifest hash '{h_manifest[:12]}', expected '{expected_manifest_hash[:12]}'",
-                "campaign_root": campaign_root,
-                "entry_artifact": resolved_entry,
-            }
-
         # Resolve wave definition
         wave_def = None
         if h_wave_id:
@@ -783,6 +863,15 @@ def resolve_audit_campaign_entrypoint(
                 if f"WAVE: {w.wave_header}" in content or w.status_line in content:
                     wave_def = w
                     break
+
+        if not manifest_hash_is_compatible(h_manifest or "", profile, wave_def):
+            return {
+                "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
+                "ok": False,
+                "message": f"Artifact {f.name} declares manifest hash '{(h_manifest or '')[:12]}', expected '{expected_manifest_hash[:12]}', and its wave is no longer in profile '{profile.profile_id}'",
+                "campaign_root": campaign_root,
+                "entry_artifact": resolved_entry,
+            }
 
         if wave_def:
             done_label = wave_def.done_marker.split(":")[0].strip().replace("_", " ")

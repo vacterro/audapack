@@ -107,7 +107,8 @@
           ],
           "no_findings_marker": "NO MATERIAL PERFORMANCE/STABILITY FINDINGS."
         }
-      ]
+      ],
+      "artifact_kind": "quick3_combined"
     },
     "super10": {
       "profile_id": "super10",
@@ -467,6 +468,52 @@
             "VERIFY"
           ],
           "no_findings_marker": "NO NEW VERIFIED REDTEAM DEFECTS."
+        }
+      ],
+      "artifact_kind": "super10_synthesis"
+    },
+    "compress": {
+      "profile_id": "compress",
+      "profile_version": "1.0.0",
+      "display_name": "Compress Audit",
+      "short_label": "CM",
+      "description": "Single-wave read-only audit for safe repository compression: dead code, duplication, obsolete paths and unnecessary complexity.",
+      "artifact_kind": "direct_handoff",
+      "final_artifact_basename": "__00_COMPRESS_AUDIT",
+      "finalizer_wave_id": "compress",
+      "waves": [
+        {
+          "id": "compress",
+          "ordinal": 1,
+          "number": "01",
+          "slug": "AUDIT_COMPRESS",
+          "title": "COMPRESS AUDIT",
+          "short_label": "CM",
+          "description": "Read-only audit producing an implementation-ready repository compression handoff.",
+          "ticket_prefix": "CMP-",
+          "wave_header": "COMPRESS AUDIT",
+          "terminal_status_key": "COMPRESS",
+          "status_line": "STATUS: COMPRESS: COMPLETE",
+          "done_marker": "COMPRESS_DONE_WHEN:",
+          "prompt_focus": "SAFE REPOSITORY COMPRESSION.\nFind implementation mass the repository does not need: verified dead code, obsolete paths kept after a migration, duplicate sources of truth, abstractions with no second caller, machinery solving a much simpler problem, dependencies earning nothing, and files with no runtime, packaging, test or documentation role.\nPrefer DELETE over CONSOLIDATE over SIMPLIFY over REWRITE: deleting dead code beats making it prettier, and one implementation beats two kept in sync.\nRemoval requires proof of safety, not absence of obvious callers. Follow whichever reference mechanisms this repository actually uses -- imports, dynamic imports, reflection, plugin/entry-point discovery, command and event registration, serialized names, config-driven dispatch, packaging manifests, platform branches, subprocess calls, tests, migrations, public API, assets. If safe removal cannot be demonstrated, it is not a ticket.\nEstablish a compact BEFORE baseline from the real source tree (excluding vendor/build/cache/generated data) so the implementation can be compared afterwards.\nSmallest LOC is NOT the goal; the smallest reasonably clear implementation that preserves supported behaviour is. Never propose minification, code golf, deleting useful tests or documentation for size, collapsing APIs consumers rely on, trading efficiency for brevity, removing observability needed for diagnosis, or dropping fallback, migration and compatibility paths without evidence their consumers are gone.\nThis is not the performance wave: it asks what is structurally larger or more complicated than necessary, and a shorter implementation that runs slower is not a win.",
+          "prompt_output_contract": "Return ONE code block only. Tickets in priority order ([P0|P1|P2] [CMP-001] <ACTION> <path/symbol> with EVIDENCE, WASTE, ACTION, BEHAVIOR_GUARD, IMPACT, VERIFY). ACTION is one of DELETE, MERGE, DEDUPLICATE, SIMPLIFY, INLINE, REMOVE_DEPENDENCY, REMOVE_COMPAT, CONSOLIDATE_STATE, REPLACE_STRUCTURE. IMPACT states the concrete reduction where it is measurable and says so plainly where it is not -- never invent a number. End with COMPRESS_DONE_WHEN. A repository with no proven waste returns TICKETS: 0 and the no-findings marker.",
+          "depends_on": [],
+          "required": true,
+          "max_partial_continuations": 12,
+          "max_stall_recoveries": 12,
+          "max_retry_clicks": 3,
+          "max_continue_generating_clicks": 10,
+          "synthesis_role": "finalizer",
+          "finalizer": true,
+          "ticket_fields": [
+            "EVIDENCE",
+            "WASTE",
+            "ACTION",
+            "BEHAVIOR_GUARD",
+            "IMPACT",
+            "VERIFY"
+          ],
+          "no_findings_marker": "NO VERIFIED SAFE COMPRESSION OPPORTUNITIES."
         }
       ]
     }

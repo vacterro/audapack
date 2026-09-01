@@ -159,6 +159,10 @@ def test_bridge_parse_wave_matches_canonical_manifest_matrix():
             pfx = wave_def.ticket_prefix.rstrip("-")
             term_key = wave_def.terminal_status_key or wave_def.slug
             done_marker = wave_def.done_marker
+            # Manifest-driven: the ticket body comes from THIS wave's declared
+            # fields. A fixed literal body only ever matched the waves that
+            # existed when it was written, and silently failed the next profile.
+            ticket_body = chr(10).join(f"{field}: sample {field.lower()}." for field in wave_def.ticket_fields)
 
             handoff_md = f"""
 PROJECT_NAME: AUDAPACK
@@ -173,13 +177,7 @@ TICKETS: 1
 HANDOFF: IMPLEMENTATION_AGENT
 
 [P1] [{pfx}-001] Sample defect title
-EVIDENCE: In codebase.
-DEFECT: Sample defect.
-REPAIR: Fix defect.
-OPTIMIZE: Optimize code.
-ISSUE: Issue description.
-GUARDRAIL: Guardrail.
-VERIFY: Run tests.
+{ticket_body}
 
 {done_marker} All tickets verified.
 """
