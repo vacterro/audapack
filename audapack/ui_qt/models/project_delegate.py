@@ -239,7 +239,6 @@ class ProjectItemDelegate(QStyledItemDelegate):
         total_waves = index.data(Qt.ItemDataRole.UserRole + 15) or 3
         prof_label = index.data(Qt.ItemDataRole.UserRole + 19) or ("A10" if total_waves == 10 else "A3")
         dispatch_state = str(index.data(Qt.ItemDataRole.UserRole + 33) or "")
-        dispatch_browser = str(index.data(Qt.ItemDataRole.UserRole + 35) or "")
         inaudit_label = str(index.data(Qt.ItemDataRole.UserRole + 40) or "")
         audit_run_state = str(index.data(Qt.ItemDataRole.UserRole + 41) or "")
 
@@ -279,36 +278,27 @@ class ProjectItemDelegate(QStyledItemDelegate):
         base_y = y + 4
 
         # ── INAUDIT badge (kept tiny, only when layers exist)
-        # ── Audit wave text (always audit, pack shown separately)
-        if all_ready:
-            wave_text = f"\u2713 {prof_label} {completed_waves}/{total_waves}"
-            wave_color = QColor(PALETTE["success"])
-        elif completed_waves > 0:
-            wave_text = f"{prof_label} {completed_waves}/{total_waves}"
-            wave_color = QColor(PALETTE["warning"])
-        else:
-            wave_text = f"{prof_label} 0/{total_waves}"
-            wave_color = QColor(PALETTE["textMuted"])
+        # ── Audit run/state label — SHORT, one column only (RUN).
+        # Every state is a compact token so the column never overflows and the
+        # rows stay aligned like a table. WAVES and AGE have their own columns.
         if audit_run_state:
             state_labels = {
-                "PREPARING": "PREPARING",
-                "INTERRUPTED": "INTERRUPTED",
-                "WAITING": "WAITING",
-                "RETRYING": "RETRYING",
-                "ATTACHING": "ATTACHING",
-                "STARTING": "STARTING",
+                "PREPARING": "PREP",
+                "INTERRUPTED": "INT",
+                "WAITING": "WAIT",
+                "RETRYING": "RETRY",
+                "ATTACHING": "ATCH",
+                "STARTING": "START",
                 "AUDITING": "AUDIT",
-                "SAVING": "SAVING",
-                "READY": "AUDIT READY ✓",
-                "BLOCKED_PRE_START": "! BLOCKED PRE",
-                "BLOCKED_POST_START": "! BLOCKED POST",
-                "RECOVERY": "! RECOVERY",
-                "FAILED": "FAILED",
-                "CANCELLED": "CANCELLED",
+                "SAVING": "SAVE",
+                "READY": "READY",
+                "BLOCKED_PRE_START": "!PRE",
+                "BLOCKED_POST_START": "!POST",
+                "RECOVERY": "RECOV",
+                "FAILED": "FAIL",
+                "CANCELLED": "CANC",
             }
-            label = state_labels.get(audit_run_state, audit_run_state)
-            suffix = f" {dispatch_browser}" if dispatch_browser and audit_run_state in {"ATTACHING", "STARTING", "AUDITING"} else ""
-            wave_text = f"{label} {completed_waves}/{total_waves}{suffix}"
+            wave_text = state_labels.get(audit_run_state, audit_run_state[:6])
             if audit_run_state == "READY":
                 wave_color = QColor(PALETTE["success"])
             elif audit_run_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}:
@@ -318,21 +308,27 @@ class ProjectItemDelegate(QStyledItemDelegate):
         elif dispatch_state and dispatch_state not in {"COMPLETE", "CANCELLED"}:
             state_labels = {
                 "QUEUED": "WAIT",
-                "LEASED": "ATTACH",
-                "ARTIFACT_FETCHED": "ATTACH",
+                "LEASED": "ATCH",
+                "ARTIFACT_FETCHED": "ATCH",
                 "ATTACHED": "START",
                 "START_PREPARED": "START",
                 "STARTED": "AUDIT",
                 "AUDITING": "AUDIT",
                 "FINALIZING": "SAVE",
-                "BLOCKED": "! BLOCKED",
-                "FAILED": "FAILED",
+                "BLOCKED": "!BLOCK",
+                "FAILED": "FAIL",
                 "RETRYABLE": "WAIT",
             }
-            label = state_labels.get(dispatch_state, dispatch_state)
-            suffix = f" {dispatch_browser}" if dispatch_browser and dispatch_state not in {"QUEUED", "RETRYABLE"} else ""
-            wave_text = f"{label}{suffix}"
+            wave_text = state_labels.get(dispatch_state, dispatch_state[:6])
             wave_color = QColor(PALETTE["warning"] if dispatch_state not in {"BLOCKED", "FAILED"} else PALETTE["dangerText"])
+        else:
+            # Idle: show profile readiness, still one short token.
+            if all_ready:
+                wave_text = "READY"
+                wave_color = QColor(PALETTE["success"])
+            else:
+                wave_text = prof_label  # A3 / A10
+                wave_color = QColor(PALETTE["textMuted"])
         if compact_rows:
             wave_text = wave_text.replace("✓ ", "✓", 1)
         # Pack badge after ZIP
