@@ -133,3 +133,45 @@ test('W9: an unswitchable Work surface stays blocked and reports once', () => {
   const log = api.readBridgeDiagnosticLog();
   assert.ok(log.some(entry => entry.event === 'worker_work_mode_blocked'), JSON.stringify(log));
 });
+
+test('W9: the widget never clicks its own CHAT button', () => {
+  // The widget renders a toolbar with a CHAT button. Searching the whole
+  // document for a control named "chat" found OUR button first and clicked it
+  // forever instead of ChatGPT's toggle.
+  const { h, api } = managedSetup();
+  workComposer(h);
+  const ours = h.el('button', { 'aria-label': 'Chat', id: 'acb-bar-chat' });
+  h.dom.querySelector('body').appendChild(ours);
+
+  assert.strictEqual(api.chatGPTWorkModeSwitchControl?.() ?? null, null);
+  const outcome = api.chatGPTEnsureChatMode();
+  assert.strictEqual(outcome.action, 'no-switch-control');
+  assert.ok(!(outcome.names || []).includes('chat'), JSON.stringify(outcome.names));
+});
+
+test('W9: an unfindable switch reports the controls the page actually offers', () => {
+  const { h, api } = managedSetup();
+  workComposer(h);
+  const other = h.el('button', { 'aria-label': 'Upgrade' });
+  h.dom.querySelector('form[data-type="unified-composer"]').appendChild(other);
+
+  const outcome = api.chatGPTEnsureChatMode();
+  assert.strictEqual(outcome.ok, false);
+  assert.ok((outcome.names || []).includes('upgrade'), JSON.stringify(outcome.names));
+});
+
+test('W9: a managed window may fall back to New chat, an ordinary call may not', () => {
+  const { h, api } = managedSetup();
+  const input = workComposer(h);
+  const fresh = h.el('button', { 'aria-label': 'New chat' });
+  fresh.addEventListener('click', () => { input.setAttribute('placeholder', 'Ask anything'); });
+  h.dom.querySelector('body').appendChild(fresh);
+
+  assert.strictEqual(api.chatGPTEnsureChatMode().action, 'no-switch-control');
+  assert.strictEqual(api.chatGPTWorkSurfaceActive(), true);
+
+  const allowed = api.chatGPTEnsureChatMode({ allowNewChat: true });
+  assert.strictEqual(allowed.ok, true);
+  assert.strictEqual(allowed.action, 'new-chat');
+  assert.strictEqual(api.chatGPTWorkSurfaceActive(), false);
+});

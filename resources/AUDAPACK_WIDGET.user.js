@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.29
+// @version      0.0.30
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -9534,32 +9534,107 @@ ordinal/name of the entrypoint file.`;
     return /meet chatgpt work/i.test(pageText);
   }
 
+  const WORK_MODE_CONTROL_SELECTOR =
+    '[role="radio"], [role="tab"], [role="menuitemradio"], [role="option"], [role="switch"], button, a';
+
+  function chatGPTNodeIsWidgetOwned(node) {
+    // This widget renders its own toolbar into the page, and that toolbar has
+    // a button labelled CHAT. Searching the whole document for a control named
+    // "chat" therefore found OUR button first and clicked it forever instead
+    // of ChatGPT's Chat/Work toggle. Never treat our own UI as page chrome.
+    for (let cur = node; cur && cur !== document.documentElement; cur = cur.parentElement) {
+      const id = String(cur.id || '');
+      if (id.startsWith('acb-') || id.startsWith('audapack')) return true;
+      const cls = String(cur.getAttribute && cur.getAttribute('class') || '');
+      if (/(^|\s)(acb|audapack)-/.test(cls)) return true;
+    }
+    return false;
+  }
+
+  function chatGPTControlName(node) {
+    const raw = String(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
+    return cleanTurnText(raw).replace(/\s+(mode|режим)$/i, '').trim().toLowerCase();
+  }
+
+  function chatGPTWorkModeControlScopes() {
+    // Composer first, then the whole document. Scoping to the composer ALONE
+    // was why the switch was never found: `no-switch-control` on every window
+    // while the toggle lives in the header/sidebar, outside the composer root.
+    const scopes = [];
+    const composer = chatGPTComposerRoot();
+    if (composer) scopes.push(composer);
+    if (document.body && document.body !== composer) scopes.push(document.body);
+    return scopes;
+  }
+
   function chatGPTWorkModeSwitchControl() {
     // The Chat option of the Chat/Work toggle. Named controls only: a button
     // that merely CONTAINS the word "chat" (e.g. "New chat" in the sidebar)
-    // must never be clicked -- only an exact accessible name qualifies.
-    const scope = chatGPTComposerRoot() || document.body;
-    const candidates = scope.querySelectorAll(
-      '[role="radio"], [role="tab"], [role="menuitemradio"], [role="option"], [role="switch"], button, a'
-    );
-    for (const node of candidates) {
-      if (!isVisible(node)) continue;
-      if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
-      const raw = String(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
-      const name = cleanTurnText(raw).replace(/\s+(mode|режим)$/i, '').trim().toLowerCase();
-      if (name !== 'chat' && name !== 'чат') continue;
-      return node;
+    // must never be clicked here -- only an exact accessible name qualifies.
+    for (const scope of chatGPTWorkModeControlScopes()) {
+      for (const node of scope.querySelectorAll(WORK_MODE_CONTROL_SELECTOR)) {
+        if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+        if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+        const name = chatGPTControlName(node);
+        if (name !== 'chat' && name !== 'чат') continue;
+        return node;
+      }
     }
     return null;
   }
 
-  function chatGPTEnsureChatMode() {
+  function chatGPTWorkModeControlNames(limit = 40) {
+    // Ground truth for a switch that could not be found. Without it the only
+    // report was `no-switch-control`, which says nothing about what the page
+    // actually offers.
+    const names = [];
+    const seen = new Set();
+    for (const scope of chatGPTWorkModeControlScopes()) {
+      for (const node of scope.querySelectorAll(WORK_MODE_CONTROL_SELECTOR)) {
+        if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+        const name = chatGPTControlName(node).slice(0, 48);
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        names.push(name);
+        if (names.length >= limit) return names;
+      }
+    }
+    return names;
+  }
+
+  function chatGPTNewChatControl() {
+    // Last resort for a MANAGED worker window only: a fresh chat is exactly
+    // the state a worker wants, and clicking it in a dedicated window can
+    // never disturb a human's conversation.
+    for (const scope of chatGPTWorkModeControlScopes()) {
+      for (const node of scope.querySelectorAll(WORK_MODE_CONTROL_SELECTOR)) {
+        if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+        if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+        const name = chatGPTControlName(node);
+        if (!/^(new chat|новый чат)$/i.test(name)) continue;
+        return node;
+      }
+    }
+    return null;
+  }
+
+  function chatGPTEnsureChatMode(options = {}) {
     if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'already-chat' };
     const control = chatGPTWorkModeSwitchControl();
-    if (!control) return { ok: false, action: 'no-switch-control' };
-    dispatchElementClick(control);
-    if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'switched' };
-    return { ok: false, action: 'switch-refused' };
+    if (control) {
+      dispatchElementClick(control);
+      if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'switched' };
+      return { ok: false, action: 'switch-refused', names: chatGPTWorkModeControlNames() };
+    }
+    if (options.allowNewChat) {
+      const fresh = chatGPTNewChatControl();
+      if (fresh) {
+        dispatchElementClick(fresh);
+        if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'new-chat' };
+        return { ok: false, action: 'new-chat-refused', names: chatGPTWorkModeControlNames() };
+      }
+    }
+    return { ok: false, action: 'no-switch-control', names: chatGPTWorkModeControlNames() };
   }
 
   function rememberStableConversationKey(key) {
@@ -18290,7 +18365,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
     if (!browserWorkerManagedIdentity()?.slot) return false;
     if (browserWorkerLease?.dispatch_id) return false;
     if (!chatGPTWorkSurfaceActive()) return false;
-    const outcome = chatGPTEnsureChatMode();
+    const outcome = chatGPTEnsureChatMode({ allowNewChat: true });
     const now = Date.now();
     if (outcome.ok) {
       browserWorkerWorkModeReportedAt = 0;
@@ -18302,7 +18377,7 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
       browserWorkerWorkModeReportedAt = now;
       appendBridgeDiagnostic('worker_work_mode_blocked', {
         severity: 'info',
-        message: `worker is on the ChatGPT Work surface and could not switch back to chat (${String(outcome.action || 'unknown')}); the lane stays OCCUPIED until the composer is switched to Chat manually`
+        message: `worker is on the ChatGPT Work surface and could not switch back to chat (${String(outcome.action || 'unknown')}); the lane stays OCCUPIED until the composer is switched to Chat manually. controls seen: ${(outcome.names || []).join(' | ') || '(none)'}`
       });
     }
     return outcome.ok;
@@ -18764,6 +18839,9 @@ if (!browserWorkerLease.dispatch_id || !browserWorkerLease.lease_id) return fals
          browserWorkerClearAbandonedDraft,
          chatGPTWorkSurfaceActive,
          chatGPTEnsureChatMode,
+         chatGPTWorkModeControlNames,
+         chatGPTWorkModeSwitchControl,
+         chatGPTNewChatControl,
          browserWorkerEnsureChatModeHousekeeping,
          composerStateOwnedBySameWrite,
          setBrowserWorkerDirtySinceForTest: value => { browserWorkerDirtySince = Number(value || 0); },
