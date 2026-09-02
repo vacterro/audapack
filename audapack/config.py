@@ -593,6 +593,35 @@ def create_default_launchers() -> list[LauncherConfig]:
 DEFAULT_GG_TEMPLATE = "/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {path}"
 
 
+def _normalized_hidden_toolbar_buttons(value: Any) -> list[str]:
+    """Keep the persisted list inside the buttons that actually exist.
+
+    A retired or misspelled key would silently hide nothing while looking like
+    a setting, so unknown entries are dropped rather than carried forever.
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return list(DEFAULT_HIDDEN_TOOLBAR_BUTTONS)
+    known = {key.upper(): key for key in TOOLBAR_BUTTON_KEYS}
+    seen: list[str] = []
+    for item in value:
+        key = known.get(str(item).strip().upper())
+        if key and key not in seen:
+            seen.append(key)
+    return seen
+
+
+#: Every action on the bottom toolbar, in the order it is built. The keys are
+#: the button labels, which is what the operator actually sees and names.
+TOOLBAR_BUTTON_KEYS = (
+    "PACK", "START", "GRP", "A3", "A10", "CM",
+    "WRK", "ALL", "COPY", "GG", "IA", "IA+", "ZIP", "MRK",
+)
+
+#: Hidden until asked for: GG has Ctrl+C, and the two INAUDIT actions live on
+#: their own tab. Hidden, never removed -- one checkbox brings any of them back.
+DEFAULT_HIDDEN_TOOLBAR_BUTTONS = ("GG", "IA", "IA+")
+
+
 @dataclass
 class UIConfig:
     window_size: list[int] = field(default_factory=lambda: [760, 680])
@@ -608,6 +637,10 @@ class UIConfig:
     show_tooltips: bool = True  # Show tooltips on hover
     compact_rows: bool = False  # One-line project rows; false keeps full two-line details
     launcher_letters: bool = True  # True: OC/FB/CL/C1/C2/CF, False: 1/2/3/4/5/6
+    #: Toolbar buttons the operator has hidden. The row has to fit 640px, so
+    #: the few actions that already have a keyboard or context-menu route are
+    #: hidden by default rather than spending width nobody asked for.
+    hidden_toolbar_buttons: list[str] = field(default_factory=lambda: list(DEFAULT_HIDDEN_TOOLBAR_BUTTONS))
 
 
 @dataclass
@@ -1076,6 +1109,9 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         show_tooltips=bool(ui_raw.get("show_tooltips", True)),
         compact_rows=bool(ui_raw.get("compact_rows", False)),
         launcher_letters=bool(ui_raw.get("launcher_letters", True)),
+        hidden_toolbar_buttons=_normalized_hidden_toolbar_buttons(
+            ui_raw.get("hidden_toolbar_buttons", DEFAULT_HIDDEN_TOOLBAR_BUTTONS)
+        ),
     )
 
     launchers_raw = data.get("launchers")

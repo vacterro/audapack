@@ -62,18 +62,11 @@ class AuditRunsWidget(QWidget):
         self.retry_button = QPushButton("START / RETRY", self)
         self.cancel_button = QPushButton("CANCEL", self)
         self.abandon_button = QPushButton("FORCE UNBLOCK", self)
-        self.abandon_button.setToolTip(
-            "Stuck BLOCKED run: mark it terminally FAILED so this project can START AUDIT again.\n"
-            "Use only when the run is dead — a Core may already have been sent, so no new START is issued automatically."
-        )
+        self.abandon_button.setToolTip("Mark a dead BLOCKED run FAILED so the project can start again")
         self.open_button = QPushButton("OPEN RESULT", self)
         self.details_button = QPushButton("COPY DETAILS", self)
         self.reset_all_button = QPushButton("RESET ALL", self)
-        self.reset_all_button.setToolTip(
-            "Clear every unfinished lane in one action. Cancels what can be "
-            "cancelled and force-unblocks what cannot, so a jammed board does "
-            "not have to be reset lane by lane."
-        )
+        self.reset_all_button.setToolTip("Clear every unfinished lane in one action")
         self.retry_button.clicked.connect(self._start_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
         self.abandon_button.clicked.connect(self._abandon_selected)

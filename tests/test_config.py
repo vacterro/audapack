@@ -170,3 +170,55 @@ class TestConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestToolbarButtonVisibility(unittest.TestCase):
+    """The 640px row is a budget, and the operator decides how to spend it."""
+
+    def test_the_default_hides_the_buttons_that_have_another_route(self):
+        from audapack.config import DEFAULT_HIDDEN_TOOLBAR_BUTTONS, UIConfig
+
+        self.assertEqual(tuple(DEFAULT_HIDDEN_TOOLBAR_BUTTONS), ("GG", "IA", "IA+"))
+        self.assertEqual(UIConfig().hidden_toolbar_buttons, ["GG", "IA", "IA+"])
+
+    def test_every_default_hidden_button_exists(self):
+        from audapack.config import DEFAULT_HIDDEN_TOOLBAR_BUTTONS, TOOLBAR_BUTTON_KEYS
+
+        for key in DEFAULT_HIDDEN_TOOLBAR_BUTTONS:
+            self.assertIn(key, TOOLBAR_BUTTON_KEYS)
+
+    def test_an_unknown_key_is_dropped_rather_than_carried_forever(self):
+        from audapack.config import _normalized_hidden_toolbar_buttons
+
+        self.assertEqual(_normalized_hidden_toolbar_buttons(["gg", "retired", "IA"]), ["GG", "IA"])
+
+    def test_an_unreadable_value_falls_back_to_the_default(self):
+        from audapack.config import _normalized_hidden_toolbar_buttons
+
+        self.assertEqual(_normalized_hidden_toolbar_buttons("nonsense"), ["GG", "IA", "IA+"])
+
+    def test_hiding_nothing_is_a_real_choice(self):
+        """An empty list means "show everything" and must survive a round trip."""
+        from audapack.config import _normalized_hidden_toolbar_buttons
+
+        self.assertEqual(_normalized_hidden_toolbar_buttons([]), [])
+
+    def test_the_choice_survives_a_config_round_trip(self):
+        import tempfile
+        from pathlib import Path
+
+        from audapack.config import load_config, save_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("AUDAPACK_RUNTIME_DIR")
+            os.environ["AUDAPACK_RUNTIME_DIR"] = str(Path(tmp) / "runtime")
+            try:
+                config = load_config()
+                config.ui.hidden_toolbar_buttons = ["ZIP"]
+                save_config(config)
+                self.assertEqual(load_config().ui.hidden_toolbar_buttons, ["ZIP"])
+            finally:
+                if old is None:
+                    os.environ.pop("AUDAPACK_RUNTIME_DIR", None)
+                else:
+                    os.environ["AUDAPACK_RUNTIME_DIR"] = old

@@ -29,6 +29,7 @@ from audapack.config import (
     OUTPUT_LAYOUT_CHOICES,
     OUTPUT_LAYOUT_GROUPED_BY_PRIORITY,
     OUTPUT_LAYOUT_SINGLE_FOLDER,
+    TOOLBAR_BUTTON_KEYS,
     LauncherConfig,
     normalize_output_layout,
     save_config,
@@ -147,6 +148,8 @@ class SettingsWidget(QWidget):
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
         self.compact_rows.toggled.connect(lambda: self._save())
+        for _box in self.toolbar_button_checks.values():
+            _box.toggled.connect(lambda: self._save())
         self.flash_duration.valueChanged.connect(lambda: self._autosave_timer.start())
 
     # ---------------------------------------------------------------- builders
@@ -183,6 +186,33 @@ class SettingsWidget(QWidget):
         self.compact_rows = QCheckBox("Compact project rows (one line)")
         self.compact_rows.setChecked(getattr(self._config.ui, "compact_rows", False))
         f.addRow("Project rows", self.compact_rows)
+
+        # Toolbar buttons, one checkbox each. The row has to fit 640px, so a
+        # button nobody presses is width taken from one they do.
+        hidden = {
+            str(key).strip().upper()
+            for key in getattr(self._config.ui, "hidden_toolbar_buttons", ()) or ()
+        }
+        self.toolbar_button_checks: dict[str, QCheckBox] = {}
+        row = QWidget(w)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(2)
+        for index, key in enumerate(TOOLBAR_BUTTON_KEYS):
+            box = QCheckBox(key, row)
+            box.setChecked(key.upper() not in hidden)
+            box.setToolTip(f"Show the {key} button on the toolbar")
+            self.toolbar_button_checks[key] = box
+            row_layout.addWidget(box)
+            # Fourteen checkboxes do not fit one 640px line.
+            if index == 6:
+                f.addRow("Toolbar buttons", row)
+                row = QWidget(w)
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(2)
+        row_layout.addStretch()
+        f.addRow("", row)
 
         self.tooltip_duration = QSpinBox()
         self.tooltip_duration.setRange(1000, 60000)
@@ -361,9 +391,7 @@ class SettingsWidget(QWidget):
         btn_install_widget.clicked.connect(self._on_bridge_install_widget)
 
         btn_launch_worker = QPushButton("Launch Chromium", grp_status)
-        btn_launch_worker.setToolTip(
-            "Open the isolated AUDAPACK browser profile with background throttling disabled"
-        )
+        btn_launch_worker.setToolTip("Open the isolated AUDAPACK browser profile")
         btn_launch_worker.clicked.connect(self._on_launch_browser_worker)
 
         btn_open_audits = QPushButton("Open Audits", grp_status)
@@ -691,6 +719,9 @@ class SettingsWidget(QWidget):
         c.packing.delete_old = self.delete_old.isChecked()
         c.packing.include_timestamp = self.include_timestamp.isChecked()
         c.packing.manifest_enabled = self.manifest.isChecked()
+        c.ui.hidden_toolbar_buttons = [
+            key for key, box in self.toolbar_button_checks.items() if not box.isChecked()
+        ]
         c.audits.root = self.audit_root.text().strip()
         c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
         c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"

@@ -96,8 +96,7 @@ class InstanceManagerWidget(QWidget):
         self.activity_label.setWordWrap(True)
         self.activity_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.activity_label.setToolTip(
-            "Shows native window state plus the last explicit SAIPEN state/log entry. "
-            "Private model reasoning and terminal output are not exposed."
+            "Window state and the last SAIPEN log entry"
         )
         root.addWidget(self.activity_label)
 

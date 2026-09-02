@@ -30,3 +30,6 @@ AGENTS.md
 CLAUDE.md
 GEMINI.md
 .freebuff/
+
+# Audit mirror written by the Bridge into the audited project.
+audit/

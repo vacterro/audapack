@@ -446,7 +446,11 @@ def _fit_toolbar_to_text(toolbar) -> int:
         ).width()
         button.setMinimumWidth(0)
         button.setFixedWidth(needed)
-        total += needed
+        # Every button is sized, so one the operator un-hides is already right.
+        # Only the visible ones are counted: the total is the width the row has
+        # to fit into, and a hidden button occupies none of it.
+        if action.isVisible():
+            total += needed
     return total
 
 
@@ -583,16 +587,19 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(0, 0))
         self.addToolBar(Qt.BottomToolBarArea, toolbar)
 
-        act_pack = toolbar.addAction("PACK", self._on_pack)
-        act_pack.setToolTip("Pack selected project in background")
+        # Every action is registered under the label the operator sees, which
+        # is also the key the visibility setting stores.
+        self.toolbar_actions: dict[str, Any] = {}
 
-        act_send_audit = toolbar.addAction("START", self._on_send_audit)
-        act_send_audit.setToolTip(
-            "START AUDIT: queue the selected project with the profile A3/A10/CM currently marks"
-        )
+        def add(key: str, handler, tip: str):
+            action = toolbar.addAction(key, handler)
+            action.setToolTip(tip)
+            self.toolbar_actions[key] = action
+            return action
 
-        act_audit_group = toolbar.addAction("GRP", self._on_start_audit_group)
-        act_audit_group.setToolTip("AUDIT GROUP: queue up to six projects from the selected group")
+        add("PACK", self._on_pack, "Pack the selected project")
+        add("START", self._on_send_audit, "Start the audit with the marked profile")
+        add("GRP", self._on_start_audit_group, "Start audits for up to six projects in the group")
 
         # Audit profile selector: A3 | A10 | CM as peers. START AUDIT used to
         # fall back to quick3 with no way to choose anything else from here.
@@ -606,45 +613,27 @@ class MainWindow(QMainWindow):
                 detail = get_profile(profile_id).description or get_profile(profile_id).display_name
             except Exception:
                 detail = label
-            act.setToolTip(
-                f"Switch the audit profile to {label}; press START to run it. {detail}"
-            )
+            # A profile description is a paragraph; a tooltip is one line.
+            summary = " ".join(str(detail).split())
+            if len(summary) > 70:
+                summary = summary[:69].rstrip() + "…"
+            act.setToolTip(f"Audit profile {label} — {summary}" if summary else f"Audit profile {label}")
             act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
             self.profile_actions[profile_id] = act
+            self.toolbar_actions[label] = act
         toolbar.addSeparator()
 
-        act_reopen_workers = toolbar.addAction("WRK", self._on_reopen_workers)
-        act_reopen_workers.setToolTip(
-            "WORKERS: reopen worker windows that are no longer on screen. "
-            "Closing one by accident used to be unrecoverable from here: the Bridge "
-            "only re-provisions while audits are queued, so an idle pool stayed short "
-            "until the next START AUDIT. A window running an audit is left alone."
-        )
-
-        act_pack_all = toolbar.addAction("ALL", self._on_pack_all)
-        act_pack_all.setToolTip("Pack all configured projects in background")
-
-        act_copy = toolbar.addAction("COPY", self._on_copy_audit)
-        act_copy.setToolTip("COPY: copy the verified audit to the clipboard")
-
-        act_copy_gg = toolbar.addAction("GG", self._on_copy_audit_file_path)
-        act_copy_gg.setToolTip("Copy /saipen gg audit path to clipboard (Ctrl+C)")
-
-        act_ia = toolbar.addAction("IA", self._on_ia_copy)
-        act_ia.setToolTip("IA — Copy selected INAUDIT path\nShift: saipen gg \"path\"\nCtrl: saipen cc \"path\"")
-
-        act_ia_plus = toolbar.addAction("IA+", self._on_ia_plus_capture)
-        act_ia_plus.setToolTip("Capture clipboard text into the durable global INAUDIT Inbox")
-
-        act_copy_arc = toolbar.addAction("ZIP", self._on_copy_archive)
-        act_copy_arc.setToolTip("Copy packed .zip archive file to clipboard")
-
-        act_reset_marks = toolbar.addAction("MRK", self._on_reset_project_marks)
-        act_reset_marks.setToolTip(
-            "RESET MARKS: clear all Done dimming, Ignore to archive marks, and audit copy counters; disabled projects stay disabled. Does NOT cancel active audits."
-        )
+        add("WRK", self._on_reopen_workers, "Reopen worker windows that are gone")
+        add("ALL", self._on_pack_all, "Pack every configured project")
+        add("COPY", self._on_copy_audit, "Copy the verified audit text")
+        add("GG", self._on_copy_audit_file_path, "Copy the saipen gg command (Ctrl+C)")
+        add("IA", self._on_ia_copy, "Copy the INAUDIT path — Shift: gg, Ctrl: cc")
+        add("IA+", self._on_ia_plus_capture, "Capture the clipboard into the INAUDIT inbox")
+        add("ZIP", self._on_copy_archive, "Copy the packed .zip file")
+        add("MRK", self._on_reset_project_marks, "Clear Done/Ignore marks and copy counters")
 
         self._action_toolbar = toolbar
+        self._apply_toolbar_visibility()
 
         # Ctrl+R refreshes everything, from anywhere in the window. It also
         # replaces the REFRESH button outright: one action does not need a
@@ -1482,6 +1471,23 @@ QToolTip QLabel {
         except Exception:
             name = chosen
         self._flash_status(f"START AUDIT profile: {name}", "#D4A840", duration_ms=4000)
+
+    def _apply_toolbar_visibility(self):
+        """Hide the toolbar buttons the operator switched off.
+
+        The row has to fit 640px, so width spent on an action that already has
+        a keyboard or context-menu route is width taken from one that does not.
+        Hidden, never removed: the action still exists and one checkbox in
+        Settings brings it back.
+        """
+        hidden = {
+            str(key).strip().upper()
+            for key in getattr(self._service.config.ui, "hidden_toolbar_buttons", ()) or ()
+        }
+        for key, action in getattr(self, "toolbar_actions", {}).items():
+            action.setVisible(str(key).upper() not in hidden)
+        if getattr(self, "_action_toolbar", None) is not None:
+            _fit_toolbar_to_text(self._action_toolbar)
 
     def _on_reopen_workers(self):
         """Reopen every managed worker window that is no longer on screen."""

@@ -152,3 +152,48 @@ def test_the_profile_buttons_are_switches_next_to_one_start(toolbar):
         assert action.isCheckable(), f"{name} must read as a switch"
     start = next(a for a in bar.actions() if a.text() == "START")
     assert not start.isCheckable()
+
+
+def test_the_default_row_hides_the_buttons_that_have_another_route(toolbar):
+    """Width is the scarce thing at 640px, so GG/IA/IA+ start hidden.
+
+    GG has Ctrl+C and the two INAUDIT actions live on their own tab, so the
+    width they used to spend now belongs to the buttons with no other way in.
+    Hidden, never removed: one checkbox in Settings brings any of them back.
+    """
+    window, _bar = toolbar
+    hidden = {key for key, action in window.toolbar_actions.items() if not action.isVisible()}
+    assert hidden == {"GG", "IA", "IA+"}
+    assert set(window.toolbar_actions) >= {"PACK", "START", "GRP", "A3", "A10", "CM", "MRK"}
+
+
+def test_a_hidden_button_costs_the_row_no_width(toolbar):
+    from audapack.ui_qt.main_window import _fit_toolbar_to_text
+
+    window, bar = toolbar
+    narrow = _fit_toolbar_to_text(bar)
+    for action in window.toolbar_actions.values():
+        action.setVisible(True)
+    wide = _fit_toolbar_to_text(bar)
+    assert wide > narrow, "showing three more buttons must widen the row"
+
+
+def test_showing_a_hidden_button_gives_it_a_correct_width(toolbar):
+    """It is sized while hidden, so it is never the style minimum when shown."""
+    window, bar = toolbar
+    button = bar.widgetForAction(window.toolbar_actions["GG"])
+    assert button is not None
+    assert button.width() < 40, f"GG kept the style minimum: {button.width()}px"
+
+
+def test_no_tooltip_is_a_paragraph(toolbar):
+    """A tooltip that wraps the whole screen is not a tooltip.
+
+    One of them ran to four sentences and rendered as a bar across the display.
+    """
+    window, _bar = toolbar
+    for key, action in window.toolbar_actions.items():
+        tip = action.toolTip()
+        assert tip, f"{key} has no tooltip"
+        assert chr(10) not in tip, f"{key} tooltip is multi-line: {tip!r}"
+        assert len(tip) <= 90, f"{key} tooltip is {len(tip)} chars: {tip!r}"
