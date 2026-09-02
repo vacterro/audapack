@@ -33,7 +33,6 @@ MAX_INDEX_FILES = 400
 MAX_INDEX_AGE_SECONDS = 24 * 60 * 60
 CAPTURE_STATUSES = {"NEW", "SUGGESTED", "ASSIGNED", "ARCHIVED", "DUPLICATE", "RECOVERY"}
 CAPTURE_KINDS = {"response", "block", "clipboard", "audit", "roadmap", "handoff", "instructions"}
-CLASSIFICATION_STATES = {"STRONG", "SUGGESTED", "UNASSIGNED"}
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 _LAYER_RE = re.compile(r"^[1-9][0-9]*\.md$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")

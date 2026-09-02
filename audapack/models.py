@@ -24,7 +24,6 @@ CANONICAL_GROUPS = [
 ]
 
 SLOTS_PER_GROUP = 6
-TOTAL_SLOTS = len(CANONICAL_GROUPS) * SLOTS_PER_GROUP
 
 
 class AuditTemperature(str, Enum):

@@ -529,29 +529,6 @@ def get_canonical_manifest_hash() -> str:
     return _MANIFEST_HASH_CACHE
 
 
-def wave_contract_signature(wave: WaveDefinition) -> str:
-    """Digest of the parts of a wave an artifact was actually written against.
-
-    CAMPAIGN_MANIFEST_SHA256 hashes the WHOLE profiles manifest, so adding an
-    unrelated profile changed it and every historical campaign on disk turned
-    into CAMPAIGN_MANIFEST_MISMATCH -- despite quick3's and super10's own rules
-    being untouched. This is the part that must not drift under an artifact.
-    """
-    payload = json.dumps({
-        "id": wave.id,
-        "ordinal": wave.ordinal,
-        "number": wave.number,
-        "wave_header": wave.wave_header,
-        "terminal_status_key": wave.terminal_status_key,
-        "status_line": wave.status_line,
-        "done_marker": wave.done_marker,
-        "ticket_prefix": wave.ticket_prefix,
-        "ticket_fields": list(wave.ticket_fields),
-        "no_findings_marker": wave.no_findings_marker,
-    }, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def manifest_hash_is_compatible(declared: str, profile: CampaignProfile, wave: Optional[WaveDefinition]) -> bool:
     """True when an artifact's declared manifest hash may still be trusted.
 

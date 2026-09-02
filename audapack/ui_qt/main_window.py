@@ -2074,15 +2074,6 @@ QToolTip QLabel {
         QApplication.clipboard().setText(f'saipen cc "{p}"')
         self._flash_status(f"IA CC copied: {p.name}", "#D4A840")
 
-    def _on_inaudit_selection_changed(self, proj: Project | None = None):
-        target = proj if isinstance(proj, Project) else self._selected_project()
-        if target:
-            try:
-                self.model.refresh_inaudit(target.id)
-                self.tree.viewport().update()
-            except Exception:
-                pass
-
     def _on_copy_archive(self, proj: Optional[Any] = None):
         """Copies the .zip archive file to clipboard."""
         target = proj if isinstance(proj, Project) else self._selected_project()

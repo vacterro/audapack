@@ -188,16 +188,3 @@ def delete_inaudit_layer(project: Project, number: int) -> str:
     if get_inaudit_selected(project) == n:
         set_inaudit_selected(project, None)
     return ""
-
-
-def delete_inaudit_layers(project: Project, numbers: list[int]) -> tuple[int, list[str]]:
-    """Bulk-deletes layers; returns (deleted_count, failure_reasons)."""
-    deleted = 0
-    failures: list[str] = []
-    for n in sorted(set(int(x) for x in numbers)):
-        reason = delete_inaudit_layer(project, n)
-        if reason:
-            failures.append(f"{n}.md: {reason}")
-        else:
-            deleted += 1
-    return deleted, failures

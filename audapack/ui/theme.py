@@ -46,18 +46,6 @@ PALETTE = {
     "staleFg": "#7D7565",
 }
 
-SPACING = {
-    "hair": 1,
-    "control": 2,
-    "group": 4,
-    "section": 8,
-    "outer": 12,
-    "outerWide": 16,
-}
 
 FONT_FAMILY = "Verdana"
-FONT_SIZE_TITLE = 11
-FONT_SIZE_BODY = 9
-FONT_SIZE_SMALL = 8
-FONT_SIZE_TINY = 7
 
