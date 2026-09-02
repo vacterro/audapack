@@ -520,6 +520,23 @@ class InstanceMonitor:
 
     _ROOTED_PATH_RE = re.compile(r"[a-z]:\\[^|\"']+", re.IGNORECASE)
 
+    _WORKDIR_RE = re.compile(
+        r'(?:--?)(?:workdir|cwd|literalpath)\s+"?([a-z]:\\[^"]*?)"?(?=\s|$)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _declared_workdir(cls, text: str) -> str:
+        """The working directory a launcher was explicitly told to use.
+
+        AI_AGENT_LAUNCHER.PS1 lives inside one project and is invoked with
+        -WorkDir pointing at another. The script path is not where the console
+        works; the workdir is, and when one is declared it settles the question
+        outright.
+        """
+        found = cls._WORKDIR_RE.findall(str(text).replace("/", "\\"))
+        return found[-1].strip().casefold().rstrip("\\") if found else ""
+
     @classmethod
     def _window_names_another_root(cls, identity: str, record: LaunchRecord) -> bool:
         """True when the window plainly says it lives somewhere else.
@@ -535,9 +552,12 @@ class InstanceMonitor:
         then showed __SAITULS twice, one of them a window belonging to
         something else entirely.
         """
-        root = str(getattr(record, "project_path", "") or "").strip().casefold().replace("/", "\\")
+        root = str(getattr(record, "project_path", "") or "").strip().casefold().replace("/", "\\").rstrip("\\")
         if not root:
             return False
+        workdir = cls._declared_workdir(identity)
+        if workdir:
+            return not workdir.startswith(root)
         found = [match.group(0).casefold().replace("/", "\\") for match in cls._ROOTED_PATH_RE.finditer(str(identity))]
         if not found:
             return False
@@ -547,6 +567,22 @@ class InstanceMonitor:
     def _project_from_command_line(command_line: str, projects: Iterable[Any]) -> Optional[Any]:
         """Prefer paths passed as working directories over launcher-script paths."""
         folded = str(command_line).casefold().replace("/", "\\")
+        # An explicit working directory is the answer, full stop. Without this
+        # a launcher script living inside project A but invoked with
+        # -WorkDir pointing at B was attributed to A, and A appeared twice in
+        # the Instances tab with one row that was never its window.
+        declared = InstanceMonitor._declared_workdir(command_line)
+        if declared:
+            rooted = [
+                project for project in projects
+                if str(getattr(project, "source_path", "")).strip()
+                and declared.startswith(
+                    str(getattr(project, "source_path", "")).strip().casefold().replace("/", "\\").rstrip("\\")
+                )
+            ]
+            if not rooted:
+                return None
+            return max(rooted, key=lambda item: len(str(getattr(item, "source_path", ""))))
         matches: list[tuple[int, int, Any]] = []
         workdir_tokens = ("-workdir", "--workdir", "--cwd", "-cwd", "-literalpath")
         for project in projects:
@@ -632,6 +668,16 @@ class InstanceMonitor:
             launcher_id = record.launcher_id if record else self._launcher_from_title(identity, launcher_list)
             if not launcher_id:
                 continue
+
+            # A launch record says where this process STARTED. The window
+            # title says where it is now, and a console the operator pointed at
+            # another directory is not a second window of the project that
+            # launched it: __SAITULS was listed twice, its own console plus an
+            # OpenCode window titled _9router and rooted under
+            # __STORE/_PERSONAL. When the window names a root the record
+            # cannot contain, the window wins and the stale association drops.
+            if record and self._window_names_another_root(identity, record):
+                record = None
 
             if record:
                 project = project_by_id.get(record.project_id)

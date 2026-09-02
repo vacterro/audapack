@@ -432,3 +432,46 @@ def test_a_foreign_window_is_not_counted_as_a_second_window_of_the_pending_proje
     owned = [item for item in instances if item.project_id == "saituls"]
     assert len(owned) == 1, [f"{item.project_id}:{item.title}" for item in instances]
     assert owned[0].hwnd == 101
+
+
+LAUNCHER_CMD = (
+    r'"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile '
+    r'-ExecutionPolicy Bypass -File "V:\___VAC\__K\__CODE\__SAITULS\Scripts\AI_AGENT_LAUNCHER.PS1" '
+    r'-Agent OpenCode -WorkDir "{workdir}"'
+)
+
+
+def test_the_declared_working_directory_is_read_from_the_command_line():
+    cmd = LAUNCHER_CMD.format(workdir=r"V:\___VAC\__K\__STORE\_PERSONAL\_9router")
+    assert InstanceMonitor._declared_workdir(cmd) == r"v:\___vac\__k\__store\_personal\_9router"
+    assert InstanceMonitor._declared_workdir("opencode.exe --serve") == ""
+
+
+def test_a_launcher_script_inside_one_project_does_not_claim_another_projects_window():
+    """AI_AGENT_LAUNCHER.PS1 lives in __SAITULS and is run for other directories.
+
+    Matching the script path attributed every such console to __SAITULS, which
+    is how the Instances tab came to show that project twice with one row that
+    was never its window.
+    """
+    saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
+    cmd = LAUNCHER_CMD.format(workdir=r"V:\___VAC\__K\__STORE\_PERSONAL\_9router")
+    assert InstanceMonitor._project_from_command_line(cmd, [saituls]) is None
+
+
+def test_a_console_launched_into_its_own_project_still_matches():
+    saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
+    cmd = LAUNCHER_CMD.format(workdir=r"V:\___VAC\__K\__CODE\__SAITULS")
+    assert InstanceMonitor._project_from_command_line(cmd, [saituls]) is saituls
+
+
+def test_a_subdirectory_workdir_still_matches_its_project():
+    saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
+    cmd = LAUNCHER_CMD.format(workdir=r"V:\___VAC\__K\__CODE\__SAITULS\tools")
+    assert InstanceMonitor._project_from_command_line(cmd, [saituls]) is saituls
+
+
+def test_without_a_declared_workdir_the_old_path_matching_still_applies():
+    saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
+    cmd = r'opencode.exe --project "V:\___VAC\__K\__CODE\__SAITULS"'
+    assert InstanceMonitor._project_from_command_line(cmd, [saituls]) is saituls
