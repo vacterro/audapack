@@ -42,11 +42,11 @@ class ProjectEditDialog(QDialog):
         self.setMinimumWidth(280)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(4)
 
         # 1. Display Name
         self.ent_name = QLineEdit(self)

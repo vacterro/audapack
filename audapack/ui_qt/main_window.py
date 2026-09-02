@@ -451,7 +451,16 @@ def _fit_toolbar_to_text(toolbar) -> int:
 
 
 def bridge_status_text(browser: dict[str, Any]) -> str:
-    """One-line worker/queue readout for the status bar."""
+    """One-line worker/queue readout for the status bar.
+
+    An empty block means the Bridge did not answer this poll. Saying so beats
+    leaving the previous line up: the startup probe writes "Bridge OFFLINE"
+    the moment it cannot reach a Bridge that is still booting, and with
+    nothing overwriting it that stale verdict stood for a whole poll interval
+    next to a Settings tab reading BRIDGE CONNECTED.
+    """
+    if not browser:
+        return "BRIDGE ✗ | not answering"
     stale = int(browser.get("stale_widget_workers", 0) or 0)
     return (
         f"BRIDGE ✓ | W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)}  "
@@ -935,7 +944,9 @@ QToolTip QLabel {
                 warning = bridge_status_warning(browser)
                 if warning:
                     self._flash_status(warning, "#D66464", duration_ms=10000)
-                self.statusBar().showMessage(bridge_status_text(browser))
+            # Written on every pass, answer or not: skipping the write is what
+            # let the startup verdict outlive the truth.
+            self.statusBar().showMessage(bridge_status_text(browser))
 
         self.task_runner.submit_coalesced("audit-runs:refresh", _load, on_success=_apply)
 

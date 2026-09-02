@@ -33,9 +33,19 @@ def test_cells_are_contiguous_and_never_overlap():
 
 
 def test_the_grid_fits_the_compact_state_column_exactly():
-    # col_w for compact rows is 230 in the delegate; a grid wider than the
+    # col_w for compact rows is 198 in the delegate; a grid wider than the
     # column would silently clip the last field on every row.
-    assert sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS) == 230
+    assert sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS) == 198
+
+
+def test_no_column_is_reserved_for_the_pack_badge():
+    """It was 32px wide, empty on almost every row, and too narrow to read.
+
+    "PACK 42% 3f 1.2MB" was elided to nothing in it. Packing borrows the ZIP
+    cell instead -- the archive size it shows is about to be replaced anyway --
+    and the width goes to the project name, which was being truncated.
+    """
+    assert "pack" not in dict(COMPACT_STATE_CELL_WIDTHS)
 
 
 def test_cell_offsets_do_not_depend_on_any_field_value():
@@ -76,3 +86,16 @@ def test_a_compact_row_paints_without_error(compact_window):
 
     assert compact_window.delegate.sizeHint(QStyleOptionViewItem(), index).height() == 22
     assert isinstance(index, QModelIndex)
+
+
+def test_an_unanswered_bridge_poll_says_so():
+    """Skipping the write is what let a startup verdict outlive the truth.
+
+    The startup probe writes "Bridge OFFLINE" the moment it cannot reach a
+    Bridge that is still booting. Nothing overwrote it, so that verdict stood
+    for a whole poll interval next to a Settings tab reading BRIDGE CONNECTED.
+    """
+    from audapack.ui_qt.main_window import bridge_status_text
+
+    assert bridge_status_text({}) == "BRIDGE ✗ | not answering"
+    assert bridge_status_text({"active_workers": 2, "max_workers": 6}).startswith("BRIDGE ✓")

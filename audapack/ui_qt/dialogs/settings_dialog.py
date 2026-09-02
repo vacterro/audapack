@@ -36,6 +36,20 @@ from audapack.config import (
 from audapack.services.bridge_service import BridgeService
 from audapack.ui_qt.dialogs.launcher_dialog import LauncherEditDialog
 
+
+def short_worker_label(worker: dict) -> str:
+    """Name a worker window in the width a 640px dialog actually has.
+
+    A managed window is worth naming by its slot -- that is what the operator
+    presses WRK to reopen. An operator's own tab has nothing but a UUID, and
+    the whole 36 characters wrapped to a second line for no information at all.
+    """
+    slot = int(worker.get("managed_slot") or 0)
+    if slot:
+        return f"slot {slot}"
+    return str(worker.get("worker_id", "?"))[:8]
+
+
 # Human-readable labels for the output-layout combo. Keep the data value as
 # the canonical key (one of OUTPUT_LAYOUT_CHOICES) so the on-disk config is
 # stable across UI translations.
@@ -64,8 +78,8 @@ class SettingsWidget(QWidget):
         self._on_saved = on_saved
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         self.sub_tabs = QTabWidget(self)
         self.general_widget = self._build_general()
@@ -241,8 +255,8 @@ class SettingsWidget(QWidget):
     def _build_bridge(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(8)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(4)
 
         self._bridge_service = BridgeService(self._config)
         self._comp_mgr = ComponentManager(self._config)
@@ -250,7 +264,8 @@ class SettingsWidget(QWidget):
         # 1. Config Form Group
         grp_cfg = QGroupBox("Bridge Configuration", w)
         f = QFormLayout(grp_cfg)
-        f.setContentsMargins(8, 8, 8, 8)
+        f.setContentsMargins(6, 4, 6, 4)
+        f.setVerticalSpacing(3)
         self.host = QLineEdit(self._config.bridge.host)
         f.addRow("Host", self.host)
         self.port = QSpinBox()
@@ -268,13 +283,14 @@ class SettingsWidget(QWidget):
         layout.addWidget(grp_cfg)
 
         # 2. Live Status Group
-        grp_status = QGroupBox("Live Bridge Status & Actions", w)
+        grp_status = QGroupBox("Live Bridge Status", w)
         s_layout = QVBoxLayout(grp_status)
-        s_layout.setContentsMargins(8, 8, 8, 8)
-        s_layout.setSpacing(6)
+        s_layout.setContentsMargins(6, 4, 6, 4)
+        s_layout.setSpacing(3)
 
         self.lbl_bridge_state = QLabel("CHECKING...", grp_status)
         self.lbl_bridge_state.setStyleSheet("font-weight: bold; font-size: 11px;")
+        self.lbl_bridge_state.setWordWrap(True)
         s_layout.addWidget(self.lbl_bridge_state)
 
         self.lbl_bridge_details = QLabel("", grp_status)
@@ -285,7 +301,7 @@ class SettingsWidget(QWidget):
         tok_row = QWidget(grp_status)
         tok_layout = QHBoxLayout(tok_row)
         tok_layout.setContentsMargins(0, 0, 0, 0)
-        tok_layout.setSpacing(6)
+        tok_layout.setSpacing(3)
 
         self.ent_bridge_token = QLineEdit(grp_status)
         self.ent_bridge_token.setEchoMode(QLineEdit.EchoMode.Password)
@@ -304,8 +320,8 @@ class SettingsWidget(QWidget):
         # Actions Buttons Row
         act_row = QWidget(grp_status)
         act_layout = QHBoxLayout(act_row)
-        act_layout.setContentsMargins(0, 4, 0, 0)
-        act_layout.setSpacing(6)
+        act_layout.setContentsMargins(0, 2, 0, 0)
+        act_layout.setSpacing(3)
 
         self.btn_bridge_start = QPushButton("Start Bridge", grp_status)
         self.btn_bridge_start.clicked.connect(self._on_bridge_start)
@@ -322,19 +338,21 @@ class SettingsWidget(QWidget):
         # Helper integration tools
         hlp_row = QWidget(grp_status)
         hlp_layout = QHBoxLayout(hlp_row)
-        hlp_layout.setContentsMargins(0, 4, 0, 0)
-        hlp_layout.setSpacing(6)
+        hlp_layout.setContentsMargins(0, 2, 0, 0)
+        hlp_layout.setSpacing(3)
 
-        btn_install_widget = QPushButton("Install Widget in AUDAPACK Chromium", grp_status)
+        btn_install_widget = QPushButton("Install Widget", grp_status)
+        btn_install_widget.setToolTip("Install or update AUDAPACK_WIDGET in the isolated AUDAPACK browser profile")
         btn_install_widget.clicked.connect(self._on_bridge_install_widget)
 
-        btn_launch_worker = QPushButton("Launch AUDAPACK Chromium", grp_status)
+        btn_launch_worker = QPushButton("Launch Chromium", grp_status)
         btn_launch_worker.setToolTip(
             "Open the isolated AUDAPACK browser profile with background throttling disabled"
         )
         btn_launch_worker.clicked.connect(self._on_launch_browser_worker)
 
-        btn_open_audits = QPushButton("Open Audits Folder", grp_status)
+        btn_open_audits = QPushButton("Open Audits", grp_status)
+        btn_open_audits.setToolTip("Open the audit output root in Explorer")
         btn_open_audits.clicked.connect(self._on_bridge_open_audits)
 
         hlp_layout.addWidget(btn_install_widget)
@@ -370,16 +388,20 @@ class SettingsWidget(QWidget):
             ver = info.get("version", "?")
             api_ver = info.get("api_version", "?")
             browser = st.get("browser", {}) or {}
+            # Short labels and a trimmed worker id keep every line inside 640px.
+            # Spelled out, one wrapped counter line plus six wrapped 36-char
+            # UUIDs pushed the action buttons off the bottom of the dialog.
             worker_line = (
-                f"Workers: {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)} · "
-                f"Free: {browser.get('free_workers', 0)} · Busy: {browser.get('busy_workers', 0)} · "
-                f"Queue: {browser.get('queued_jobs', 0)} · Active audits: {browser.get('active_jobs', 0)} · "
-                f"Finalizing: {browser.get('finalizing_jobs', 0)} · Blocked: {browser.get('blocked_jobs', 0)} · "
-                f"Failed: {browser.get('failed_jobs', 0)}"
+                f"W {browser.get('active_workers', 0)}/{browser.get('max_workers', 6)} · "
+                f"free {browser.get('free_workers', 0)} · busy {browser.get('busy_workers', 0)} · "
+                f"queue {browser.get('queued_jobs', 0)} · audits {browser.get('active_jobs', 0)} · "
+                f"fin {browser.get('finalizing_jobs', 0)} · blocked {browser.get('blocked_jobs', 0)} · "
+                f"failed {browser.get('failed_jobs', 0)}"
             )
             workers = browser.get("workers", []) or []
             worker_rows = "\n".join(
-                f"{item.get('worker_id', '?')}  {item.get('browser_name', '') or '-'}  {item.get('state', '?')}  {item.get('project_name', '') or '-'}"
+                f"{short_worker_label(item)}  {item.get('browser_name', '') or '-'}  "
+                f"{item.get('state', '?')}  {item.get('project_name', '') or '-'}"
                 for item in workers[:6]
             )
             self.lbl_bridge_details.setText(

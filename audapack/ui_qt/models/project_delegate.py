@@ -79,7 +79,7 @@ FIXED_ACTIONS_WIDTH = 150
 #: that do not depend on the value of any other field. Concatenating them into
 #: one string made every field start wherever the previous one happened to end,
 #: so nothing lined up down the list.
-COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 74), ("pack", 32))
+COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 74))
 
 
 def compact_state_columns(col_x: int) -> dict[str, tuple[int, int]]:
@@ -270,7 +270,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
         # Full mode gives the state column room for the aligned sub-columns
         # (RUN | WAVES | AGE / ZIP | PACK); compact keeps its one wide line.
-        col_w = 230 if compact_rows else 175
+        col_w = 198 if compact_rows else 175
         col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
 
         # Data used by the column
@@ -474,7 +474,6 @@ class ProjectItemDelegate(QStyledItemDelegate):
             wav_cx, C_WAV = cells["waves"]
             age_cx, C_AGE = cells["age"]
             zip_cx, C_ZIP = cells["zip"]
-            pack_cx, C_PACK = cells["pack"]
 
             _draw_cell(run_cx, C_RUN, wave_text, wave_color)
             wav_color = QColor(PALETTE["success"]) if all_ready else QColor(
@@ -486,8 +485,16 @@ class ProjectItemDelegate(QStyledItemDelegate):
             age_cell = (audit_display or "").strip() or (copy_display or "").strip() or (inaudit_display or "").strip()
             age_color = audit_color if (audit_display or "").strip() else inaudit_color
             _draw_cell(age_cx, C_AGE, age_cell, age_color)
-            _draw_cell(zip_cx, C_ZIP, zip_text, arc_color)
-            _draw_cell(pack_cx, C_PACK, (pack_display or "").strip(), pack_color)
+            # Packing owns the ZIP cell while it runs: the archive size it
+            # reports is about to be replaced anyway, and the progress badge
+            # reads "PACK 42% 3f 1.2MB" -- which never fit the 32px column it
+            # used to have, so that column was elided to nothing on every row
+            # and sat empty the rest of the time.
+            packing = (pack_display or "").strip()
+            if packing:
+                _draw_cell(zip_cx, C_ZIP, packing, pack_color)
+            else:
+                _draw_cell(zip_cx, C_ZIP, zip_text, arc_color)
         else:
             # Full mode: each state field is a fixed-width column so every row
             # aligns vertically -- RUN | WAVES | AGE on line 0, ZIP | PACK on
