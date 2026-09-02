@@ -126,6 +126,8 @@ class SettingsWidget(QWidget):
         self.gg_template.textChanged.connect(lambda: self._autosave_timer.start())
         self.output_dir.textChanged.connect(lambda: self._autosave_timer.start())
         self.audit_root.textChanged.connect(lambda: self._autosave_timer.start())
+        self.mirror_into_project.toggled.connect(lambda: self._autosave_timer.start())
+        self.mirror_dir_name.textChanged.connect(lambda: self._autosave_timer.start())
         self.host.textChanged.connect(lambda: self._autosave_timer.start())
 
         # Spinboxes -> debounced auto-save
@@ -232,8 +234,21 @@ class SettingsWidget(QWidget):
     def _build_audit(self) -> QWidget:
         w = QWidget()
         f = QFormLayout(w)
+        f.setContentsMargins(6, 4, 6, 4)
+        f.setVerticalSpacing(3)
         self.audit_root = QLineEdit(self._config.audits.root)
         f.addRow("Audit root", self.audit_root)
+        self.mirror_into_project = QCheckBox("Also copy each finished audit into the project")
+        self.mirror_into_project.setChecked(bool(getattr(self._config.audits, "mirror_into_project", False)))
+        self.mirror_into_project.setToolTip(
+            "A copy, not a move: the audit root stays the index this app reads.\n"
+            "An agent working inside the repo finds the audit without being told where it lives."
+        )
+        f.addRow("Copy to project", self.mirror_into_project)
+        self.mirror_dir_name = QLineEdit(str(getattr(self._config.audits, "mirror_dir_name", "audit")))
+        self.mirror_dir_name.setPlaceholderText("audit")
+        self.mirror_dir_name.setToolTip("Folder created inside the project source path")
+        f.addRow("Project folder", self.mirror_dir_name)
         self.hot = QSpinBox()
         self.hot.setRange(0, 400 * 24 * 3600)
         self.hot.setValue(self._config.audits.hot_seconds)
@@ -677,6 +692,8 @@ class SettingsWidget(QWidget):
         c.packing.include_timestamp = self.include_timestamp.isChecked()
         c.packing.manifest_enabled = self.manifest.isChecked()
         c.audits.root = self.audit_root.text().strip()
+        c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
+        c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"
         c.audits.hot_seconds = self.hot.value()
         c.audits.warm_seconds = self.warm.value()
         c.audits.cool_seconds = self.cool.value()

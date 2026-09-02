@@ -1598,6 +1598,22 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                             )
                     except Exception as exc:
                         logger.warning("could not close dispatch lanes for %s: %s", resolved_name, exc)
+                    # Put the finished audit where an agent working inside the
+                    # repo will find it, without it having to know the audit
+                    # root. Best effort: a failed copy must never fail a run
+                    # whose artifacts are already durable in the central root.
+                    try:
+                        from audapack.bridge.storage import mirror_project_audits
+
+                        mirror_project = live_registry.get_project_by_id(str(project_id or ""))
+                        if mirror_project is not None:
+                            mirror_project_audits(
+                                live_cfg,
+                                getattr(mirror_project, "source_path", ""),
+                                target_dir,
+                            )
+                    except Exception as exc:
+                        logger.warning("could not mirror audits into %s: %s", resolved_name, exc)
                 except Exception as exc:
                     restore_file_snapshots(snapshots)
                     self.send_json(503, {

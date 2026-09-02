@@ -457,6 +457,12 @@ class AuditsConfig:
     #: than inferred: the launch path used to fall back to "quick3" with no way
     #: for the operator to pick anything else from the desktop.
     profile: str = "quick3"
+    #: Copy each finished audit into the audited project's own tree, so an
+    #: agent working in that repo finds it without knowing the audit root.
+    #: A copy, not a move: the central root stays the index the desktop reads.
+    mirror_into_project: bool = False
+    #: Folder name used for that copy, created inside the project source path.
+    mirror_dir_name: str = "audit"
     hot_seconds: int = 6 * 3600           # <= 6 hours
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
@@ -1041,6 +1047,8 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         cool_seconds=int(audits_raw.get("cool_seconds", 72 * 3600)),
         cold_seconds=int(audits_raw.get("cold_seconds", 7 * 86400)),
         profile=_normalized_audit_profile(audits_raw.get("profile")),
+        mirror_into_project=bool(audits_raw.get("mirror_into_project", False)),
+        mirror_dir_name=str(audits_raw.get("mirror_dir_name") or "audit").strip() or "audit",
     )
 
     bridge_raw = data.get("bridge", {})

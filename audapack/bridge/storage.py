@@ -698,3 +698,47 @@ def generate_canonical_campaign(
         "super_final": super_final_content,
         "super_index": super_index_json,
     }
+
+
+def mirror_project_audits(config, source_path, audit_dir) -> list[Path]:
+    """Copy a finished audit into the audited project's own tree.
+
+    The audit root is one central place, which is right for the desktop and
+    wrong for an agent working inside the repo: it has to be told where the
+    audits live. With the mirror on, every finished audit also lands in
+    ``<project>/audit/``, so `cc` in that repo finds it with no configuration
+    at all.
+
+    A copy, never a move. The central root stays the index the desktop reads,
+    so nothing about READY, history or retention changes. History is not
+    mirrored -- the project wants the current audit, not every past run.
+    """
+    if not getattr(config.audits, "mirror_into_project", False):
+        return []
+    root = Path(str(source_path or "")).expanduser()
+    src = Path(str(audit_dir or ""))
+    if not str(source_path or "").strip() or not root.is_dir() or not src.is_dir():
+        return []
+    folder = str(getattr(config.audits, "mirror_dir_name", "audit") or "audit").strip() or "audit"
+    # One path segment only: a configured name must never escape the project.
+    if any(sep in folder for sep in ("/", "\\", "..")) or Path(folder).is_absolute():
+        folder = "audit"
+    dest = root / folder
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []
+
+    copied: list[Path] = []
+    for item in sorted(src.iterdir()):
+        if not item.is_file() or item.name.startswith((".", "_history")):
+            continue
+        if item.suffix.lower() not in {".md", ".json"}:
+            continue
+        target = dest / item.name
+        try:
+            target.write_bytes(item.read_bytes())
+        except OSError:
+            continue
+        copied.append(target)
+    return copied
