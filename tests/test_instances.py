@@ -352,3 +352,83 @@ def test_main_window_enforces_limit_and_project_click_opens_manager(tmp_path, qa
         assert window._instance_manager.project is p2
     finally:
         window.close()
+
+
+def _pending_record(path=r"V:\___VAC\__K\__CODE\__SAITULS"):
+    from audapack.instances import LaunchRecord
+
+    return LaunchRecord(
+        pid=1, launcher_id="opencode", project_id="saituls",
+        project_name="__SAITULS", project_path=path, started_at="",
+    )
+
+
+def test_a_window_rooted_elsewhere_is_not_adopted_by_a_pending_launch():
+    """A window that already names a directory has told you where it lives.
+
+    A window with no project match is adopted by the only pending launch
+    record for its launcher, on the theory that a just-started console has not
+    titled itself yet. Observed live: an OpenCode window under
+    __STORE/_PERSONAL/_9router was adopted as __SAITULS -- whose source is
+    __CODE/__SAITULS -- purely because it was the only pending OpenCode
+    launch, and the Instances tab then showed __SAITULS twice.
+    """
+    identity = r"_9router | OpenCode YOLO | V:\___VAC\__K\__STORE\_PERSONAL\_9router"
+    assert InstanceMonitor._window_names_another_root(identity, _pending_record()) is True
+
+
+def test_the_projects_own_window_is_still_adopted():
+    identity = r"__SAITULS | OpenCode YOLO | V:\___VAC\__K\__CODE\__SAITULS"
+    assert InstanceMonitor._window_names_another_root(identity, _pending_record()) is False
+
+
+def test_a_subdirectory_of_the_project_is_still_adopted():
+    identity = r"x | OpenCode YOLO | V:\___VAC\__K\__CODE\__SAITULS	ools"
+    assert InstanceMonitor._window_names_another_root(identity, _pending_record()) is False
+
+
+def test_a_window_naming_no_path_is_still_adoptable():
+    """The case the adoption exists for: a console that has not titled itself."""
+    assert InstanceMonitor._window_names_another_root("OpenCode YOLO", _pending_record()) is False
+
+
+def test_a_record_without_a_project_path_never_refuses():
+    identity = r"_9router | OpenCode YOLO | V:\somewhere\else"
+    assert InstanceMonitor._window_names_another_root(identity, _pending_record(path="")) is False
+
+
+def test_a_foreign_window_is_not_counted_as_a_second_window_of_the_pending_project(tmp_path):
+    """End to end: the Instances tab must not show one project twice.
+
+    A pending OpenCode launch for __SAITULS plus an unrelated OpenCode window
+    rooted under __STORE/_PERSONAL/_9router used to produce two __SAITULS rows,
+    because the foreign window matched no project and was adopted as the only
+    pending candidate for its launcher.
+    """
+    saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
+    # The foreign window is enumerated FIRST: that is what let it take the
+    # pending record before the project's own window was ever considered.
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(
+                202, 2002,
+                r"_9router | OpenCode YOLO | V:\___VAC\__K\__STORE\_PERSONAL\_9router",
+                "powershell.exe",
+            ),
+            NativeWindow(
+                101, 1001,
+                r"__SAITULS | OpenCode YOLO | V:\___VAC\__K\__CODE\__SAITULS",
+                "powershell.exe",
+            ),
+        ]
+    )
+    backend.alive[1001] = True
+    backend.tokens[1001] = 77
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(1001, "opencode", saituls)
+
+    instances = monitor.refresh([saituls], create_default_launchers())
+
+    owned = [item for item in instances if item.project_id == "saituls"]
+    assert len(owned) == 1, [f"{item.project_id}:{item.title}" for item in instances]
+    assert owned[0].hwnd == 101

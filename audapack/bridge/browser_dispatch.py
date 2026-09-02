@@ -716,6 +716,15 @@ class BrowserDispatcher:
         the builds that need telling. The Bridge is the one that can stop
         asking, and it can do it for clients that will never be updated.
 
+        Keyed by worker id, which is the window's session: it lives in
+        sessionStorage and survives the reload, so the reloaded window is the
+        same worker and is not asked twice -- the churn stays fixed. Keying by
+        managed SLOT instead made a single refusal permanent: a window that
+        declined the one ask because it was mid-recycle was never asked again,
+        and a brand new window opened into that slot inherited the refusal.
+        Observed live: four free windows stuck on 0.0.37 for forty minutes
+        with the Bridge requiring 0.0.38 and not one reload request sent.
+
         Keyed by managed slot: a reloaded window comes back with a new worker
         id, and asking that one again is the same futile loop.
         """
@@ -724,8 +733,7 @@ class BrowserDispatcher:
         required = str(_get_required_widget_build() or "")
         if not required:
             return False
-        slot = int(getattr(worker, "managed_slot", 0) or 0)
-        key = f"slot:{slot}" if slot else f"worker:{worker.worker_id}"
+        key = f"worker:{worker.worker_id}"
         with self._lock:
             if self._widget_reload_asked.get(key) == required:
                 return False

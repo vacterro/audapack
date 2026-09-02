@@ -1749,12 +1749,34 @@ def test_a_stale_window_is_asked_to_reload_once_per_build(tmp_path, monkeypatch)
     assert d.should_ask_widget_reload(record) is True
     assert d.should_ask_widget_reload(record) is False
 
-    # The window reloaded, came back on the same build under a new id: asking
-    # that one again is the identical futile loop.
-    again = d.register_worker(_stale_widget_worker("w1-reloaded", slot=1))
-    assert d.should_ask_widget_reload(again) is False
-    # Status still tells the operator the truth about the build.
-    assert d.worker_widget_is_stale(again) is True
+    # autoTabId lives in sessionStorage and survives the reload, so the window
+    # that came back IS this worker: asking it again is the identical futile
+    # loop. Status still tells the operator the truth about the build.
+    reloaded = d.register_worker(_stale_widget_worker("w1", slot=1))
+    assert d.should_ask_widget_reload(reloaded) is False
+    assert d.worker_widget_is_stale(reloaded) is True
+
+
+def test_a_new_window_in_the_same_slot_gets_its_own_ask(tmp_path, monkeypatch):
+    """A refusal must not outlive the window that made it.
+
+    Keying the ask by managed slot made one refusal permanent: a window that
+    declined because it was mid-recycle was never asked again, and a brand new
+    window opened into that slot inherited the refusal. Observed live: four
+    free windows stuck on 0.0.37 for forty minutes with the Bridge requiring
+    0.0.38 and not one reload request sent.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    first = d.register_worker(_stale_widget_worker("w1-session-a", slot=1))
+    assert d.should_ask_widget_reload(first) is True
+    assert d.should_ask_widget_reload(first) is False
+
+    # That window was closed and the slot relaunched: a new session, a new id.
+    fresh = d.register_worker(_stale_widget_worker("w1-session-b", slot=1))
+    assert d.should_ask_widget_reload(fresh) is True
 
 
 def test_a_different_slot_still_gets_its_one_ask(tmp_path, monkeypatch):

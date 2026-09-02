@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -517,6 +518,31 @@ class InstanceMonitor:
         matches = path_matches or name_matches
         return max(matches, key=lambda item: item[0])[1] if matches else None
 
+    _ROOTED_PATH_RE = re.compile(r"[a-z]:\\[^|\"']+", re.IGNORECASE)
+
+    @classmethod
+    def _window_names_another_root(cls, identity: str, record: LaunchRecord) -> bool:
+        """True when the window plainly says it lives somewhere else.
+
+        A window with no project match is adopted by the only pending launch
+        record for its launcher, on the theory that a just-started console has
+        not titled itself yet. But a window that already names a concrete
+        directory has titled itself, and that directory is the answer.
+
+        Observed live: an OpenCode window under __STORE/_PERSONAL/_9router was
+        adopted as __SAITULS -- whose source is __CODE/__SAITULS -- because it
+        happened to be the only pending OpenCode launch. The Instances tab
+        then showed __SAITULS twice, one of them a window belonging to
+        something else entirely.
+        """
+        root = str(getattr(record, "project_path", "") or "").strip().casefold().replace("/", "\\")
+        if not root:
+            return False
+        found = [match.group(0).casefold().replace("/", "\\") for match in cls._ROOTED_PATH_RE.finditer(str(identity))]
+        if not found:
+            return False
+        return not any(path.startswith(root) for path in found)
+
     @staticmethod
     def _project_from_command_line(command_line: str, projects: Iterable[Any]) -> Optional[Any]:
         """Prefer paths passed as working directories over launcher-script paths."""
@@ -626,7 +652,11 @@ class InstanceMonitor:
                     launcher_id = record.launcher_id
                     consumed_records.add(record.pid)
             if project is None:
-                candidates = [item for item in pending_by_launcher.get(launcher_id, []) if item.pid not in consumed_records]
+                candidates = [
+                    item for item in pending_by_launcher.get(launcher_id, [])
+                    if item.pid not in consumed_records
+                    and not self._window_names_another_root(identity, item)
+                ]
                 if len(candidates) == 1:
                     record = candidates[0]
                     consumed_records.add(record.pid)
