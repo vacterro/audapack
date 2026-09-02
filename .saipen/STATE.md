@@ -1,7 +1,7 @@
 ---
 phase: SHIP
-task: T-128
-next_action: "install widget 0.0.39 in the pool, then a clean six-lane run watching for any event that needs a human"
+task: T-129
+next_action: "get widget 0.0.40 into the four managed pool windows (all four sit on 0.0.39, required is 0.0.40)"
 blocker: none
 agent: claude
 saipen_version: 7
@@ -9,8 +9,8 @@ schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
 transition_from: REVIEW
-last_event: 648
-updated: "2026-09-02T15:00:00Z"
+last_event: 650
+updated: "2026-09-02T18:50:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
