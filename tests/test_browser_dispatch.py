@@ -1997,3 +1997,26 @@ def test_a_widget_release_does_not_take_the_pool_offline(tmp_path):
         assert claimed is not None and claimed.dispatch_id == item.dispatch_id
     finally:
         module._get_required_widget_build = original
+
+
+def test_a_lease_for_a_purged_dispatch_does_not_hold_a_lane(tmp_path):
+    """A phantom lease ate one of the six lanes, so six windows ran five audits.
+
+    get_owned_job() answers None for a job the Bridge no longer has, so the
+    window has nothing to ACK against and keeps reporting RESERVED with its
+    dead lease forever. Live: a Brave worker stuck on
+    ``unknown_job: dispatch_id is unknown`` since the morning, counted in
+    active_workers, and every six-project press dispatching only five.
+    """
+    d = BrowserDispatcher(state_dir=tmp_path)
+    record = d.register_worker(worker(
+        "ghost",
+        state="RESERVED",
+        dispatch_id="dsp-does-not-exist",
+        lease_id="lease-does-not-exist",
+    ))
+
+    assert record.state == "FREE"
+    assert record.meta.get("reports_lease") is False
+    assert "unknown_job" in record.meta.get("last_reconcile_error", "")
+    assert d._worker_owns_live_job(record) is False

@@ -625,6 +625,17 @@ class BrowserDispatcher:
                     # for good over a single stuck dispatch. The job stays
                     # BLOCKED for the operator; the worker stays alive.
                     record.meta["last_reconcile_error"] = f"{exc.code}: {exc}"[:200]
+                    if exc.code == "unknown_job":
+                        # A lease for a dispatch this Bridge has no record of
+                        # is not a lease. get_owned_job() answers None for a
+                        # purged job, so the window has nothing to ACK against
+                        # and holds its phantom lease forever -- reported
+                        # RESERVED, counted in active_workers, eating one of
+                        # the six lanes. Live: six windows open and only five
+                        # audits ever dispatched. Cleanliness, not this flag,
+                        # is what stops a second Core landing in a busy window.
+                        record.state = WORKER_FREE
+                        record.meta["reports_lease"] = False
             return record
 
     def _worker_owns_live_job(self, worker: Optional[WorkerRecord]) -> bool:

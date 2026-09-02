@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.40
+// @version      0.0.41
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -12401,11 +12401,21 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     const input = getChatGPTInput();
     if (!input) return false;
     const text = cleanTurnText(composerPlainText(input));
-    return Boolean(
-      text &&
-      classifyAuditMessage(text) === 'core' &&
-      text.includes(`${AUTO_SEND_RECEIPT_PREFIX}: ${handoff.receipt}`)
-    );
+    if (!text || !text.includes(`${AUTO_SEND_RECEIPT_PREFIX}: ${handoff.receipt}`)) return false;
+    // START prepares the ACTIVE PROFILE's first wave, and that is CORE only
+    // under quick3: super10 opens with AUDIT ARCHITECTURE and compress has no
+    // classifier marker at all. Demanding the literal 'core' made every A10
+    // START read as a foreign human draft one line later in
+    // beforeIrreversibleSend, so the pre-send guard blocked its own prompt --
+    // six lanes pressed, six BLOCKED PRE-START: clean-state-lost, every
+    // composer left loaded and unsent. knownAuditReceiptKind already maps this
+    // same receipt to prof.waves[0].id. The receipt is minted per handoff by
+    // this widget and cannot appear in a human draft, so it is the identity
+    // proof; classification only has to refuse a composer holding SOME OTHER
+    // wave's prompt.
+    const kind = classifyAuditMessage(text);
+    const firstWaveId = getActiveProfile()?.waves?.[0]?.id || 'core';
+    return !kind || kind === 'core' || kind === firstWaveId;
   }
 
   function preservePreparedStartBeforeManualSend(target) {
@@ -18423,6 +18433,16 @@ let browserWorkerBraveConfirmed = false;
           (snap.has_attachments && !(ready?.ok)) || snap.has_conversation_turns;
         if (!hasLease || !sameDispatch || foreignActivity) {
           await transition('BLOCKED', { error: 'clean-state-lost' });
+          // Nothing was sent -- BLOCKED pre-start is exactly that guarantee --
+          // so the handoff describes a Send that will never happen. Keeping it
+          // armed jams the window shut: browserWorkerClearAbandonedDraft
+          // refuses to touch a composer while a prepared handoff exists, so the
+          // dead prompt stayed forever and every later job on this worker was
+          // released with worker-has-draft. RESET ALL cannot reach it either --
+          // the draft lives in the browser, not in the Bridge. Clearing the
+          // handoff only releases OUR claim; the composer itself is still only
+          // ever cleared by the machine-authored check, never a human's text.
+          clearStartAuditHandoff();
           showBrowserWorkerBlocked('clean-state-lost');
           return false;
         }
@@ -19255,6 +19275,7 @@ let browserWorkerBraveConfirmed = false;
         preservePreparedStartBeforeManualSend,
         recoverArmedStartSend,
         readStartAuditHandoff,
+        clearStartAuditHandoff,
         beginStartAuditHandoff,
         armStartAuditHandoffForSend,
         markStartAuditHandoffClicking,
