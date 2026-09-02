@@ -66,3 +66,30 @@ test('T126: with nothing uploading the short wait still fails fast', async () =>
   assert.strictEqual(settled, true, 'no attachment means no extension');
   assert.strictEqual(await pending, null);
 });
+
+test('T129: a tile with no spinner still holds the wait open', async () => {
+  // The first version of this fix keyed on a visible animate-spin inside the
+  // tile and missed entirely: at 15:00:05, on the build carrying that very
+  // fix, two dispatches still reported "aria=true tiles=1" and gave up after
+  // the 12s wait. ChatGPT no longer paints a spinner there. A Send held
+  // disabled with a file attached IS ingestion.
+  const { h, api } = setup();
+  const { form, send } = composerFixture(h);
+  send.setAttribute('aria-disabled', 'true');
+  const tile = h.el('div', { role: 'group', 'aria-label': 'PROJECT.zip' });
+  tile.appendChild(h.el('button', { 'aria-label': 'Remove file' }));
+  form.appendChild(tile);
+
+  let settled = false;
+  const pending = api.waitForChatGPTSendReady(40, 4000).then(value => {
+    settled = true;
+    return value;
+  });
+
+  await drive(h, 500);
+  assert.strictEqual(settled, false, 'an attached file must hold the wait open with no spinner');
+
+  send.setAttribute('aria-disabled', 'false');
+  await drive(h, 300);
+  assert.strictEqual(await pending, send);
+});

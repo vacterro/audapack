@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.39
+// @version      0.0.40
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -3629,7 +3629,15 @@ ordinal/name of the entrypoint file.`;
       ) return button;
 
       try {
-        if (chatGPTComposerAttachmentTiles().some(tile => chatGPTAttachmentIsBusy(tile))) {
+        // The presence of an attachment is the signal, not a spinner inside
+        // it. Keying on a visible `animate-spin` tile missed entirely: at
+        // 15:00:05, on the build carrying that very fix, two dispatches still
+        // reported "aria=true tiles=1" and gave up after the 12s wait --
+        // ChatGPT no longer paints a spinner there, so a composer that was
+        // plainly still ingesting looked idle. A Send held disabled with a
+        // file attached is ingestion; the only case worth failing fast is a
+        // composer with nothing attached at all.
+        if (chatGPTComposerAttachmentTiles().length) {
           deadline = Math.min(hardDeadline, Date.now() + CHATGPT_ATTACHMENT_TIMEOUT_MS);
         }
       } catch (_) { }
