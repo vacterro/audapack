@@ -100,3 +100,23 @@ def test_the_setting_survives_a_config_round_trip(tmp_path, monkeypatch):
     reloaded = load_config()
     assert reloaded.audits.mirror_into_project is True
     assert reloaded.audits.mirror_dir_name == "audit"
+
+
+def test_the_mirror_excludes_itself_from_the_repository(tmp_path):
+    """Audits are generated output; a `git add -A` must not sweep them in.
+
+    The mirror lands inside a working repository, so the folder carries its own
+    .gitignore rather than relying on the audited project to add one.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, _audit_dir(tmp_path))
+    assert (project / "audit" / ".gitignore").read_text(encoding="utf-8").strip() == "*"
+
+
+def test_an_existing_gitignore_is_left_alone(tmp_path):
+    project = tmp_path / "proj"
+    (project / "audit").mkdir(parents=True)
+    (project / "audit" / ".gitignore").write_text("# mine\n", encoding="utf-8")
+    mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, _audit_dir(tmp_path))
+    assert (project / "audit" / ".gitignore").read_text(encoding="utf-8") == "# mine\n"

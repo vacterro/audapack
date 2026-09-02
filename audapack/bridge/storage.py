@@ -726,6 +726,13 @@ def mirror_project_audits(config, source_path, audit_dir) -> list[Path]:
     dest = root / folder
     try:
         dest.mkdir(parents=True, exist_ok=True)
+        # The mirror lands inside a repository, so it must not become part of
+        # it: audits are generated output and a `git add -A` in the audited
+        # project would otherwise sweep them in. The folder excludes itself,
+        # which needs no cooperation from the project's own .gitignore.
+        marker = dest / ".gitignore"
+        if not marker.exists():
+            marker.write_text("*\n", encoding="utf-8")
     except OSError:
         return []
 
