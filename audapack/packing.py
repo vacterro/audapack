@@ -117,8 +117,23 @@ def human_mb(value: int) -> str:
 
 def _build_exclusion_matcher(patterns: set[str]):
     lowered = frozenset(pat.lower() for pat in patterns)
-    exact = {pat for pat in lowered if not any(char in pat for char in "*?[")}
-    globs = tuple(re.compile(fnmatch.translate(pat)) for pat in lowered if pat not in exact)
+    # A pattern containing a separator names a RUN of directories, not one
+    # name. ".git/objects" has to exclude the pack files without excluding
+    # every directory called "objects" a project happens to have.
+    multi = tuple(
+        tuple(seg for seg in pat.replace("\\", "/").split("/") if seg)
+        for pat in lowered
+        if "/" in pat or "\\" in pat
+    )
+    single = {pat for pat in lowered if "/" not in pat and "\\" not in pat}
+    exact = {pat for pat in single if not any(char in pat for char in "*?[")}
+    globs = tuple(re.compile(fnmatch.translate(pat)) for pat in single if pat not in exact)
+    multi_res = tuple(
+        tuple(re.compile(fnmatch.translate(seg)) for seg in segs) for segs in multi
+    )
+
+    def _segment_matches(pattern: re.Pattern[str], part: str) -> bool:
+        return bool(pattern.fullmatch(part))
 
     def matches(path: Path | str) -> bool:
         p = path if isinstance(path, Path) else Path(path)
@@ -126,6 +141,13 @@ def _build_exclusion_matcher(patterns: set[str]):
         for part in (p.name.lower(), *parts):
             if part in exact or any(pattern.fullmatch(part) for pattern in globs):
                 return True
+        for segs in multi_res:
+            span = len(segs)
+            if span > len(parts):
+                continue
+            for start in range(len(parts) - span + 1):
+                if all(_segment_matches(segs[i], parts[start + i]) for i in range(span)):
+                    return True
         return False
 
     return matches

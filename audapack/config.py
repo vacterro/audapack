@@ -90,6 +90,56 @@ DEFAULT_EXCLUDES = [
     "*.pre-redact",
     "*.secret",
     "*.secrets",
+    # Weight the auditor cannot read. Measured on this machine: __SAITULS
+    # packed to 346MB of which 326MB was .exe and 14MB .dll; 9router to 210MB
+    # of which 150MB was git pack files and 16MB web fonts; FastPrompter to
+    # 160MB with 89MB of .git and 35MB of .wav. Every byte of that is uploaded
+    # and then read by the model before it can write a single ticket.
+    # Text stays -- source, config, docs, and images are all still packed.
+    "*.exe",
+    "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.pyd",
+    "*.msi",
+    "*.bin",
+    "*.wasm",
+    "*.obj",
+    "*.lib",
+    "*.class",
+    "*.jar",
+    "*.wav",
+    "*.mp3",
+    "*.ogg",
+    "*.flac",
+    "*.mp4",
+    "*.avi",
+    "*.mov",
+    "*.mkv",
+    "*.webm",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.otf",
+    "*.eot",
+    "*.tar",
+    "*.tgz",
+    "*.gz",
+    "*.bz2",
+    "*.xz",
+    "*.7z",
+    "*.rar",
+    "*.iso",
+    "*.bak",
+    "*.old",
+    "*.zst",
+    ".codebase-memory",
+    # Next.js build output, the same class as dist/ and build/ above. One
+    # project carried 568MB of .next plus 520MB of .next-cli-build.
+    ".next*",
+    # Object storage only. HEAD, refs, config and logs stay, so the audit
+    # keeps its GIT_CONTEXT line -- branch, sha, tag, dirty worktree.
+    ".git/objects",
 ]
 
 DEFAULT_PROJECT_TEMPLATES = [

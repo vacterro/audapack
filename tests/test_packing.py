@@ -437,3 +437,63 @@ class TestTkFallbackPackingOptions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestArchiveWeightExclusions(unittest.TestCase):
+    """The auditor reads text. Everything else is upload time and nothing else.
+
+    Measured on the operator's machine: __SAITULS packed to 346MB of which
+    326MB was .exe and 14MB .dll; 9router to 210MB of which 150MB was git pack
+    files and 16MB of web fonts; FastPrompter to 160MB with 89MB of .git and
+    35MB of .wav. All of it is uploaded, and the model reads all of it before
+    it can write a single ticket.
+    """
+
+    def setUp(self):
+        from audapack.config import DEFAULT_EXCLUDES
+
+        self.patterns = set(DEFAULT_EXCLUDES)
+
+    def _excluded(self, path: str) -> bool:
+        from audapack.packing import path_is_excluded
+
+        return path_is_excluded(Path(path), self.patterns)
+
+    def test_unreadable_weight_is_dropped(self):
+        for path in (
+            "C:/p/Bin/tool.exe",
+            "C:/p/Bin/native.dll",
+            "C:/p/lib/core.so",
+            "C:/p/sounds/alert.wav",
+            "C:/p/clips/demo.mp4",
+            "C:/p/assets/inter.woff2",
+            "C:/p/vendor/bundle.tgz",
+            "C:/p/state/index.zst",
+            "C:/p/old/main.py.bak",
+            "C:/p/.codebase-memory/graph.db2",
+        ):
+            self.assertTrue(self._excluded(path), path)
+
+    def test_source_and_docs_and_images_still_ship(self):
+        for path in (
+            "C:/p/src/main.py",
+            "C:/p/README.md",
+            "C:/p/pyproject.toml",
+            "C:/p/assets/logo.png",
+            "C:/p/assets/icon.svg",
+            "C:/p/data/fixture.json",
+        ):
+            self.assertFalse(self._excluded(path), path)
+
+    def test_git_objects_go_but_git_context_stays(self):
+        """The audit's GIT_CONTEXT line needs refs, not pack files."""
+        self.assertTrue(self._excluded("C:/p/.git/objects/pack/x.pack"))
+        self.assertTrue(self._excluded("C:/p/.git/objects/ab/cdef123"))
+        self.assertFalse(self._excluded("C:/p/.git/HEAD"))
+        self.assertFalse(self._excluded("C:/p/.git/refs/heads/main"))
+        self.assertFalse(self._excluded("C:/p/.git/config"))
+
+    def test_a_path_pattern_never_matches_a_bare_directory_name(self):
+        """".git/objects" must not take every directory called "objects"."""
+        self.assertFalse(self._excluded("C:/p/src/objects/model.py"))
+        self.assertFalse(self._excluded("C:/p/objects/README.md"))
