@@ -597,6 +597,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "managed_slot": worker.managed_slot,
                 "managed_generation": worker.managed_generation,
                 "widget_build_version": worker.widget_build_version,
+                # Which campaign this window is currently set to run. Dispatch
+                # holds a profiled job for a matching window, so an operator
+                # staring at a queued CM audit needs to see where it can go.
+                "profile": worker.profile,
                 # A refused reconcile is why a post-restart run can sit BLOCKED
                 # with its original worker present and heartbeating. Invisible,
                 # it looks like the recovery path simply never runs.
