@@ -71,6 +71,12 @@ POST_START_RECOVERY_GRACE_SECONDS = 7200.0
 #: window can see the terminal state and release its lease. Only the poll's
 #: acknowledgement path reads it; nothing treats such a job as live work.
 TERMINAL_ACK_WINDOW_SECONDS = 300.0
+#: How long a queued job waits for a window that already runs its campaign
+#: profile before any free window may take it. Switching a window's profile
+#: resets its audit runtime, which is what left a compress run sent with no
+#: engine armed behind it; not switching is free when a matching window exists.
+#: Short, because a matching window that never polls must never starve the job.
+PROFILE_AFFINITY_GRACE_SECONDS = 60.0
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
 PRE_START_MAX_RETRIES = 5
@@ -992,7 +998,30 @@ class BrowserDispatcher:
             if (j.state == JOB_QUEUED)
             or (j.state == JOB_RETRYABLE and now >= j.next_retry_at)
         ]
+        candidates = [j for j in candidates if self._worker_may_take(worker, j, now)]
         return min(candidates, key=lambda j: j.created_at) if candidates else None
+
+    def _worker_may_take(self, worker: WorkerRecord, job: DispatchJob, now: float) -> bool:
+        """Hold a job briefly for a window already running its campaign profile.
+
+        Handing a compress job to a window set to quick3 makes that window
+        switch profiles, and a profile switch resets its audit runtime -- the
+        exact sequence that sent a CM Core with no engine armed behind it and
+        saved nothing. When some other free window is already on the requested
+        profile, let that one have it. Never longer than the grace: a matching
+        window that stops polling must not starve the job.
+        """
+        wanted = str(job.requested_profile or "")
+        if not wanted or str(worker.profile or "") == wanted:
+            return True
+        if now - float(job.created_at or 0.0) > PROFILE_AFFINITY_GRACE_SECONDS:
+            return True
+        return not any(
+            str(other.profile or "") == wanted
+            and other.worker_id != worker.worker_id
+            and self.worker_free_for_claim(other)
+            for other in self._workers.values()
+        )
 
     def _next_worker_for_assignment(self) -> Optional[str]:
         eligible = [worker for worker in self._workers.values() if self.worker_free_for_claim(worker)]

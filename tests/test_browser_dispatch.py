@@ -1663,6 +1663,61 @@ def test_a_long_finished_dispatch_stops_being_reported_as_owned(tmp_path):
     assert d.get_owned_job("w1") is None
 
 
+def test_a_profiled_job_waits_briefly_for_a_window_already_on_that_profile(tmp_path):
+    """Switching a window's profile resets its audit runtime.
+
+    That reset is what sent a compress Core with no engine armed behind it and
+    saved nothing, twice. When another free window is already on the requested
+    profile, handing it there costs nothing and skips the reset entirely.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w-quick", profile="quick3"))
+    d.register_worker(worker("w-compress", profile="compress"))
+    item = d.enqueue_job(dict(job_payload(path, "CMPROJ"), profile="compress"))
+
+    assert d.claim_job("w-quick") is None, "the quick3 window must not grab it first"
+    leased = d.claim_job("w-compress")
+    assert leased is not None and leased.dispatch_id == item.dispatch_id
+
+
+def test_a_profiled_job_is_never_starved_by_affinity(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w-quick", profile="quick3"))
+    d.register_worker(worker("w-compress", profile="compress"))
+    item = d.enqueue_job(dict(job_payload(path, "CMPROJ"), profile="compress"))
+
+    assert d.claim_job("w-quick") is None
+    # The matching window went away without ever polling.
+    d.get_job(item.dispatch_id).created_at = time.time() - 61
+    leased = d.claim_job("w-quick")
+    assert leased is not None and leased.dispatch_id == item.dispatch_id
+
+
+def test_affinity_does_not_hold_a_job_for_a_busy_window(tmp_path):
+    """Only a window that could actually claim counts as the better home."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w-quick", profile="quick3"))
+    d.register_worker(worker("w-compress", profile="compress", has_conversation_turns=True, generating=True))
+    item = d.enqueue_job(dict(job_payload(path, "CMPROJ"), profile="compress"))
+
+    leased = d.claim_job("w-quick")
+    assert leased is not None and leased.dispatch_id == item.dispatch_id
+
+
+def test_a_job_with_no_profile_is_taken_by_anyone(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w-quick", profile="quick3"))
+    d.register_worker(worker("w-compress", profile="compress"))
+    item = d.enqueue_job(job_payload(path, "ANYPROJ"))
+
+    leased = d.claim_job("w-quick")
+    assert leased is not None and leased.dispatch_id == item.dispatch_id
+
+
 def _stale_widget_worker(wid: str, slot: int = 1) -> dict:
     return worker(
         wid,
