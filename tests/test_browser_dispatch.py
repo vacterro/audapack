@@ -24,6 +24,7 @@ from audapack.bridge.browser_dispatch import (
     JOB_STARTED,
     MAX_ACTIVE_WORKERS,
     POST_START_RECOVERY_GRACE_SECONDS,
+    TERMINAL_ACK_WINDOW_SECONDS,
     WORKER_AUDITING,
     WORKER_TTL_SECONDS,
     BrowserDispatcher,
@@ -1614,6 +1615,52 @@ def test_a_pre_start_job_is_never_failed_as_unrecoverable(tmp_path):
 
     assert d.expire_unrecoverable_runs() == 0
     assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+
+def test_a_lane_closed_server_side_still_reaches_its_own_worker(tmp_path):
+    """The window releases its lease only on a terminal ACK from the Bridge.
+
+    Completion once happened only through the worker's own ACK, so it cleared
+    the lease as it sent it. Lanes are now also closed server-side, and the
+    window was never told: its lease stayed, browserWorkerRecycleBlockReason()
+    answered `lease-still-owned` forever, and the window never returned to the
+    clean pool. Observed live: five managed windows all reporting AUDITING
+    with not one live job in the dispatcher, and a queued audit starving in
+    front of them.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+
+    # The Bridge writes the handoff and closes the lane; no worker ACK at all.
+    assert d.complete_runs_for_project("wintage", "WINTAGE", "/final.md", "abc") == 1
+
+    owned = d.get_owned_job("w1")
+    assert owned is not None, "the window must be able to see that its run is over"
+    assert owned.state == JOB_COMPLETE
+    # And it is never mistaken for live work.
+    assert d._worker_owns_live_job(d._workers["w1"]) is False
+
+
+def test_a_long_finished_dispatch_stops_being_reported_as_owned(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "WINTAGE"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "acb-run", "start_receipt": "receipt"})
+    d.complete_runs_for_project("wintage", "WINTAGE", "/final.md", "abc")
+
+    job = d.get_job(item.dispatch_id)
+    job.completed_at = time.time() - (TERMINAL_ACK_WINDOW_SECONDS + 1)
+    assert d.get_owned_job("w1") is None
 
 
 def test_a_campaign_finished_before_this_dispatch_started_closes_nothing(tmp_path):

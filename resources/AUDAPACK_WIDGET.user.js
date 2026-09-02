@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.36
+// @version      0.0.37
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18769,9 +18769,12 @@ let browserWorkerBraveConfirmed = false;
       }
       browserWorkerConsecutivePollFailures = 0;
       if (browserWorkerLease && result.data?.owned_job?.dispatch_id === browserWorkerLease.dispatch_id &&
-          result.data?.owned_job?.state === 'COMPLETE') {
+          ['COMPLETE', 'FAILED'].includes(String(result.data?.owned_job?.state || ''))) {
         // Positive terminal acknowledgement from Bridge is the only point at
-        // which local recovery identity may be destroyed.
+        // which local recovery identity may be destroyed. FAILED counts too:
+        // a lane the Bridge gave up on is just as finished as one it closed,
+        // and holding the lease past it pins this window out of the pool
+        // behind `lease-still-owned` with no run left to protect.
         browserWorkerLease = null;
         persistBrowserWorkerLease();
       }

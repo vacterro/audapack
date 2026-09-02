@@ -67,6 +67,10 @@ LEASE_SECONDS = 180
 #: and wrote its finished 3-wave handoff at 02:40. So this must outlast the
 #: longest plausible audit, or it fabricates a FAILED for a run that succeeds.
 POST_START_RECOVERY_GRACE_SECONDS = 7200.0
+#: How long a finished dispatch stays visible to its own worker's poll so the
+#: window can see the terminal state and release its lease. Only the poll's
+#: acknowledgement path reads it; nothing treats such a job as live work.
+TERMINAL_ACK_WINDOW_SECONDS = 300.0
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
 PRE_START_MAX_RETRIES = 5
@@ -857,13 +861,30 @@ class BrowserDispatcher:
         W5.2: a CANCELLED dispatch still belongs to its original worker (via
         cancel_owner_* identity) so the browser can receive the terminal
         CANCELLED ACK and clear its local lease -- otherwise it would loop on
-        stale_owner forever."""
+        stale_owner forever.
+
+        A COMPLETE or FAILED dispatch needs the same courtesy, and for longer
+        than it used to. Completion once happened only through the worker's own
+        terminal ACK, so the window cleared its lease as it sent it. Lanes are
+        now also closed server-side -- on finalization, and by the reconcilers
+        after a restart -- and a window is never told. Its lease stays, so
+        browserWorkerRecycleBlockReason() answers `lease-still-owned` forever
+        and the window never returns to the clean pool. Observed live: five
+        managed windows all reporting AUDITING with not one live job in the
+        dispatcher, and a queued audit starving in front of them.
+
+        Bounded on purpose: long enough for the window to see it across a few
+        polls, short enough that a finished job never lingers as ownership."""
         with self._lock:
+            now = _now()
             jobs = [
                 job for job in self._jobs.values()
                 if (job.assigned_worker_id == str(worker_id)
                     or job.cancel_owner_worker_id == str(worker_id))
-                and job.state not in {JOB_COMPLETE, JOB_FAILED}
+                and (
+                    job.state not in {JOB_COMPLETE, JOB_FAILED}
+                    or now - float(job.completed_at or job.updated_at or 0.0) <= TERMINAL_ACK_WINDOW_SECONDS
+                )
             ]
             return min(jobs, key=lambda item: item.created_at) if jobs else None
 
