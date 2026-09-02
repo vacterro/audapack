@@ -1663,6 +1663,84 @@ def test_a_long_finished_dispatch_stops_being_reported_as_owned(tmp_path):
     assert d.get_owned_job("w1") is None
 
 
+def _stale_widget_worker(wid: str, slot: int = 1) -> dict:
+    return worker(
+        wid,
+        widget_version="AUDAPACK_WIDGET/3",
+        widget_protocol="AUDAPACK_WIDGET/3",
+        widget_build_version="0.0.1",
+        managed_slot=slot,
+        managed_generation=1,
+    )
+
+
+def test_a_stale_window_is_asked_to_reload_once_per_build(tmp_path, monkeypatch):
+    """A reload only re-runs the script the manager already holds.
+
+    A window whose userscript manager has nothing newer comes back on the same
+    build and is asked again on the next poll. Observed live: free windows
+    reloading every two minutes forever, dropping out of the registry each
+    time, and a run stranded when one of those reloads landed on the window
+    that had just taken a job. The client stopped asking twice in 0.0.37,
+    which is no help to the builds that need telling -- the Bridge has to.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    record = d.register_worker(_stale_widget_worker("w1", slot=1))
+
+    assert d.worker_widget_is_stale(record) is True
+    assert d.should_ask_widget_reload(record) is True
+    assert d.should_ask_widget_reload(record) is False
+
+    # The window reloaded, came back on the same build under a new id: asking
+    # that one again is the identical futile loop.
+    again = d.register_worker(_stale_widget_worker("w1-reloaded", slot=1))
+    assert d.should_ask_widget_reload(again) is False
+    # Status still tells the operator the truth about the build.
+    assert d.worker_widget_is_stale(again) is True
+
+
+def test_a_different_slot_still_gets_its_one_ask(tmp_path, monkeypatch):
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    first = d.register_worker(_stale_widget_worker("w1", slot=1))
+    second = d.register_worker(_stale_widget_worker("w2", slot=2))
+
+    assert d.should_ask_widget_reload(first) is True
+    assert d.should_ask_widget_reload(second) is True
+
+
+def test_a_newer_required_build_earns_a_fresh_ask(tmp_path, monkeypatch):
+    import audapack.bridge.browser_dispatch as bd
+
+    build = {"value": "0.0.9"}
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: build["value"])
+    d = dispatcher(tmp_path)
+    record = d.register_worker(_stale_widget_worker("w1", slot=1))
+
+    assert d.should_ask_widget_reload(record) is True
+    assert d.should_ask_widget_reload(record) is False
+    build["value"] = "0.1.0"
+    assert d.should_ask_widget_reload(record) is True
+
+
+def test_a_current_window_is_never_asked_to_reload(tmp_path, monkeypatch):
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    record = d.register_worker(worker(
+        "w1", widget_version="AUDAPACK_WIDGET/3", widget_protocol="AUDAPACK_WIDGET/3",
+        widget_build_version="0.0.9", managed_slot=1, managed_generation=1,
+    ))
+    assert d.worker_widget_is_stale(record) is False
+    assert d.should_ask_widget_reload(record) is False
+
+
 def test_a_campaign_finished_before_this_dispatch_started_closes_nothing(tmp_path):
     """Every project audited even once keeps a complete campaign on disk.
 

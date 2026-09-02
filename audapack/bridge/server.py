@@ -1789,8 +1789,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "worker_state": worker.state,
                 # A window cannot see its own build verdict, and a stale build
                 # can never claim. Told plainly, it reloads itself and picks the
-                # new script up instead of idling in the pool forever.
-                "worker_widget_stale": dispatcher.worker_widget_is_stale(worker),
+                # new script up instead of idling in the pool forever -- but
+                # only once per build: a manager with nothing newer to hand
+                # back turns this into a reload every two minutes.
+                "worker_widget_stale": dispatcher.should_ask_widget_reload(worker),
                 "required_widget_build": _get_required_widget_build(),
                 "status": dispatcher.status(),
             })
@@ -1798,7 +1800,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, {
             "ok": True,
             "worker_state": worker.state,
-            "worker_widget_stale": dispatcher.worker_widget_is_stale(worker),
+            "worker_widget_stale": dispatcher.should_ask_widget_reload(worker),
             "required_widget_build": _get_required_widget_build(),
             "status": dispatcher.status(),
             "job": {

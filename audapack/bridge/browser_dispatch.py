@@ -300,6 +300,9 @@ class BrowserDispatcher:
         self._work_available = threading.Condition(self._lock)
         self._workers: dict[str, WorkerRecord] = {}
         self._managed_slot_seen: dict[int, float] = {}
+        #: Which required build each managed slot has already been asked to
+        #: reload for. Asking twice is a loop, never a fix.
+        self._widget_reload_asked: dict[str, str] = {}
         self._jobs: dict[str, DispatchJob] = {}
         self._expired_worker_count = 0
         self._campaign_probe: Optional[Any] = None
@@ -693,6 +696,36 @@ class BrowserDispatcher:
             return False
         required = _get_required_widget_build()
         return bool(required and worker.widget_build_version and worker.widget_build_version != required)
+
+    def should_ask_widget_reload(self, worker: WorkerRecord) -> bool:
+        """Ask a stale window to reload at most once per required build.
+
+        A reload only re-runs the script the userscript manager already holds,
+        so a window whose manager has nothing newer comes back on the same
+        build -- and asks again on the next poll. Observed live: free windows
+        reloading every two minutes forever, dropping out of the registry each
+        time, and a run stranded when one of those reloads landed on the window
+        that had just taken a job.
+
+        The widget stopped asking twice in 0.0.37, which is no help at all to
+        the builds that need telling. The Bridge is the one that can stop
+        asking, and it can do it for clients that will never be updated.
+
+        Keyed by managed slot: a reloaded window comes back with a new worker
+        id, and asking that one again is the same futile loop.
+        """
+        if not self.worker_widget_is_stale(worker):
+            return False
+        required = str(_get_required_widget_build() or "")
+        if not required:
+            return False
+        slot = int(getattr(worker, "managed_slot", 0) or 0)
+        key = f"slot:{slot}" if slot else f"worker:{worker.worker_id}"
+        with self._lock:
+            if self._widget_reload_asked.get(key) == required:
+                return False
+            self._widget_reload_asked[key] = required
+            return True
 
     def stale_widget_workers(self) -> int:
         with self._lock:
