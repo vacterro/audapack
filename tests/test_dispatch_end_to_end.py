@@ -285,3 +285,134 @@ def test_the_compress_handoff_is_what_the_audit_index_calls_ready(bridge_server,
     assert snapshot.campaign_complete is True
     assert snapshot.final_handoff_ready is True
     assert Path(snapshot.final_handoff_path).resolve() == handoff.resolve()
+
+
+def test_a_compress_dispatch_reaches_complete_through_the_real_protocol(bridge_server, tmp_path):
+    """The CM lane, not just the CM artifact.
+
+    The one-wave profile was proven from /v1/audits onward, which skips the
+    half where dispatch actually lives: the profile riding the lease, the
+    archive streaming under it, and the state machine landing COMPLETE without
+    a quick3 assumption anywhere. That is the segment every CM failure this
+    session happened in.
+    """
+    config, base_url = bridge_server
+    archive = tmp_path / "CMLANE.zip"
+    archive.write_bytes(b"PK\x03\x04compress-lane-archive")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    worker = _worker_payload(worker_id="audapack-managed-4-1-cm", managed_slot=4)
+
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_id": "cmlane",
+        "project_name": "CMLANE",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "compress",
+    }, token)
+    assert status == 200, payload
+    dispatch_id = payload["dispatch"]["dispatch_id"]
+
+    status, payload = _post(conn, "/v1/browser/poll", worker, token)
+    assert status == 200, payload
+    job = payload["job"]
+    assert job["dispatch_id"] == dispatch_id
+    # The window must be told WHICH campaign to run: a CM press that arrives as
+    # a bare project is how a compress dispatch ended up running A3.
+    assert job.get("profile") == "compress", job
+    lease_id = job["lease_id"]
+
+    conn.request("GET", f"/v1/browser/jobs/{dispatch_id}/artifact", headers={
+        "X-ACB-Token": token,
+        "X-Worker-Id": worker["worker_id"],
+        "X-Lease-Id": lease_id,
+    })
+    resp = conn.getresponse()
+    body = resp.read()
+    assert resp.status == 200, body[:200]
+    assert body == archive.read_bytes()
+
+    def transition(state: str, **extra) -> dict:
+        code, data = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+            "dispatch_id": dispatch_id,
+            "worker_id": worker["worker_id"],
+            "lease_id": lease_id,
+            "state": state,
+            **extra,
+        }, token)
+        assert code == 200, (state, data)
+        return data
+
+    run_id = "acb-cm-lane-0001"
+    transition("ARTIFACT_FETCHED")
+    transition("ATTACHED")
+    transition("START_PREPARED", campaign_run_id=run_id, start_receipt="startcm-e2e")
+    transition("STARTED", campaign_run_id=run_id)
+    transition("AUDITING", campaign_run_id=run_id)
+    transition("FINALIZING", campaign_run_id=run_id)
+
+    status, payload = _post(conn, "/v1/audits", {
+        "run_id": run_id,
+        "project": "CMLANE",
+        "wave": "compress",
+        "profile_id": "compress",
+        "status": "complete",
+        "api_version": 3,
+        "receipt": "rcpt-cm-lane-001",
+        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", "CMLANE"),
+    }, token)
+    assert status == 200, payload
+
+    transition("COMPLETE", campaign_run_id=run_id)
+
+    jobs = [item for item in _jobs(conn, token) if item["dispatch_id"] == dispatch_id]
+    assert jobs and jobs[0]["state"] == "COMPLETE", jobs
+
+    root = Path(config.audits.root)
+    handoff = list(root.rglob("CMLANE__00_COMPRESS_AUDIT.md"))
+    assert handoff, f"the compress lane produced no canonical handoff under {root}"
+    text = handoff[0].read_text(encoding="utf-8")
+    assert "CAMPAIGN_PROFILE: compress" in text
+    assert "[CMP-001]" in text
+    assert not list(root.rglob("CMLANE*AUDIT_ALL_3*")), "the CM lane must not borrow the quick3 name"
+
+
+def test_a_finished_compress_lane_releases_its_window(bridge_server, tmp_path):
+    """A window that cannot see its run end never rejoins the pool."""
+    config, base_url = bridge_server
+    archive = tmp_path / "CMFREE.zip"
+    archive.write_bytes(b"PK\x03\x04compress-release")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    worker = _worker_payload(worker_id="audapack-managed-5-1-cmfree", managed_slot=5)
+
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_id": "cmfree", "project_name": "CMFREE",
+        "archive_path": str(archive), "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size, "profile": "compress",
+    }, token)
+    dispatch_id = payload["dispatch"]["dispatch_id"]
+    status, payload = _post(conn, "/v1/browser/poll", worker, token)
+    lease_id = payload["job"]["lease_id"]
+    run_id = "acb-cm-free-0001"
+    for state, extra in (
+        ("ARTIFACT_FETCHED", {}), ("ATTACHED", {}),
+        ("START_PREPARED", {"campaign_run_id": run_id, "start_receipt": "r"}),
+        ("STARTED", {"campaign_run_id": run_id}),
+        ("AUDITING", {"campaign_run_id": run_id}),
+        ("COMPLETE", {"campaign_run_id": run_id}),
+    ):
+        code, data = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+            "dispatch_id": dispatch_id, "worker_id": worker["worker_id"],
+            "lease_id": lease_id, "state": state, **extra,
+        }, token)
+        assert code == 200, (state, data)
+
+    # The next poll has to carry the terminal state back, or the window keeps
+    # its lease and `lease-still-owned` pins it out of the clean pool forever.
+    status, payload = _post(conn, "/v1/browser/poll", worker, token)
+    assert status == 200, payload
+    owned = payload.get("owned_job") or {}
+    assert owned.get("dispatch_id") == dispatch_id, payload
+    assert owned.get("state") == "COMPLETE", owned
