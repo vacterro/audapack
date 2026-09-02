@@ -282,3 +282,26 @@ def test_a_stale_widget_still_outranks_the_missing_window_warning():
     both = {"stale_widget_workers": 2, "required_widget_build": "0.0.33",
             "managed_slots_launched": 6, "managed_slots_registered": 0}
     assert "OUTDATED widget" in bridge_status_warning(both)
+
+
+def test_closing_the_window_drops_a_press_still_in_the_debounce(window):
+    """A closed window must not dispatch later and open a browser nobody owns.
+
+    ``close()`` left ``_audit_start_debounce`` armed and the window alive behind
+    it, so the timer fired on whatever spun the event loop next -- in the test
+    suite, a later test -- and ran the real dispatch. That provisions real
+    Chromium workers, which is how the suite grew a permanent row of orphan
+    browser windows on the operator's desktop.
+    """
+    batches: list[list[str]] = []
+    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+
+    window._start_audit_projects(["p1"], "Project 1")
+    assert window._audit_start_debounce.isActive() is True
+
+    window.close()
+    assert window._audit_start_debounce.isActive() is False
+    assert window._audit_start_pending == []
+
+    window._pump_audit_start_queue()
+    assert batches == [], "a press dropped at close must never dispatch"

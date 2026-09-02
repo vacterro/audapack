@@ -848,7 +848,18 @@ QToolTip QLabel {
         under the registry lock and update ONLY the geometry fields. Never write
         the stale project registry or unrelated settings from self._service.config
         during close, or concurrent Bridge/CLI project mutations get silently lost.
+
+        A press still sitting in the debounce is dropped here. Letting the timer
+        survive the window means a START AUDIT nobody is watching any more --
+        the dispatch provisions real browser windows, so a stray fire opens one
+        with no owner left to close it. RESET ALL already establishes that an
+        undispatched press is droppable.
         """
+        try:
+            self._audit_start_debounce.stop()
+            self._audit_start_pending.clear()
+        except Exception:
+            pass
         try:
             from audapack.config import cross_process_lock, get_registry_lock_path, load_config
             geometry = {
