@@ -248,3 +248,33 @@ test('T94: a window the Bridge says still owns a dispatch never reloads', async 
   assert.strictEqual(blocked, false);
   assert.strictEqual(h.location.reloaded, before, 'an owned run outranks a build update');
 });
+
+test('T124: a poll re-asserts STARTED for a dispatch stranded in START_PREPARED', async () => {
+  // The same lost call one step earlier. START_PREPARED -> STARTED is sent
+  // once, and the re-assert above only fires on STARTED, so a lost response
+  // left the dispatch at START_PREPARED while the browser audited straight
+  // past it. Observed live: SAIPEN with 2 of 3 waves already on disk and its
+  // lane still reading START_PREPARED 110 minutes after the Core went out.
+  const { h, api, posted } = pollHarness({ ownedState: 'START_PREPARED' });
+
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  assert.ok(posted.includes('STARTED'), `expected a STARTED re-assert, saw ${JSON.stringify(posted)}`);
+  assert.ok(api.browserWorkerLease, 'the lease must survive the re-assert');
+});
+
+test('T124: START_PREPARED is not re-asserted without proof the Core was sent', async () => {
+  // START_PREPARED is the exactly-once boundary. Claiming STARTED from a
+  // window that cannot show a committed handoff or a live runtime would be
+  // asserting a send that may never have happened.
+  const { h, api, posted } = pollHarness({ ownedState: 'START_PREPARED', runId: '' });
+  api.autoRuntime = api.emptyAutoRuntime({ enabled: false });
+
+  const pending = api.browserWorkerPollOnce();
+  await h.settle();
+  await pending;
+
+  assert.ok(!posted.includes('STARTED'), `no STARTED expected, saw ${JSON.stringify(posted)}`);
+});

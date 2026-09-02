@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.37
+// @version      0.0.38
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18794,6 +18794,23 @@ let browserWorkerBraveConfirmed = false;
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           ['STARTED', 'AUDITING', 'FINALIZING'].includes(String(owned.state || ''))) {
         browserWorkerRecoverIdleEngine();
+      }
+      // The same loss one step earlier. START_PREPARED -> STARTED is a single
+      // call too, and when it goes missing nothing ever re-asserts it: the
+      // re-assert below only fires on STARTED, so the dispatch sits at
+      // START_PREPARED while the browser audits happily past it. Observed
+      // live: SAIPEN at 2/3 waves on disk with its lane still reading
+      // START_PREPARED 110 minutes after the Core went out, occupying a lane
+      // that could never finish or be restarted.
+      //
+      // Only claimed with proof the Core really was sent -- a committed START
+      // handoff, or a live runtime bound to this run. START_PREPARED is the
+      // exactly-once boundary; this asserts what already happened past it and
+      // never causes a second send.
+      if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
+          String(owned.state || '') === 'START_PREPARED' &&
+          (startHandoffIsCommitted(readStartAuditHandoff()) || Boolean(autoRuntime?.runId))) {
+        await browserWorkerTransition('STARTED');
       }
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           String(owned.state || '') === 'STARTED') {
