@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.38
+// @version      0.0.39
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -1013,6 +1013,10 @@ ordinal/name of the entrypoint file.`;
   const CHAT_RENAME_429_COOLDOWN_MS = 900000;
   const CHATGPT_LONG_PROMPT_THRESHOLD = 6000;
   const CHATGPT_ATTACHMENT_TIMEOUT_MS = 30000;
+  //: Ceiling on waiting for Send while an attachment is still being ingested.
+  //: Only reached when a tile keeps reporting progress, so it bounds a stuck
+  //: upload without cutting off a large one that is genuinely working.
+  const CHATGPT_SEND_READY_MAX_MS = 300000;
   const CHATGPT_PROMPT_DELIVERY_MODES = Object.freeze(['auto', 'file', 'text']);
   const AUDIT_ATTACHMENT_FILES = Object.freeze({
     core: 'AUDIT_CORE.md',
@@ -3598,14 +3602,23 @@ ordinal/name of the entrypoint file.`;
     return { ok: true, filename, marker, tile };
   }
 
-  async function waitForChatGPTSendReady(timeoutMs = CHATGPT_ATTACHMENT_TIMEOUT_MS) {
+  async function waitForChatGPTSendReady(timeoutMs = CHATGPT_ATTACHMENT_TIMEOUT_MS, maxMs = CHATGPT_SEND_READY_MAX_MS) {
     // Do not observe one captured composer root for the whole attachment wait.
     // ChatGPT can replace the unified-composer subtree while an injected file is
     // being registered. The old root then receives no more mutations, leaving a
     // visibly enabled Send button in the NEW root while this function sleeps all
     // the way to timeout. Re-resolve the live composer/button on every probe.
-    const deadline = Date.now() + Math.max(1, Number(timeoutMs) || CHATGPT_ATTACHMENT_TIMEOUT_MS);
-    while (Date.now() < deadline) {
+    let deadline = Date.now() + Math.max(1, Number(timeoutMs) || CHATGPT_ATTACHMENT_TIMEOUT_MS);
+    // ChatGPT keeps Send aria-disabled while it ingests an attachment, and a
+    // few hundred megabytes take far longer than any fixed wait. Observed
+    // live on four of six dispatches at once: "button=found disabled=false
+    // aria=true tiles=1 composerPrepared=true", the wait expiring, and the
+    // operator told to press Send by hand on a run that was supposed to need
+    // nobody. Progress, not a stopwatch, decides how long to wait: while a
+    // tile is visibly still processing the deadline keeps moving, bounded so
+    // a genuinely stuck upload still ends.
+    const hardDeadline = Date.now() + Math.max(1, Number(maxMs) || CHATGPT_SEND_READY_MAX_MS);
+    while (Date.now() < deadline && Date.now() < hardDeadline) {
       const button = getChatGPTSend();
       if (
         button &&
@@ -3614,6 +3627,12 @@ ordinal/name of the entrypoint file.`;
         !button.disabled &&
         button.getAttribute('aria-disabled') !== 'true'
       ) return button;
+
+      try {
+        if (chatGPTComposerAttachmentTiles().some(tile => chatGPTAttachmentIsBusy(tile))) {
+          deadline = Math.min(hardDeadline, Date.now() + CHATGPT_ATTACHMENT_TIMEOUT_MS);
+        }
+      } catch (_) { }
 
       await sleep(Math.min(120, Math.max(20, deadline - Date.now())));
     }
@@ -19208,6 +19227,7 @@ let browserWorkerBraveConfirmed = false;
         chatGPTSendAccepted,
         clickChatGPTSendVerified,
         chatGPTComposerAttachmentTiles,
+        waitForChatGPTSendReady,
         chatGPTProjectComposerAttachments,
         chatGPTReadyComposerAttachments,
         chatGPTReadyAttachmentSummary,
