@@ -45,6 +45,15 @@ WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS = 600.0
 WORKER_POOL_SETTLE_SECONDS = 90.0
 WORKER_POOL_SETTLE_POLL_SECONDS = 3.0
 
+#: How long a transport-COMPLETE dispatch may stay SAVING before its
+#: readiness proof is treated as never arriving. Finalization writes its
+#: artifacts in seconds; past this the proof is not late, it is not coming --
+#: the index belongs to a later run, or the campaign identity drifted. Three
+#: such rows sat SAVING for over a day with no action able to move them:
+#: a terminal dispatch refuses Cancel and refuses FORCE UNBLOCK, so RESET ALL
+#: offered to clear them and could not.
+COMPLETE_SETTLE_AFTER_SECONDS = 1800.0
+
 ACTIVE_DISPATCH_STATES = {
     "QUEUED", "RETRYABLE", "LEASED", "ARTIFACT_FETCHED", "ATTACHED",
     "START_PREPARED", "STARTED", "AUDITING", "FINALIZING", "BLOCKED",
@@ -907,14 +916,21 @@ class AuditRunCoordinator:
         """
         path = str(job.get("final_handoff_path") or "")
         digest = str(job.get("final_handoff_sha256") or "")
-        if not path or not digest:
-            return True
-        artifact = Path(path)
-        try:
-            if artifact.is_file() and _sha256_file(artifact) != digest:
-                return False
-        except OSError:
-            pass
+        if path and digest:
+            artifact = Path(path)
+            try:
+                if artifact.is_file() and _sha256_file(artifact) != digest:
+                    return False
+            except OSError:
+                pass
+        # The digest can still match while the proof fails for another reason --
+        # the audit index holding a later run, or a drifted campaign identity --
+        # and those never resolve either. Age is the only thing that separates
+        # "finalization is still writing" from "this is not coming". A run with
+        # no completion time recorded is left alone: unknown is not old.
+        completed_at = float(job.get("completed_at") or 0.0)
+        if completed_at and (time.time() - completed_at) > COMPLETE_SETTLE_AFTER_SECONDS:
+            return False
         return True
 
     def _snapshot(

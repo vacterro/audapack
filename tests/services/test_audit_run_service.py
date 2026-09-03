@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -203,8 +204,10 @@ def test_ready_requires_complete_matching_run_waves_file_and_hash(tmp_path):
         "campaign_run_id": "run-1",
         "final_handoff_path": str(handoff),
         "final_handoff_sha256": digest,
-        "completed_at": 5.0,
-        "updated_at": 5.0,
+        # A real completion instant: this test is about the proof chain, not
+        # about how long a COMPLETE run may stay unproven.
+        "completed_at": time.time(),
+        "updated_at": time.time(),
     })
     audits.snapshots["p1"] = AuditSnapshot(
         project_id="p1", project_name="Project p1", campaign_run_id="wrong",
@@ -1107,3 +1110,52 @@ def test_autopack_can_be_turned_off(tmp_path):
     service.start("p1")
     assert service.packing.repacks == []
     assert service.packing.calls == ["p1"]
+
+
+def test_a_complete_run_whose_proof_never_lands_stops_being_unclearable(tmp_path):
+    """Three rows sat SAVING for over a day and nothing could move them.
+
+    The digest matched, so the supersede check passed them, but the proof still
+    failed for another reason -- the audit index belonging to a later run. A
+    terminal dispatch refuses Cancel and refuses FORCE UNBLOCK, so RESET ALL
+    offered to clear them and cleared nothing, every time.
+    """
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+    handoff = tmp_path / "PROJ__00_AUDIT_ALL_3.md"
+    handoff.write_text("mine", encoding="utf-8")
+    bridge.jobs[0].update({
+        "state": "COMPLETE",
+        "campaign_run_id": "run-1",
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(b"mine").hexdigest(),
+        "completed_at": time.time() - 86400,
+    })
+
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "SUPERSEDED"
+    assert run.operator_state in service.RESET_SETTLED_STATES
+
+
+def test_a_run_that_just_finished_is_still_saving(tmp_path):
+    """Finalization writes in seconds; a fresh one is settling, not stuck."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+    handoff = tmp_path / "PROJ__00_AUDIT_ALL_3.md"
+    handoff.write_text("mine", encoding="utf-8")
+    bridge.jobs[0].update({
+        "state": "COMPLETE",
+        "campaign_run_id": "run-1",
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(b"mine").hexdigest(),
+        "completed_at": time.time(),
+    })
+    assert service.refresh_runs()[0].operator_state == "SAVING"
+
+
+def test_a_run_with_no_completion_time_is_left_alone(tmp_path):
+    """Unknown is not old: never settle a run on a timestamp nobody wrote."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+    bridge.jobs[0].update({"state": "COMPLETE", "campaign_run_id": "run-1", "completed_at": 0.0})
+    assert service.refresh_runs()[0].operator_state == "SAVING"
