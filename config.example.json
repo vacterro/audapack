@@ -38,14 +38,21 @@
       "*.secret",
       "*.secrets"
     ],
-    "manifest_enabled": true
+    "manifest_enabled": true,
+    "include_timestamp": true,
+    "output_layout": "single_folder"
   },
   "audits": {
     "root": "PATH_TO_AUDITING_IMPLEMENTATION",
     "hot_seconds": 21600,
     "warm_seconds": 86400,
     "cool_seconds": 259200,
-    "cold_seconds": 604800
+    "cold_seconds": 604800,
+    "profile": "quick3",
+    "autopack_before_audit": true,
+    "mirror_into_project": true,
+    "mirror_dir_name": "audit",
+    "dedicated_profile_only": false
   },
   "bridge": {
     "host": "127.0.0.1",
@@ -55,7 +62,45 @@
     "history_retention_days": 30
   },
   "ui": {
-    "window_size": [860, 600],
-    "reply_language": "et"
-  }
+    "window_size": [
+      860,
+      600
+    ],
+    "reply_language": "et",
+    "compact_rows": false,
+    "launcher_letters": true,
+    "arrange_worker_windows": true,
+    "worker_window_layout": "grid",
+    "worker_window_monitor": -1,
+    "worker_windows_minimized": true
+  },
+  "launchers": [
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "short_label": "OC",
+      "command_template": "",
+      "agent_type": "powershell",
+      "enabled": true,
+      "max_instances": 0
+    },
+    {
+      "id": "freebuff",
+      "name": "FreeBuff",
+      "short_label": "FB",
+      "command_template": "",
+      "agent_type": "powershell",
+      "enabled": true,
+      "max_instances": 1
+    },
+    {
+      "id": "cline",
+      "name": "Cline",
+      "short_label": "CL",
+      "command_template": "",
+      "agent_type": "powershell",
+      "enabled": true,
+      "max_instances": 0
+    }
+  ]
 }

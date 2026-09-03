@@ -10,8 +10,8 @@
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.2.2-D4B86A?style=for-the-badge" alt="Релиз v0.2.2"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/платформа-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
-  <a href="tests/"><img src="https://img.shields.io/badge/Python%20тесты-374%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="374 теста Python проходят"></a>
-  <a href="tests/widget/"><img src="https://img.shields.io/badge/тесты%20виджета-156%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="156 тестов виджета проходят"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Python%20тесты-passing-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Тесты Python проходят"></a>
+  <a href="tests/widget/"><img src="https://img.shields.io/badge/тесты%20виджета-passing-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Тесты виджета проходят"></a>
 </p>
 
 <p align="center"><a href="README.md">English</a> · <a href="README.ru.md"><strong>Русский</strong></a></p>
@@ -140,7 +140,7 @@ ruff check audapack tests
 Get-ChildItem tests/widget -Filter *.test.js | ForEach-Object { node $_.FullName }
 ```
 
-Текущая база: **374 теста Python** и **156 Node-тестов виджета**.
+Текущая база: pytest-набор в `tests/` и Node-тесты виджета в `tests/widget/` — точные числа смотри в прогоне, а не здесь.
 
 ## Карта репозитория
 
@@ -167,7 +167,7 @@ AUDAPACK/
 ├── CHANGELOG.md            # История релизов
 ├── README.md               # Документация на английском
 ├── README.ru.md            # Документация на русском
-└── VERSION                 # Каноническая версия
+└── VERSION                 # Версия релиза, равна pyproject и __init__
 ```
 
 ## Документация

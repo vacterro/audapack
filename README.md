@@ -12,8 +12,8 @@
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.2-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/Platform-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
-  <a href="tests/"><img src="https://img.shields.io/badge/Tests-374%20PASS-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest"></a>
-  <a href="resources/AUDAPACK_WIDGET.user.js"><img src="https://img.shields.io/badge/Widget-156%20PASS-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Widget"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Tests-passing-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest suite passing"></a>
+  <a href="resources/AUDAPACK_WIDGET.user.js"><img src="https://img.shields.io/badge/Widget-passing-4A7A20?style=for-the-badge&logo=javascript&logoColor=white" alt="Widget"></a>
   <a href="docs/wiki/UI-Golden-Vintage.md"><img src="https://img.shields.io/badge/Theme-Golden%20Vintage-75663D?style=for-the-badge" alt="Golden Vintage"></a>
 </p>
 
@@ -145,7 +145,7 @@ _AUDAPACK/
 │   ├── packing.py          # Atomic ZIP packager with .part staging
 │   └── projects.py         # 24-slot registry & priority groups
 ├── docs/                   # Documentation & developer wiki
-│   └── wiki/               # 5-part comprehensive documentation
+│   └── wiki/               # Developer wiki, one file per subsystem
 ├── resources/              # Brand assets, icons & Tampermonkey widget
 │   ├── AUDAPACK_WIDGET.user.js # Browser automation userscript
 │   ├── app_icon.ico        # Multi-size Windows application icon
@@ -155,14 +155,14 @@ _AUDAPACK/
 ├── tests/                  # Pytest & Node widget test suites
 │   ├── services/           # Neutral service unit tests
 │   ├── ui/                 # Model & UI component tests
-│   └── widget/             # 152 Node.js browser widget unit tests across 23 suites
+│   └── widget/             # Node.js browser widget unit tests
 ├── AUDAPACK.pyw            # Main GUI entry point
 ├── AUDAPACK.vbs            # Silent GUI launcher
 ├── PACK_ALL_SILENT.vbs     # Silent batch pack launcher
 ├── CHANGELOG.md            # Monotonic release changelog
 ├── README.md               # English documentation
 ├── README.ru.md            # Russian documentation
-└── VERSION                 # Canonical semver release version
+└── VERSION                 # Release version, kept equal to pyproject and __init__
 ```
 
 ---
@@ -175,6 +175,7 @@ Detailed guides are available in [`docs/wiki/`](docs/wiki/):
 - 🤖 **[Auto3 Audit Pipeline](docs/wiki/Auto3-Audit-Pipeline.md)** — 3-wave audit lifecycle and userscript mechanics.
 - 🎨 **[Golden Vintage UI Design](docs/wiki/UI-Golden-Vintage.md)** — Win95 palette tokens and pixel-crisp rules.
 - 📦 **[CLI & Silent Packaging](docs/wiki/CLI-and-Silent-Packaging.md)** — Advanced automation and scripting.
+- 🎯 **[Audit Campaign Engine](docs/wiki/Audit-Campaign-Engine.md)** — Campaign profiles, wave definitions and the run manifest.
 
 ---
 
