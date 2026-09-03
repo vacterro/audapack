@@ -2348,15 +2348,22 @@ QToolTip QLabel {
             "main_codex3_free": lambda p: self._on_open_with_codex(p, "main_codex3_free"),
         }
 
-        handler = _map.get(launcher_id)
-        if handler:
-            handler(target)
-            return
-
-        # Custom launcher with command_template — execute via PowerShell
+        # A command_template the operator wrote wins over the built-in command,
+        # for a built-in id too. The built-in map used to be consulted FIRST and
+        # return, so a template typed into Settings -> Launchers -> Edit for one
+        # of the six shipped launchers was accepted, saved, and silently never
+        # run. It is also the only way to change what those buttons pass: the
+        # Cline button hardcodes --auto-approve true and the OpenCode one --auto,
+        # and without this there was no way to launch either without its
+        # confirmation gate disabled.
         cfg = next((lc for lc in getattr(self._service.config, "launchers", []) if lc.id == launcher_id), None)
         if cfg and cfg.command_template:
             self._launch_custom(cfg, target)
+            return
+
+        handler = _map.get(launcher_id)
+        if handler:
+            handler(target)
             return
 
         self.statusBar().showMessage(f"Unknown launcher: {launcher_id}")

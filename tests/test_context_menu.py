@@ -388,3 +388,67 @@ if __name__ == "__main__":
 
 
 
+
+
+def test_a_command_template_overrides_a_built_in_launcher(qapp, tmp_path):
+    """It was accepted, saved, and silently never run.
+
+    The built-in dispatch map was consulted first and returned, so a template
+    typed into Settings -> Launchers -> Edit for one of the six shipped ids did
+    nothing. It is also the only way to launch Cline without the hardcoded
+    --auto-approve true, or OpenCode without --auto.
+    """
+    from unittest.mock import patch
+
+    from audapack.config import AppConfig, AuditsConfig
+    from audapack.models import Project
+    from audapack.services.project_service import ProjectService
+    from audapack.ui_qt.main_window import MainWindow
+
+    project_dir = tmp_path / "Proj"
+    project_dir.mkdir()
+    config = AppConfig(
+        audits=AuditsConfig(root=str(tmp_path / "audits")),
+        projects=[Project(id="p1", display_name="Proj", source_path=str(project_dir),
+                          priority_group="MAIN0", slot=1)],
+    )
+    cline = next(lc for lc in config.launchers if lc.id == "cline")
+    cline.command_template = 'cline.cmd --cwd "{workdir}"'
+    window = MainWindow(ProjectService(config, base_dir=tmp_path))
+    try:
+        with patch.object(window, "_on_open_with_cline") as built_in, \
+             patch.object(window, "_launch_custom") as custom:
+            window._on_open_with_launcher(config.projects[0], "cline")
+        built_in.assert_not_called()
+        custom.assert_called_once()
+        assert custom.call_args.args[0].command_template == 'cline.cmd --cwd "{workdir}"'
+    finally:
+        window.close()
+
+
+def test_an_empty_template_still_uses_the_built_in_command(qapp, tmp_path):
+    """Nobody's existing button changes behaviour: empty is the shipped default."""
+    from unittest.mock import patch
+
+    from audapack.config import AppConfig, AuditsConfig
+    from audapack.models import Project
+    from audapack.services.project_service import ProjectService
+    from audapack.ui_qt.main_window import MainWindow
+
+    project_dir = tmp_path / "Proj"
+    project_dir.mkdir()
+    config = AppConfig(
+        audits=AuditsConfig(root=str(tmp_path / "audits")),
+        projects=[Project(id="p1", display_name="Proj", source_path=str(project_dir),
+                          priority_group="MAIN0", slot=1)],
+    )
+    assert next(lc for lc in config.launchers if lc.id == "cline").command_template == ""
+    window = MainWindow(ProjectService(config, base_dir=tmp_path))
+    try:
+        with patch.object(window, "_on_open_with_cline") as built_in, \
+             patch.object(window, "_launch_custom") as custom:
+            window._on_open_with_launcher(config.projects[0], "cline")
+        built_in.assert_called_once()
+        custom.assert_not_called()
+    finally:
+        window.close()
