@@ -727,7 +727,19 @@ class AuditRunCoordinator:
                 continue
             # Cancel refuses a BLOCKED dispatch; force it terminal instead.
             forced = self.abandon(snapshot.dispatch_id, "operator reset all audit runs")
-            (unblocked if forced.ok else failed).append(label)
+            if forced.ok:
+                unblocked.append(label)
+                continue
+            # Neither would move it, which for a dispatch that is already
+            # terminal or already pruned is the correct refusal -- the run is
+            # over. Settling the intent is what stops it reappearing in the
+            # next "unfinished" count forever; without it RESET ALL reports the
+            # same lanes on every press and clears nothing.
+            if snapshot.intent_id:
+                self.intents.update(snapshot.intent_id, status="CANCELLED")
+                cancelled.append(label)
+                continue
+            failed.append(label)
 
         return {
             "cancelled": cancelled,
@@ -940,13 +952,45 @@ class AuditRunCoordinator:
             actions=_actions_for(operator),
         )
 
+    #: A finished intent's true operator state. Everything not in
+    #: ACTIVE_INTENT_STATES is finished, so this map is exhaustive by
+    #: construction and an unknown settled status falls to FAILED rather than
+    #: pretending to be live work.
+    _SETTLED_INTENT_STATES = {"READY": "READY", "COMPLETE": "READY", "CANCELLED": "CANCELLED"}
+
     def _intent_snapshot(self, intent: dict[str, Any]) -> AuditRunSnapshot:
         raw = str(intent.get("status") or "PREPARING")
+        error = str(intent.get("error") or "")
+        # An intent whose dispatch record is gone falls through to here, and
+        # every settled status except FAILED used to collapse into PREPARING --
+        # so 16 finished runs read as live work, RESET ALL offered to "clear 16
+        # unfinished audit run(s)", and Yes cleared nothing: their dispatches
+        # are terminal, so Cancel refuses, FORCE UNBLOCK refuses, and the same
+        # 16 came back on the next refresh. Finished is finished.
+        if raw not in ACTIVE_INTENT_STATES:
+            operator = self._SETTLED_INTENT_STATES.get(raw, "FAILED")
+            summary = (
+                f"{operator}: {error}" if error
+                else "FINISHED · no dispatch record on the Bridge"
+                if operator == "READY" else operator
+            )
+            return AuditRunSnapshot(
+                project_id=str(intent.get("project_id") or ""),
+                project_name=str(intent.get("project_name") or ""),
+                operator_state=operator,
+                summary=summary,
+                intent_id=str(intent.get("intent_id") or ""),
+                profile_id=str(intent.get("profile_id") or "quick3"),
+                error=error,
+                created_at=float(intent.get("created_at") or 0.0),
+                updated_at=float(intent.get("updated_at") or 0.0),
+                completed_at=float(intent.get("completed_at") or 0.0),
+                actions=_actions_for(operator),
+            )
         interrupted = raw in {"PREPARING", "PACKING", "SUBMITTING"} and int(intent.get("owner_pid", 0) or 0) not in {0, os.getpid()}
         operator = "INTERRUPTED" if interrupted else (
-            "FAILED" if raw == "FAILED" else ("RECOVERY" if raw == "RECOVERY_NEEDED" else "PREPARING")
+            "RECOVERY" if raw == "RECOVERY_NEEDED" else "PREPARING"
         )
-        error = str(intent.get("error") or "")
         if operator == "INTERRUPTED":
             summary = "INTERRUPTED · Resume Start"
         else:

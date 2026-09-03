@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -958,3 +959,50 @@ def test_wave_progress_never_leaks_from_an_unrelated_campaign(tmp_path):
     )
     job = {"project_id": "p1", "campaign_run_id": "acb-dispatch", "meta_run_id_drift": ""}
     assert service.audit_matches_dispatch(job, audit) is False
+
+
+def _intent(status: str, **extra) -> dict:
+    base = {
+        "intent_id": f"int-{status.lower()}",
+        "project_id": "p1",
+        "project_name": "PROJ",
+        "profile_id": "quick3",
+        "status": status,
+        "dispatch_id": "dsp-gone",
+        "owner_pid": 0,
+    }
+    base.update(extra)
+    return base
+
+
+def test_a_finished_intent_is_not_counted_as_unfinished_work(tmp_path):
+    """RESET ALL offered to clear 16 runs and Yes cleared nothing.
+
+    An intent whose dispatch record is gone falls through to _intent_snapshot,
+    and every settled status except FAILED collapsed into PREPARING. So 16
+    finished runs read as live work; their dispatches are terminal, Cancel
+    refuses and FORCE UNBLOCK refuses, and the same 16 came back on the next
+    refresh. The dialog counts anything outside {READY, FAILED, CANCELLED}.
+    """
+    service, _bridge, _audits = coordinator(tmp_path)
+    settled = {"COMPLETE": "READY", "READY": "READY", "CANCELLED": "CANCELLED", "FAILED": "FAILED"}
+    for status, expected in settled.items():
+        snapshot = service._intent_snapshot(_intent(status))
+        assert snapshot.operator_state == expected, status
+        assert snapshot.operator_state in {"READY", "FAILED", "CANCELLED"}, status
+
+
+def test_live_intent_states_still_read_as_live(tmp_path):
+    service, _bridge, _audits = coordinator(tmp_path)
+    assert service._intent_snapshot(_intent("PREPARING")).operator_state == "PREPARING"
+    assert service._intent_snapshot(_intent("QUEUED")).operator_state == "PREPARING"
+    assert service._intent_snapshot(_intent("RECOVERY_NEEDED")).operator_state == "RECOVERY"
+    stolen = _intent("PACKING", owner_pid=os.getpid() + 99999)
+    assert service._intent_snapshot(stolen).operator_state == "INTERRUPTED"
+
+
+def test_a_finished_intent_says_why_it_has_no_run_record(tmp_path):
+    service, _bridge, _audits = coordinator(tmp_path)
+    snapshot = service._intent_snapshot(_intent("COMPLETE"))
+    assert "no dispatch record" in snapshot.summary
+    assert snapshot.ready is False, "READY without proof must not inflate the ready count"
