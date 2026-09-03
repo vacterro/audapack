@@ -53,6 +53,15 @@ def agent_inbox_suffix(runs) -> str:
     return (" · " + " · ".join(parts)) if parts else ""
 
 
+def _queue_position(run) -> int:
+    """Place in the waiting line, or -1. Zero is a POSITION, not a missing one."""
+    value = getattr(run, "queue_position", None)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 class AuditRunsWidget(QWidget):
     """Shows six current lanes plus bounded recent history and safe actions."""
 
@@ -62,11 +71,14 @@ class AuditRunsWidget(QWidget):
     open_requested = Signal(str)
     diagnostics_requested = Signal(object)
     reset_all_requested = Signal()
+    #: (dispatch_id, delta) -- move a waiting run up (-1) or down (+1).
+    reorder_requested = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._runs: list[AuditRunSnapshot] = []
         self._lane_runs: list[AuditRunSnapshot] = []
+        self._queue_runs: list[AuditRunSnapshot] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -112,6 +124,41 @@ class AuditRunsWidget(QWidget):
         actions.addStretch(1)
         layout.addLayout(actions)
 
+        # QUEUE: everyone waiting for a window. The lane table only ever shows
+        # six, so a seventh queued project was invisible -- and an order you
+        # cannot see is one you cannot decide.
+        self.queue_label = QLabel("QUEUE — next window goes to the top row", self)
+        layout.addWidget(self.queue_label)
+        self.queue = QTableWidget(0, 4, self)
+        self.queue.setHorizontalHeaderLabels(("#", "PROJECT", "PROFILE", "WAITING"))
+        self.queue.verticalHeader().setVisible(False)
+        self.queue.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.queue.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.queue.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.queue.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.queue.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.queue.setMaximumHeight(120)
+        self.queue.itemSelectionChanged.connect(self._sync_actions)
+        layout.addWidget(self.queue)
+
+        self.queue_actions_row = QWidget(self)
+        queue_actions = QHBoxLayout(self.queue_actions_row)
+        queue_actions.setContentsMargins(0, 0, 0, 0)
+        queue_actions.setSpacing(3)
+        self.queue_up_button = QPushButton("▲ UP", self)
+        self.queue_up_button.setToolTip("Move this project one place towards the next free window")
+        self.queue_down_button = QPushButton("▼ DOWN", self)
+        self.queue_down_button.setToolTip("Let the project below it take the next free window first")
+        self.queue_up_button.clicked.connect(lambda: self._reorder_selected(-1))
+        self.queue_down_button.clicked.connect(lambda: self._reorder_selected(+1))
+        queue_actions.addWidget(self.queue_up_button)
+        queue_actions.addWidget(self.queue_down_button)
+        queue_actions.addStretch(1)
+        layout.addWidget(self.queue_actions_row)
+        # Nothing waiting means no line to show. An empty table with a header
+        # is 120px of nothing between the lanes and the history.
+        self._set_queue_visible(False)
+
         history_label = QLabel("RECENT", self)
         layout.addWidget(history_label)
         # AGENT: READY only says the station finished. Whether anyone READ the
@@ -148,6 +195,10 @@ class AuditRunsWidget(QWidget):
         current_row = self.lanes.currentRow()
         if 0 <= current_row < len(self._lane_runs):
             selected_project = str(self._lane_runs[current_row].project_id)
+        queue_selected = ""
+        queue_row = self.queue.currentRow()
+        if 0 <= queue_row < len(self._queue_runs):
+            queue_selected = str(self._queue_runs[queue_row].dispatch_id)
         self._runs = list(runs)
         latest: list[AuditRunSnapshot] = []
         seen: set[str] = set()
@@ -196,6 +247,42 @@ class AuditRunsWidget(QWidget):
             # The lane genuinely disappeared; do not leave a stale highlight.
             self.lanes.clearSelection()
 
+        # The waiting line, in the order the dispatcher will consume it. A run
+        # is in it only while it has no window: queue_position goes to -1 the
+        # moment one claims the job.
+        # `or -1` here would drop position ZERO -- the front of the line, and
+        # the one row that matters most.
+        self._queue_runs = sorted(
+            (run for run in self._runs if _queue_position(run) >= 0),
+            key=_queue_position,
+        )
+        self.queue.blockSignals(True)
+        self.queue.setRowCount(len(self._queue_runs))
+        for row, run in enumerate(self._queue_runs):
+            values = (
+                str(row + 1),
+                run.project_name,
+                run.profile_id,
+                self._time_label(run.created_at),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in {0, 3}:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.queue.setItem(row, column, item)
+        self.queue.blockSignals(False)
+        self._set_queue_visible(bool(self._queue_runs))
+        restored_queue_row = next(
+            (index for index, snapshot in enumerate(self._queue_runs)
+             if str(snapshot.dispatch_id) == queue_selected),
+            -1,
+        ) if queue_selected else -1
+        if restored_queue_row >= 0:
+            if self.queue.currentRow() != restored_queue_row:
+                self.queue.selectRow(restored_queue_row)
+        elif queue_selected:
+            self.queue.clearSelection()
+
         terminal = [
             run for run in self._runs
             if run.operator_state in {"READY", "FAILED", "CANCELLED", "SUPERSEDED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}
@@ -222,6 +309,21 @@ class AuditRunsWidget(QWidget):
             return self._lane_runs[row]
         return None
 
+    def _set_queue_visible(self, visible: bool) -> None:
+        for part in (self.queue_label, self.queue, self.queue_actions_row):
+            part.setVisible(bool(visible))
+
+    def _selected_queued(self) -> AuditRunSnapshot | None:
+        row = self.queue.currentRow()
+        if 0 <= row < len(self._queue_runs):
+            return self._queue_runs[row]
+        return None
+
+    def _reorder_selected(self, delta: int) -> None:
+        run = self._selected_queued()
+        if run and run.dispatch_id:
+            self.reorder_requested.emit(run.dispatch_id, int(delta))
+
     def _sync_actions(self) -> None:
         run = self._selected()
         actions = set(run.actions) if run else set()
@@ -230,6 +332,13 @@ class AuditRunsWidget(QWidget):
         self.abandon_button.setEnabled(bool(run and "ABANDON" in actions and run.dispatch_id))
         self.open_button.setEnabled(bool(run and "OPEN" in actions and run.handoff_path))
         self.details_button.setEnabled(bool(run))
+        # A row already at an end of the line has nowhere to go, and a button
+        # that does nothing when pressed is worse than one that is greyed out.
+        queued = self._selected_queued()
+        queued_row = self.queue.currentRow()
+        movable = bool(queued and queued.dispatch_id and "UP" in set(queued.actions))
+        self.queue_up_button.setEnabled(movable and queued_row > 0)
+        self.queue_down_button.setEnabled(movable and 0 <= queued_row < len(self._queue_runs) - 1)
         # RESET ALL never depends on a selection: it exists precisely for the
         # board state where nothing is usefully selectable. It also stays live
         # while presses are still queued in the desktop's dispatch debounce --

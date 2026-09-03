@@ -209,6 +209,16 @@ class BridgeService:
         from urllib.parse import quote
         return _browser_bridge_request(self.config, "POST", f"/v1/browser/jobs/{quote(str(dispatch_id), safe='')}/cancel")
 
+    def reorder_browser_job(self, dispatch_id: str, delta: int) -> dict[str, Any]:
+        """Move a waiting dispatch up (-1) or down (+1) the line."""
+        from urllib.parse import quote
+        return _browser_bridge_request(
+            self.config,
+            "POST",
+            f"/v1/browser/jobs/{quote(str(dispatch_id), safe='')}/reorder",
+            payload={"delta": int(delta)},
+        )
+
     def abandon_browser_job(self, dispatch_id: str, reason: str = "") -> dict[str, Any]:
         """Force a stuck BLOCKED dispatch terminal so the project lane frees up."""
         from urllib.parse import quote

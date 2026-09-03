@@ -271,6 +271,15 @@ class DispatchJob:
     updated_at: float = 0.0
     cancel_owner_worker_id: str = ""
     cancel_owner_lease_id: str = ""
+    #: Where this job sits in the waiting line. Zero means "never reordered",
+    #: and falls back to created_at -- so a job written before this field
+    #: existed keeps its FIFO place instead of jumping to the front.
+    queue_order: float = 0.0
+
+    @property
+    def queue_key(self) -> tuple[float, float]:
+        """Sort key for the waiting line: explicit order first, then age."""
+        return (float(self.queue_order or self.created_at), float(self.created_at))
 
 
 def new_dispatch_id() -> str:
@@ -932,6 +941,63 @@ class BrowserDispatcher:
             self._work_available.notify_all()
             return job
 
+    def queued_jobs_in_order(self) -> list[DispatchJob]:
+        """The waiting line, in the order a freed window will consume it.
+
+        RETRYABLE jobs sit in the same line -- they are waiting for a window
+        exactly like a QUEUED one, and hiding them would make the next claim
+        look like it jumped the queue.
+        """
+        with self._lock:
+            return sorted(
+                (job for job in self._jobs.values() if job.state in (JOB_QUEUED, JOB_RETRYABLE)),
+                key=lambda job: job.queue_key,
+            )
+
+    def reorder_job(self, dispatch_id: str, delta: int) -> list[str]:
+        """Move a waiting job up (-1) or down (+1) the line.
+
+        Which project takes the NEXT window to come free is the operator's
+        call, not the order they happened to press START in. Only jobs still
+        WAITING can move: one already leased to a window has a window, and
+        reordering it would mean taking it away from that window.
+
+        Returns the dispatch ids in their new order. A move off either end is
+        a no-op, not an error -- the button stays pressable at the top row.
+        """
+        with self._lock:
+            job = self._jobs.get(str(dispatch_id))
+            if job is None:
+                raise DispatchError("unknown_dispatch", "dispatch_id is not known")
+            if job.state not in (JOB_QUEUED, JOB_RETRYABLE):
+                raise DispatchError(
+                    "not_waiting", f"only a waiting job can be reordered (this one is {job.state})"
+                )
+            line = self.queued_jobs_in_order()
+            index = next((i for i, item in enumerate(line) if item.dispatch_id == job.dispatch_id), -1)
+            if index < 0 or not delta:
+                return [item.dispatch_id for item in line]
+            # MOVE, not swap: "up two" means two places up the line, leaving the
+            # jobs it passed in their own relative order. A swap would put the
+            # job it jumped over at the BACK, which is not what an arrow means.
+            # Clamped rather than refused, so holding the arrow at either end
+            # settles instead of erroring.
+            target = max(0, min(len(line) - 1, index + int(delta)))
+            if target == index:
+                return [item.dispatch_id for item in line]
+            line.insert(target, line.pop(index))
+            # Renumber the whole line from one. Safe under the lock: claim_job
+            # takes the same lock, so no window is picking a job mid-renumber.
+            # Small integers also keep NEW jobs at the back, because their
+            # fallback order is created_at -- an epoch, far larger than any of
+            # these.
+            now = _now()
+            for position, item in enumerate(line, start=1):
+                item.queue_order = float(position)
+                item.updated_at = now
+            self._persist_jobs()
+            return [item.dispatch_id for item in line]
+
     def _prune_history_locked(self) -> None:
         terminal = sorted(
             (job for job in self._jobs.values() if job.state in TERMINAL_STATES),
@@ -1050,7 +1116,10 @@ class BrowserDispatcher:
             or (j.state == JOB_RETRYABLE and now >= j.next_retry_at)
         ]
         candidates = [j for j in candidates if self._worker_may_take(worker, j, now)]
-        return min(candidates, key=lambda j: j.created_at) if candidates else None
+        # FIFO by default, but the operator can move a job up the line: which
+        # project takes the NEXT window to come free is their call, not the
+        # order they happened to press START in.
+        return min(candidates, key=lambda j: j.queue_key) if candidates else None
 
     def _worker_may_take(self, worker: WorkerRecord, job: DispatchJob, now: float) -> bool:
         """Hold a job briefly for a window already running its campaign profile.

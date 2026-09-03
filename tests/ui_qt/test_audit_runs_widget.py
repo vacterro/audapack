@@ -188,3 +188,99 @@ def test_reset_all_button_tracks_unfinished_work(qapp):
 
     widget.set_runs([run(1, "READY", True), run(2, "AUDITING")])
     assert widget.reset_all_button.isEnabled() is True
+
+
+# ------------------------------------------------------------------- queue
+#
+# The lane table only ever shows six. A seventh queued project was invisible,
+# and an order you cannot see is one you cannot decide.
+
+
+def waiting(index: int, position: int):
+    return AuditRunSnapshot(
+        project_id=f"q{index}",
+        project_name=f"Queued {index}",
+        operator_state="WAITING",
+        summary="WAITING FOR WORKER · 0/3",
+        dispatch_id=f"dsp-q{index}",
+        dispatch_state="QUEUED",
+        actions=("UP", "DOWN", "CANCEL", "DETAILS"),
+        queue_position=position,
+        created_at=float(index),
+    )
+
+
+def test_the_queue_section_is_hidden_when_nothing_is_waiting(qapp):
+    """An empty table with a header is 120px of nothing."""
+    widget = AuditRunsWidget()
+    widget.set_runs([run(index) for index in range(1, 7)])
+    assert widget.queue.rowCount() == 0
+    assert not widget.queue.isVisibleTo(widget)
+    assert not widget.queue_actions_row.isVisibleTo(widget)
+
+
+def test_a_project_past_the_sixth_lane_is_still_visible_in_the_queue(qapp):
+    widget = AuditRunsWidget()
+    widget.set_runs([run(index) for index in range(1, 7)] + [waiting(7, 0), waiting(8, 1)])
+    assert widget.queue.rowCount() == 2
+    assert widget.queue.isVisibleTo(widget)
+    assert widget.queue.item(0, 1).text() == "Queued 7"
+    assert widget.queue.item(1, 1).text() == "Queued 8"
+
+
+def test_the_queue_is_shown_in_the_order_the_dispatcher_will_consume_it(qapp):
+    widget = AuditRunsWidget()
+    widget.set_runs([waiting(7, 2), waiting(8, 0), waiting(9, 1)])
+    assert [widget.queue.item(row, 1).text() for row in range(3)] == [
+        "Queued 8", "Queued 9", "Queued 7"
+    ]
+    assert [widget.queue.item(row, 0).text() for row in range(3)] == ["1", "2", "3"]
+
+
+def test_moving_a_queued_project_emits_its_dispatch_and_direction(qapp):
+    widget = AuditRunsWidget()
+    widget.set_runs([waiting(7, 0), waiting(8, 1), waiting(9, 2)])
+    moves = []
+    widget.reorder_requested.connect(lambda did, delta: moves.append((did, delta)))
+    widget.queue.selectRow(1)
+    widget.queue_up_button.click()
+    widget.queue_down_button.click()
+    assert moves == [("dsp-q8", -1), ("dsp-q8", 1)]
+
+
+def test_the_ends_of_the_line_have_nowhere_to_go(qapp):
+    """A button that does nothing when pressed is worse than a greyed one."""
+    widget = AuditRunsWidget()
+    widget.set_runs([waiting(7, 0), waiting(8, 1)])
+    widget.queue.selectRow(0)
+    assert not widget.queue_up_button.isEnabled()
+    assert widget.queue_down_button.isEnabled()
+    widget.queue.selectRow(1)
+    assert widget.queue_up_button.isEnabled()
+    assert not widget.queue_down_button.isEnabled()
+
+
+def test_a_run_that_already_has_a_window_cannot_be_moved(qapp):
+    """ATTACHING means a window is holding it; moving it would take it away."""
+    import dataclasses
+
+    attaching = dataclasses.replace(
+        waiting(7, 0), operator_state="ATTACHING", actions=("CANCEL", "DETAILS")
+    )
+    widget = AuditRunsWidget()
+    widget.set_runs([attaching, waiting(8, 1)])
+    widget.queue.selectRow(0)
+    assert not widget.queue_up_button.isEnabled()
+    assert not widget.queue_down_button.isEnabled()
+
+
+def test_a_refresh_keeps_the_queue_selection(qapp):
+    """A 4s repaint that drops the selection makes UP/DOWN unusable."""
+    widget = AuditRunsWidget()
+    widget.set_runs([waiting(7, 0), waiting(8, 1), waiting(9, 2)])
+    widget.queue.selectRow(2)
+    widget.set_runs([waiting(7, 0), waiting(8, 1), waiting(9, 2)])
+    assert widget.queue.currentRow() == 2
+    # It follows the project, not the row: that is the point of moving it.
+    widget.set_runs([waiting(9, 0), waiting(7, 1), waiting(8, 2)])
+    assert widget.queue.currentRow() == 0

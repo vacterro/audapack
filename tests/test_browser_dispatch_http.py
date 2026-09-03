@@ -340,3 +340,70 @@ def test_owner_poll_renews_the_lease_of_a_long_running_audit(bridge_server, tmp_
     job = dispatcher.get_job(dispatch_id)
     assert job.state == "AUDITING"
     assert job.lease_expires_at > time.time()
+
+
+def _enqueue(conn, config, tmp_path, name: str) -> str:
+    archive = _archive(tmp_path, f"{name}.zip")
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": name,
+        "project_id": name.lower(),
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 200, payload
+    return payload["dispatch"]["dispatch_id"]
+
+
+def _get_jobs(conn, config) -> list[dict]:
+    conn.request("GET", "/v1/browser/jobs", headers={"X-ACB-Token": config.bridge.token})
+    resp = conn.getresponse()
+    return json.loads(resp.read().decode("utf-8"))["jobs"]
+
+
+def test_the_waiting_line_can_be_reordered_over_the_wire(bridge_server, tmp_path):
+    """Which project takes the next freed window is the operator's call."""
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    first = _enqueue(conn, config, tmp_path, "QA")
+    second = _enqueue(conn, config, tmp_path, "QB")
+    third = _enqueue(conn, config, tmp_path, "QC")
+
+    # Move, not swap: two places up, leaving what it passed in its own order.
+    status, payload = _post(conn, f"/v1/browser/jobs/{third}/reorder", {"delta": -2}, config.bridge.token)
+    assert status == 200, payload
+    assert payload["order"] == [third, first, second]
+
+    positions = {job["dispatch_id"]: job["queue_position"] for job in _get_jobs(conn, config)}
+    assert positions[third] == 0
+    assert positions[first] == 1
+    assert positions[second] == 2
+
+
+def test_a_job_with_a_window_refuses_to_be_reordered_over_the_wire(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    dispatch_id = _enqueue(conn, config, tmp_path, "QD")
+    status, payload = _post(conn, "/v1/browser/poll", {
+        "worker_id": "w_reorder", "generating": False, "action_in_flight": False,
+        "has_manual_draft": False, "has_attachments": False,
+    }, config.bridge.token)
+    assert status == 200 and payload["job"]["dispatch_id"] == dispatch_id
+
+    status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/reorder", {"delta": -1}, config.bridge.token)
+    assert status == 400
+    assert payload["error"]["code"] == "not_waiting"
+
+    # A job that is not waiting reports no place in the line, rather than 0 --
+    # which would put it at the FRONT of a queue it is not even in.
+    positions = {job["dispatch_id"]: job["queue_position"] for job in _get_jobs(conn, config)}
+    assert positions[dispatch_id] == -1
+
+
+def test_reorder_needs_the_token_like_every_other_dispatch_call(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    dispatch_id = _enqueue(conn, config, tmp_path, "QE")
+    status, _payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/reorder", {"delta": -1}, "wrong-token")
+    assert status == 403

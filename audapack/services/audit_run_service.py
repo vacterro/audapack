@@ -115,6 +115,9 @@ class AuditRunSnapshot:
     agent_summary: str = ""
     agent_guidance: str = ""
     agent_residue: int = 0
+    #: Place in the line for the next window to come free. Zero-based; -1 for a
+    #: run that is not waiting -- one that already has a window, or is finished.
+    queue_position: int = -1
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -463,8 +466,20 @@ def _profile_wave_count(profile_id: str, default: int = 3) -> int:
     return default
 
 
+def _as_queue_position(value: Any) -> int:
+    """Place in the waiting line, or -1 when the run is not waiting."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _actions_for(operator_state: str) -> tuple[str, ...]:
-    if operator_state in {"PREPARING", "WAITING", "RETRYING", "ATTACHING"}:
+    if operator_state in {"WAITING", "RETRYING"}:
+        # Still in the line, so it can still be moved in it. ATTACHING is not:
+        # by then a window is already holding the job.
+        return ("UP", "DOWN", "CANCEL", "DETAILS")
+    if operator_state in {"PREPARING", "ATTACHING"}:
         return ("CANCEL", "DETAILS")
     if operator_state in {"STARTING", "AUDITING", "SAVING"}:
         return ("DETAILS",)
@@ -581,7 +596,9 @@ class AuditRunCoordinator:
         dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
         if self.workers is None:
             return {"desired": 0, "launched": []}
-        wanted = max(1, int(lanes or 0))
+        # More queued projects than lanes is the normal case now; opening a
+        # window per queued job is exactly the multiplying this must not do.
+        wanted = max(1, min(int(lanes or 0), MAX_AUDIT_LANES))
         demand = (
             int(dispatch_status.get("queued_jobs", 0) or 0)
             + int(dispatch_status.get("active_jobs", 0) or 0)
@@ -779,7 +796,11 @@ class AuditRunCoordinator:
         }
 
     def start_batch(self, project_ids: Iterable[str], profile_id: str = "quick3") -> list[AuditStartResult]:
-        unique = list(dict.fromkeys(str(value) for value in project_ids if str(value)))[:MAX_AUDIT_LANES]
+        # No lane cap on the QUEUE. The pool holds the waiting jobs and a window
+        # that frees up claims the next one, so asking for more projects than
+        # there are windows is a line, not an overflow. Only the WINDOWS are
+        # capped, inside provision_capacity.
+        unique = list(dict.fromkeys(str(value) for value in project_ids if str(value)))
         if not unique:
             return []
         # Windows first, for the whole batch, before the first archive is
@@ -794,6 +815,27 @@ class AuditRunCoordinator:
         except Exception:
             provisioned = False
         return [self.start(project_id, profile_id, provision=not provisioned) for project_id in unique]
+
+    def reorder(self, dispatch_id: str, delta: int) -> AuditStartResult:
+        """Move a waiting run up (-1) or down (+1) the line for the next window.
+
+        The pool already holds more jobs than there are windows and a freed
+        window claims the next one; this decides which one that is.
+        """
+        response = self.bridge.reorder_browser_job(str(dispatch_id), int(delta))
+        intent = self.intents.find_for_dispatch(str(dispatch_id))
+        project_id = str((intent or {}).get("project_id") or "")
+        intent_id = str((intent or {}).get("intent_id") or "")
+        if response.get("ok"):
+            place = list(response.get("order") or []).index(str(dispatch_id)) + 1                 if str(dispatch_id) in list(response.get("order") or []) else 0
+            return AuditStartResult(
+                True, project_id, intent_id, str(dispatch_id), "WAITING",
+                f"Now {place} in the queue" if place else "Queue reordered",
+            )
+        error = response.get("error") or "Bridge refused the reorder"
+        if isinstance(error, dict):
+            error = error.get("message") or error.get("code") or "Bridge refused the reorder"
+        return AuditStartResult(False, project_id, intent_id, str(dispatch_id), "WAITING", str(error))
 
     def cancel(self, dispatch_id: str) -> AuditStartResult:
         response = self.bridge.cancel_browser_job(str(dispatch_id))
@@ -1035,6 +1077,9 @@ class AuditRunCoordinator:
             updated_at=float(job.get("updated_at") or (intent or {}).get("updated_at") or 0.0),
             completed_at=float(job.get("completed_at") or (intent or {}).get("completed_at") or 0.0),
             actions=_actions_for(operator),
+            # Zero is the FRONT of the line, not a missing value: `or -1` here
+            # hid the one row the operator cares most about.
+            queue_position=_as_queue_position(job.get("queue_position")),
         )
 
     #: A finished intent's true operator state. Everything not in

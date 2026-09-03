@@ -626,7 +626,14 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(parsed.query)
             project_id = str((query.get("project_id") or [""])[0]).strip()
-            jobs = self._dispatcher().list_jobs()
+            dispatcher = self._dispatcher()
+            jobs = dispatcher.list_jobs()
+            # Computed over the WHOLE line, before any project filter: position
+            # 3 has to mean third in the queue, not third among what was asked for.
+            waiting_positions = {
+                item.dispatch_id: index
+                for index, item in enumerate(dispatcher.queued_jobs_in_order())
+            }
             if project_id:
                 jobs = [job for job in jobs if job.project_id == project_id]
             self.send_json(200, {
@@ -656,6 +663,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     # the coordinator cannot prove campaign_match, and a
                     # finished audit never leaves SAVING.
                     "meta_run_id_drift": job.meta_run_id_drift,
+                    # Where a WAITING job sits in the line for the next window
+                    # to come free. Zero-based; -1 for a job that is not waiting.
+                    "queue_position": waiting_positions.get(job.dispatch_id, -1),
                 } for job in jobs],
             })
         elif parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/artifact"):
@@ -730,6 +740,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/abandon"):
             self._handle_browser_abandon(parsed.path)
+            return
+
+        if parsed.path.startswith("/v1/browser/jobs/") and parsed.path.endswith("/reorder"):
+            self._handle_browser_reorder(parsed.path)
             return
 
         if parsed.path == "/v1/browser/relaunch-slot":
@@ -1920,6 +1934,33 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
             return
         self.send_json(200, {"ok": True, "dispatch_id": dispatch_id, "state": job.state, "error": job.error})
+
+    def _handle_browser_reorder(self, path: str) -> None:
+        """Move a waiting job up or down the line for the next freed window.
+
+        The pool already holds more jobs than there are windows and a window
+        that frees up claims the next one; this is the say in WHICH one, which
+        was otherwise strictly the order START happened to be pressed in.
+        """
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 5 or parts[2] != "jobs" or parts[4] != "reorder":
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+            return
+        data = self._read_json_body() if self.headers.get("Content-Length") else {}
+        if data is None:
+            return
+        try:
+            delta = int((data or {}).get("delta", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {"ok": False, "error": {"code": "invalid_delta", "message": "delta must be an integer"}})
+            return
+        dispatcher = self._dispatcher()
+        try:
+            order = dispatcher.reorder_job(parts[3], delta)
+        except BrowserDispatchError as exc:
+            self.send_json(400, {"ok": False, "error": {"code": exc.code, "message": str(exc), "retriable": exc.retriable}})
+            return
+        self.send_json(200, {"ok": True, "dispatch_id": parts[3], "order": order})
 
     def _handle_browser_submit(self) -> None:
         data = self._read_json_body()

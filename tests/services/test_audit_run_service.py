@@ -183,13 +183,19 @@ def test_restart_reconstructs_predispatch_intent_without_duplicate(tmp_path):
     assert bridge.submits == 1
 
 
-def test_batch_caps_at_six_and_isolates_pack_failure(tmp_path):
+def test_the_whole_batch_is_queued_and_a_pack_failure_is_isolated(tmp_path):
+    """Seven projects, seven answers -- the seventh is not dropped on the floor.
+
+    The pool holds more jobs than there are windows and a freed window claims
+    the next one, so a batch bigger than the lane count is a LINE, not an
+    overflow. Only the windows are capped.
+    """
     projects = [project(f"p{index}") for index in range(1, 8)]
     service, bridge, _audits = coordinator(tmp_path, projects, failures={"p3"})
     results = service.start_batch([item.id for item in projects])
-    assert len(results) == 6
+    assert len(results) == 7
     assert [result.project_id for result in results if not result.ok] == ["p3"]
-    assert len(bridge.jobs) == 5
+    assert len(bridge.jobs) == 6
 
 
 def test_ready_requires_complete_matching_run_waves_file_and_hash(tmp_path):
@@ -402,13 +408,38 @@ def test_intent_history_is_bounded(tmp_path):
     assert entries[0]["project_id"] == "p3"
 
 
-def test_seventh_project_is_capped_not_silently_dropped(tmp_path):
+def test_eight_projects_all_join_the_queue(tmp_path):
     projects = [project(f"p{index}") for index in range(1, 9)]
     service, bridge, _audits = coordinator(tmp_path, projects)
     results = service.start_batch([item.id for item in projects])
-    assert len(results) == 6
-    assert len(bridge.jobs) == 6
+    assert len(results) == 8
+    assert len(bridge.jobs) == 8
     assert all(result.ok for result in results)
+
+
+def test_a_long_queue_never_asks_for_more_than_six_windows(tmp_path):
+    """The multiplying this must not do: one window per queued job.
+
+    This is the ASK side. The supervisor clamps the answer too -- see
+    test_managed_worker_capacity_is_six_slot_bounded_and_cooldown_safe, which
+    hands it 99 and gets six slots -- so a raised ask cannot open a seventh
+    window either. Both halves, because the ask is what the operator sees in
+    the settle wait.
+    """
+    from audapack.services.audit_run_service import MAX_AUDIT_LANES
+
+    asked = []
+
+    class CountingSupervisor:
+        def ensure_capacity(self, _status, demand):
+            asked.append(int(demand))
+            return {"desired": 0, "launched": []}
+
+    projects = [project(f"p{index}") for index in range(1, 13)]
+    service, _bridge, _audits = coordinator(tmp_path, projects, supervisor=CountingSupervisor())
+    service.start_batch([item.id for item in projects])
+    assert asked, "capacity was never provisioned"
+    assert max(asked) <= MAX_AUDIT_LANES, asked
 
 
 def test_duplicate_double_start_returns_same_dispatch_and_intent(tmp_path):

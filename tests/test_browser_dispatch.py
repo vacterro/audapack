@@ -2083,3 +2083,128 @@ def test_a_numbered_slot_is_proof_of_the_dedicated_profile(tmp_path):
     ))
     assert record.managed_profile is True
     assert d.worker_free_for_claim(record) is True
+
+
+# --------------------------------------------------------------- queue order
+#
+# The pool already holds more jobs than there are windows, and a window that
+# frees up claims the next one instead of a new window being opened. What was
+# missing was any say in WHICH one: the line was strictly the order START was
+# pressed in.
+
+
+def free_worker(wid: str, **overrides) -> dict:
+    return worker(
+        wid, widget_version="AUDAPACK_WIDGET/3", is_chromium=True, page_eligible=True,
+        url_path="/", browser_name="Chrome", clean_for_audit=True,
+        has_conversation_turns=False, **overrides,
+    )
+
+
+def queued_line(d: BrowserDispatcher) -> list[str]:
+    return [job.project_name for job in d.queued_jobs_in_order()]
+
+
+def three_queued(tmp_path) -> tuple[BrowserDispatcher, dict]:
+    d = dispatcher(tmp_path)
+    jobs = {}
+    for name in ("A", "B", "C"):
+        path = archive(tmp_path, f"{name}.zip")
+        jobs[name] = d.enqueue_job(job_payload(path, name))
+        # Distinct creation stamps: the default line is FIFO by age.
+        time.sleep(0.01)
+    return d, jobs
+
+
+def test_the_line_is_fifo_until_somebody_reorders_it(tmp_path):
+    d, _jobs = three_queued(tmp_path)
+    assert queued_line(d) == ["A", "B", "C"]
+
+
+def test_a_waiting_job_can_be_moved_up_the_line(tmp_path):
+    d, jobs = three_queued(tmp_path)
+    assert d.reorder_job(jobs["C"].dispatch_id, -1) == [
+        jobs["A"].dispatch_id, jobs["C"].dispatch_id, jobs["B"].dispatch_id
+    ]
+    assert queued_line(d) == ["A", "C", "B"]
+
+
+def test_the_freed_window_takes_whatever_is_now_first(tmp_path):
+    """The whole point: reordering decides who gets the next window."""
+    d, jobs = three_queued(tmp_path)
+    d.reorder_job(jobs["C"].dispatch_id, -1)
+    d.reorder_job(jobs["C"].dispatch_id, -1)
+    d.register_worker(free_worker("w1"))
+    assert d.claim_job("w1").dispatch_id == jobs["C"].dispatch_id
+
+
+def test_a_move_off_either_end_is_a_no_op_not_an_error(tmp_path):
+    """Or the button at the top row throws instead of doing nothing."""
+    d, jobs = three_queued(tmp_path)
+    assert queued_line(d) == ["A", "B", "C"]
+    d.reorder_job(jobs["A"].dispatch_id, -1)
+    d.reorder_job(jobs["C"].dispatch_id, +1)
+    assert queued_line(d) == ["A", "B", "C"]
+
+
+def test_a_bigger_step_moves_rather_than_swaps(tmp_path):
+    """"Up two" means two places up, leaving what it passed in order.
+
+    A swap would send the job it jumped over to the BACK of the line, which is
+    not what an arrow means and not what a drag would do either.
+    """
+    d, jobs = three_queued(tmp_path)
+    assert d.reorder_job(jobs["C"].dispatch_id, -2) == [
+        jobs["C"].dispatch_id, jobs["A"].dispatch_id, jobs["B"].dispatch_id
+    ]
+    assert queued_line(d) == ["C", "A", "B"]
+
+
+def test_a_step_past_the_end_is_clamped_not_refused(tmp_path):
+    """Holding the arrow at the end settles instead of erroring."""
+    d, jobs = three_queued(tmp_path)
+    d.reorder_job(jobs["C"].dispatch_id, -99)
+    assert queued_line(d) == ["C", "A", "B"]
+    d.reorder_job(jobs["C"].dispatch_id, +99)
+    assert queued_line(d) == ["A", "B", "C"]
+
+
+def test_a_job_that_already_has_a_window_cannot_be_reordered(tmp_path):
+    """It has a window. Moving it in the line would mean taking that away."""
+    d, jobs = three_queued(tmp_path)
+    d.register_worker(free_worker("w1"))
+    leased = d.claim_job("w1")
+    with pytest.raises(DispatchError) as excinfo:
+        d.reorder_job(leased.dispatch_id, +1)
+    assert excinfo.value.code == "not_waiting"
+
+
+def test_reordering_an_unknown_dispatch_says_so(tmp_path):
+    d, _jobs = three_queued(tmp_path)
+    with pytest.raises(DispatchError) as excinfo:
+        d.reorder_job("dsp-nope", -1)
+    assert excinfo.value.code == "unknown_dispatch"
+
+
+def test_a_new_job_joins_the_back_even_after_a_reorder(tmp_path):
+    """Reordering swaps two places; it must not make the line unstable."""
+    d, jobs = three_queued(tmp_path)
+    d.reorder_job(jobs["C"].dispatch_id, -1)
+    time.sleep(0.01)
+    d.enqueue_job(job_payload(archive(tmp_path, "D.zip"), "D"))
+    assert queued_line(d) == ["A", "C", "B", "D"]
+
+
+def test_the_order_survives_a_restart(tmp_path):
+    d, jobs = three_queued(tmp_path)
+    d.reorder_job(jobs["C"].dispatch_id, -1)
+    reopened = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    assert queued_line(reopened) == ["A", "C", "B"]
+
+
+def test_a_job_written_before_the_field_existed_keeps_its_place(tmp_path):
+    """queue_order 0 means "never reordered", not "first in the line"."""
+    d, _jobs = three_queued(tmp_path)
+    for job in d._jobs.values():
+        job.queue_order = 0.0
+    assert queued_line(d) == ["A", "B", "C"]

@@ -681,6 +681,7 @@ class MainWindow(QMainWindow):
         self.audit_runs_widget.reset_all_requested.connect(self._on_reset_all_audit_runs)
         self.audit_runs_widget.open_requested.connect(self._on_open_audit_result)
         self.audit_runs_widget.diagnostics_requested.connect(self._on_copy_audit_diagnostics)
+        self.audit_runs_widget.reorder_requested.connect(self._on_reorder_audit_queue)
 
         # Tab 2: embedded instance management; never creates a separate window.
         self._instance_manager = InstanceManagerWidget(
@@ -1623,10 +1624,12 @@ QToolTip QLabel {
             self._flash_status("AUDIT GROUP: select a project first", "#D66464")
             return
         group = proj.priority_group.upper()
+        # The whole group, not the first six: the rest wait in the pool queue
+        # and take windows as they come free, instead of being dropped here.
         projects = [
             item.id for item in self._service.list_projects()
             if item.enabled and item.source_path and item.priority_group.upper() == group
-        ][:6]
+        ]
         if not projects:
             self._flash_status(f"AUDIT GROUP: no enabled projects in {group}", "#D66464")
             return
@@ -1844,6 +1847,35 @@ QToolTip QLabel {
             self._flash_status(f"Reset all failed: {err}", "#D66464")
 
         self.task_runner.submit("audit-runs-reset-all", _reset, on_success=_done, on_error=_error)
+
+    def _on_reorder_audit_queue(self, dispatch_id: str, delta: int):
+        """Move a waiting run in the line for the next window to come free.
+
+        No confirmation: it changes who goes next, nothing irreversible, and a
+        dialog per press would make reordering six projects unusable.
+        """
+        did = str(dispatch_id or "")
+        if not did:
+            return
+        key = f"audit:reorder:{did}"
+        if self.task_runner.is_running(key):
+            return
+
+        def _work():
+            return self._audit_runs.reorder(did, int(delta))
+
+        def _done(result):
+            self._flash_status(
+                result.message if result.ok else f"Queue move failed: {result.message}",
+                "#D4A840" if result.ok else "#D66464",
+                duration_ms=3000 if result.ok else 6000,
+            )
+            self._refresh_audit_runs_async()
+
+        def _error(error):
+            self._flash_status(f"Queue move failed: {error}", "#D66464", duration_ms=6000)
+
+        self.task_runner.submit(key, _work, on_success=_done, on_error=_error)
 
     def _on_abandon_audit_dispatch_id(self, dispatch_id: str):
         """Force a stuck BLOCKED run terminal after explicit operator confirmation."""
