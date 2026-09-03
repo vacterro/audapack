@@ -206,6 +206,45 @@ def print_status() -> int:
     return 0
 
 
+#: Everything the Tkinter window cannot do. It predates the audit pipeline and
+#: has no reference to any of it, so a fallback that opened quietly looked like
+#: a working AUDAPACK and simply had no audits in it.
+TKINTER_FALLBACK_MISSING = (
+    "audit runs, the worker pool, the audit queue, agent launcher buttons, "
+    "compact rows and worker window arrangement"
+)
+
+
+def _warn_qt_missing(detail: str) -> None:
+    """Say the Qt UI could not load somewhere the operator will actually see.
+
+    The only warning used to be a line on stderr, and the documented ways in
+    are AUDAPACK.vbs and pythonw -- both of which discard it. So the fallback
+    opened silently, and the Tkinter window has NO audit pipeline in it at all:
+    it looks like AUDAPACK with the audits mysteriously missing.
+    """
+    message = (
+        f"PySide6 could not be loaded ({detail}).\n\n"
+        f"AUDAPACK is opening its legacy Tkinter window, which cannot drive "
+        f"{TKINTER_FALLBACK_MISSING}.\n\n"
+        "Install the Qt UI with:  pip install PySide6"
+    )
+    print(message, file=sys.stderr)
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        MB_ICONWARNING, MB_OK, MB_SETFOREGROUND = 0x30, 0x0, 0x10000
+        ctypes.windll.user32.MessageBoxW(
+            None, message, f"{__app_name__} - Qt UI unavailable",
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND,
+        )
+    except Exception:
+        # A missing message box must never be the reason the app does not open.
+        pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"{__app_name__} — Windows cockpit for verified ZIP packaging and multi-wave AI audit handoff."
@@ -334,7 +373,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         return run_qt_gui()
     except ImportError as exc:
-        print(f"Qt (PySide6) not available ({exc}); falling back to Tkinter. Install with: pip install PySide6", file=sys.stderr)
+        _warn_qt_missing(str(exc))
         from audapack.ui.main_window import run_gui
 
         return run_gui()

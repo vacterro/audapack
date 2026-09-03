@@ -96,3 +96,49 @@ def test_the_example_config_is_loadable_and_has_no_invalid_key(tmp_path):
     shutil.copy(ROOT / "config.example.json", tmp_path / "config.json")
     loaded = load_config(tmp_path)
     assert loaded.launchers, "the example's launchers did not survive a load"
+
+
+# --------------------------------------------------- T-137: the quiet fallback
+#
+# audapack/ui/ predates the audit pipeline and has NO reference to any of it,
+# so a fallback that opened quietly looked like a working AUDAPACK with the
+# audits mysteriously missing. The only warning was a line on stderr, and the
+# documented ways in -- AUDAPACK.vbs and pythonw -- both discard it.
+
+
+def test_the_tkinter_fallback_is_announced_where_it_can_be_seen():
+    from unittest.mock import patch
+
+    from audapack import app
+
+    with patch.object(app.sys, "platform", "win32"), \
+         patch("ctypes.windll", create=True) as windll:
+        app._warn_qt_missing("No module named 'PySide6'")
+    windll.user32.MessageBoxW.assert_called_once()
+    shown = windll.user32.MessageBoxW.call_args.args[1]
+    assert "PySide6" in shown
+    assert "audit runs" in shown
+
+
+def test_a_missing_message_box_never_stops_the_app_opening():
+    from unittest.mock import patch
+
+    from audapack import app
+
+    with patch.object(app.sys, "platform", "win32"), \
+         patch("ctypes.windll", create=True) as windll:
+        windll.user32.MessageBoxW.side_effect = OSError("no user32")
+        app._warn_qt_missing("boom")  # must not raise
+
+
+def test_the_fallback_names_what_the_old_window_cannot_do():
+    """If audapack/ui/ ever learns one of these, the warning must stop saying it."""
+    from audapack.app import TKINTER_FALLBACK_MISSING
+
+    legacy = (ROOT / "audapack" / "ui").rglob("*.py")
+    legacy_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in legacy)
+    for marker in ("audit_runs", "queue_position", "arrange_worker_windows", "compact_rows"):
+        assert marker not in legacy_text, (
+            f"audapack/ui/ now references {marker}; TKINTER_FALLBACK_MISSING is stale"
+        )
+    assert TKINTER_FALLBACK_MISSING
