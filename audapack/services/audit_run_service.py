@@ -441,6 +441,19 @@ def blocked_guidance(error: str, post_start: bool) -> tuple[str, str]:
     return why, action
 
 
+def _profile_wave_count(profile_id: str, default: int = 3) -> int:
+    """How many waves this profile actually has, before any wave is saved."""
+    try:
+        from audapack.campaign import get_profile
+
+        waves = getattr(get_profile(str(profile_id or "")), "waves", None)
+        if waves:
+            return len(waves)
+    except Exception:
+        pass
+    return default
+
+
 def _actions_for(operator_state: str) -> tuple[str, ...]:
     if operator_state in {"PREPARING", "WAITING", "RETRYING", "ATTACHING"}:
         return ("CANCEL", "DETAILS")
@@ -654,7 +667,15 @@ class AuditRunCoordinator:
                 )
                 self.workers.ensure_capacity(dispatch_status, demand)
             self.intents.update(intent_id, status="PACKING")
-            packed = self.packing.ensure_fresh_archive(project.id)
+            # Freshness is an mtime comparison, and mtime lies often enough to
+            # matter: a restored file, a clock skew or a changed exclude list
+            # all leave a stale archive looking current, and the operator then
+            # waits out a full audit of code they have already moved past.
+            audits_cfg = getattr(getattr(self.projects, "config", None), "audits", None)
+            if bool(getattr(audits_cfg, "autopack_before_audit", True)):
+                packed = self.packing.pack_project(project.id)
+            else:
+                packed = self.packing.ensure_fresh_archive(project.id)
             if not packed.success or not packed.output_path:
                 raise RuntimeError(packed.error_message or "Packing failed")
             self.intents.update(intent_id, status="SUBMITTING", archive_path=str(Path(packed.output_path).resolve()))
@@ -908,7 +929,17 @@ class AuditRunCoordinator:
         ready, proof, handoff_path, handoff_hash = self._ready_proof(job, audit)
         matching = self.audit_matches_dispatch(job, audit)
         completed = int(getattr(audit, "completed_waves", 0) or 0) if matching else 0
-        total = int(getattr(audit, "total_waves", 3) or 3) if matching and audit else 3
+        # The DISPATCH knows its profile from the moment it is queued; the audit
+        # index only learns the wave count once a wave has been saved. Falling
+        # back to a hardcoded 3 made every A10 lane read "AUDIT 0/3" for the
+        # whole of wave 1 -- which on a real repo is 15-25 minutes of a ten-wave
+        # run looking like a stalled three-wave one. Six healthy lanes were
+        # RESET ALL'd over exactly that.
+        total = int(getattr(audit, "total_waves", 0) or 0) if matching and audit else 0
+        if not total:
+            total = _profile_wave_count(
+                str(job.get("profile") or (intent or {}).get("profile_id") or "")
+            )
         mapping = {
             "QUEUED": "WAITING", "RETRYABLE": "RETRYING",
             "LEASED": "ATTACHING", "ARTIFACT_FETCHED": "ATTACHING", "ATTACHED": "ATTACHING",

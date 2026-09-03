@@ -469,6 +469,14 @@ class AuditsConfig:
     #: deleted, so an inbox the agent has fully settled still reports dirty.
     #: Off by default -- the central audit root already keeps every wave.
     mirror_include_waves: bool = False
+    #: Repack the project archive before every audit instead of reusing one
+    #: that freshness says is still current. Freshness compares the archive's
+    #: mtime against the newest file in the source tree, which is right until
+    #: it is not -- a touch-free edit, a restored file, a clock skew, or an
+    #: exclude change all leave a stale zip looking current, and then the audit
+    #: is of code the operator has already moved past. On by default: a wasted
+    #: 20s pack is cheaper than a 40-minute audit of the wrong bytes.
+    autopack_before_audit: bool = True
     #: Where the agent journals what it consumed, relative to the project root.
     #: A probe, not a coupling: AUDAPACK reads it if present and reports
     #: "never consumed" if not, and never writes to it. The default suits
@@ -1105,6 +1113,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         mirror_into_project=bool(audits_raw.get("mirror_into_project", False)),
         mirror_dir_name=str(audits_raw.get("mirror_dir_name") or "audit").strip() or "audit",
         mirror_include_waves=bool(audits_raw.get("mirror_include_waves", False)),
+        autopack_before_audit=bool(audits_raw.get("autopack_before_audit", True)),
         agent_receipt_path=str(
             audits_raw.get("agent_receipt_path", DEFAULT_BINDING_REL)
         ).strip(),

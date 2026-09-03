@@ -130,6 +130,7 @@ class SettingsWidget(QWidget):
         self.mirror_into_project.toggled.connect(lambda: self._autosave_timer.start())
         self.mirror_dir_name.textChanged.connect(lambda: self._autosave_timer.start())
         self.mirror_include_waves.toggled.connect(lambda: self._autosave_timer.start())
+        self.autopack_before_audit.toggled.connect(lambda: self._autosave_timer.start())
         self.dedicated_profile_only.toggled.connect(lambda: self._autosave_timer.start())
         self.host.textChanged.connect(lambda: self._autosave_timer.start())
 
@@ -291,6 +292,13 @@ class SettingsWidget(QWidget):
             "never read, never cleaned up, so a settled inbox still reports dirty."
         )
         f.addRow("Per-wave copies", self.mirror_include_waves)
+        self.autopack_before_audit = QCheckBox("Autopack zip before audit")
+        self.autopack_before_audit.setChecked(bool(getattr(self._config.audits, "autopack_before_audit", True)))
+        self.autopack_before_audit.setToolTip(
+            "Always repack, instead of trusting the archive's mtime.\n"
+            "A stale zip means auditing code you have already moved past."
+        )
+        f.addRow("Fresh archive", self.autopack_before_audit)
         self.dedicated_profile_only = QCheckBox("Work only in specialized Chromium instances with widget")
         self.dedicated_profile_only.setChecked(
             bool(getattr(self._config.audits, "dedicated_profile_only", False))
@@ -747,6 +755,7 @@ class SettingsWidget(QWidget):
         c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
         c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"
         c.audits.mirror_include_waves = bool(self.mirror_include_waves.isChecked())
+        c.audits.autopack_before_audit = bool(self.autopack_before_audit.isChecked())
         c.audits.dedicated_profile_only = bool(self.dedicated_profile_only.isChecked())
         c.audits.hot_seconds = self.hot.value()
         c.audits.warm_seconds = self.warm.value()

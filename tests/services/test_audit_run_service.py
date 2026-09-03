@@ -28,6 +28,11 @@ class FakePacking:
         self.root = root
         self.failures = set(failures)
         self.calls = []
+        self.repacks = []
+
+    def pack_project(self, project_id, **_kwargs):
+        self.repacks.append(project_id)
+        return self.ensure_fresh_archive(project_id)
 
     def ensure_fresh_archive(self, project_id):
         self.calls.append(project_id)
@@ -1048,3 +1053,57 @@ def test_a_matching_digest_is_still_saving_until_the_proof_lands(tmp_path):
         "final_handoff_sha256": hashlib.sha256(b"mine").hexdigest(),
     })
     assert service.refresh_runs()[0].operator_state == "SAVING"
+
+
+def test_an_a10_lane_shows_ten_waves_not_three(tmp_path):
+    """Six healthy A10 lanes were RESET ALL'd because the panel said 0/3.
+
+    The dispatch carries its profile from the moment it is queued; the audit
+    index only learns the wave count once a wave has been SAVED. Falling back to
+    a hardcoded 3 meant a ten-wave run read "AUDIT 0/3" for the whole of wave 1
+    -- 15-25 minutes on a real repo -- which is indistinguishable from a stalled
+    three-wave run.
+    """
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1", "super10")
+    bridge.jobs[0].update({"state": "AUDITING", "profile": "super10"})
+
+    run = service.refresh_runs()[0]
+    assert run.total_waves == 10
+    assert run.completed_waves == 0
+    assert "0/10" in run.summary
+
+
+def test_quick3_still_shows_three(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1", "quick3")
+    bridge.jobs[0].update({"state": "AUDITING", "profile": "quick3"})
+    assert service.refresh_runs()[0].total_waves == 3
+
+
+def test_a_saved_wave_count_still_wins(tmp_path):
+    """Once the index knows, it is the authority -- this only fills the gap."""
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1", "super10")
+    bridge.jobs[0].update({"state": "AUDITING", "profile": "super10", "campaign_run_id": "run-1"})
+    audits.snapshots["p1"] = AuditSnapshot(
+        project_id="p1", project_name="Project p1", campaign_run_id="run-1",
+        completed_waves=2, total_waves=10,
+    )
+    run = service.refresh_runs()[0]
+    assert (run.completed_waves, run.total_waves) == (2, 10)
+
+
+def test_autopack_repacks_instead_of_trusting_the_archive_mtime(tmp_path):
+    """Freshness is an mtime compare, and mtime lies often enough to matter."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+    assert service.packing.repacks == ["p1"], "on by default"
+
+
+def test_autopack_can_be_turned_off(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    service.projects.config = SimpleNamespace(audits=SimpleNamespace(autopack_before_audit=False))
+    service.start("p1")
+    assert service.packing.repacks == []
+    assert service.packing.calls == ["p1"]
