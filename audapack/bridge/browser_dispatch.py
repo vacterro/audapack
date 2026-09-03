@@ -369,9 +369,14 @@ class BrowserDispatcher:
         #: reload for. Asking twice is a loop, never a fix.
         self._widget_reload_asked: dict[str, str] = {}
         self._jobs: dict[str, DispatchJob] = {}
+        #: The job list as last written to disk, and whether the generation
+        #: notification for it still needs publishing (W2-004).
+        self._committed_jobs: list[dict[str, Any]] = []
+        self._generation_pending = False
         self._expired_worker_count = 0
         self._campaign_probe: Optional[Any] = None
         self._load_jobs()
+        self._committed_jobs = self._job_state_snapshot()
         try:
             self._generation = int(json.loads(self.generation_file.read_text(encoding="utf-8")).get("generation", 0))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -428,23 +433,59 @@ class BrowserDispatcher:
         if changed:
             self._persist_jobs()
 
+    def _job_state_snapshot(self) -> list[dict[str, Any]]:
+        return [
+            {k: getattr(job, k) for k in DispatchJob.__dataclass_fields__}
+            for job in self._jobs.values()
+        ]
+
+    def _restore_job_state(self, snapshot: list[dict[str, Any]]) -> None:
+        """Put memory back exactly where the last durable write left it.
+
+        W2-004 (audit/1.md): every mutator changed the live job objects and only
+        then called `_persist_jobs()`, with nothing to undo. A failed jobs.json
+        write left the running process holding a state no restart could ever
+        reproduce -- cancel_job raised OSError while the in-memory job said
+        CANCELLED and a new dispatcher built from disk said QUEUED. Two
+        authorities, permanently disagreeing, from one failed write.
+        """
+        self._jobs = {}
+        for raw in snapshot:
+            job = DispatchJob(**raw)
+            self._jobs[job.dispatch_id] = job
+
     def _persist_jobs(self) -> None:
         doc = {
             "schema_version": 1,
             "updated_at": _now(),
-            "jobs": [
-                {k: getattr(j, k) for k in DispatchJob.__dataclass_fields__}
-                for j in self._jobs.values()
-            ],
+            "jobs": self._job_state_snapshot(),
         }
         with cross_process_lock(self.jobs_file.with_suffix(".lock")):
-            _atomic_write_json(self.jobs_file, doc)
+            try:
+                _atomic_write_json(self.jobs_file, doc)
+            except Exception:
+                # The authoritative document did not move, so neither may
+                # memory. The caller still sees the failure.
+                self._restore_job_state(self._committed_jobs)
+                raise
+            self._committed_jobs = doc["jobs"]
             self._generation += 1
-            _atomic_write_json(self.generation_file, {
-                "generation": self._generation,
-                **self._generation_context,
-                "updated_at": _now(),
-            })
+            try:
+                _atomic_write_json(self.generation_file, {
+                    "generation": self._generation,
+                    **self._generation_context,
+                    "updated_at": _now(),
+                })
+                self._generation_pending = False
+            except Exception as exc:
+                # W2-004: the jobs document is committed -- the transition really
+                # happened. Raising here reported a successful state change as a
+                # failure, and the caller's retry then got invalid_transition on
+                # a job that had already moved. The generation file is a change
+                # NOTIFICATION; a failed publish is repaired on the next write,
+                # exactly like the run-state marker in the audit path.
+                self._generation_pending = True
+                logger.warning("dispatch generation publish deferred: %s", exc)
 
     # ------------------------------------------------------------------ #
     # workers
@@ -1914,6 +1955,14 @@ class BrowserDispatcher:
             job = self._jobs.get(dispatch_id)
             if job is None:
                 return False
+            if job.state == JOB_CANCELLED:
+                # W2-004 (audit/1.md): cancelling an already-cancelled dispatch
+                # is the state the caller asked for. It used to raise
+                # invalid_transition, which is exactly what a retry after a
+                # failed generation publish did -- the operation had committed,
+                # the caller was told it failed, and the retry then said the
+                # transition was illegal.
+                return True
             if job.state not in (JOB_QUEUED, JOB_BLOCKED, JOB_RETRYABLE, *PRE_START_STATES):
                 raise DispatchError("invalid_transition", "only pre-start/queued/blocked jobs can be cancelled")
             # W6: a BLOCKED job that holds post-start lineage (start_receipt,

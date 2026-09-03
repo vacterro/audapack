@@ -62,6 +62,18 @@ def body_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _bytes_sha256(path: Path) -> str:
+    """Digest a body whose bytes may not be valid UTF-8 (W2-002).
+
+    A pair reaches recovery precisely when its body might be undecodable, so a
+    recovery digest must never come from re-decoding it.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 def extract_title(text: str) -> str:
     lines = text.splitlines()
     candidates: list[str] = []
@@ -207,33 +219,85 @@ class InauditCaptureStore:
             return None
         return value if isinstance(value, dict) else None
 
+    def _lifecycle_dirs(self) -> tuple[Path, ...]:
+        return (self.inbox_dir, self.archive_dir, self.recovery_dir)
+
+    def _pair_fragments(self) -> dict[str, dict[Path, tuple[Path | None, dict[str, Any] | None]]]:
+        """Every capture fragment in every lifecycle directory, keyed by id.
+
+        W2-002 (audit/1.md): recovery scanned the INBOX only, so a body that a
+        half-finished archive left in `archive/` while its metadata stayed in
+        `inbox/` was never reunited -- recovery moved the orphan metadata away
+        and synthesized an EMPTY record while the real body sat unreachable one
+        directory over. A pair is a pair wherever its halves ended up.
+        """
+        found: dict[str, dict[Path, tuple[Path | None, dict[str, Any] | None]]] = {}
+        for directory in self._lifecycle_dirs():
+            ids: set[str] = {path.stem for path in directory.glob("*.md")}
+            for path in directory.glob("*.json"):
+                if path.name.endswith(".broken.json"):
+                    continue
+                ids.add(path.stem)
+            for raw_id in ids:
+                body = self._body_path(raw_id, directory)
+                meta = self._meta_path(raw_id, directory)
+                parsed = self._read_json(meta) if meta.is_file() else None
+                found.setdefault(raw_id, {})[directory] = (
+                    body if body.is_file() else None,
+                    parsed,
+                )
+        return found
+
+    def _pair_is_intact(self, raw_id: str, body: Path | None, parsed: dict[str, Any] | None) -> bool:
+        if body is None or parsed is None or parsed.get("capture_id") != raw_id:
+            return False
+        try:
+            text = body.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return False
+        return parsed.get("content_sha256") == body_sha256(text)
+
     def recover_partial_records(self) -> list[dict[str, Any]]:
         """Move unmatched/corrupt pairs to recovery and preserve useful bytes."""
         self._ensure_dirs()
         recovered: list[dict[str, Any]] = []
         with _LOCAL_LOCK, cross_process_lock(self.lock_path):
-            ids = {path.stem for path in self.inbox_dir.glob("*.md")} | {path.stem for path in self.inbox_dir.glob("*.json")}
-            for raw_id in sorted(ids):
-                body = self._body_path(raw_id)
-                meta = self._meta_path(raw_id)
-                parsed = self._read_json(meta) if meta.is_file() else None
-                complete = body.is_file() and parsed is not None and parsed.get("capture_id") == raw_id
-                if complete:
-                    try:
-                        text = body.read_text(encoding="utf-8")
-                    except (OSError, UnicodeError):
-                        complete = False
-                    else:
-                        complete = parsed.get("content_sha256") == body_sha256(text)
-                if complete:
+            for raw_id, per_dir in sorted(self._pair_fragments().items()):
+                intact = {
+                    directory: parsed
+                    for directory, (body, parsed) in per_dir.items()
+                    if self._pair_is_intact(raw_id, body, parsed)
+                }
+                if intact:
+                    # An interrupted move copies before it deletes, so both
+                    # copies are byte-identical and the destination metadata is
+                    # the one written last. Keep the newest and drop the rest:
+                    # nothing is lost, and the capture stops existing twice.
+                    keeper = max(
+                        intact,
+                        key=lambda directory: str(intact[directory].get("updated_at") or ""),
+                    )
+                    for directory in per_dir:
+                        if directory is keeper:
+                            continue
+                        for path in (self._body_path(raw_id, directory), self._meta_path(raw_id, directory)):
+                            try:
+                                path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                     continue
+
                 recovery_id = raw_id if _UUID_RE.fullmatch(raw_id) else str(uuid.uuid4())
                 moved_body = self.recovery_dir / f"{recovery_id}.md"
                 moved_meta = self.recovery_dir / f"{recovery_id}.json"
-                if body.exists():
-                    os.replace(body, moved_body)
-                if meta.exists():
-                    os.replace(meta, self.recovery_dir / f"{recovery_id}.broken.json")
+                for _directory, (body, _parsed) in per_dir.items():
+                    if body is not None and body != moved_body:
+                        os.replace(body, moved_body)
+                        break
+                for directory in per_dir:
+                    meta = self._meta_path(raw_id, directory)
+                    if meta.is_file() and meta != moved_meta:
+                        os.replace(meta, self.recovery_dir / f"{recovery_id}.broken.json")
                 recovery_meta = {
                     "schema_version": CAPTURE_SCHEMA_VERSION,
                     "capture_id": recovery_id,
@@ -243,7 +307,13 @@ class InauditCaptureStore:
                     "capture_kind": "instructions",
                     "source": "recovery",
                     "title": "Recovered partial INAUDIT capture",
-                    "content_sha256": body_sha256(moved_body.read_text(encoding="utf-8")) if moved_body.is_file() else "",
+                    # Raw bytes, never a re-decode: the pair reaches recovery
+                    # BECAUSE the body may not be valid UTF-8, and the old code
+                    # decoded it again here with no handler -- the constructor
+                    # raised UnicodeDecodeError, the next startup found an empty
+                    # inbox, and the preserved bytes were unreachable through
+                    # the API for good.
+                    "content_sha256": _bytes_sha256(moved_body) if moved_body.is_file() else "",
                     "recovery_reason": "partial or corrupt body/metadata pair",
                 }
                 self._atomic_json(moved_meta, recovery_meta)
@@ -555,8 +625,21 @@ class InauditCaptureStore:
             meta = self._read_json(self._meta_path(capture_id, directory))
             body = self._body_path(capture_id, directory)
             if meta is not None:
-                text = body.read_text(encoding="utf-8") if body.is_file() else ""
-                return {"record": meta, "text": text}
+                text = ""
+                undecodable = False
+                if body.is_file():
+                    try:
+                        text = body.read_text(encoding="utf-8")
+                    except UnicodeError:
+                        # W2-002: a RECOVERY record exists precisely because the
+                        # body may be corrupt. Raising here made the preserved
+                        # bytes unreachable through the API, which is the same
+                        # loss the recovery was supposed to prevent. Reported as
+                        # undecodable, with the bytes still on disk and their
+                        # raw digest in the record.
+                        text = body.read_bytes().decode("utf-8", errors="replace")
+                        undecodable = True
+                return {"record": meta, "text": text, "body_undecodable": undecodable}
         raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
 
     @staticmethod
@@ -715,6 +798,22 @@ class InauditCaptureStore:
         *,
         source: Path | None = None,
     ) -> dict[str, Any]:
+        """Move one capture pair between lifecycle directories.
+
+        W2-002 (audit/1.md): this published the new status into the SOURCE
+        metadata first, then moved body and metadata as two independent
+        `os.replace` calls with nothing to recover from. A sharing violation on
+        the second one left the body in `archive/` and the metadata in `inbox/`,
+        and `get()` answered ARCHIVED with empty text -- for good, because
+        startup recovery only ever looked in the inbox.
+
+        Copy, then delete: the destination pair is complete and self-consistent
+        before the source stops existing, so every interruption leaves at least
+        one intact pair on disk and never a published status with no body behind
+        it. A crash between the two deletes leaves two byte-identical copies,
+        which recovery settles by keeping the newer metadata -- the destination's,
+        by construction, because it is written last.
+        """
         capture_id = _safe_uuid(capture_id)
         source = source or self.inbox_dir
         with _LOCAL_LOCK, cross_process_lock(self.lock_path):
@@ -723,14 +822,19 @@ class InauditCaptureStore:
             record = self._read_json(meta)
             if record is None or not body.is_file():
                 raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
-            record["status"] = status
-            record["updated_at"] = utc_now()
+            moved = dict(record)
+            moved["status"] = status
+            moved["updated_at"] = utc_now()
             destination.mkdir(parents=True, exist_ok=True)
-            self._atomic_json(meta, record)
-            os.replace(body, self._body_path(capture_id, destination))
-            os.replace(meta, self._meta_path(capture_id, destination))
+            destination_body = self._body_path(capture_id, destination)
+            destination_meta = self._meta_path(capture_id, destination)
+
+            atomic_write(destination_body, body.read_text(encoding="utf-8"))
+            self._atomic_json(destination_meta, moved)
+            meta.unlink(missing_ok=True)
+            body.unlink(missing_ok=True)
             self._signal(capture_id, event)
-            return record
+            return moved
 
     def delete(self, capture_id: str) -> None:
         capture_id = _safe_uuid(capture_id)

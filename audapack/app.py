@@ -353,15 +353,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"AUDAPACK: single-instance guard failed, refusing to start: {exc}", file=sys.stderr)
         return 1
     if already_running:
-        if not single.activate_existing_window("AUDAPACK"):
-            # Mutex reported held but no window was found -- zombie holder.
-            # Do NOT silently no-op (that bricks the launcher). Open a new instance.
+        if single.activate_existing_window("AUDAPACK"):
+            return 0
+        if single.owner_is_alive():
+            # W2-005 (audit/1.md): activation failing is not evidence the owner
+            # is dead. On POSIX it can NEVER succeed, so every genuine second
+            # instance took the branch below and opened a second GUI -- two
+            # config writers, which is the amplifier for the stale-registry
+            # writes in CORE-002. A live owner that has not shown its window yet
+            # gets a bounded wait, then this launcher stands down either way.
+            hwnd = single.wait_for_owner_window()
+            if hwnd is not None and single.activate_existing_window("AUDAPACK"):
+                return 0
             print(
-                "AUDAPACK: detected a leftover lock with no visible window; opening a new instance.",
+                "AUDAPACK: already running; its window is not answering yet, so this launcher is standing down.",
                 file=sys.stderr,
             )
-        else:
             return 0
+        # Mutex reported held, the recorded owner is gone and no window was
+        # found -- a leftover lock. Do NOT silently no-op (that bricks the
+        # launcher). Open a new instance.
+        print(
+            "AUDAPACK: detected a leftover lock with no visible window; opening a new instance.",
+            file=sys.stderr,
+        )
 
     # Qt is the production default (Wave N cutover). Tkinter remains only as explicit fallback.
     if args.ui == "tkinter":

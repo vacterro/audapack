@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import atexit
+import json
+import os
 import sys
+import time
+from pathlib import Path
 from typing import Optional
 
 from audapack.config import get_state_dir
@@ -15,6 +19,55 @@ class GuardEstablishmentError(RuntimeError):
     W2-007: a failed guard must not fail open (permit a second instance).
     The launcher must surface the error rather than silently starting.
     """
+
+
+#: How long a launcher waits for a live owner to put its window up before it
+#: reports "already running" without having activated anything. A Qt MainWindow
+#: reaches WS_VISIBLE in well under a second; this only has to outlast that.
+OWNER_WINDOW_GRACE_SECONDS = 6.0
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Is this PID a live process right now?
+
+    W2-005 (audit/1.md): the guard decided the mutex owner was a zombie from the
+    ABSENCE OF A WINDOW, and a process between `CreateMutexW` and
+    `window.show()` looks exactly like a dead one. Liveness is a question about
+    the process, so it is asked about the process.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    # Cannot prove it is gone, so it is not treated as gone.
+                    return True
+                return int(code.value) == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            # An unanswerable question is never answered "dead": that is the
+            # answer that authorizes a second GUI.
+            return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
 
 
 # The em-dash "—" is the MainWindow's distinctive marker. Bare "AUDAPACK"
@@ -52,6 +105,56 @@ class SingleInstance:
         self._recovery_mutex = None
         self._file_handle = None
         self._is_already_running = False
+        #: Whoever holds the guard, when this launcher found it already held.
+        self._owner_pid = 0
+
+    # ------------------------------------------------------------------ #
+    # owner record: who holds this guard, and is that process still alive
+    # ------------------------------------------------------------------ #
+
+    def _owner_record_path(self) -> Path:
+        return get_state_dir() / f"{self.name.lower()}.owner.json"
+
+    def _write_owner_record(self) -> None:
+        """Record the owning PID, best effort: the guard itself still rules."""
+        try:
+            path = self._owner_record_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"pid": os.getpid(), "started_at": time.time()}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _read_owner_pid(self) -> int:
+        try:
+            data = json.loads(self._owner_record_path().read_text(encoding="utf-8"))
+            return int(data.get("pid") or 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0
+
+    def owner_is_alive(self) -> bool:
+        """True when the process holding this guard is demonstrably running.
+
+        W2-005: this is the question `is_already_running` used to answer with
+        "can I see a window", which a launcher racing a normal startup gets
+        wrong. An unreadable/absent record answers False -- that is the pre-
+        record behaviour, and the Win32 window check still gates takeover.
+        """
+        pid = self._owner_pid or self._read_owner_pid()
+        return _process_is_alive(pid)
+
+    def wait_for_owner_window(self, timeout: float = OWNER_WINDOW_GRACE_SECONDS) -> Optional[int]:
+        """Give a live owner that is still starting time to show its window."""
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            hwnd = self._find_window_hwnd()
+            if hwnd is not None:
+                return hwnd
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.15)
 
     def _find_window_hwnd(self, title_prefix: str = "AUDAPACK") -> Optional[int]:
         """Return the first visible top-level HWND whose title identifies it as an
@@ -121,6 +224,18 @@ class SingleInstance:
                     )
                 last_error = ctypes.windll.kernel32.GetLastError()
                 if last_error == ERROR_ALREADY_EXISTS:
+                    # W2-005 (audit/1.md): a live owner keeps the guard, window
+                    # or no window. A process sitting between CreateMutexW and
+                    # window.show() is observationally identical to the "zombie"
+                    # this branch was written for, so a rapid second launch used
+                    # to open a second GUI beside a perfectly healthy first one
+                    # -- and two GUIs is the multiple-writer condition CORE-002
+                    # is about. Takeover now needs the recorded owner to be
+                    # provably gone.
+                    self._owner_pid = self._read_owner_pid()
+                    if self.owner_is_alive():
+                        self._is_already_running = True
+                        return True
                     # Mutex is held by someone. Before treating this as "another AUDAPACK
                     # instance is running and we should yield", verify an actual AUDAPACK
                     # window is reachable. A windowless/wunged/stuck mutex holder
@@ -155,11 +270,13 @@ class SingleInstance:
                         self._recovery_mutex = recovery
                         self._mutex = recovery
                         atexit.register(self.release)
+                        self._write_owner_record()
                         self._is_already_running = False
                         return False
                     self._is_already_running = True
                     return True
                 atexit.register(self.release)
+                self._write_owner_record()
                 return False
             except GuardEstablishmentError:
                 raise
@@ -171,12 +288,27 @@ class SingleInstance:
             lock_file = get_state_dir() / f"{self.name.lower()}.lock"
             try:
                 import fcntl
-
+            except ImportError as exc:
+                # No advisory locking available: the guard cannot be established
+                # at all, which is a failure to report, never permission to
+                # start a second writer.
+                raise GuardEstablishmentError(
+                    f"Single-instance guard needs advisory file locking: {exc}"
+                ) from exc
+            try:
                 self._file_handle = open(lock_file, "w")
                 fcntl.flock(self._file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 atexit.register(self.release)
+                self._write_owner_record()
                 return False
-            except Exception:
+            except OSError:
+                # The lock is held (BlockingIOError) or unreachable. Either way
+                # this launcher does not own the guard, so it does not start a
+                # GUI: on POSIX `activate_existing_window` can never succeed, and
+                # app.main() used to read that failure as "leftover lock, open
+                # another one" -- making every genuine second instance on POSIX
+                # fail open by construction (W2-005).
+                self._owner_pid = self._read_owner_pid()
                 self._is_already_running = True
                 return True
 

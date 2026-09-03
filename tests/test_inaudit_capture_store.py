@@ -139,3 +139,92 @@ def test_project_object_is_not_required_for_uncertain_capture(tmp_path: Path):
     project = Project(id="p", display_name="P", source_path=str(tmp_path / "missing"))
     result = store.capture(_payload("generic notes"), [project])
     assert result["record"]["classification_state"] == "UNASSIGNED"
+
+
+def _seed(store: InauditCaptureStore, text: str = "pair body") -> str:
+    payload = _payload(text)
+    store.capture(payload, [])
+    return payload["capture_id"]
+
+
+def test_a_split_archive_is_reunited_not_reported_empty(tmp_path: Path):
+    """W2-002 (audit/1.md): the pair is one capture, wherever its halves land.
+
+    _move_to_status published the new status into the source metadata and then
+    moved body and metadata independently. A failure on the second move left the
+    body in archive/ and the metadata in inbox/, get() answered ARCHIVED with
+    empty text, and recovery -- which only ever scanned the inbox -- moved the
+    orphan metadata away and synthesized an EMPTY record while the real body sat
+    one directory over.
+    """
+    store = InauditCaptureStore(tmp_path)
+    capture_id = _seed(store, "survives a split move")
+
+    # Hand-build the exact split state the interrupted move produced.
+    (store.archive_dir / f"{capture_id}.md").write_text("survives a split move", encoding="utf-8")
+    (store.inbox_dir / f"{capture_id}.md").unlink()
+
+    reopened = InauditCaptureStore(tmp_path)
+    fetched = reopened.get(capture_id)
+    assert fetched["text"] == "survives a split move", "the real body was not reunited with its metadata"
+    assert fetched["record"]["capture_id"] == capture_id
+
+
+def test_an_interrupted_move_never_leaves_the_capture_in_two_places(tmp_path: Path):
+    """Copy-then-delete means both copies are intact; recovery keeps one."""
+    store = InauditCaptureStore(tmp_path)
+    capture_id = _seed(store, "duplicated by a crash")
+    record = store.get(capture_id)["record"]
+
+    # The crash point between the two deletes: destination complete, source too.
+    (store.archive_dir / f"{capture_id}.md").write_text("duplicated by a crash", encoding="utf-8")
+    archived = dict(record)
+    archived["status"] = "ARCHIVED"
+    archived["updated_at"] = "2999-01-01T00:00:00Z"
+    (store.archive_dir / f"{capture_id}.json").write_text(
+        json.dumps(archived, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    reopened = InauditCaptureStore(tmp_path)
+    fetched = reopened.get(capture_id)
+    assert fetched["text"] == "duplicated by a crash"
+    assert fetched["record"]["status"] == "ARCHIVED", "the newer half must win"
+    assert not (reopened.inbox_dir / f"{capture_id}.md").exists()
+    assert not (reopened.inbox_dir / f"{capture_id}.json").exists()
+
+
+def test_an_undecodable_body_never_crashes_startup_and_keeps_its_bytes(tmp_path: Path):
+    """The pair reaches recovery BECAUSE the body may not decode.
+
+    Recovery detected exactly that, then re-decoded the moved body with no
+    handler: the constructor raised UnicodeDecodeError, the next startup found
+    an empty inbox, and the preserved bytes were unreachable through the API.
+    """
+    import hashlib
+
+    store = InauditCaptureStore(tmp_path)
+    capture_id = _seed(store, "will be corrupted")
+    raw = b"\xff\xfe not valid utf-8 \x80\x81"
+    (store.inbox_dir / f"{capture_id}.md").write_bytes(raw)
+
+    reopened = InauditCaptureStore(tmp_path)  # must not raise
+    record = reopened.get(capture_id)["record"]
+    assert record["status"] == "RECOVERY"
+    assert record["content_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert (reopened.recovery_dir / f"{capture_id}.md").read_bytes() == raw, "the exact bytes were lost"
+
+
+def test_an_archive_that_cannot_finish_leaves_the_source_intact(tmp_path: Path):
+    """The status is never published before the destination pair is complete."""
+    from unittest.mock import patch
+
+    store = InauditCaptureStore(tmp_path)
+    capture_id = _seed(store, "unmoved")
+
+    with patch.object(InauditCaptureStore, "_atomic_json", side_effect=OSError("injected")):
+        with pytest.raises(OSError):
+            store.archive(capture_id)
+
+    fetched = InauditCaptureStore(tmp_path).get(capture_id)
+    assert fetched["record"]["status"] == "NEW", "a failed archive published its status anyway"
+    assert fetched["text"] == "unmoved"

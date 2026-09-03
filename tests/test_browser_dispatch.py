@@ -2455,3 +2455,97 @@ def test_the_id_match_is_case_folded_like_before(tmp_path):
 
     assert d.complete_runs_for_project("MIXEDCASE", "Mixed Case", "/final.md", "abc") == 1
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
+def _queued(d: BrowserDispatcher, tmp_path: Path, name="PERSIST"):
+    return d.enqueue_job(job_payload(archive(tmp_path, f"{name}.zip"), name))
+
+
+def test_a_failed_jobs_write_leaves_memory_where_disk_is(tmp_path, monkeypatch):
+    """W2-004 (audit/1.md): one failed write must not create two authorities.
+
+    Mutators changed the live job objects and only then persisted, with nothing
+    to undo. Measured on the pre-fix code: cancel_job raised OSError while the
+    running process held CANCELLED and a dispatcher rebuilt from disk said
+    QUEUED -- a state no restart could ever reproduce.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    item = _queued(d, tmp_path)
+    assert d.get_job(item.dispatch_id).state == JOB_QUEUED
+
+    real_write = bd._atomic_write_json
+
+    def refuse_jobs(path, value):
+        if Path(path).name == "jobs.json":
+            raise OSError("injected jobs.json replace failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_jobs)
+    with pytest.raises(OSError):
+        d.cancel_job(item.dispatch_id)
+    monkeypatch.undo()
+
+    assert d.get_job(item.dispatch_id).state == JOB_QUEUED, "memory kept an uncommitted state"
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    assert reloaded.get_job(item.dispatch_id).state == JOB_QUEUED
+
+
+def test_a_committed_transition_is_never_reported_as_failed(tmp_path, monkeypatch):
+    """The generation file is a notification, not the authority.
+
+    jobs.json committed and only the generation write failed, yet the call
+    raised: the caller was told its cancel failed while the dispatch really was
+    CANCELLED, and the retry then answered invalid_transition.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    item = _queued(d, tmp_path, "GENFAIL")
+
+    real_write = bd._atomic_write_json
+
+    def refuse_generation(path, value):
+        if "generation" in Path(path).name:
+            raise OSError("injected generation replace failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_generation)
+    assert d.cancel_job(item.dispatch_id) is True
+    monkeypatch.undo()
+
+    assert d.get_job(item.dispatch_id).state == JOB_CANCELLED
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    assert reloaded.get_job(item.dispatch_id).state == JOB_CANCELLED, "the committed jobs document was lost"
+
+
+def test_a_deferred_generation_publish_is_repaired_by_the_next_write(tmp_path, monkeypatch):
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    first = _queued(d, tmp_path, "REPAIR1")
+    real_write = bd._atomic_write_json
+
+    def refuse_generation(path, value):
+        if "generation" in Path(path).name:
+            raise OSError("injected generation replace failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_generation)
+    d.cancel_job(first.dispatch_id)
+    monkeypatch.undo()
+
+    before = json.loads(d.generation_file.read_text(encoding="utf-8"))["generation"]
+    _queued(d, tmp_path, "REPAIR2")
+    after = json.loads(d.generation_file.read_text(encoding="utf-8"))["generation"]
+    assert after > before, "the deferred generation was never published"
+
+
+def test_cancelling_an_already_cancelled_dispatch_is_idempotent(tmp_path):
+    """A retry of a terminal operation asks for a state that already holds."""
+    d = dispatcher(tmp_path)
+    item = _queued(d, tmp_path, "IDEMP")
+    assert d.cancel_job(item.dispatch_id) is True
+    assert d.cancel_job(item.dispatch_id) is True
+    assert d.get_job(item.dispatch_id).state == JOB_CANCELLED
