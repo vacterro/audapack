@@ -211,3 +211,58 @@ class TestArrangeThroughTheManager(unittest.TestCase):
         self.assertFalse(minimize)
         self.assertIn("display 2", message)
         self.assertNotIn("minimized", message)
+
+
+class TestSlots(unittest.TestCase):
+    """A fixed lattice, filled one window at a time from the bottom-left.
+
+    The grid divides the display by however many windows there are, so opening
+    a second one halves the first. These cells do not move with the count.
+    """
+
+    def test_the_fill_order_is_bottom_row_left_to_right_then_top(self):
+        from audapack.window_layout import slot_geometry
+
+        places = slot_geometry(6, SCREEN)
+        bottom_y = SCREEN.y + SCREEN.height // 2
+        self.assertEqual([x for x, _y, _w, _h in places[:3]], [0, 640, 1280])
+        self.assertTrue(all(y == bottom_y for _x, y, _w, _h in places[:3]))
+        self.assertEqual([x for x, _y, _w, _h in places[3:]], [0, 640, 1280])
+        self.assertTrue(all(y == SCREEN.y for _x, y, _w, _h in places[3:]))
+
+    def test_the_first_window_is_the_bottom_left_cell(self):
+        from audapack.window_layout import slot_geometry
+
+        x, y, _w, _h = slot_geometry(1, SCREEN)[0]
+        self.assertEqual(x, SCREEN.x)
+        self.assertEqual(y, SCREEN.y + SCREEN.height // 2)
+
+    def test_a_cell_is_the_same_size_whatever_the_count(self):
+        """This is the whole difference from the grid."""
+        from audapack.window_layout import slot_geometry, tile_geometry
+
+        self.assertEqual(slot_geometry(2, SCREEN)[0], slot_geometry(6, SCREEN)[0])
+        # The grid does the opposite, on purpose -- two windows take half each.
+        self.assertNotEqual(tile_geometry(2, SCREEN)[0], tile_geometry(6, SCREEN)[0])
+
+    def test_the_lattice_reaches_the_right_and_bottom_edges(self):
+        from audapack.window_layout import slot_geometry
+
+        places = slot_geometry(6, SCREEN)
+        self.assertEqual(max(x + w for x, _y, w, _h in places), SCREEN.x + SCREEN.width)
+        self.assertEqual(max(y + h for _x, y, _w, h in places), SCREEN.y + SCREEN.height)
+
+    def test_a_seventh_window_wraps_instead_of_walking_off_the_display(self):
+        """A seventh window is a bug to SEE, not one to lose off the edge."""
+        from audapack.window_layout import slot_geometry
+
+        places = slot_geometry(7, SCREEN)
+        self.assertEqual(places[6], places[0])
+        for x, y, w, h in places:
+            self.assertLessEqual(x + w, SCREEN.x + SCREEN.width)
+            self.assertLessEqual(y + h, SCREEN.y + SCREEN.height)
+
+    def test_the_layout_name_picks_it(self):
+        from audapack.window_layout import LAYOUT_SLOTS, slot_geometry
+
+        self.assertEqual(layout_geometry(LAYOUT_SLOTS, 6, SCREEN), slot_geometry(6, SCREEN))

@@ -165,3 +165,14 @@ def test_a_disabled_launcher_has_no_row_button(tmp_path, qapp):
     after, _ = compute_row_button_rects(row, cfg.launchers)
     assert len(after) == len(before) - 1
     assert all(lc.id != cfg.launchers[0].id for lc, _rect in after)
+
+
+def test_all_three_worker_layouts_are_offered_and_round_trip(tmp_path, qapp):
+    from audapack.window_layout import LAYOUT_SLOTS, LAYOUTS
+
+    w, _cfg = widget(tmp_path)
+    offered = {w.worker_layout.itemData(i) for i in range(w.worker_layout.count())}
+    assert offered == set(LAYOUTS)
+
+    w.worker_layout.setCurrentIndex(w.worker_layout.findData(LAYOUT_SLOTS))
+    assert load_config(tmp_path).ui.worker_window_layout == LAYOUT_SLOTS

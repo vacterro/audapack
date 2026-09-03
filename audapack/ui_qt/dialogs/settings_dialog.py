@@ -37,7 +37,7 @@ from audapack.config import (
 from audapack.services.bridge_service import BridgeService
 from audapack.ui_qt.dialogs.launcher_dialog import LauncherEditDialog
 from audapack.ui_qt.even_layout import EvenTabBar
-from audapack.window_layout import LAYOUT_CASCADE, LAYOUT_GRID, list_monitors
+from audapack.window_layout import LAYOUT_CASCADE, LAYOUT_GRID, LAYOUT_SLOTS, list_monitors
 
 
 def short_worker_label(worker: dict) -> str:
@@ -330,6 +330,9 @@ class SettingsWidget(QWidget):
         self.worker_layout = QComboBox()
         self.worker_layout.addItem("Grid — tiled edge to edge (six become 3x2)", LAYOUT_GRID)
         self.worker_layout.addItem("Cascade — overlapped, each title bar reachable", LAYOUT_CASCADE)
+        self.worker_layout.addItem(
+            "Slots — fixed 3x2 cells, filled from the bottom-left", LAYOUT_SLOTS
+        )
         current_layout = str(getattr(self._config.ui, "worker_window_layout", LAYOUT_GRID))
         self.worker_layout.setCurrentIndex(max(0, self.worker_layout.findData(current_layout)))
         f.addRow("Arrangement", self.worker_layout)

@@ -21,7 +21,15 @@ from typing import Any, Iterable, Optional
 #: each one still grabbable by its title bar.
 LAYOUT_GRID = "grid"
 LAYOUT_CASCADE = "cascade"
-LAYOUTS = (LAYOUT_GRID, LAYOUT_CASCADE)
+LAYOUT_SLOTS = "slots"
+LAYOUTS = (LAYOUT_GRID, LAYOUT_CASCADE, LAYOUT_SLOTS)
+
+#: The fixed lattice LAYOUT_SLOTS fills. Unlike the grid, these numbers do not
+#: move with the window count: one window takes one sixth of the display and
+#: the other five cells stay empty, so a window is in the same place whether
+#: there are two of them or six.
+SLOT_COLUMNS = 3
+SLOT_ROWS = 2
 
 #: Step between cascaded windows, and the share of the monitor one of them
 #: takes. Both are in the units the monitor rect is in.
@@ -161,9 +169,47 @@ def cascade_geometry(
     ]
 
 
+def slot_geometry(
+    count: int,
+    monitor: Monitor,
+    columns: int = SLOT_COLUMNS,
+    rows: int = SLOT_ROWS,
+) -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) per window, into a lattice that never resizes.
+
+    The grid divides the display by however many windows there are, so opening
+    a second one halves the first. Here the cells are fixed: windows land in
+    them one after another, starting at the BOTTOM-LEFT, right along the bottom
+    row, then up to the top-left and right again.
+
+    Past the lattice it wraps back to the bottom-left and overlaps rather than
+    walking off the display -- a seventh window is a bug to see, not one to
+    lose behind the edge of the screen.
+    """
+    if count <= 0:
+        return []
+    columns = max(1, int(columns))
+    rows = max(1, int(rows))
+    cell_w = monitor.width // columns
+    cell_h = monitor.height // rows
+    places = []
+    for i in range(count):
+        col = i % columns
+        row_from_bottom = (i // columns) % rows
+        row_from_top = rows - 1 - row_from_bottom
+        # The last column and the bottom row absorb the rounding, so the
+        # lattice reaches the right and bottom edges of the work area.
+        width = monitor.width - cell_w * col if col == columns - 1 else cell_w
+        height = monitor.height - cell_h * row_from_top if row_from_top == rows - 1 else cell_h
+        places.append((monitor.x + cell_w * col, monitor.y + cell_h * row_from_top, width, height))
+    return places
+
+
 def layout_geometry(layout: str, count: int, monitor: Monitor) -> list[tuple[int, int, int, int]]:
     if str(layout) == LAYOUT_CASCADE:
         return cascade_geometry(count, monitor)
+    if str(layout) == LAYOUT_SLOTS:
+        return slot_geometry(count, monitor)
     return tile_geometry(count, monitor)
 
 
