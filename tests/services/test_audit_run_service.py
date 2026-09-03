@@ -1190,3 +1190,45 @@ def test_a_run_with_no_completion_time_is_left_alone(tmp_path):
     service.start("p1")
     bridge.jobs[0].update({"state": "COMPLETE", "campaign_run_id": "run-1", "completed_at": 0.0})
     assert service.refresh_runs()[0].operator_state == "SAVING"
+
+
+def test_a_quiet_slot_is_not_a_vacancy_to_launch_into(tmp_path):
+    """Seven windows for six lanes, observed live on slot 3.
+
+    The worker registry drops a worker 75s after its last heartbeat with no
+    exemption for one mid-audit; the dispatcher remembers the slot has a window
+    for 150s. In that gap the slot looked free, a second window was opened on
+    it, and registration would not evict the first because it held a live run.
+    """
+    from audapack.services.audit_run_service import ManagedWorkerSupervisor
+
+    launches = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append(slot) is None, "ok"),
+        tmp_path / "workers.json",
+    )
+    dispatch = {
+        # Slot 3's worker fell out of the registry; only 1 and 2 are heard from.
+        "workers": [
+            {"managed_slot": 1, "managed_generation": 1, "last_seen_at": 10.0},
+            {"managed_slot": 2, "managed_generation": 1, "last_seen_at": 10.0},
+        ],
+        "managed_slot_lanes": [1, 2, 3],
+    }
+    supervisor.ensure_capacity(dispatch, 3)
+    assert 3 not in launches, f"opened a second window on a live slot: {launches}"
+
+
+def test_an_older_bridge_without_the_slot_memory_still_works(tmp_path):
+    """The key is absent when the running Bridge predates it: behave as before."""
+    from audapack.services.audit_run_service import ManagedWorkerSupervisor
+
+    launches = []
+    supervisor = ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append(slot) is None, "ok"),
+        tmp_path / "workers.json",
+    )
+    supervisor.ensure_capacity(
+        {"workers": [{"managed_slot": 1, "managed_generation": 1, "last_seen_at": 10.0}]}, 2
+    )
+    assert launches == [2]

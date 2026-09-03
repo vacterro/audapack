@@ -427,6 +427,41 @@ class BrowserDispatcher:
         for wid in expired:
             self._workers.pop(wid, None)
         self._expired_worker_count += len(expired)
+        self._retire_duplicate_slots()
+
+    def _retire_duplicate_slots(self) -> None:
+        """One slot, one lane -- enforced continuously, not only on arrival.
+
+        register_worker already evicts a predecessor on the same slot, but it
+        refuses to touch one holding a live run, which is right: a window is
+        not to be dropped mid-audit. The consequence was that a duplicate born
+        while the first window was auditing outlived the run and then stayed
+        forever, because nothing looked again once the run finished.
+
+        The keeper is whoever owns live work; failing that, the one heard from
+        most recently. Only a duplicate that owns nothing is dropped, so this
+        can never retire a window with a run behind it.
+        """
+        by_slot: dict[int, list[WorkerRecord]] = {}
+        for worker in self._workers.values():
+            if worker.managed_slot:
+                by_slot.setdefault(int(worker.managed_slot), []).append(worker)
+        for peers in by_slot.values():
+            if len(peers) < 2:
+                continue
+            keeper = max(
+                peers,
+                key=lambda w: (
+                    bool(w.campaign_run_id) or self._worker_owns_live_job(w),
+                    w.last_seen_at,
+                ),
+            )
+            for other in peers:
+                if other.worker_id == keeper.worker_id:
+                    continue
+                if other.campaign_run_id or self._worker_owns_live_job(other):
+                    continue
+                self._workers.pop(other.worker_id, None)
 
     @staticmethod
     def _incoming_managed_slot(payload: dict[str, Any]) -> int:
@@ -1898,6 +1933,14 @@ class BrowserDispatcher:
                 # Named so the operator is told to update the widget instead
                 # of watching six "clean" windows claim nothing.
                 "stale_widget_workers": sum(1 for w in live if self.worker_widget_is_stale(w)),
+                # Slots that still have a WINDOW behind them, which is a longer
+                # memory than the worker registry keeps (MANAGED_SLOT_MEMORY_
+                # SECONDS vs WORKER_TTL_SECONDS). Published because the launcher
+                # decides vacancy from this file: without it, a window that went
+                # quiet for 76s looked like a free slot and got a second window
+                # opened on top of it -- and registration will not evict the
+                # first one while it is mid-audit, so the duplicate was forever.
+                "managed_slot_lanes": sorted(self._live_managed_slots()),
                 "required_widget_build": _get_required_widget_build(),
                 "queued_jobs": sum(1 for j in jobs if j.state in (JOB_QUEUED, JOB_RETRYABLE)),
                 "active_jobs": sum(1 for j in jobs if j.state in POST_START_STATES | {JOB_LEASED, JOB_ARTIFACT_FETCHED, JOB_ATTACHED}),

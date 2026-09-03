@@ -2208,3 +2208,66 @@ def test_a_job_written_before_the_field_existed_keeps_its_place(tmp_path):
     for job in d._jobs.values():
         job.queue_order = 0.0
     assert queued_line(d) == ["A", "B", "C"]
+
+
+# ----------------------------------------------------- one slot, one window
+#
+# Seven windows for six lanes, observed live: slot 3 held two workers, one
+# AUDITING and one FREE. The launcher decides vacancy from the worker registry
+# (75s TTL, no exemption for a worker mid-audit) while the dispatcher remembers
+# a managed slot for 150s -- so a window that went quiet for 76s looked vacant,
+# got a second window opened on it, and registration would not evict the first
+# because it was holding a live run. Nothing ever looked again.
+
+
+def managed(wid: str, slot: int, **overrides) -> dict:
+    return free_worker(wid, managed_slot=slot, managed_generation=1, **overrides)
+
+
+def test_the_slot_memory_outlives_the_worker_registry(tmp_path):
+    d = dispatcher(tmp_path)
+    d.register_worker(managed("w_slot3", 3))
+    assert 3 in d.status()["managed_slot_lanes"]
+
+    # Quiet for longer than the worker TTL but inside the slot memory.
+    d._workers["w_slot3"].last_seen_at = time.time() - (WORKER_TTL_SECONDS + 10)
+    status = d.status()
+    assert status["active_workers"] == 0, "the worker itself is gone"
+    assert 3 in status["managed_slot_lanes"], "but the slot still has a window"
+
+
+def test_a_duplicate_that_owns_nothing_is_retired(tmp_path):
+    d = dispatcher(tmp_path)
+    d.register_worker(managed("w_first", 3))
+    d._workers["w_first"].campaign_run_id = "run-live"
+    # A second window on the same slot: registration will not evict the first
+    # while it holds a run, so both are live for a moment.
+    d.register_worker(managed("w_second", 3))
+    assert {w.worker_id for w in d.list_workers()} == {"w_first", "w_second"}
+
+    # The run ends. The duplicate owns nothing now and must not outlive it.
+    d._workers["w_first"].campaign_run_id = ""
+    d.status()
+    slots = [w.managed_slot for w in d.list_workers()]
+    assert slots.count(3) == 1, f"slot 3 still doubled: {slots}"
+
+
+def test_the_window_holding_the_run_is_the_one_kept(tmp_path):
+    """Never drop a window with a run behind it -- that is the whole caution."""
+    d = dispatcher(tmp_path)
+    d.register_worker(managed("w_idle", 3))
+    d.register_worker(managed("w_busy", 3))
+    d._workers["w_busy"].campaign_run_id = "run-live"
+    d.status()
+    assert [w.worker_id for w in d.list_workers()] == ["w_busy"]
+
+
+def test_two_windows_both_holding_runs_are_both_kept(tmp_path):
+    """A bad state, but not one to resolve by killing somebody's audit."""
+    d = dispatcher(tmp_path)
+    d.register_worker(managed("w_a", 3))
+    d._workers["w_a"].campaign_run_id = "run-a"
+    d.register_worker(managed("w_b", 3))
+    d._workers["w_b"].campaign_run_id = "run-b"
+    d.status()
+    assert len(d.list_workers()) == 2

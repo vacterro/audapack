@@ -264,6 +264,18 @@ class ManagedWorkerSupervisor:
                 and str(worker.get("managed_slot", "")).isdigit()
                 and 1 <= int(worker.get("managed_slot")) <= MAX_AUDIT_LANES
             }
+            # A slot whose window went quiet is NOT a vacancy. The worker
+            # registry drops a worker after 75s without a heartbeat, with no
+            # exemption for one that is mid-audit, while the dispatcher itself
+            # remembers the slot has a window for 150s. Launching into that gap
+            # opened a second window on a slot that already had one, and
+            # registration refuses to evict a predecessor holding a live run --
+            # so the duplicate never went away. Trust the longer memory.
+            registered |= {
+                int(slot)
+                for slot in (dispatch.get("managed_slot_lanes") or [])
+                if str(slot).isdigit() and 1 <= int(slot) <= MAX_AUDIT_LANES
+            }
             # A window that was launched but has not registered yet still
             # occupies its slot and one lane.
             pending = {
@@ -277,17 +289,24 @@ class ManagedWorkerSupervisor:
             launched: list[dict[str, Any]] = []
             for slot in range(1, desired + 1):
                 if slot in registered:
-                    doc["slots"][str(slot)] = {
-                        "state": "HEARTBEAT",
-                        "launch_attempts": 0,
-                        "last_seen_at": max(
-                            float(worker.get("last_seen_at", 0.0) or 0.0)
-                            for worker in workers
-                            if int(worker.get("managed_slot", 0) or 0) == slot
-                            and int(worker.get("managed_generation", 0) or 0) == generation
-                        ),
-                        "cooldown_until": 0.0,
-                    }
+                    heard = [
+                        float(worker.get("last_seen_at", 0.0) or 0.0)
+                        for worker in workers
+                        if int(worker.get("managed_slot", 0) or 0) == slot
+                        and int(worker.get("managed_generation", 0) or 0) == generation
+                    ]
+                    if heard:
+                        doc["slots"][str(slot)] = {
+                            "state": "HEARTBEAT",
+                            "launch_attempts": 0,
+                            "last_seen_at": max(heard),
+                            "cooldown_until": 0.0,
+                        }
+                    # No row for a slot the dispatcher still counts as occupied
+                    # means its window has gone quiet, not that it is gone. The
+                    # ledger entry is left exactly as it stands -- there is no
+                    # heartbeat to record and nothing to reset. All that matters
+                    # here is that nothing is launched into it.
                     continue
                 if slot in pending:
                     continue
