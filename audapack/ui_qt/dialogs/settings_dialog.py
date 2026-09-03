@@ -36,6 +36,7 @@ from audapack.config import (
 )
 from audapack.services.bridge_service import BridgeService
 from audapack.ui_qt.dialogs.launcher_dialog import LauncherEditDialog
+from audapack.ui_qt.even_layout import EvenTabBar
 
 
 def short_worker_label(worker: dict) -> str:
@@ -83,6 +84,7 @@ class SettingsWidget(QWidget):
         layout.setSpacing(4)
 
         self.sub_tabs = QTabWidget(self)
+        self.sub_tabs.setTabBar(EvenTabBar(self.sub_tabs))
         self.general_widget = self._build_general()
         self.packing_widget = self._build_packing()
         self.audit_widget = self._build_audit()

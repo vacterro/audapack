@@ -29,8 +29,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QStyle,
-    QStyleOptionToolButton,
     QSystemTrayIcon,
     QTabWidget,
     QToolBar,
@@ -63,6 +61,7 @@ from audapack.ui_qt.dialogs.audit_runs_widget import AuditRunsWidget
 from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
 from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
+from audapack.ui_qt.even_layout import EvenTabBar, fit_toolbar
 from audapack.ui_qt.models.project_delegate import (
     ProjectItemDelegate,
     compute_info_button_rect,
@@ -438,43 +437,13 @@ class ProjectTreeView(QTreeView):
         event.ignore()
 
 
-def _fit_toolbar_to_text(toolbar) -> int:
-    """Size every toolbar button to its label. Returns the total width used.
+def _fit_toolbar_to_text(toolbar, available: Optional[int] = None) -> int:
+    """Size the action row to fill ``available`` px (its own width by default).
 
-    The style's own minimum for a QToolButton is ~59px whatever the text, so a
-    two-character label cost as much as a word and the action row could not fit
-    a 640px window. The width comes from the style itself rather than a guessed
-    constant: a hand-picked padding was 5px short of the border and padding the
-    stylesheet adds, and every label rendered elided as "P...K".
+    Kept as the module-level name the window and its tests call; the layout
+    itself lives in even_layout, which the Settings tab row uses too.
     """
-    total = 0
-    for action in toolbar.actions():
-        if not action.text():
-            continue
-        button = toolbar.widgetForAction(action)
-        if button is None:
-            continue
-        # Without this the button is measured before the stylesheet's border
-        # and padding are applied, and every label ends up two pixels short.
-        button.ensurePolished()
-        metrics = button.fontMetrics()
-        option = QStyleOptionToolButton()
-        option.initFrom(button)
-        option.text = action.text()
-        needed = button.style().sizeFromContents(
-            QStyle.ContentsType.CT_ToolButton,
-            option,
-            QSize(metrics.horizontalAdvance(action.text()), metrics.height()),
-            button,
-        ).width()
-        button.setMinimumWidth(0)
-        button.setFixedWidth(needed)
-        # Every button is sized, so one the operator un-hides is already right.
-        # Only the visible ones are counted: the total is the width the row has
-        # to fit into, and a hidden button occupies none of it.
-        if action.isVisible():
-            total += needed
-    return total
+    return fit_toolbar(toolbar, available)
 
 
 def bridge_status_text(browser: dict[str, Any]) -> str:
@@ -617,6 +586,10 @@ class MainWindow(QMainWindow):
         def add(key: str, handler, tip: str):
             action = toolbar.addAction(key, handler)
             action.setToolTip(tip)
+            # The label is swapped for a spelled-out one when the row is wide
+            # enough, so the short form has to live somewhere else: it is the
+            # visibility key and the name the operator calls the button by.
+            action.setProperty("toolbar_key", key)
             self.toolbar_actions[key] = action
             return action
 
@@ -642,6 +615,7 @@ class MainWindow(QMainWindow):
                 summary = summary[:69].rstrip() + "…"
             act.setToolTip(f"Audit profile {label} — {summary}" if summary else f"Audit profile {label}")
             act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
+            act.setProperty("toolbar_key", label)
             self.profile_actions[profile_id] = act
             self.toolbar_actions[label] = act
         toolbar.addSeparator()
@@ -667,6 +641,7 @@ class MainWindow(QMainWindow):
 
         # Central Tabs: [Project Room] [Instances] [Settings]
         self.tabs = QTabWidget(self)
+        self.tabs.setTabBar(EvenTabBar(self.tabs))
 
         # Tab 0: Project Room
         projects_tab = QWidget(self)
@@ -1522,6 +1497,17 @@ QToolTip QLabel {
             action.setVisible(str(key).upper() not in hidden)
         if getattr(self, "_action_toolbar", None) is not None:
             _fit_toolbar_to_text(self._action_toolbar)
+
+    def resizeEvent(self, event):
+        """The action row is sized to the width it has, so it is re-sized here.
+
+        Without this the row keeps whatever widths it was given at build time
+        and a widened window grows a band of empty surface beside the buttons.
+        """
+        super().resizeEvent(event)
+        toolbar = getattr(self, "_action_toolbar", None)
+        if toolbar is not None:
+            _fit_toolbar_to_text(toolbar)
 
     def _on_reopen_workers(self):
         """Reopen every managed worker window that is no longer on screen."""

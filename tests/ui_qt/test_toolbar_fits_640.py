@@ -19,6 +19,11 @@ TARGET_WIDTH = 640
 
 @pytest.fixture
 def toolbar(tmp_path, qapp):
+    """The window at its NARROWEST supported width.
+
+    The row fills whatever width it is given, so every "does it fit" assertion
+    below has to be made at the width that actually constrains it.
+    """
     from audapack.ui_qt.main_window import MainWindow
 
     # Deliberately NOT set on the app: production applies the theme from
@@ -35,12 +40,27 @@ def toolbar(tmp_path, qapp):
     window = MainWindow(ProjectService(config, base_dir=tmp_path))
     bars = [bar for bar in window.findChildren(QToolBar) if any(a.text() for a in bar.actions())]
     assert bars, "the action toolbar must exist"
+    window.resize(TARGET_WIDTH, 480)
+    window.show()
+    qapp.processEvents()
+    from audapack.ui_qt.main_window import _fit_toolbar_to_text
+    _fit_toolbar_to_text(bars[0], TARGET_WIDTH)
     yield window, bars[0]
     window.close()
 
 
 def test_every_button_is_sized_to_its_own_label(toolbar):
+    """No button carries the style's ~59px minimum whatever its label.
+
+    That minimum is what made a two-character button cost as much as a word and
+    fourteen actions wrap onto a second row. The row DOES pad buttons out to
+    fill the width it is given -- that is the point of it -- so the question is
+    asked of the natural widths, which is what a zero-width fit hands back.
+    """
+    from audapack.ui_qt.main_window import _fit_toolbar_to_text
+
     _window, bar = toolbar
+    _fit_toolbar_to_text(bar, 0)
     actions = [a for a in bar.actions() if a.text()]
     for action in actions:
         button = bar.widgetForAction(action)
@@ -75,7 +95,7 @@ def test_no_label_is_narrow_enough_to_elide(toolbar):
 
 def test_the_whole_action_row_fits_640(toolbar):
     _window, bar = toolbar
-    actions = [a for a in bar.actions() if a.text()]
+    actions = [a for a in bar.actions() if a.text() and a.isVisible()]
     used = sum(bar.widgetForAction(a).width() for a in actions)
     # Toolbar spacing is 2px per item plus its own 2px padding on both sides.
     used += bar.layout().spacing() * len(actions) + 8
@@ -168,13 +188,19 @@ def test_the_default_row_hides_the_buttons_that_have_another_route(toolbar):
 
 
 def test_a_hidden_button_costs_the_row_no_width(toolbar):
+    """Asked at zero available width, so the answer is the natural widths.
+
+    Given room the row fills it either way -- that is what the widths mean now
+    -- so the question "does a hidden button take width" is only meaningful
+    where there is none to hand out.
+    """
     from audapack.ui_qt.main_window import _fit_toolbar_to_text
 
     window, bar = toolbar
-    narrow = _fit_toolbar_to_text(bar)
+    narrow = _fit_toolbar_to_text(bar, 0)
     for action in window.toolbar_actions.values():
         action.setVisible(True)
-    wide = _fit_toolbar_to_text(bar)
+    wide = _fit_toolbar_to_text(bar, 0)
     assert wide > narrow, "showing three more buttons must widen the row"
 
 
