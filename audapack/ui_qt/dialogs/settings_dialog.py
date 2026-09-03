@@ -130,6 +130,7 @@ class SettingsWidget(QWidget):
         self.mirror_into_project.toggled.connect(lambda: self._autosave_timer.start())
         self.mirror_dir_name.textChanged.connect(lambda: self._autosave_timer.start())
         self.mirror_include_waves.toggled.connect(lambda: self._autosave_timer.start())
+        self.dedicated_profile_only.toggled.connect(lambda: self._autosave_timer.start())
         self.host.textChanged.connect(lambda: self._autosave_timer.start())
 
         # Spinboxes -> debounced auto-save
@@ -290,6 +291,15 @@ class SettingsWidget(QWidget):
             "never read, never cleaned up, so a settled inbox still reports dirty."
         )
         f.addRow("Per-wave copies", self.mirror_include_waves)
+        self.dedicated_profile_only = QCheckBox("Only the AUDAPACK Chromium profile may run audits")
+        self.dedicated_profile_only.setChecked(
+            bool(getattr(self._config.audits, "dedicated_profile_only", False))
+        )
+        self.dedicated_profile_only.setToolTip(
+            "Off, any Chromium browser holding the widget and the token joins the pool\n"
+            "and can claim an audit -- including your own Brave or Chrome tab."
+        )
+        f.addRow("Worker pool", self.dedicated_profile_only)
         self.hot = QSpinBox()
         self.hot.setRange(0, 400 * 24 * 3600)
         self.hot.setValue(self._config.audits.hot_seconds)
@@ -737,6 +747,7 @@ class SettingsWidget(QWidget):
         c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
         c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"
         c.audits.mirror_include_waves = bool(self.mirror_include_waves.isChecked())
+        c.audits.dedicated_profile_only = bool(self.dedicated_profile_only.isChecked())
         c.audits.hot_seconds = self.hot.value()
         c.audits.warm_seconds = self.warm.value()
         c.audits.cool_seconds = self.cool.value()

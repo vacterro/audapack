@@ -231,6 +231,11 @@ class WorkerRecord:
     clean_for_audit: bool = False
     managed_slot: int = 0
     managed_generation: int = 0
+    #: Whether the window lives in the dedicated AUDAPACK Chromium profile.
+    #: Tri-state on purpose: None means the widget is too old to say, and an
+    #: unknown answer must never lock a working pool out. Only an explicit
+    #: False is refused when the operator asks to keep audits in that profile.
+    managed_profile: Optional[bool] = None
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -294,7 +299,12 @@ class BrowserDispatcher:
     mirrored to a small JSON state file so they survive a Bridge restart.
     """
 
-    def __init__(self, state_dir: Optional[Path] = None):
+    def __init__(self, state_dir: Optional[Path] = None, dedicated_profile_only: bool = False):
+        #: Confine audits to the dedicated AUDAPACK Chromium profile. Off by
+        #: default: the historical pool is any Chromium-family browser with the
+        #: widget and the token, and silently narrowing that would strand a
+        #: setup that works. The Bridge sets it from config at startup.
+        self.dedicated_profile_only = bool(dedicated_profile_only)
         self.state_dir = Path(state_dir) if state_dir else (get_state_dir() / "browser_dispatch")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.jobs_file = self.state_dir / "jobs.json"
@@ -595,6 +605,11 @@ class BrowserDispatcher:
             except (TypeError, ValueError):
                 record.managed_slot = 0
                 record.managed_generation = 0
+            if "managed_profile" in payload:
+                record.managed_profile = bool(payload.get("managed_profile"))
+            elif record.managed_slot:
+                # A numbered slot is only ever handed to a launched worker.
+                record.managed_profile = True
             if payload.get("browser_name"):
                 record.meta["browser_name"] = str(payload.get("browser_name"))[:80]
             record.last_seen_at = _now()
@@ -760,6 +775,22 @@ class BrowserDispatcher:
                 and self.worker_widget_is_stale(worker)
             )
 
+    def worker_in_allowed_profile(self, worker: WorkerRecord) -> bool:
+        """False only when the operator confined audits and this window is not in.
+
+        The pool is any Chromium-family browser carrying the widget and the
+        token, which is what let an operator's own Brave tab register, count
+        toward the six lanes and claim a real audit. Confining the pool to the
+        dedicated AUDAPACK profile removes that whole class of surprise.
+
+        Unknown is allowed. A widget too old to report the field says nothing
+        either way, and locking out a pool over a missing field is a worse
+        failure than one stray browser claiming a job.
+        """
+        if not self.dedicated_profile_only:
+            return True
+        return worker.managed_profile is not False
+
     def worker_free_for_claim(self, worker: WorkerRecord) -> bool:
         """FREE + CLEAN must both be true to claim a new audit.
 
@@ -794,6 +825,8 @@ class BrowserDispatcher:
         if worker.campaign_run_id:
             return False
         if self._worker_owns_live_job(worker):
+            return False
+        if not self.worker_in_allowed_profile(worker):
             return False
         return True
 

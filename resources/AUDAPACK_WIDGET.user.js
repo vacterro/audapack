@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.41
+// @version      0.0.42
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -17978,6 +17978,14 @@ let browserWorkerBraveConfirmed = false;
       worker_id: String(autoTabId || ''),
       managed_slot: managedIdentity.slot,
       managed_generation: managedIdentity.generation,
+      // Whether this window lives in the dedicated AUDAPACK Chromium profile.
+      // NOT the same as having a slot: "Launch Chromium" opens that profile
+      // with no slot params at all, so slot 0 there is normal. The GM marker
+      // is per browser profile and is only ever written by a window that was
+      // opened as a worker, so the operator's own Brave or Chrome cannot carry
+      // it. The Bridge uses this to keep audits inside the dedicated profile
+      // when the operator asks for that.
+      managed_profile: Boolean(browserWorkerIsManagedProfile()),
       widget_version: BROWSER_WORKER_PROTOCOL_VERSION,
       widget_protocol: BROWSER_WORKER_PROTOCOL_VERSION,
       widget_build_version: widgetBuildVersion(),

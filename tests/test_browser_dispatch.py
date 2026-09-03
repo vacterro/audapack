@@ -2020,3 +2020,66 @@ def test_a_lease_for_a_purged_dispatch_does_not_hold_a_lane(tmp_path):
     assert record.meta.get("reports_lease") is False
     assert "unknown_job" in record.meta.get("last_reconcile_error", "")
     assert d._worker_owns_live_job(record) is False
+
+
+def test_any_chromium_browser_can_claim_by_default(tmp_path):
+    """The historical pool is deliberately wide; narrowing it silently would
+    strand a working setup."""
+    d = BrowserDispatcher(state_dir=tmp_path)
+    record = d.register_worker(worker(
+        "brave-tab", is_chromium=True, is_brave=True, page_eligible=True,
+        url_path="/", browser_name="Brave", clean_for_audit=True,
+        widget_version="AUDAPACK_WIDGET/3", managed_profile=False,
+    ))
+    assert d.worker_in_allowed_profile(record) is True
+    assert d.worker_free_for_claim(record) is True
+
+
+def test_confining_the_pool_keeps_a_personal_browser_out(tmp_path):
+    """A Brave tab registered, counted toward the six lanes and claimed a real
+    audit. With the pool confined it may still register and never claim."""
+    d = BrowserDispatcher(state_dir=tmp_path, dedicated_profile_only=True)
+    record = d.register_worker(worker(
+        "brave-tab", is_chromium=True, is_brave=True, page_eligible=True,
+        url_path="/", browser_name="Brave", clean_for_audit=True,
+        widget_version="AUDAPACK_WIDGET/3", managed_profile=False,
+    ))
+    assert d.worker_in_allowed_profile(record) is False
+    assert d.worker_free_for_claim(record) is False
+
+
+def test_a_dedicated_window_with_no_slot_still_claims_when_confined(tmp_path):
+    """Launch Chromium opens the dedicated profile with no slot params at all,
+    so slot 0 there is normal and must not be mistaken for a foreign browser."""
+    d = BrowserDispatcher(state_dir=tmp_path, dedicated_profile_only=True)
+    record = d.register_worker(worker(
+        "dedicated", is_chromium=True, page_eligible=True, url_path="/",
+        browser_name="Chrome", clean_for_audit=True,
+        widget_version="AUDAPACK_WIDGET/3", managed_profile=True, managed_slot=0,
+    ))
+    assert d.worker_free_for_claim(record) is True
+
+
+def test_a_widget_too_old_to_answer_is_never_locked_out(tmp_path):
+    """Unknown is allowed. Locking out a pool over a missing field is a worse
+    failure than one stray browser claiming a job."""
+    d = BrowserDispatcher(state_dir=tmp_path, dedicated_profile_only=True)
+    record = d.register_worker(worker(
+        "old-widget", is_chromium=True, page_eligible=True, url_path="/",
+        browser_name="Chrome", clean_for_audit=True,
+        widget_version="AUDAPACK_WIDGET/3",
+    ))
+    assert record.managed_profile is None
+    assert d.worker_free_for_claim(record) is True
+
+
+def test_a_numbered_slot_is_proof_of_the_dedicated_profile(tmp_path):
+    """Slots are only ever handed to a launched worker window."""
+    d = BrowserDispatcher(state_dir=tmp_path, dedicated_profile_only=True)
+    record = d.register_worker(worker(
+        "slot-3", is_chromium=True, page_eligible=True, url_path="/",
+        browser_name="Chrome", clean_for_audit=True,
+        widget_version="AUDAPACK_WIDGET/3", managed_slot=3, managed_generation=1,
+    ))
+    assert record.managed_profile is True
+    assert d.worker_free_for_claim(record) is True

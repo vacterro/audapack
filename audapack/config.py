@@ -480,6 +480,11 @@ class AuditsConfig:
     #: disk nor in the receipt journal, so skipping it hands the number out
     #: twice. Empty disables it.
     agent_allocator_path: str = DEFAULT_ALLOCATOR_REL
+    #: Only windows in the dedicated AUDAPACK Chromium profile may claim an
+    #: audit. Without it any Chromium-family browser carrying the widget and
+    #: the token joins the pool -- which is how an operator's own Brave tab
+    #: registered, counted toward the six lanes and claimed a real audit.
+    dedicated_profile_only: bool = False
     hot_seconds: int = 6 * 3600           # <= 6 hours
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
@@ -1106,6 +1111,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         agent_allocator_path=str(
             audits_raw.get("agent_allocator_path", DEFAULT_ALLOCATOR_REL)
         ).strip(),
+        dedicated_profile_only=bool(audits_raw.get("dedicated_profile_only", False)),
     )
 
     bridge_raw = data.get("bridge", {})

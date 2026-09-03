@@ -605,6 +605,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 # with its original worker present and heartbeating. Invisible,
                 # it looks like the recovery path simply never runs.
                 "last_reconcile_error": worker.meta.get("last_reconcile_error", ""),
+                "managed_profile": worker.managed_profile,
+                "profile_allowed": self._dispatcher().worker_in_allowed_profile(worker),
                 "reports_lease": bool(worker.meta.get("reports_lease")),
                 # A stale build can never claim, so reporting it as CLEAN is a
                 # lie the operator cannot act on. Name it first.
@@ -2076,7 +2078,9 @@ def run_bridge_server(config: AppConfig) -> int:
         print(f"Error starting AUDAPACK Bridge: Port {port} on {host} already in use or unavailable: {exc}", file=sys.stderr)
         return 1
 
-    dispatcher = BrowserDispatcher()
+    dispatcher = BrowserDispatcher(
+        dedicated_profile_only=bool(getattr(config.audits, "dedicated_profile_only", False)),
+    )
     HandlerWithConfig.set_browser_dispatcher(dispatcher)
 
     def _campaign_probe(project_id: str, project_name: str) -> dict[str, Any]:
