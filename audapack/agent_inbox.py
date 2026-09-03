@@ -62,26 +62,52 @@ IN_WORK = "IN_WORK"
 UNREAD = "UNREAD"
 BLOCKED = "BLOCKED"
 
+# The headline is the ACTION, so the ranking is by what the operator should do
+# and NOT by how alarming a layer looks. A blocked layer is a diagnostic: an
+# unreadable file, or a record whose transport vanished after capture -- and a
+# vanished transport is never a reason to lose Work, because the receipt is
+# already durable authority. Ranking it top hid a fresh unread audit sitting
+# right beside it (__SAITULS: orphan record for a gone audit/1.md, unread 2.md
+# on disk, headline "AGENT BLOCKED · read the reason before delivering more").
+# The agent pins the inverse rule with a test: an invalid lower layer never
+# starves a later workable one. Blocked stays visible, as a note, not a
+# headline.
 _VERDICT_URGENCY = {
     NO_INBOX: 0,
     EMPTY: 1,
     CONSUMED: 2,
+    BLOCKED: 3,
+    IN_WORK: 4,
+    UNREAD: 5,
     UNKNOWN: 6,
-    IN_WORK: 3,
-    UNREAD: 4,
-    BLOCKED: 5,
 }
 
-#: Transport states SAIPEN journals. Kept as data, not imported.
+#: Transport states the agent journals. Kept as data, not imported.
+#: ACTIVE is deliberately absent: the state field alone does not say whether
+#: anyone is working it -- see _verdict_for_record.
 _STATE_VERDICT = {
     "NEW": UNREAD,
-    "ACTIVE": IN_WORK,
     "BLOCKED": BLOCKED,
     "CLOSED_PENDING_DELETE": CONSUMED,
     "DELETED": CONSUMED,
     "INVALID": BLOCKED,
     "MISSING_AFTER_CAPTURE": BLOCKED,
 }
+
+
+def _verdict_for_record(record: dict[str, Any]) -> str:
+    """What a bound layer means, from state AND the Work it became.
+
+    An ACTIVE record with no linked_work was captured into a receipt that never
+    became a ticket. Nobody is working it -- it is stalled and still owed, and
+    the agent's own projection answers `audit ingest` on exactly this state.
+    Reading the state field alone told the operator to wait for a worker that
+    does not exist (_SAIWORK2: audit/1.md ACTIVE, SRC-002, linked_work null).
+    """
+    state = str(record.get("state") or "")
+    if state == "ACTIVE":
+        return IN_WORK if str(record.get("linked_work") or "").strip() else UNREAD
+    return _STATE_VERDICT.get(state, UNREAD)
 
 _LABELS = {
     NO_INBOX: "—",
@@ -141,6 +167,16 @@ class InboxState:
         return sum(1 for item in self.layers if item.verdict == UNREAD)
 
     @property
+    def blocked_count(self) -> int:
+        """Diagnostics. They are reported, and they never become the headline."""
+        return sum(1 for item in self.layers if item.verdict == BLOCKED)
+
+    @property
+    def stalled_count(self) -> int:
+        """Unread layers the agent already captured into a receipt with no Work."""
+        return sum(1 for item in self.layers if item.verdict == UNREAD and item.receipt_id)
+
+    @property
     def live_count(self) -> int:
         """Layers still physically in the inbox."""
         return sum(1 for item in self.layers if item.present)
@@ -159,6 +195,18 @@ class InboxState:
     @property
     def guidance(self) -> str:
         base = _GUIDANCE.get(self.verdict, "")
+        if self.verdict == UNREAD and self.stalled_count:
+            receipts = ", ".join(
+                item.receipt_id for item in self.layers
+                if item.verdict == UNREAD and item.receipt_id
+            )
+            base = (
+                f"Captured as {receipts} but never turned into work"
+                f" ({self.stalled_count} of {self.unread_count}). Hand it back (cc);"
+                " nobody is working it."
+            )
+        if self.blocked_count and self.verdict != BLOCKED:
+            base = f"{base} {self.blocked_count} earlier layer(s) unsettled -- a note, not a blocker."
         if not self.residue:
             return base
         shown = ", ".join(self.residue[:3])
@@ -174,6 +222,9 @@ class InboxState:
 
     def summary(self) -> str:
         residue = f" · +{len(self.residue)} residue" if self.residue else ""
+        # A blocked layer is reported beside the headline, never as it.
+        if self.blocked_count and self.verdict != BLOCKED:
+            residue = f" · !{self.blocked_count} blocked{residue}"
         if self.verdict == UNREAD:
             return f"{self.label} · {self.unread_count}{residue}"
         if self.verdict == IN_WORK:
@@ -358,7 +409,9 @@ def read_inbox(root: Path | str, binding_rel: str = "") -> InboxState:
             item.generation = int(record.get("generation") or 1)
             item.receipt_id = str(record.get("receipt_id") or "")
             item.linked_work = str(record.get("linked_work") or "")
-            item.verdict = _STATE_VERDICT.get(str(record.get("state") or ""), UNREAD)
+            item.verdict = _verdict_for_record(record)
+            if item.verdict == UNREAD and item.receipt_id:
+                item.detail = f"captured as {item.receipt_id} but never became work"
         elif record:
             # Same path, different bytes. Whatever the old generation settled
             # to, these bytes are new and nobody has read them.

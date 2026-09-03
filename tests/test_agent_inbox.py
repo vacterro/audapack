@@ -231,3 +231,66 @@ def test_the_cache_follows_the_inbox_rather_than_a_clock(tmp_path):
     (root / si.AUDIT_DIRNAME / "1.md").write_text("audit", encoding="utf-8")
     # Same instant, changed directory: a delivery must be visible at once.
     assert si.read_inbox_cached(root, now=1000.0).verdict == si.UNREAD
+
+
+def test_an_active_capture_with_no_work_is_not_someone_working_it(tmp_path):
+    """Live _SAIWORK2: audit/1.md ACTIVE, SRC-002, linked_work null.
+
+    Reading the state field alone said "the agent is working this now. Running
+    a new one duplicates the work" and the operator waits for a worker that
+    does not exist. The capture never became a ticket; it is still owed.
+    """
+    root = _project(tmp_path, layers={"1.md": "audit"}, binding={"layers": {
+        "audit/1.md": {"state": "ACTIVE", "file_sha256": _sha("audit"),
+                       "receipt_id": "SRC-002", "linked_work": None},
+    }})
+    state = si.read_inbox(root)
+    assert state.verdict == si.UNREAD
+    assert state.stalled_count == 1
+    assert "SRC-002" in state.layers[0].detail
+    assert "never turned into work" in state.guidance
+    assert "cc" in state.guidance
+
+
+def test_an_active_capture_that_became_work_is_in_progress(tmp_path):
+    root = _project(tmp_path, layers={"1.md": "audit"}, binding={"layers": {
+        "audit/1.md": {"state": "ACTIVE", "file_sha256": _sha("audit"),
+                       "receipt_id": "SRC-002", "linked_work": "T-1222"},
+    }})
+    assert si.read_inbox(root).verdict == si.IN_WORK
+
+
+def test_a_blocked_diagnostic_never_starves_a_workable_layer(tmp_path):
+    """Live __SAITULS: orphan record for a gone audit/1.md, unread 2.md on disk.
+
+    A vanished transport is a diagnostic -- the receipt is already durable
+    authority -- so it must not become the headline and send the operator
+    hunting a failure reason instead of running cc on the audit sitting there.
+    The agent pins the same rule: an invalid lower layer never starves a later
+    workable one.
+    """
+    root = _project(tmp_path, layers={"2.md": "fresh"}, binding={"layers": {
+        "audit/1.md": {"state": "ACTIVE", "file_sha256": _sha("gone"),
+                       "receipt_id": "SRC-004", "linked_work": "T-66"},
+    }})
+    state = si.read_inbox(root)
+    assert state.verdict == si.UNREAD
+    assert state.blocked_count == 1
+    assert "!1 blocked" in state.summary(), "the diagnostic stays visible"
+    assert "not a blocker" in state.guidance
+
+
+def test_a_blocked_layer_is_still_the_headline_when_it_is_all_there_is(tmp_path):
+    root = _project(tmp_path, binding={"layers": {
+        "audit/1.md": {"state": "ACTIVE", "file_sha256": _sha("gone"), "receipt_id": "SRC-004"},
+    }})
+    state = si.read_inbox(root)
+    assert state.verdict == si.BLOCKED
+    assert "!1 blocked" not in state.summary(), "no note duplicating the headline"
+
+
+def test_unread_outranks_in_work_which_outranks_blocked(tmp_path):
+    """The headline is the ACTION, not how alarming a layer looks."""
+    assert si._VERDICT_URGENCY[si.UNREAD] > si._VERDICT_URGENCY[si.IN_WORK]
+    assert si._VERDICT_URGENCY[si.IN_WORK] > si._VERDICT_URGENCY[si.BLOCKED]
+    assert si._VERDICT_URGENCY[si.UNKNOWN] > si._VERDICT_URGENCY[si.UNREAD]
