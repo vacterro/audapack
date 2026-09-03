@@ -189,6 +189,71 @@ class TestDnDPipeline(unittest.TestCase):
             ProjectTreeView.startDrag = orig
         self.assertTrue(started, "drag never started on press+move")
 
+    def test_e_row_buttons_never_drag_the_project(self):
+        """Pressing [i] or a launcher and moving must not reorder anything.
+
+        The old code consumed the button press without calling super(), which
+        stopped Qt recording a press position for THAT press -- but an ordinary
+        click on the row beforehand leaves pressedIndex/pressedPosition set, and
+        Qt's own mouseMoveEvent starts a drag off that stale state. Hence the
+        select-then-press-[i] order below: without it the bug does not appear.
+        """
+        from unittest.mock import patch
+
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        from audapack.ui_qt.main_window import ProjectTreeView
+        from audapack.ui_qt.models.project_delegate import (
+            compute_info_button_rect,
+            compute_row_button_rects,
+        )
+
+        idx = self.win.model.index_for_project_id(self.p1.id)
+        rect = self.win.tree.visualRect(idx)
+        launchers = getattr(self.win._service.config, "launchers", None)
+        launcher_buttons, gg_rect = compute_row_button_rects(rect, launchers)
+        self.assertTrue(launcher_buttons, "no launcher buttons to press")
+        info_rect = compute_info_button_rect(rect, launcher_buttons, gg_rect)
+
+        started = []
+        orig = ProjectTreeView.startDrag
+        ProjectTreeView.startDrag = lambda self_, actions: started.append(actions)
+        try:
+            viewport = self.win.tree.viewport()
+            for name, press_at in (
+                ("info", info_rect.center()),
+                ("launcher", launcher_buttons[0][1].center()),
+            ):
+                started.clear()
+                # Select the row the ordinary way first -- this is what leaves
+                # the stale Qt press state the button press then dragged off.
+                row_at = rect.center()
+                QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=row_at)
+                QTest.mouseMove(viewport, QPoint(row_at.x(), row_at.y() + 2))
+                QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=row_at)
+                self.assertEqual(started, [], "the plain row click itself dragged")
+                with patch.object(self.win, "_show_project_info"),                      patch.object(self.win, "_on_open_with_launcher"):
+                    QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=press_at)
+                    for dy in range(2, 40, 4):
+                        QTest.mouseMove(viewport, QPoint(press_at.x(), press_at.y() - dy))
+                    QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=press_at)
+                self.assertEqual(started, [], f"pressing the {name} button started a drag")
+        finally:
+            ProjectTreeView.startDrag = orig
+
+    def test_f_start_drag_refuses_when_not_armed(self):
+        """startDrag is the one funnel every drag path goes through."""
+        from unittest.mock import patch
+
+        from PySide6.QtCore import Qt
+
+        self.win.tree._drag_armed = False
+        with patch.object(self.win.model, "mimeData") as mime:
+            self.win.tree.startDrag(Qt.DropAction.MoveAction)
+        mime.assert_not_called()
+
+
 
 if __name__ == "__main__":
     unittest.main()

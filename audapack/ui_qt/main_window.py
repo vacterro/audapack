@@ -87,6 +87,12 @@ class ProjectTreeView(QTreeView):
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.viewport().setMouseTracking(True)
+        self._press_pos = None
+        # A drag is only ever legitimate when it grew out of a press that hit
+        # the ROW, not one of the row's buttons. Pressing [i] or a launcher and
+        # letting the hand wander used to reorder projects behind the operator's
+        # back; startDrag now refuses unless this was armed by such a press.
+        self._drag_armed = False
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -160,16 +166,22 @@ class ProjectTreeView(QTreeView):
             # Button was clicked — consume event WITHOUT calling super().
             # Calling super() would record press position in Qt's internal state,
             # which allows accidental drag initiation on subsequent mouse move.
+            # Disarming as well is what makes a press-and-hold on [i] stay a
+            # press-and-hold instead of quietly turning into a row drag.
+            self._press_pos = None
+            self._drag_armed = False
             event.accept()
             return
 
         # No button hit — call super() so Qt initializes internal drag state.
         # Without this, mouseMoveEvent cannot trigger startDrag.
         self._press_pos = pos
+        self._drag_armed = True
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._press_pos = None
+        self._drag_armed = False
         super().mouseReleaseEvent(event)
 
     def _deferred_manual_start_drag(self):
@@ -179,6 +191,8 @@ class ProjectTreeView(QTreeView):
         if self.state() == QAbstractItemView.State.DraggingState:
             return
         if not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            return
+        if not self._drag_armed:
             return
         idx = self.currentIndex()
         if not idx.isValid() or idx.internalId() == 0:
@@ -266,6 +280,10 @@ class ProjectTreeView(QTreeView):
         return None
 
     def startDrag(self, supportedActions):
+        # Single funnel for every drag Qt or we can start. A press that landed
+        # on a row button never arms it, so no button can drag a project.
+        if not getattr(self, "_drag_armed", False):
+            return
         indexes = self.selectedIndexes()
         # Fallback: ensure at least the current index is included
         cur = self.currentIndex()
@@ -311,6 +329,11 @@ class ProjectTreeView(QTreeView):
     def mouseMoveEvent(self, event):
         """No hover tooltip — info is on the [ⓘ] button. Keep only drag fallback."""
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        if (event.buttons() & Qt.MouseButton.LeftButton) and not self._drag_armed:
+            # Holding a row button and moving. Qt's own mouseMoveEvent would
+            # read its internal pressed state and start a drag; swallow it.
+            event.accept()
+            return
         if event.buttons() & Qt.MouseButton.LeftButton:
             press_pos = getattr(self, "_press_pos", None)
             if (
