@@ -158,7 +158,7 @@ class AuditRunsWidget(QWidget):
             if len(latest) == MAX_AUDIT_LANES:
                 break
         self._lane_runs = latest
-        active = sum(run.operator_state not in {"READY", "FAILED", "CANCELLED"} for run in latest)
+        active = sum(run.operator_state not in {"READY", "FAILED", "CANCELLED", "SUPERSEDED"} for run in latest)
         ready = sum(run.ready for run in latest)
         attention = sum(run.operator_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"} for run in latest)
         self.summary.setText(
@@ -198,7 +198,7 @@ class AuditRunsWidget(QWidget):
 
         terminal = [
             run for run in self._runs
-            if run.operator_state in {"READY", "FAILED", "CANCELLED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}
+            if run.operator_state in {"READY", "FAILED", "CANCELLED", "SUPERSEDED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"}
         ][:12]
         self.history.setRowCount(len(terminal))
         for row, run in enumerate(terminal):
@@ -237,7 +237,7 @@ class AuditRunsWidget(QWidget):
         # mind" needs to cancel.
         self.reset_all_button.setEnabled(
             any(
-                snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
+                snapshot.operator_state not in {"READY", "FAILED", "CANCELLED", "SUPERSEDED"}
                 for snapshot in self._runs
             )
             or bool(self._pending_dispatch_count)

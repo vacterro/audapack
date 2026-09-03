@@ -446,7 +446,7 @@ def _actions_for(operator_state: str) -> tuple[str, ...]:
         return ("CANCEL", "DETAILS")
     if operator_state in {"STARTING", "AUDITING", "SAVING"}:
         return ("DETAILS",)
-    if operator_state in {"FAILED", "CANCELLED"}:
+    if operator_state in {"FAILED", "CANCELLED", "SUPERSEDED"}:
         return ("RETRY", "DETAILS")
     if operator_state == "INTERRUPTED":
         return ("RETRY", "DETAILS")
@@ -689,7 +689,7 @@ class AuditRunCoordinator:
             self.intents.update(intent_id, status="FAILED", error=str(exc)[:500])
             return AuditStartResult(False, project.id, intent_id, state="FAILED", message=str(exc))
 
-    RESET_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED"})
+    RESET_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED", "SUPERSEDED"})
 
     def reset_all(self, project_ids: Optional[Iterable[str]] = None) -> dict[str, Any]:
         """Clear every non-terminal run in one operator action.
@@ -871,6 +871,31 @@ class AuditRunCoordinator:
         proof.append("handoff_hash_match" if dispatch_digest else "handoff_hash_index_only")
         return True, tuple(proof), str(audit_path), digest
 
+    @staticmethod
+    def _complete_may_still_settle(job: dict[str, Any]) -> bool:
+        """Could this COMPLETE dispatch still become READY, or is it over?
+
+        One precise signal, not a timeout: the artifact this run names still
+        exists, but hashes to something else. Only a LATER run for the same
+        project writes that canonical path, so this run's recorded digest can
+        never match again and no amount of waiting will make it READY.
+
+        A handoff that is simply absent is a different failure -- the result
+        was never written, which is worth an operator's attention rather than
+        being quietly settled -- and it deliberately stays SAVING.
+        """
+        path = str(job.get("final_handoff_path") or "")
+        digest = str(job.get("final_handoff_sha256") or "")
+        if not path or not digest:
+            return True
+        artifact = Path(path)
+        try:
+            if artifact.is_file() and _sha256_file(artifact) != digest:
+                return False
+        except OSError:
+            pass
+        return True
+
     def _snapshot(
         self,
         job: dict[str, Any],
@@ -898,8 +923,19 @@ class AuditRunCoordinator:
         )
         if state == "BLOCKED":
             operator = "BLOCKED_POST_START" if post_start_block else "BLOCKED_PRE_START"
+        elif state == "COMPLETE" and not ready:
+            # Transport finished and the proof did not pass. SAVING is the
+            # honest transient right after completion -- finalization is still
+            # writing. It is NOT honest forever: 13 of 32 COMPLETE dispatches
+            # here point at a canonical artifact a LATER run for the same
+            # project has since overwritten, so their recorded digest can never
+            # match again. Those read SAVING permanently, RESET ALL counted
+            # them as unfinished, and Yes could not clear them because a
+            # terminal dispatch refuses both Cancel and FORCE UNBLOCK -- the
+            # same 16 came back on every press.
+            operator = "SAVING" if self._complete_may_still_settle(job) else "SUPERSEDED"
         else:
-            operator = "READY" if ready else ("SAVING" if state == "COMPLETE" else mapping.get(state, "PREPARING"))
+            operator = "READY" if ready else mapping.get(state, "PREPARING")
         error = str(job.get("error") or job.get("last_error_code") or "")
         worker_id = str(job.get("assigned_worker_id") or "")
         if operator == "READY":
@@ -912,6 +948,8 @@ class AuditRunCoordinator:
             summary = f"RETRYING {int(job.get('retry_count') or 0)}/5 · {error or 'pre-start retry'}"
         elif operator == "SAVING":
             summary = f"SAVING · {completed}/{total}"
+        elif operator == "SUPERSEDED":
+            summary = "SUPERSEDED · a later run for this project replaced the result"
         elif operator in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START"}:
             label = "BLOCKED PRE-START" if operator == "BLOCKED_PRE_START" else ("BLOCKED POST-START" if operator == "BLOCKED_POST_START" else "FAILED")
             _why, _action = blocked_guidance(error, operator == "BLOCKED_POST_START")

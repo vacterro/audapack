@@ -315,6 +315,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 "RECOVERY": "RECOV",
                 "FAILED": "FAIL",
                 "CANCELLED": "CANC",
+                "SUPERSEDED": "OLD",
             }
             wave_text = state_labels.get(audit_run_state, audit_run_state[:6])
             if audit_run_state == "READY":

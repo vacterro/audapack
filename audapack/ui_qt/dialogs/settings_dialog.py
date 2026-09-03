@@ -291,7 +291,7 @@ class SettingsWidget(QWidget):
             "never read, never cleaned up, so a settled inbox still reports dirty."
         )
         f.addRow("Per-wave copies", self.mirror_include_waves)
-        self.dedicated_profile_only = QCheckBox("Only the AUDAPACK Chromium profile may run audits")
+        self.dedicated_profile_only = QCheckBox("Work only in specialized Chromium instances with widget")
         self.dedicated_profile_only.setChecked(
             bool(getattr(self._config.audits, "dedicated_profile_only", False))
         )

@@ -905,7 +905,7 @@ QToolTip QLabel {
         """Compatibility alias for the composite audit-run refresh."""
         self._refresh_audit_runs_async()
 
-    RUN_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED", "BLOCKED_PRE_START", "BLOCKED_POST_START"})
+    RUN_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED", "SUPERSEDED", "BLOCKED_PRE_START", "BLOCKED_POST_START"})
 
     def _tune_bridge_poll_interval(self, runs) -> int:
         """Poll fast while anything is actually moving, slowly when idle."""
@@ -1718,7 +1718,7 @@ QToolTip QLabel {
         """Clear every unfinished lane in one action after one confirmation."""
         pending = [
             snapshot for snapshot in self.audit_runs_widget._runs
-            if snapshot.operator_state not in {"READY", "FAILED", "CANCELLED"}
+            if snapshot.operator_state not in {"READY", "FAILED", "CANCELLED", "SUPERSEDED"}
         ]
         # A press that is still sitting in the debounce queue has no dispatch
         # and no run snapshot yet, so RESET ALL could not see it and the audit

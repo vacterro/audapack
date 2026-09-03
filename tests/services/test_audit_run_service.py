@@ -1006,3 +1006,45 @@ def test_a_finished_intent_says_why_it_has_no_run_record(tmp_path):
     snapshot = service._intent_snapshot(_intent("COMPLETE"))
     assert "no dispatch record" in snapshot.summary
     assert snapshot.ready is False, "READY without proof must not inflate the ready count"
+
+
+def test_a_run_whose_result_a_later_run_replaced_is_finished_not_saving(tmp_path):
+    """13 of 32 COMPLETE dispatches read SAVING forever and RESET ALL could not
+    clear them.
+
+    Only a LATER run for the same project writes that canonical path, so once
+    the bytes there hash to something else this run's recorded digest can never
+    match and READY is unreachable. Calling it SAVING made it count as
+    unfinished work; Yes then tried Cancel (refused: terminal) and FORCE
+    UNBLOCK (refused: terminal) and the same rows came back on every press.
+    """
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1")
+    handoff = tmp_path / "PROJ__00_AUDIT_ALL_3.md"
+    handoff.write_text("the run that overwrote it", encoding="utf-8")
+    bridge.jobs[0].update({
+        "state": "COMPLETE",
+        "campaign_run_id": "run-1",
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(b"what this run actually wrote").hexdigest(),
+    })
+
+    run = service.refresh_runs()[0]
+    assert run.ready is False
+    assert run.operator_state == "SUPERSEDED"
+    assert "later run" in run.summary
+    assert run.operator_state in service.RESET_SETTLED_STATES, "must not count as unfinished"
+
+
+def test_a_matching_digest_is_still_saving_until_the_proof_lands(tmp_path):
+    service, bridge, audits = coordinator(tmp_path)
+    service.start("p1")
+    handoff = tmp_path / "PROJ__00_AUDIT_ALL_3.md"
+    handoff.write_text("mine", encoding="utf-8")
+    bridge.jobs[0].update({
+        "state": "COMPLETE",
+        "campaign_run_id": "run-1",
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(b"mine").hexdigest(),
+    })
+    assert service.refresh_runs()[0].operator_state == "SAVING"
