@@ -107,12 +107,57 @@ class ComponentManager:
     def get_bridge_token(self) -> str:
         return self.config.bridge.token
 
+    #: How long to wait for a freshly launched worker window to register before
+    #: opening the installer into it anyway.
+    WIDGET_INSTALL_WARMUP_SECONDS = 25.0
+
+    def _worker_profile_is_live(self) -> bool:
+        """True when a window already exists in the dedicated worker profile."""
+        try:
+            from audapack.services.bridge_service import BridgeService
+
+            status = BridgeService(self.config).browser_status()
+            if not status.get("ok"):
+                return False
+            return int((status.get("dispatch") or {}).get("active_workers", 0) or 0) > 0
+        except Exception:
+            return False
+
     def trigger_widget_install(self) -> tuple[bool, str]:
+        """Open the userscript installer in the dedicated worker profile.
+
+        Warms the profile first when nothing is running in it. Tampermonkey's
+        install goes through an intermediate page that waits on the extension's
+        MV3 service worker, and a Chromium started only to open that URL is a
+        cold start every time -- measured as often 1-2 minutes as instant, with
+        the Bridge serving all 840KB in 2ms and therefore not the cause. When a
+        window already exists, Chrome forwards the URL into that live process
+        and the worker is already awake.
+
+        A HYPOTHESIS about the cold start, not a measurement: the message says
+        which path was taken so the two can be told apart in use.
+        """
+        import time
+
         bridge_healthy = is_bridge_healthy(self.config.bridge.host, self.config.bridge.port)
-        return open_widget_in_dedicated_chromium(
+        warmed = ""
+        if bridge_healthy and not self._worker_profile_is_live():
+            launched, _msg = self.launch_browser_worker()
+            if launched:
+                deadline = time.time() + self.WIDGET_INSTALL_WARMUP_SECONDS
+                while time.time() < deadline:
+                    if self._worker_profile_is_live():
+                        break
+                    time.sleep(1.0)
+                warmed = " (profile was cold; warmed it first)"
+        elif bridge_healthy:
+            warmed = " (profile already live)"
+
+        ok, message = open_widget_in_dedicated_chromium(
             use_bridge=bridge_healthy,
             bridge_url=f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js",
         )
+        return ok, (message + warmed) if ok else message
 
     def launch_browser_worker(
         self,

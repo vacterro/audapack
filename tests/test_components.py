@@ -108,3 +108,62 @@ class TestComponents(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWidgetInstallWarmsTheProfile(unittest.TestCase):
+    """Tampermonkey's install page waits on the extension's MV3 service worker.
+
+    A Chromium started only to open that URL is a cold start every time. When a
+    window already exists in the profile, Chrome forwards the URL into that live
+    process instead. So the installer warms the profile first when nothing is
+    running in it -- and never opens a second window when something is.
+    """
+
+    def _manager(self, active_workers):
+        from audapack.components.manager import ComponentManager
+        from audapack.config import AppConfig
+
+        manager = ComponentManager(AppConfig())
+        manager.WIDGET_INSTALL_WARMUP_SECONDS = 0.0
+        manager._worker_profile_is_live = lambda: bool(active_workers)
+        return manager
+
+    def test_a_cold_profile_is_warmed_before_the_installer_opens(self):
+        from audapack.components import manager as mgr
+
+        manager = self._manager(active_workers=0)
+        launches = []
+        manager.launch_browser_worker = lambda **kw: (launches.append(kw) or (True, "started"))
+        with patch.object(mgr, "is_bridge_healthy", return_value=True), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
+            ok, message = manager.trigger_widget_install()
+        self.assertTrue(ok)
+        self.assertEqual(len(launches), 1, "a cold profile needs one window")
+        self.assertIn("warmed", message)
+        self.assertTrue(opener.call_args.kwargs["use_bridge"])
+
+    def test_a_live_profile_never_gets_a_second_window(self):
+        from audapack.components import manager as mgr
+
+        manager = self._manager(active_workers=3)
+        launches = []
+        manager.launch_browser_worker = lambda **kw: (launches.append(kw) or (True, "started"))
+        with patch.object(mgr, "is_bridge_healthy", return_value=True), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")):
+            ok, message = manager.trigger_widget_install()
+        self.assertTrue(ok)
+        self.assertEqual(launches, [], "Chrome forwards into the live process")
+        self.assertIn("already live", message)
+
+    def test_a_dead_bridge_still_opens_the_installer(self):
+        from audapack.components import manager as mgr
+
+        manager = self._manager(active_workers=0)
+        launches = []
+        manager.launch_browser_worker = lambda **kw: (launches.append(kw) or (True, "started"))
+        with patch.object(mgr, "is_bridge_healthy", return_value=False), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
+            ok, _message = manager.trigger_widget_install()
+        self.assertTrue(ok)
+        self.assertEqual(launches, [], "no Bridge means no pool to warm")
+        self.assertFalse(opener.call_args.kwargs["use_bridge"])
