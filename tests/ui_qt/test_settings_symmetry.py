@@ -83,3 +83,41 @@ def test_autostart_failure_reverts_checkbox_so_ui_never_lies(tmp_path, qapp, mon
     w._on_autostart_toggled(True)
     assert w.autostart.isChecked() is False
     assert "schtasks denied" in w.lbl_save_status.text()
+
+
+def test_settings_autosave_does_not_revert_a_change_made_elsewhere(qapp, tmp_path, monkeypatch):
+    """The dialog owns fields, not whole sections.
+
+    Swapping `latest.audits = c.audits` looked like a narrow merge and was not:
+    every field in that section came from the snapshot taken when the tab was
+    BUILT, so anything changed from outside -- another window, a script, the
+    Bridge -- was reverted by the next autosave, and autosave fires on every
+    checkbox toggle. Observed live: dedicated_profile_only was enabled outside
+    the dialog and came back False on its own.
+    """
+    from audapack.config import AppConfig, load_config, save_config
+    from audapack.models import Project
+    from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
+
+    monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path / "runtime"))
+    base = AppConfig()
+    # save_config refuses to truncate a project list, so give it one to keep.
+    base.projects = [Project(id="p1", display_name="P1", source_path=str(tmp_path / "p1"))]
+    base.audits.dedicated_profile_only = False
+    base.audits.hot_seconds = 111
+    save_config(base)
+
+    widget = SettingsWidget(load_config())
+
+    # Something else changes the same SECTION while the tab is open.
+    outside = load_config()
+    outside.audits.dedicated_profile_only = True
+    save_config(outside)
+
+    # An unrelated toggle fires autosave.
+    widget.compact_rows.setChecked(not widget.compact_rows.isChecked())
+    widget._save()
+
+    reloaded = load_config()
+    assert reloaded.audits.dedicated_profile_only is True, "an outside change must survive autosave"
+    assert reloaded.audits.hot_seconds == 111, "and the dialog's own fields still persist"

@@ -119,6 +119,10 @@ class SettingsWidget(QWidget):
         self._autosave_timer.timeout.connect(self._save)
 
         self._wire_autosave()
+        # What the widgets held when this tab was built. A save writes only
+        # what MOVED since then, so a field nobody touched here is left to
+        # whatever is on disk -- see _persist_settings.
+        self._baseline = {(section, field): value for section, field, value in self._owned_values()}
 
     def _wire_autosave(self):
         # Text fields -> debounced auto-save
@@ -733,44 +737,59 @@ class SettingsWidget(QWidget):
         self.launcher_list.setCurrentRow(row + 1)
         self._save()
 
-    def _save(self):
+    def _owned_values(self) -> list[tuple[str, str, object]]:
+        """Exactly the (section, field, value) triples this dialog owns.
+
+        Field-level, not section-level. Swapping whole sections looked like a
+        narrow merge but was not: every field in a section the dialog happens
+        to touch got overwritten from the snapshot taken when the tab was
+        BUILT, so any change made to that section from anywhere else -- another
+        window, the Bridge, a script -- was silently reverted by the next
+        autosave, and autosave fires on every checkbox toggle. Observed live:
+        dedicated_profile_only was enabled outside the dialog and came back
+        False on its own.
+        """
         c = self._config
-        c.ui.ui_language = self.ui_language.text().strip() or c.ui.ui_language
-        c.ui.reply_language = self.reply_language.text().strip() or c.ui.reply_language
+        owned: list[tuple[str, str, object]] = []
+        owned.append(("ui", "ui_language", self.ui_language.text().strip() or c.ui.ui_language))
+        owned.append(("ui", "reply_language", self.reply_language.text().strip() or c.ui.reply_language))
         gg_val = self.gg_template.text().strip()
         if gg_val:
-            c.ui.gg_template = gg_val
-        c.packing.output_dir = self.output_dir.text().strip()
+            owned.append(("ui", "gg_template", gg_val))
+        owned.append(("packing", "output_dir", self.output_dir.text().strip()))
         layout_value = self.output_layout.currentData()
         if layout_value not in OUTPUT_LAYOUT_CHOICES:
             layout_value = normalize_output_layout(layout_value)
-        c.packing.output_layout = layout_value
-        c.packing.delete_old = self.delete_old.isChecked()
-        c.packing.include_timestamp = self.include_timestamp.isChecked()
-        c.packing.manifest_enabled = self.manifest.isChecked()
-        c.ui.hidden_toolbar_buttons = [
+        owned.append(("packing", "output_layout", layout_value))
+        owned.append(("packing", "delete_old", self.delete_old.isChecked()))
+        owned.append(("packing", "include_timestamp", self.include_timestamp.isChecked()))
+        owned.append(("packing", "manifest_enabled", self.manifest.isChecked()))
+        owned.append(("ui", "hidden_toolbar_buttons", [
             key for key, box in self.toolbar_button_checks.items() if not box.isChecked()
-        ]
-        c.audits.root = self.audit_root.text().strip()
-        c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
-        c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"
-        c.audits.mirror_include_waves = bool(self.mirror_include_waves.isChecked())
-        c.audits.autopack_before_audit = bool(self.autopack_before_audit.isChecked())
-        c.audits.dedicated_profile_only = bool(self.dedicated_profile_only.isChecked())
-        c.audits.hot_seconds = self.hot.value()
-        c.audits.warm_seconds = self.warm.value()
-        c.audits.cool_seconds = self.cool.value()
-        c.audits.cold_seconds = self.cold.value()
-        c.bridge.host = self.host.text().strip()
-        c.bridge.port = self.port.value()
-        c.bridge.autostart = self.autostart.isChecked()
-        c.bridge.history_retention_days = self.history_retention.value()
-        c.ui.auto_copy_gg_on_launch = self.auto_copy_gg.isChecked()
-        c.ui.show_tooltips = self.show_tooltips.isChecked()
-        c.ui.compact_rows = self.compact_rows.isChecked()
-        c.ui.tooltip_duration_ms = self.tooltip_duration.value()
-        c.ui.flash_duration_ms = self.flash_duration.value()
-        ok = self._persist_settings(c)
+        ]))
+        owned.append(("audits", "root", self.audit_root.text().strip()))
+        owned.append(("audits", "mirror_into_project", bool(self.mirror_into_project.isChecked())))
+        owned.append(("audits", "mirror_dir_name", self.mirror_dir_name.text().strip() or "audit"))
+        owned.append(("audits", "mirror_include_waves", bool(self.mirror_include_waves.isChecked())))
+        owned.append(("audits", "autopack_before_audit", bool(self.autopack_before_audit.isChecked())))
+        owned.append(("audits", "dedicated_profile_only", bool(self.dedicated_profile_only.isChecked())))
+        owned.append(("audits", "hot_seconds", self.hot.value()))
+        owned.append(("audits", "warm_seconds", self.warm.value()))
+        owned.append(("audits", "cool_seconds", self.cool.value()))
+        owned.append(("audits", "cold_seconds", self.cold.value()))
+        owned.append(("bridge", "host", self.host.text().strip()))
+        owned.append(("bridge", "port", self.port.value()))
+        owned.append(("bridge", "autostart", self.autostart.isChecked()))
+        owned.append(("bridge", "history_retention_days", self.history_retention.value()))
+        owned.append(("ui", "auto_copy_gg_on_launch", self.auto_copy_gg.isChecked()))
+        owned.append(("ui", "show_tooltips", self.show_tooltips.isChecked()))
+        owned.append(("ui", "compact_rows", self.compact_rows.isChecked()))
+        owned.append(("ui", "tooltip_duration_ms", self.tooltip_duration.value()))
+        owned.append(("ui", "flash_duration_ms", self.flash_duration.value()))
+        return owned
+
+    def _save(self):
+        ok = self._persist_settings(self._owned_values())
         self.lbl_save_status.setText("✓ Settings saved" if ok else "✗ Save FAILED — settings not persisted")
         self.lbl_save_status.setStyleSheet("color: #4A7A20; font-size: 10px;" if ok else "color: #D9534F; font-size: 10px;")
         if ok:
@@ -778,13 +797,12 @@ class SettingsWidget(QWidget):
             if callable(self._on_saved):
                 self._on_saved()
 
-    def _persist_settings(self, c):
-        """Transactional rebase of UI-owned fields onto the latest config.
+    def _persist_settings(self, owned) -> bool:
+        """Apply only the fields this dialog owns onto the LATEST config.
 
-        W2-002: never overwrite a newer project registry mutation with a stale
-        whole-snapshot write. Reload the latest config under the registry lock,
-        apply ONLY the non-project fields this dialog owns, and save that merged
-        snapshot. ProjectRegistry remains the owner of project-list mutations.
+        Reload under the registry lock, set each owned field by name, save.
+        Nothing else in the file is touched -- not the project registry, and
+        not a neighbouring field in a section this dialog happens to write.
         """
         from audapack.config import cross_process_lock, get_registry_lock_path, load_config
 
@@ -795,14 +813,33 @@ class SettingsWidget(QWidget):
                 try:
                     latest = load_config(base)
                 except Exception:
-                    latest = c
-                latest.ui = c.ui
-                latest.packing = c.packing
-                latest.audits = c.audits
-                latest.bridge = c.bridge
-                latest.launchers = c.launchers
-                self._config.projects = latest.projects
-                return bool(save_config(latest, base))
+                    latest = self._config
+                for section, field, value in owned:
+                    # Only what the operator actually changed HERE. A field the
+                    # dialog renders but nobody touched is not evidence of
+                    # intent, and writing it back is how an enabled setting
+                    # silently reverted itself: the checkbox still held the
+                    # value from when the tab was built, and every autosave --
+                    # one per toggle, anywhere in the dialog -- rewrote it.
+                    if self._baseline.get((section, field), object()) == value:
+                        continue
+                    target = getattr(latest, section, None)
+                    if target is not None and hasattr(target, field):
+                        setattr(target, field, value)
+                latest.launchers = self._config.launchers
+                ok = bool(save_config(latest, base))
+                if ok:
+                    # Keep the in-memory snapshot honest, or the next autosave
+                    # would write back what we just merged away.
+                    self._config.projects = latest.projects
+                    for section in ("ui", "packing", "audits", "bridge"):
+                        setattr(self._config, section, getattr(latest, section))
+                    # The baseline is deliberately NOT advanced. It records what
+                    # this tab was BUILT with, so a field the operator changed
+                    # here stays changed and is re-asserted on every later save;
+                    # only fields nobody touched are left to disk. Advancing it
+                    # made a second save forget the first one's choice.
+                return ok
         except Exception as exc:
             self.lbl_save_status.setText(f"✗ Save FAILED: {exc}")
             self.lbl_save_status.setStyleSheet("color: #D9534F; font-size: 10px;")
