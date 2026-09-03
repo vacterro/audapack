@@ -1818,6 +1818,48 @@ def test_a_current_window_is_never_asked_to_reload(tmp_path, monkeypatch):
     assert d.should_ask_widget_reload(record) is False
 
 
+def test_a_six_worker_status_reads_the_userscript_once(tmp_path, monkeypatch):
+    """The required build is a release marker, not something to re-derive.
+
+    `_get_required_widget_build()` read and regex-scanned the whole 841 KB
+    bundled userscript on every call, and status() calls it once per live
+    worker through `worker_widget_is_stale()` plus once for its own field: a
+    six-worker status did seven full reads, a poll response nine, every four
+    seconds, to learn a version that changes when the operator upgrades the
+    widget and at no other time.
+    """
+    from audapack.components import widget as widget_mod
+    from audapack.components.widget import WIDGET_FILE_NAME
+
+    # Defensive, not the assertion: this test must fail on the READ COUNT, so
+    # it still runs against a module that has no cache at all.
+    getattr(widget_mod, "_WIDGET_METADATA_CACHE", {}).clear()
+    reads = {"count": 0}
+    real_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        if self.name == WIDGET_FILE_NAME:
+            reads["count"] += 1
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    d = dispatcher(tmp_path)
+    for slot in range(1, 7):
+        d.register_worker(supported_worker(
+            f"w{slot}", managed_slot=slot, managed_generation=1,
+            widget_protocol="AUDAPACK_WIDGET/3", widget_build_version="9.9.9",
+        ))
+
+    first = d.status()
+    d.status()
+    d.status()
+
+    assert first["active_workers"] == 6
+    assert first["required_widget_build"]
+    assert reads["count"] == 1
+
+
 def test_a_campaign_finished_before_this_dispatch_started_closes_nothing(tmp_path):
     """Every project audited even once keeps a complete campaign on disk.
 

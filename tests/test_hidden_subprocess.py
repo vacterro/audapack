@@ -141,3 +141,47 @@ class TestSpawnStormIsCached(unittest.TestCase):
                 self.assertEqual(server_mod._get_widget_bundle_info()[0], "1.0.0")
                 bundle.write_text("// @version      2.0.0\n\n", encoding="utf-8")
                 self.assertEqual(server_mod._get_widget_bundle_info()[0], "2.0.0")
+
+    def test_widget_metadata_is_not_rescanned_per_lookup(self):
+        """The required widget build is a release marker, not live state.
+
+        `_get_required_widget_build()` sits under every dispatcher status and
+        every browser poll, and it read and regex-scanned the whole 841 KB
+        userscript on each call -- seven reads for one six-worker status, nine
+        for one poll, on a four-second cadence.
+        """
+        from audapack.components import widget as widget_mod
+
+        widget_mod._WIDGET_METADATA_CACHE.clear()
+        first = widget_mod.read_bundled_widget_metadata()
+        self.assertTrue(first["exists"])
+        with patch.object(Path, "read_text", side_effect=AssertionError("re-read the 841KB bundle")):
+            second = widget_mod.read_bundled_widget_metadata()
+        self.assertEqual(first, second)
+
+    def test_a_changed_bundle_invalidates_the_metadata_cache(self):
+        """Replacing the userscript must move the required build with no restart."""
+        import tempfile
+
+        from audapack.components import widget as widget_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "AUDAPACK_WIDGET.user.js"
+            bundle.write_text("// @name AUDAPACK Widget\n// @version      1.0.0\n", encoding="utf-8")
+            widget_mod._WIDGET_METADATA_CACHE.clear()
+            with patch.object(widget_mod, "get_bundled_widget_path", return_value=bundle):
+                self.assertEqual(widget_mod.read_bundled_widget_metadata()["version"], "1.0.0")
+                bundle.write_text("// @name AUDAPACK Widget\n// @version      2.0.0\n\n", encoding="utf-8")
+                self.assertEqual(widget_mod.read_bundled_widget_metadata()["version"], "2.0.0")
+
+    def test_an_unreadable_bundle_is_never_cached(self):
+        """A transient read failure must not pin the placeholder for the process."""
+        from audapack.components import widget as widget_mod
+
+        widget_mod._WIDGET_METADATA_CACHE.clear()
+        with patch.object(Path, "read_text", side_effect=OSError("sharing violation")):
+            failed = widget_mod.read_bundled_widget_metadata()
+        self.assertEqual(failed["version"], "0.0.01")
+        self.assertEqual(widget_mod._WIDGET_METADATA_CACHE, {})
+        recovered = widget_mod.read_bundled_widget_metadata()
+        self.assertNotEqual(recovered["version"], "0.0.01")
