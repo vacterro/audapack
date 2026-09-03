@@ -1,7 +1,7 @@
 ---
 phase: SHIP
-task: T-131
-next_action: "operator installs widget 0.0.41, then one 6x A10 press -- proves the first-wave fix AND that a finished audit lands as audit/N.md"
+task: T-132
+next_action: "operator restarts the desktop app (the RESET fix lives in the GUI process) and installs widget 0.0.42"
 blocker: none
 agent: claude
 saipen_version: 7
@@ -9,8 +9,8 @@ schema_version: 3
 saipen_home: V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\_SAIPEN
 mode: full
 transition_from: REVIEW
-last_event: 657
-updated: "2026-09-03T11:00:00Z"
+last_event: 659
+updated: "2026-09-03T12:10:00Z"
 style_contract: ded-4ae736e4
 execution_intent: goal
 goal_waves: 1
