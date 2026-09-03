@@ -176,3 +176,86 @@ def test_tabs_are_re_measured_when_the_window_widens(window, qapp):
     window.resize(ROOMY, 600)
     qapp.processEvents()
     assert bar.tabRect(0).width() > narrow
+
+
+# ------------------------------------------- closing the pool when it falls idle
+#
+# Edge-triggered off the status poll the window already makes. Enumerating every
+# window and reading a command line per process is not free, and doing it every
+# four seconds while nothing changed is the idle burn this app has too much of.
+
+
+def _fire(window, **counts):
+    window._maybe_close_idle_worker_windows({"active_workers": 6, **counts})
+
+
+def _settle(window, qapp, timeout_s=4.0):
+    """Pump Qt until the close task has run; it is submitted to a thread."""
+    import time
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        qapp.processEvents()
+        if not window.task_runner.is_running("workers:close-idle"):
+            qapp.processEvents()
+            return
+        time.sleep(0.02)
+
+
+def test_the_close_fires_once_when_the_pool_falls_idle(window, qapp):
+    from unittest.mock import patch
+
+    with patch.object(window._comp_mgr, "close_idle_worker_windows",
+                      return_value=(True, "Closed 3 idle worker window(s).")) as closer:
+        _fire(window, queued_jobs=2, active_jobs=1)   # busy
+        closer.assert_not_called()
+        _fire(window, queued_jobs=0, active_jobs=0)   # busy -> idle
+        _settle(window, qapp)
+    assert closer.call_count == 1
+
+
+def test_a_pool_that_was_never_busy_does_not_fire(window, qapp):
+    """Opening the app onto an idle pool must not close windows behind you."""
+    from unittest.mock import patch
+
+    with patch.object(window._comp_mgr, "close_idle_worker_windows") as closer:
+        _fire(window, queued_jobs=0, active_jobs=0)
+        _fire(window, queued_jobs=0, active_jobs=0)
+        _settle(window, qapp, 1.5)
+    closer.assert_not_called()
+
+
+def test_staying_idle_does_not_fire_again(window, qapp):
+    from unittest.mock import patch
+
+    with patch.object(window._comp_mgr, "close_idle_worker_windows",
+                      return_value=(False, "No worker window to close.")) as closer:
+        _fire(window, queued_jobs=1)
+        _fire(window, queued_jobs=0)
+        _settle(window, qapp)
+        _fire(window, queued_jobs=0)
+        _fire(window, queued_jobs=0)
+        _settle(window, qapp, 1.5)
+    assert closer.call_count == 1
+
+
+def test_the_setting_off_stops_it(window, qapp):
+    from unittest.mock import patch
+
+    window._service.config.ui.close_idle_worker_windows = False
+    with patch.object(window._comp_mgr, "close_idle_worker_windows") as closer:
+        _fire(window, queued_jobs=1)
+        _fire(window, queued_jobs=0)
+        _settle(window, qapp, 1.5)
+    closer.assert_not_called()
+
+
+def test_a_blocked_run_counts_as_busy(window, qapp):
+    """It is waiting for the operator IN that window."""
+    from unittest.mock import patch
+
+    with patch.object(window._comp_mgr, "close_idle_worker_windows") as closer:
+        _fire(window, queued_jobs=1)
+        _fire(window, queued_jobs=0, blocked_jobs=1)
+        _settle(window, qapp, 1.5)
+    closer.assert_not_called()

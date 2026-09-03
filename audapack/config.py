@@ -700,6 +700,11 @@ class UIConfig:
     #: those launch flags are for -- the audit keeps running, the desktop comes
     #: back, and a restored window is where it was put.
     worker_windows_minimized: bool = True
+    #: Close the worker windows once the pool has nothing left to do. Six idle
+    #: Chromium windows are six windows in the way; the next audit reopens what
+    #: it needs. A window the operator opened by hand with NEW is never closed,
+    #: and neither is one still holding a run.
+    close_idle_worker_windows: bool = True
 
 
 @dataclass
@@ -1184,6 +1189,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         worker_window_layout=_normalized_worker_layout(ui_raw.get("worker_window_layout", "grid")),
         worker_window_monitor=_as_int(ui_raw.get("worker_window_monitor", -1), -1),
         worker_windows_minimized=bool(ui_raw.get("worker_windows_minimized", True)),
+        close_idle_worker_windows=bool(ui_raw.get("close_idle_worker_windows", True)),
     )
 
     launchers_raw = data.get("launchers")

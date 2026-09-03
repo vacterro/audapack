@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from audapack.bridge.lifecycle import (
@@ -215,13 +216,130 @@ class ComponentManager:
         tail = ", minimized" if minimized else ""
         return True, f"Arranged {moved} worker window(s) as {layout} on display {monitor.index + 1}{tail}."
 
+    #: Windows the operator opened by hand with NEW. Automatic close must never
+    #: touch one: it holds an audit they are running themselves, and nothing in
+    #: the window itself distinguishes it from a worker at the Win32 level.
+    MANUAL_WINDOW_REGISTRY = "manual_worker_windows.json"
+    #: How long to watch for the window a NEW press just asked Chromium for.
+    MANUAL_WINDOW_SETTLE_SECONDS = 8.0
+
+    def _manual_window_file(self) -> Path:
+        from audapack.config import get_state_dir
+
+        return get_state_dir() / self.MANUAL_WINDOW_REGISTRY
+
+    def _read_manual_windows(self) -> set[int]:
+        import json
+
+        path = self._manual_window_file()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        if not isinstance(raw, list):
+            return set()
+        return {int(item) for item in raw if isinstance(item, (int, float, str)) and str(item).isdigit()}
+
+    def _write_manual_windows(self, handles: set[int]) -> None:
+        import json
+
+        try:
+            self._manual_window_file().write_text(
+                json.dumps(sorted(handles)), encoding="utf-8"
+            )
+        except OSError:
+            # Losing the registry means a hand-opened window could be closed by
+            # the idle sweep. Bad, but not worth refusing to open the window.
+            pass
+
     def open_manual_worker_window(self) -> tuple[bool, str]:
         """A window in the worker profile that no lane owns.
 
         The dispatcher only knows a window by its slot/generation query params,
         so one opened without them is the operator's to use by hand.
+
+        Its handle is remembered, because the idle sweep closes worker windows
+        and Win32 cannot tell this one from a worker: same profile, same
+        executable, same title.
         """
-        return open_manual_chromium_window()
+        import time
+
+        from audapack.components.widget import get_dedicated_chromium_profile_dir
+        from audapack.window_layout import find_profile_windows
+
+        profile = get_dedicated_chromium_profile_dir()
+        before = set(find_profile_windows(profile))
+        ok, message = open_manual_chromium_window()
+        if not ok:
+            return ok, message
+
+        deadline = time.time() + self.MANUAL_WINDOW_SETTLE_SECONDS
+        while time.time() < deadline:
+            appeared = set(find_profile_windows(profile)) - before
+            if appeared:
+                known = self._read_manual_windows()
+                # Prune handles that are no longer windows while we are here,
+                # or the registry grows for the life of the install.
+                alive = set(find_profile_windows(profile))
+                self._write_manual_windows((known & alive) | appeared)
+                break
+            time.sleep(0.5)
+        return ok, message
+
+    def close_idle_worker_windows(self, *, force: bool = False) -> tuple[bool, str]:
+        """Close the worker windows once the pool has nothing left to do.
+
+        Idle means the Bridge reports nothing queued, nothing in flight,
+        nothing blocked awaiting recovery and no busy worker. Anything less and
+        this does nothing: a window holding a run is not ours to close.
+
+        Windows the operator opened by hand with NEW are excluded by handle --
+        at the Win32 level they are indistinguishable from a worker, so the
+        registry written when NEW opened one is the only thing that knows.
+        """
+        from audapack.components.widget import get_dedicated_chromium_profile_dir
+        from audapack.window_layout import close_windows, find_profile_windows
+
+        if not force and not bool(getattr(self.config.ui, "close_idle_worker_windows", True)):
+            return False, "Closing idle worker windows is switched off."
+
+        busy = self._pool_busy_reason()
+        if busy:
+            return False, f"Worker windows left open: {busy}."
+
+        profile = get_dedicated_chromium_profile_dir()
+        handles = set(find_profile_windows(profile))
+        manual = self._read_manual_windows() & handles
+        closable = handles - manual
+        if not closable:
+            kept = f" ({len(manual)} opened by hand, left alone)" if manual else ""
+            return False, f"No worker window to close{kept}."
+
+        closed = close_windows(closable)
+        self._write_manual_windows(manual)
+        tail = f", {len(manual)} opened by hand left alone" if manual else ""
+        return bool(closed), f"Closed {closed} idle worker window(s){tail}."
+
+    def _pool_busy_reason(self) -> str:
+        """Why the pool is not idle, or "" when it is. Unreadable counts as busy."""
+        try:
+            from audapack.services.bridge_service import BridgeService
+
+            status = BridgeService(self.config).browser_status()
+        except Exception as exc:
+            return f"the Bridge could not be read ({exc})"
+        if not status.get("ok"):
+            return "the Bridge did not answer"
+        dispatch = status.get("dispatch") or {}
+        for key, label in (
+            ("queued_jobs", "audits are queued"),
+            ("active_jobs", "an audit is in flight"),
+            ("blocked_jobs", "a blocked run is waiting for you"),
+            ("busy_workers", "a worker is busy"),
+        ):
+            if int(dispatch.get(key, 0) or 0) > 0:
+                return label
+        return ""
 
     def launch_browser_worker(
         self,

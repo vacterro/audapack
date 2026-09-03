@@ -266,3 +266,118 @@ class TestSlots(unittest.TestCase):
         from audapack.window_layout import LAYOUT_SLOTS, slot_geometry
 
         self.assertEqual(layout_geometry(LAYOUT_SLOTS, 6, SCREEN), slot_geometry(6, SCREEN))
+
+
+class TestClosingIdleWindows(unittest.TestCase):
+    """Six idle windows are six windows in the way.
+
+    But a window holding a run is not ours to close, and neither is one the
+    operator opened by hand with NEW -- which at the Win32 level is
+    indistinguishable from a worker: same profile, same exe, same title.
+    """
+
+    def _manager(self, tmp):
+        from audapack.components.manager import ComponentManager
+        from audapack.config import AppConfig
+
+        manager = ComponentManager(AppConfig())
+        manager._manual_window_file = lambda: tmp / "manual.json"
+        return manager
+
+    def test_the_setting_off_means_nothing_closes(self):
+        import tempfile
+
+        manager = self._manager(Path(tempfile.mkdtemp()))
+        manager.config.ui.close_idle_worker_windows = False
+        with patch("audapack.window_layout.close_windows") as closer:
+            ok, message = manager.close_idle_worker_windows()
+        self.assertFalse(ok)
+        closer.assert_not_called()
+        self.assertIn("switched off", message)
+
+    def test_a_pool_with_work_keeps_its_windows(self):
+        import tempfile
+
+        for key, phrase in (
+            ("queued_jobs", "queued"),
+            ("active_jobs", "in flight"),
+            ("blocked_jobs", "blocked run"),
+            ("busy_workers", "busy"),
+        ):
+            manager = self._manager(Path(tempfile.mkdtemp()))
+            manager._pool_busy_reason = (
+                lambda k=key: {"queued_jobs": "audits are queued",
+                               "active_jobs": "an audit is in flight",
+                               "blocked_jobs": "a blocked run is waiting for you",
+                               "busy_workers": "a worker is busy"}[k]
+            )
+            with patch("audapack.window_layout.close_windows") as closer:
+                ok, message = manager.close_idle_worker_windows()
+            self.assertFalse(ok, key)
+            closer.assert_not_called()
+            self.assertIn(phrase, message)
+
+    def test_an_unreadable_bridge_counts_as_busy(self):
+        """Never close on a guess: silence is not proof the pool is idle."""
+        import tempfile
+
+        manager = self._manager(Path(tempfile.mkdtemp()))
+        with patch("audapack.services.bridge_service.BridgeService.browser_status",
+                   side_effect=OSError("no bridge")):
+            self.assertIn("could not be read", manager._pool_busy_reason())
+
+    def test_an_idle_pool_closes_its_worker_windows(self):
+        import tempfile
+
+        manager = self._manager(Path(tempfile.mkdtemp()))
+        manager._pool_busy_reason = lambda: ""
+        with patch("audapack.window_layout.find_profile_windows", return_value=[11, 22, 33]), \
+             patch("audapack.window_layout.close_windows", return_value=3) as closer:
+            ok, message = manager.close_idle_worker_windows()
+        self.assertTrue(ok)
+        self.assertEqual(set(closer.call_args.args[0]), {11, 22, 33})
+        self.assertIn("Closed 3", message)
+
+    def test_a_hand_opened_window_is_never_closed(self):
+        import json
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp())
+        manager = self._manager(tmp)
+        (tmp / "manual.json").write_text(json.dumps([22]), encoding="utf-8")
+        manager._pool_busy_reason = lambda: ""
+        with patch("audapack.window_layout.find_profile_windows", return_value=[11, 22, 33]), \
+             patch("audapack.window_layout.close_windows", return_value=2) as closer:
+            ok, message = manager.close_idle_worker_windows()
+        self.assertTrue(ok)
+        self.assertEqual(set(closer.call_args.args[0]), {11, 33})
+        self.assertIn("opened by hand", message)
+
+    def test_only_hand_opened_windows_left_means_nothing_to_close(self):
+        import json
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp())
+        manager = self._manager(tmp)
+        (tmp / "manual.json").write_text(json.dumps([22]), encoding="utf-8")
+        manager._pool_busy_reason = lambda: ""
+        with patch("audapack.window_layout.find_profile_windows", return_value=[22]), \
+             patch("audapack.window_layout.close_windows") as closer:
+            ok, message = manager.close_idle_worker_windows()
+        self.assertFalse(ok)
+        closer.assert_not_called()
+        self.assertIn("opened by hand", message)
+
+    def test_a_dead_hand_opened_handle_is_pruned(self):
+        """Or the registry grows for the life of the install."""
+        import json
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp())
+        manager = self._manager(tmp)
+        (tmp / "manual.json").write_text(json.dumps([22, 999]), encoding="utf-8")
+        manager._pool_busy_reason = lambda: ""
+        with patch("audapack.window_layout.find_profile_windows", return_value=[11, 22]), \
+             patch("audapack.window_layout.close_windows", return_value=1):
+            manager.close_idle_worker_windows()
+        self.assertEqual(json.loads((tmp / "manual.json").read_text(encoding="utf-8")), [22])

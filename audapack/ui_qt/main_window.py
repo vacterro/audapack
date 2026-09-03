@@ -944,6 +944,7 @@ QToolTip QLabel {
                 warning = bridge_status_warning(browser)
                 if warning:
                     self._flash_status(warning, "#D66464", duration_ms=10000)
+            self._maybe_close_idle_worker_windows(browser)
             # Written on every pass, answer or not: skipping the write is what
             # let the startup verdict outlive the truth.
             self.statusBar().showMessage(bridge_status_text(browser))
@@ -1515,6 +1516,44 @@ QToolTip QLabel {
         # can still be reporting the width it had, and a fit against a stale
         # width is how the row ended up one button too wide for itself.
         QTimer.singleShot(0, lambda: _fit_toolbar_to_text(toolbar))
+
+    #: Counts that mean the pool still has something to do. Any one above zero
+    #: and the windows stay open.
+    POOL_BUSY_COUNTS = ("queued_jobs", "active_jobs", "blocked_jobs", "busy_workers")
+
+    def _maybe_close_idle_worker_windows(self, browser: dict):
+        """Close the worker windows the first time the pool falls idle.
+
+        Edge-triggered, off the status poll the GUI already makes. Enumerating
+        every window and reading a command line per process is not free, and
+        doing it every four seconds while nothing has changed is exactly the
+        idle burn this app already has too much of. Rising edges do nothing;
+        only busy -> idle fires, and only once per fall.
+        """
+        if not isinstance(browser, dict) or not browser:
+            return
+        busy = any(int(browser.get(key, 0) or 0) > 0 for key in self.POOL_BUSY_COUNTS)
+        was_busy = getattr(self, "_pool_was_busy", None)
+        self._pool_was_busy = busy
+        if busy or was_busy is not True:
+            return
+        if not bool(getattr(self._service.config.ui, "close_idle_worker_windows", True)):
+            return
+        key = "workers:close-idle"
+        if self.task_runner.is_running(key):
+            return
+
+        def _work():
+            # It re-checks the pool itself: this edge is a hint, the Bridge is
+            # the authority, and a run can start in the gap.
+            return self._comp_mgr.close_idle_worker_windows()
+
+        def _done(result):
+            ok, message = result
+            if ok:
+                self._flash_status(message, "#D4A840", duration_ms=5000)
+
+        self.task_runner.submit(key, _work, on_success=_done, on_error=lambda _e: None)
 
     def _arrange_worker_windows_async(self, settle_seconds: float = 0.0):
         """Put the worker windows on the configured display, off the GUI thread.

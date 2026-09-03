@@ -176,3 +176,48 @@ def test_all_three_worker_layouts_are_offered_and_round_trip(tmp_path, qapp):
 
     w.worker_layout.setCurrentIndex(w.worker_layout.findData(LAYOUT_SLOTS))
     assert load_config(tmp_path).ui.worker_window_layout == LAYOUT_SLOTS
+
+
+def test_closing_idle_worker_windows_is_on_by_default_and_round_trips(tmp_path, qapp):
+    w, _cfg = widget(tmp_path)
+    assert w.close_idle_workers.isChecked()
+    w.close_idle_workers.setChecked(False)
+    assert load_config(tmp_path).ui.close_idle_worker_windows is False
+    w.close_idle_workers.setChecked(True)
+    assert load_config(tmp_path).ui.close_idle_worker_windows is True
+
+
+def test_a_setting_toggled_back_to_where_it_started_still_saves(tmp_path, qapp):
+    """Tick a box, untick it, and the ticked value stayed on disk.
+
+    The merge wrote only fields differing from the construction baseline, and
+    the baseline is frozen on purpose. But "differs from the baseline" is only
+    the same thing as "touched" until the first change: moving a field back
+    matched the baseline again, the write was skipped, and the dialog sat there
+    showing one value while disk held the other. Affects every field here.
+    """
+    w, _cfg = widget(tmp_path)
+    started = w.compact_rows.isChecked()
+
+    w.compact_rows.setChecked(not started)
+    assert load_config(tmp_path).ui.compact_rows is (not started)
+
+    w.compact_rows.setChecked(started)
+    assert load_config(tmp_path).ui.compact_rows is started, "the revert was dropped"
+
+    w.compact_rows.setChecked(not started)
+    assert load_config(tmp_path).ui.compact_rows is (not started)
+
+
+def test_a_field_nobody_touched_is_still_left_to_disk(tmp_path, qapp):
+    """The property the frozen baseline exists to protect, kept intact."""
+    from audapack.config import AppConfig, save_config
+
+    on_disk = AppConfig()
+    on_disk.ui.show_tooltips = False
+    save_config(on_disk, tmp_path)
+
+    w, _cfg = widget(tmp_path)          # built from a default config: True
+    assert w.show_tooltips.isChecked()  # so the widget disagrees with disk
+    w.compact_rows.setChecked(not w.compact_rows.isChecked())  # save something else
+    assert load_config(tmp_path).ui.show_tooltips is False, "an untouched field was overwritten"

@@ -126,6 +126,10 @@ class SettingsWidget(QWidget):
         # what MOVED since then, so a field nobody touched here is left to
         # whatever is on disk -- see _persist_settings.
         self._baseline = {(section, field): value for section, field, value in self._owned_values()}
+        #: Fields the operator has moved in THIS dialog. Once moved, a field is
+        #: written on every later save even if it is moved back to where it
+        #: started -- see _persist_settings.
+        self._touched: set[tuple[str, str]] = set()
 
     def _wire_autosave(self):
         # Text fields -> debounced auto-save
@@ -160,6 +164,7 @@ class SettingsWidget(QWidget):
         self.compact_rows.toggled.connect(lambda: self._save())
         self.arrange_workers.toggled.connect(lambda: self._save())
         self.worker_minimized.toggled.connect(lambda: self._save())
+        self.close_idle_workers.toggled.connect(lambda: self._save())
         self.worker_layout.currentIndexChanged.connect(lambda: self._save())
         self.worker_monitor.currentIndexChanged.connect(lambda: self._save())
         for _box in self.toolbar_button_checks.values():
@@ -356,6 +361,14 @@ class SettingsWidget(QWidget):
             "and every backgrounding throttle off, so a minimized audit keeps running."
         )
         f.addRow("Minimized", self.worker_minimized)
+
+        self.close_idle_workers = QCheckBox("Close them when the queue is empty and nothing is running")
+        self.close_idle_workers.setChecked(bool(getattr(self._config.ui, "close_idle_worker_windows", True)))
+        self.close_idle_workers.setToolTip(
+            "Six idle windows are six windows in the way; the next audit reopens what it needs.\n"
+            "A window you opened yourself with NEW is never closed, and neither is one holding a run."
+        )
+        f.addRow("When idle", self.close_idle_workers)
 
         self.arrange_now_btn = QPushButton("Arrange worker windows now")
         self.arrange_now_btn.clicked.connect(self._on_arrange_worker_windows)
@@ -867,6 +880,7 @@ class SettingsWidget(QWidget):
         owned.append(("ui", "worker_window_layout", str(self.worker_layout.currentData() or LAYOUT_GRID)))
         owned.append(("ui", "worker_window_monitor", int(self.worker_monitor.currentData() if self.worker_monitor.currentData() is not None else -1)))
         owned.append(("ui", "worker_windows_minimized", bool(self.worker_minimized.isChecked())))
+        owned.append(("ui", "close_idle_worker_windows", bool(self.close_idle_workers.isChecked())))
         owned.append(("audits", "hot_seconds", self.hot.value()))
         owned.append(("audits", "warm_seconds", self.warm.value()))
         owned.append(("audits", "cool_seconds", self.cool.value()))
@@ -915,7 +929,16 @@ class SettingsWidget(QWidget):
                     # silently reverted itself: the checkbox still held the
                     # value from when the tab was built, and every autosave --
                     # one per toggle, anywhere in the dialog -- rewrote it.
-                    if self._baseline.get((section, field), object()) == value:
+                    #
+                    # "Differs from the baseline" is only the same thing as
+                    # "touched" until the first change. Tick a box and untick
+                    # it and the value matches the baseline again -- so the
+                    # write was skipped, the ticked value stayed on disk, and
+                    # the dialog sat there showing unticked. A field stays
+                    # touched once it has moved, and is written from then on.
+                    if value != self._baseline.get((section, field), object()):
+                        self._touched.add((section, field))
+                    elif (section, field) not in self._touched:
                         continue
                     target = getattr(latest, section, None)
                     if target is not None and hasattr(target, field):

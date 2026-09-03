@@ -236,6 +236,33 @@ def find_profile_windows(profile_dir: Path, backend: Optional[Any] = None) -> li
     return handles
 
 
+def close_windows(handles: Iterable[int]) -> int:
+    """Ask each window to close, the way clicking its X does.
+
+    WM_CLOSE, never TerminateProcess: Chromium gets to shut its own session
+    down, and a window that refuses (a beforeunload prompt, say) simply stays
+    open instead of losing whatever it was holding.
+
+    Returns how many were asked.
+    """
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    WM_CLOSE = 0x0010
+    user32 = ctypes.windll.user32
+    asked = 0
+    for hwnd in handles:
+        try:
+            if not user32.IsWindow(int(hwnd)):
+                continue
+            if user32.PostMessageW(int(hwnd), WM_CLOSE, 0, 0):
+                asked += 1
+        except Exception:
+            continue
+    return asked
+
+
 def arrange_windows(
     handles: Iterable[int],
     places: Iterable[tuple[int, int, int, int]],
