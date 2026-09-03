@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.42
+// @version      0.0.43
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18221,13 +18221,24 @@ let browserWorkerBraveConfirmed = false;
     try {
       browserWorkerArmAuditEngine();
       const key = autoBoundConversationKey || currentConversationKey();
-      repaired = Boolean(key && reassertA3FromMachineReceipt(key));
+      // Arming sets enabled=true, and reassertA3FromMachineReceipt refuses an
+      // already-enabled runtime on its first line by design -- it exists to
+      // repair a BLANK one. Calling it here could therefore never repair
+      // anything: six A10 windows logged "armed, no machine turn to adopt yet"
+      // every six seconds for sixteen minutes with the finished ARCHITECTURE
+      // answer sitting on screen, and not one wave was ever harvested.
+      // The state after arming is "enabled, stage idle, audit turn visible",
+      // which is exactly what reconcileEnabledIdleAuditRuntime repairs -- and
+      // it walks the ACTIVE PROFILE's waves, so it finds an A10 ARCHITECTURE
+      // turn and not only a quick3 CORE one.
+      repaired = Boolean(reconcileEnabledIdleAuditRuntime());
+      if (!repaired && key) repaired = Boolean(reassertA3FromMachineReceipt(key));
     } catch (_) {
       repaired = false;
     }
     appendBridgeDiagnostic('worker_engine_recovered', {
       severity: 'info',
-      message: `owned run is live but the audit engine was ${stage}; ${repaired ? 're-armed from the visible audit turn' : 'armed, no machine turn to adopt yet'}`
+      message: `owned run is live but the audit engine was ${stage}; ${repaired ? 'resumed from the visible audit turn' : 'armed, no machine turn to adopt yet'}`
     });
     return repaired;
   }
