@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.44
+// @version      0.0.45
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -15479,17 +15479,21 @@ async function recoverArmedStartSend(options = {}) {
   }
 
   function stageForAuditKind(kind) {
-    if (kind === 'core') return 'wait-core';
-    if (kind === 'second') return 'wait-second';
-    if (kind === 'performance') return 'wait-performance';
-    return '';
+    // The quick3 three, hardcoded, and '' for everything else. So an A10 run
+    // whose wave 1 is ARCHITECTURE got no stage, resumeRuntimeFromAuditTurn
+    // refused on its `!stage` guard, and the whole recovery chain above it --
+    // reconcileEnabledIdleAuditRuntime, browserWorkerRecoverIdleEngine -- had
+    // nothing to stand on. Six windows, finished ARCHITECTURE answer on
+    // screen, "no machine turn to adopt yet" every six seconds forever.
+    // waveWaitStage is the profile-aware version of exactly this and was
+    // sitting right there; this is now its alias.
+    return waveWaitStage(kind);
   }
 
   function auditKindForStage(stage) {
-    if (stage === 'wait-core') return 'core';
-    if (stage === 'wait-second') return 'second';
-    if (stage === 'wait-performance') return 'performance';
-    return '';
+    const clean = String(stage || '').replace(/^wait-/, '');
+    if (!clean || clean === String(stage || '')) return '';
+    return isValidAuditWaveKind(clean) ? clean : '';
   }
 
   function latestRecognizableAuditUserTurn(turns = getChatGPTTurns()) {
@@ -19348,6 +19352,7 @@ let browserWorkerBraveConfirmed = false;
         getChatGPTTurns,
         findTurnById,
         stageForAuditKind,
+        auditKindForStage,
         reconcileExecutionGap,
         campaignCompletionSnapshot,
         reconcilePrematureCampaignCompletion,
