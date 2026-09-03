@@ -96,13 +96,21 @@ class TestComponents(unittest.TestCase):
         cfg.bridge.host = "127.0.0.1"
         cfg.bridge.port = 18765
 
-        ok, message = ComponentManager(cfg).trigger_widget_install()
+        # A cold profile makes trigger_widget_install warm the pool first, and
+        # an unstubbed warm-up launches a REAL Chrome from the test run.
+        manager = ComponentManager(cfg)
+        manager.WIDGET_INSTALL_WARMUP_SECONDS = 0.0
+        manager._worker_profile_is_live = lambda: False
+        manager.launch_browser_worker = lambda **kw: (False, "stubbed")
+
+        ok, message = manager.trigger_widget_install()
 
         self.assertTrue(ok)
         self.assertEqual(message, "opened")
         open_dedicated.assert_called_once_with(
             use_bridge=True,
             bridge_url="http://127.0.0.1:18765/widget.user.js",
+            new_window=True,
         )
 
 
@@ -167,3 +175,48 @@ class TestWidgetInstallWarmsTheProfile(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(launches, [], "no Bridge means no pool to warm")
         self.assertFalse(opener.call_args.kwargs["use_bridge"])
+
+
+class TestInstallerDoesNotAddAWindow(unittest.TestCase):
+    """One press had started opening two windows: a warmed one and the installer.
+
+    A worker lane wants its own window. The installer does not -- when the
+    profile is already live Chrome can put it in a tab of the window that is
+    already there.
+    """
+
+    def test_the_command_can_omit_new_window(self):
+        from audapack.components.widget import dedicated_chromium_command
+
+        exe = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+        with_window = dedicated_chromium_command(exe, Path("C:/profile"), "https://x/", True)
+        as_tab = dedicated_chromium_command(exe, Path("C:/profile"), "https://x/", False)
+        self.assertIn("--new-window", with_window)
+        self.assertNotIn("--new-window", as_tab)
+        self.assertEqual(as_tab[-1], "https://x/")
+
+    def test_a_live_profile_gets_the_installer_as_a_tab(self):
+        from audapack.components import manager as mgr
+        from audapack.components.manager import ComponentManager
+        from audapack.config import AppConfig
+
+        manager = ComponentManager(AppConfig())
+        manager._worker_profile_is_live = lambda: True
+        with patch.object(mgr, "is_bridge_healthy", return_value=True), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
+            manager.trigger_widget_install()
+        self.assertFalse(opener.call_args.kwargs["new_window"])
+
+    def test_a_cold_profile_still_gets_its_window(self):
+        from audapack.components import manager as mgr
+        from audapack.components.manager import ComponentManager
+        from audapack.config import AppConfig
+
+        manager = ComponentManager(AppConfig())
+        manager.WIDGET_INSTALL_WARMUP_SECONDS = 0.0
+        manager._worker_profile_is_live = lambda: False
+        manager.launch_browser_worker = lambda **kw: (False, "no browser")
+        with patch.object(mgr, "is_bridge_healthy", return_value=True), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
+            manager.trigger_widget_install()
+        self.assertTrue(opener.call_args.kwargs["new_window"])

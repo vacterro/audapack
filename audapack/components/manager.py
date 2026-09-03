@@ -141,12 +141,14 @@ class ComponentManager:
 
         bridge_healthy = is_bridge_healthy(self.config.bridge.host, self.config.bridge.port)
         warmed = ""
-        if bridge_healthy and not self._worker_profile_is_live():
+        live = bridge_healthy and self._worker_profile_is_live()
+        if bridge_healthy and not live:
             launched, _msg = self.launch_browser_worker()
             if launched:
                 deadline = time.time() + self.WIDGET_INSTALL_WARMUP_SECONDS
                 while time.time() < deadline:
                     if self._worker_profile_is_live():
+                        live = True
                         break
                     time.sleep(1.0)
                 warmed = " (profile was cold; warmed it first)"
@@ -156,6 +158,9 @@ class ComponentManager:
         ok, message = open_widget_in_dedicated_chromium(
             use_bridge=bridge_healthy,
             bridge_url=f"http://{self.config.bridge.host}:{self.config.bridge.port}/widget.user.js",
+            # A live profile takes the installer as a TAB. Opening a window for
+            # it as well is how one press started producing two.
+            new_window=not live,
         )
         return ok, (message + warmed) if ok else message
 

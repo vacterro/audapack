@@ -337,8 +337,15 @@ def dedicated_chromium_command(
     browser_exe: str,
     profile_dir: Path,
     target: str = AUDAPACK_WORKER_URL,
+    new_window: bool = True,
 ) -> list[str]:
-    """Build the isolated worker launch command without starting a process."""
+    """Build the isolated worker launch command without starting a process.
+
+    ``new_window`` off opens the target as a TAB in whatever window the profile
+    already has. A worker lane wants its own window; the userscript installer
+    does not, and forcing one on it is how pressing Install Widget started
+    producing two windows -- an empty warmed one and the installer beside it.
+    """
     if not _is_chromium_exe(browser_exe):
         raise ValueError("AUDAPACK worker requires a Chromium-family browser")
     return [
@@ -346,7 +353,7 @@ def dedicated_chromium_command(
         *CHROMIUM_KEEPALIVE_FLAGS,
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
-        "--new-window",
+        *(["--new-window"] if new_window else []),
         target,
     ]
 
@@ -354,6 +361,7 @@ def dedicated_chromium_command(
 def _launch_dedicated_chromium(
     target: str,
     browser_exe: Optional[str] = None,
+    new_window: bool = True,
 ) -> tuple[bool, str, Optional[str], Path]:
     selected = select_dedicated_chromium(browser_exe)
     profile = get_dedicated_chromium_profile_dir()
@@ -361,7 +369,7 @@ def _launch_dedicated_chromium(
         return False, "No supported Chromium browser was found.", None, profile
     profile.mkdir(parents=True, exist_ok=True)
     try:
-        command = dedicated_chromium_command(selected, profile, target)
+        command = dedicated_chromium_command(selected, profile, target, new_window)
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
         # popen_hidden ORs in CREATE_NO_WINDOW: a portable launcher that is
         # itself a console program must not flash a black window over the
@@ -404,6 +412,7 @@ def open_widget_in_dedicated_chromium(
     browser_exe: Optional[str] = None,
     use_bridge: bool = False,
     bridge_url: Optional[str] = None,
+    new_window: bool = True,
 ) -> tuple[bool, str]:
     """Open the widget installer inside the same isolated worker profile."""
     widget = get_bundled_widget_path()
@@ -414,7 +423,7 @@ def open_widget_in_dedicated_chromium(
         cfg = load_config()
         bridge_url = f"http://{cfg.bridge.host}:{cfg.bridge.port}/widget.user.js"
     target = str(bridge_url) if use_bridge else widget.as_uri()
-    ok, error, selected, profile = _launch_dedicated_chromium(target, browser_exe)
+    ok, error, selected, profile = _launch_dedicated_chromium(target, browser_exe, new_window)
     if not ok or not selected:
         return False, error
     return True, f"Widget installer opened in AUDAPACK Chromium ({_clean_browser_name('', selected)}; profile: {profile})."
