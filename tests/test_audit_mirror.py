@@ -60,15 +60,15 @@ def test_a_finished_audit_arrives_as_a_canonical_layer(tmp_path):
 
 def test_the_layer_is_visible_to_the_inbox_reader(tmp_path):
     """The whole point: what we deliver must read as work the agent owes."""
-    from audapack import saipen_inbox
+    from audapack import agent_inbox
 
     project = tmp_path / "proj"
     project.mkdir()
     src = _audit_dir(tmp_path)
     mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, src, _handoff(src))
 
-    state = saipen_inbox.read_inbox(project)
-    assert state.verdict == saipen_inbox.UNREAD
+    state = agent_inbox.read_inbox(project)
+    assert state.verdict == agent_inbox.UNREAD
     assert state.unread_count == 1
     assert state.residue == [], "a delivery must not leave anything the inbox never reads"
 

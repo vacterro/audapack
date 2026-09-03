@@ -278,7 +278,10 @@ class SettingsWidget(QWidget):
         f.addRow("Copy to project", self.mirror_into_project)
         self.mirror_dir_name = QLineEdit(str(getattr(self._config.audits, "mirror_dir_name", "audit")))
         self.mirror_dir_name.setPlaceholderText("audit")
-        self.mirror_dir_name.setToolTip("Folder created inside the project source path")
+        self.mirror_dir_name.setToolTip(
+            "Folder created inside the project source path.\n"
+            "Agent inboxes read 'audit' specifically: rename it and `cc` finds nothing."
+        )
         f.addRow("Project folder", self.mirror_dir_name)
         self.mirror_include_waves = QCheckBox("Also copy the per-wave files beside it")
         self.mirror_include_waves.setChecked(bool(getattr(self._config.audits, "mirror_include_waves", False)))

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from audapack import saipen_inbox
+from audapack import agent_inbox
 from audapack.services.audit_run_service import AuditRunSnapshot
 from audapack.ui_qt.dialogs.audit_runs_widget import AuditRunsWidget, agent_inbox_suffix
 
@@ -33,18 +33,18 @@ def test_a_run_with_no_inbox_adds_nothing_to_the_summary():
 
 def test_unread_audits_are_counted_once_per_project():
     runs = [
-        run("p1", agent_state=saipen_inbox.UNREAD),
-        run("p1", agent_state=saipen_inbox.UNREAD),
-        run("p2", agent_state=saipen_inbox.UNREAD),
-        run("p3", agent_state=saipen_inbox.CONSUMED),
+        run("p1", agent_state=agent_inbox.UNREAD),
+        run("p1", agent_state=agent_inbox.UNREAD),
+        run("p2", agent_state=agent_inbox.UNREAD),
+        run("p3", agent_state=agent_inbox.CONSUMED),
     ]
     assert agent_inbox_suffix(runs) == " · 2 unread by agent"
 
 
 def test_work_in_progress_and_residue_are_named_separately():
     runs = [
-        run("p1", agent_state=saipen_inbox.IN_WORK),
-        run("p2", agent_state=saipen_inbox.UNREAD, agent_residue=5),
+        run("p1", agent_state=agent_inbox.IN_WORK),
+        run("p2", agent_state=agent_inbox.UNREAD, agent_residue=5),
     ]
     suffix = agent_inbox_suffix(runs)
     assert "1 unread by agent" in suffix
@@ -65,7 +65,7 @@ def test_the_recent_table_carries_an_agent_column(widget):
 def test_a_finished_run_shows_what_the_agent_did_with_it(widget):
     widget.set_runs([run(
         "p1",
-        agent_state=saipen_inbox.UNREAD,
+        agent_state=agent_inbox.UNREAD,
         agent_summary="AGENT UNREAD · 1",
         agent_guidance="Delivered and never read.",
     )])

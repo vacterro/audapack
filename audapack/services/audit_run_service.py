@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from audapack import saipen_inbox
+from audapack import agent_inbox
 from audapack.config import cross_process_lock, get_state_dir
 from audapack.models import AuditSnapshot
 
@@ -98,11 +98,11 @@ class AuditRunSnapshot:
     updated_at: float = 0.0
     completed_at: float = 0.0
     actions: tuple[str, ...] = ()
-    #: What the agent did with what we delivered, read from SAIPEN's Audit
-    #: Inbox binding. READY means the station is finished; it says nothing
-    #: about whether anyone read the result, and that is the question the
-    #: operator actually has before pressing START AUDIT again.
-    agent_state: str = saipen_inbox.NO_INBOX
+    #: What the agent did with what we delivered, read from the agent's own
+    #: journal at the configured probe path. READY means the station is
+    #: finished; it says nothing about whether anyone read the result, and that
+    #: is the question the operator actually has before pressing START AUDIT.
+    agent_state: str = agent_inbox.NO_INBOX
     agent_summary: str = ""
     agent_guidance: str = ""
     agent_residue: int = 0
@@ -977,7 +977,9 @@ class AuditRunCoordinator:
             root = str(getattr(project, "source_path", "") or "") if project else ""
             if not root:
                 return snapshot
-            state = saipen_inbox.read_inbox_cached(root)
+            audits = getattr(getattr(self.projects, "config", None), "audits", None)
+            binding = str(getattr(audits, "agent_receipt_path", "") or "")
+            state = agent_inbox.read_inbox_cached(root, binding_rel=binding)
             snapshot.agent_state = state.verdict
             snapshot.agent_summary = state.summary()
             snapshot.agent_guidance = state.guidance

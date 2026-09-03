@@ -12,11 +12,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from audapack import saipen_inbox as si
+from audapack import agent_inbox as si
 
 
 def _project(tmp_path: Path, layers: dict[str, str] | None = None, binding: dict | None = None,
-             residue: tuple[str, ...] = ()) -> Path:
+             residue: tuple[str, ...] = (), allocator: dict | None = None) -> Path:
     root = tmp_path / "proj"
     inbox = root / si.AUDIT_DIRNAME
     inbox.mkdir(parents=True)
@@ -25,9 +25,15 @@ def _project(tmp_path: Path, layers: dict[str, str] | None = None, binding: dict
     for name in residue:
         (inbox / name).write_text("x", encoding="utf-8")
     if binding is not None:
+        binding = {"schema_version": si.SUPPORTED_SCHEMA_VERSION, **binding}
         target = root / si.BINDING_REL
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(binding), encoding="utf-8")
+    if allocator is not None:
+        target = root / si.DEFAULT_ALLOCATOR_REL
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(
+            {"schema_version": si.SUPPORTED_SCHEMA_VERSION, **allocator}), encoding="utf-8")
     return root
 
 
@@ -143,12 +149,80 @@ def test_next_layer_number_starts_at_one(tmp_path):
     assert si.next_layer_number(_project(tmp_path)) == 1
 
 
-def test_an_unreadable_binding_is_not_a_crash(tmp_path):
+def test_an_unreadable_journal_is_unknown_not_a_confident_guess(tmp_path):
+    """A copied contract needs the one field that says the contract moved."""
     root = _project(tmp_path, layers={"1.md": "audit"})
     target = root / si.BINDING_REL
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("{ not json", encoding="utf-8")
-    assert si.read_inbox(root).verdict == si.UNREAD
+    state = si.read_inbox(root)
+    assert state.verdict == si.UNKNOWN
+    assert state.wants_new_audit is False
+    assert state.label != si.UNKNOWN, "a verdict with no label leaks a raw enum into the UI"
+
+
+def test_a_journal_from_another_schema_is_not_parsed(tmp_path):
+    root = _project(tmp_path, layers={"1.md": "audit"}, binding={"layers": {}})
+    target = root / si.BINDING_REL
+    target.write_text(json.dumps({"schema_version": 99, "layers": {}}), encoding="utf-8")
+    assert si.read_inbox(root).verdict == si.UNKNOWN
+
+
+def test_a_missing_journal_is_simply_never_consumed(tmp_path):
+    """Absent is fine; only a journal that cannot be trusted is UNKNOWN."""
+    assert si.read_inbox(_project(tmp_path, layers={"1.md": "audit"})).verdict == si.UNREAD
+
+
+def test_residue_stops_a_settled_inbox_reading_clean(tmp_path):
+    """The agent answers clean:false on this state; two tools must not disagree."""
+    root = _project(tmp_path, residue=("notes.md",))
+    state = si.read_inbox(root)
+    assert state.verdict == si.EMPTY
+    assert state.wants_new_audit is False
+    assert "clean" not in state.guidance.lower() or "not clean" in state.guidance.lower()
+    assert "notes.md" in state.guidance
+    assert "+1 residue" in state.summary()
+
+
+def test_residue_is_named_beside_a_real_verdict_too(tmp_path):
+    root = _project(tmp_path, layers={"1.md": "audit"}, residue=("notes.md", "campaign.json"))
+    state = si.read_inbox(root)
+    assert state.verdict == si.UNREAD
+    assert "never reads" in state.guidance
+    assert "+2 residue" in state.summary()
+
+
+def test_a_canonical_name_that_is_a_directory_is_a_bad_layer_not_residue(tmp_path):
+    """Name decides. Calling it residue would disagree with the agent."""
+    root = _project(tmp_path)
+    (root / si.AUDIT_DIRNAME / "1.md").mkdir()
+    state = si.read_inbox(root)
+    assert state.residue == []
+    assert state.verdict == si.BLOCKED
+    assert "not a regular file" in state.layers[0].detail
+
+
+def test_the_allocator_floor_covers_a_reserved_but_unplaced_number(tmp_path):
+    """SAIPEN reserves an id before the bytes land, so it is on neither side.
+
+    Live proof: its allocator held next_id 5 with layer 4 committed while disk
+    and binding topped out at 3. A two-source floor hands out 4 and keys two
+    different audits on the same audit/4.md.
+    """
+    root = _project(
+        tmp_path,
+        binding={"layers": {"audit/3.md": {"state": "DELETED", "file_sha256": "x"}}},
+        allocator={"next_id": 5, "operations": {"manual op-1": {"layer": 4}}},
+    )
+    assert si.next_layer_number(root) == 5
+
+
+def test_an_allocator_from_another_schema_contributes_nothing(tmp_path):
+    root = _project(tmp_path, layers={"2.md": "live"})
+    target = root / si.DEFAULT_ALLOCATOR_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"schema_version": 99, "next_id": 40}), encoding="utf-8")
+    assert si.next_layer_number(root) == 3
 
 
 def test_the_cache_follows_the_inbox_rather_than_a_clock(tmp_path):

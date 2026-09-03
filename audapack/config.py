@@ -32,6 +32,7 @@ try:  # POSIX advisory locks
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
+from audapack.agent_inbox import DEFAULT_ALLOCATOR_REL, DEFAULT_BINDING_REL
 from audapack.models import Project
 
 CONFIG_FILE_NAME = "config.json"
@@ -468,6 +469,17 @@ class AuditsConfig:
     #: deleted, so an inbox the agent has fully settled still reports dirty.
     #: Off by default -- the central audit root already keeps every wave.
     mirror_include_waves: bool = False
+    #: Where the agent journals what it consumed, relative to the project root.
+    #: A probe, not a coupling: AUDAPACK reads it if present and reports
+    #: "never consumed" if not, and never writes to it. The default suits
+    #: SAIPEN's Audit Inbox; any tool journaling {layers: {<rel>: {file_sha256,
+    #: state, receipt_id, linked_work}}} reads the same. Empty disables it.
+    agent_receipt_path: str = DEFAULT_BINDING_REL
+    #: Where the agent reserves layer numbers before the bytes land. Probed the
+    #: same way and for the same reason: a number spent there exists on neither
+    #: disk nor in the receipt journal, so skipping it hands the number out
+    #: twice. Empty disables it.
+    agent_allocator_path: str = DEFAULT_ALLOCATOR_REL
     hot_seconds: int = 6 * 3600           # <= 6 hours
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
@@ -1088,6 +1100,12 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         mirror_into_project=bool(audits_raw.get("mirror_into_project", False)),
         mirror_dir_name=str(audits_raw.get("mirror_dir_name") or "audit").strip() or "audit",
         mirror_include_waves=bool(audits_raw.get("mirror_include_waves", False)),
+        agent_receipt_path=str(
+            audits_raw.get("agent_receipt_path", DEFAULT_BINDING_REL)
+        ).strip(),
+        agent_allocator_path=str(
+            audits_raw.get("agent_allocator_path", DEFAULT_ALLOCATOR_REL)
+        ).strip(),
     )
 
     bridge_raw = data.get("bridge", {})

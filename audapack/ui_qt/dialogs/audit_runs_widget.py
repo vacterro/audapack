@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from audapack import saipen_inbox
+from audapack import agent_inbox
 from audapack.services.audit_run_service import MAX_AUDIT_LANES, AuditRunSnapshot
 
 
@@ -37,9 +37,9 @@ def agent_inbox_suffix(runs) -> str:
         if not project:
             continue
         state = str(getattr(run, "agent_state", "") or "")
-        if state == saipen_inbox.UNREAD:
+        if state == agent_inbox.UNREAD:
             unread.add(project)
-        elif state == saipen_inbox.IN_WORK:
+        elif state == agent_inbox.IN_WORK:
             working.add(project)
         if int(getattr(run, "agent_residue", 0) or 0):
             residue.add(project)

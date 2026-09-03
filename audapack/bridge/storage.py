@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from audapack import saipen_inbox
+from audapack import agent_inbox
 from audapack.campaign import (
     ARTIFACT_KIND_DIRECT_HANDOFF,
     ARTIFACT_KIND_QUICK3_COMBINED,
@@ -757,13 +757,15 @@ def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=Non
             # Redelivering the same bytes must not create a second unread layer:
             # the operator would be told the agent owes work it already has.
             already = any(
-                saipen_inbox.layer_number(item.name) is not None
+                agent_inbox.layer_number(item.name) is not None
                 and item.is_file()
                 and hashlib.sha256(item.read_bytes()).hexdigest() == digest
                 for item in dest.iterdir()
             )
             if not already:
-                target = dest / f"{saipen_inbox.next_layer_number(root, dest)}.md"
+                probe = str(getattr(config.audits, "agent_receipt_path", "") or "")
+                spent = str(getattr(config.audits, "agent_allocator_path", "") or "")
+                target = dest / f"{agent_inbox.next_layer_number(root, dest, probe, spent)}.md"
                 target.write_bytes(payload)
                 copied.append(target)
         except OSError:

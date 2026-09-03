@@ -32,8 +32,21 @@ from typing import Any, Optional
 AUDIT_DIRNAME = "audit"
 #: A canonical layer. `01.md`, `notes.md`, `1.txt` and `done/1.md` are not.
 LAYER_RE = re.compile(r"^[1-9][0-9]*\.md$")
-#: Where SAIPEN journals what it captured, relative to the project root.
-BINDING_REL = ".saipen/intake/audit_inbox.json"
+#: Default probe location for the agent's own record of what it captured,
+#: relative to the project root. A default, not a hardcode: callers pass their
+#: own, and a project with nothing there simply reads as never-consumed.
+DEFAULT_BINDING_REL = ".saipen/intake/audit_inbox.json"
+#: Kept as the module-level default so existing callers need not pass a path.
+BINDING_REL = DEFAULT_BINDING_REL
+#: Some agents reserve a layer number BEFORE the bytes land, so a number can be
+#: durably spent while existing on neither disk nor in the journal. Probing the
+#: allocator too is the difference between allocating forward and colliding.
+DEFAULT_ALLOCATOR_REL = ".saipen/intake/audit_allocator.json"
+#: The journal shape this reader was written against. A different value means
+#: the contract moved and these records must not be parsed as if it had not --
+#: that is the one field that keeps a copied contract honest instead of
+#: silently drifting into confident wrong answers.
+SUPPORTED_SCHEMA_VERSION = 1
 #: Dot-prefixed entries are directory infrastructure (`.gitkeep`, our own
 #: `.gitignore`), never a producer's leftovers, so they are not residue.
 RESIDUE_EXEMPT_PREFIX = "."
@@ -44,6 +57,7 @@ RESIDUE_REPORT_CAP = 20
 NO_INBOX = "NO_INBOX"
 EMPTY = "EMPTY"
 CONSUMED = "CONSUMED"
+UNKNOWN = "UNKNOWN"
 IN_WORK = "IN_WORK"
 UNREAD = "UNREAD"
 BLOCKED = "BLOCKED"
@@ -52,6 +66,7 @@ _VERDICT_URGENCY = {
     NO_INBOX: 0,
     EMPTY: 1,
     CONSUMED: 2,
+    UNKNOWN: 6,
     IN_WORK: 3,
     UNREAD: 4,
     BLOCKED: 5,
@@ -75,16 +90,18 @@ _LABELS = {
     IN_WORK: "AGENT WORKING",
     UNREAD: "AGENT UNREAD",
     BLOCKED: "AGENT BLOCKED",
+    UNKNOWN: "AGENT STATE UNREADABLE",
 }
 
 #: The one sentence the operator actually wants: run a new audit, or not.
 _GUIDANCE = {
-    NO_INBOX: "No audit/ inbox in this project. Enable the audit mirror to deliver one.",
+    NO_INBOX: "No audit/ inbox in this project. Enable the audit mirror to deliver one.",  # noqa: E501
     EMPTY: "Inbox is clean. A new audit is the useful thing to run.",
     CONSUMED: "The agent closed every delivered layer. A new audit is the useful thing to run.",
     IN_WORK: "The agent is working this audit now. Running a new one duplicates the work.",
     UNREAD: "Delivered and never read. Point the agent at it (cc) instead of auditing again.",
     BLOCKED: "The agent could not settle this layer. Read the reason before delivering more.",
+    UNKNOWN: "The agent's journal is a schema this build does not read. Treat its state as unknown.",
 }
 
 
@@ -120,10 +137,6 @@ class InboxState:
         return _LABELS.get(self.verdict, self.verdict)
 
     @property
-    def guidance(self) -> str:
-        return _GUIDANCE.get(self.verdict, "")
-
-    @property
     def unread_count(self) -> int:
         return sum(1 for item in self.layers if item.verdict == UNREAD)
 
@@ -134,16 +147,40 @@ class InboxState:
 
     @property
     def wants_new_audit(self) -> bool:
-        """True only when nothing delivered is still waiting on the agent."""
-        return self.verdict in (EMPTY, CONSUMED)
+        """True only when nothing delivered is still waiting on the agent.
+
+        Residue counts against it. The inbox rule is REPORT_NEVER_DELETE, so
+        leftovers are permanent until someone removes them, and an inbox
+        holding them is not the clean directory a green verdict implies --
+        the agent's own status answers `clean: false` on exactly this state.
+        """
+        return self.verdict in (EMPTY, CONSUMED) and not self.residue
+
+    @property
+    def guidance(self) -> str:
+        base = _GUIDANCE.get(self.verdict, "")
+        if not self.residue:
+            return base
+        shown = ", ".join(self.residue[:3])
+        more = "..." if len(self.residue) > 3 or self.residue_truncated else ""
+        note = (
+            f"{len(self.residue)}{'+' if self.residue_truncated else ''} file(s) the agent never reads"
+            f" and never deletes: {shown}{more}."
+        )
+        if self.verdict in (EMPTY, CONSUMED):
+            # Never say "clean" while leftovers are sitting there.
+            return f"Nothing is owed, but the inbox is not clean. {note}"
+        return f"{base} {note}"
 
     def summary(self) -> str:
+        residue = f" · +{len(self.residue)} residue" if self.residue else ""
         if self.verdict == UNREAD:
-            return f"{self.label} · {self.unread_count}"
+            return f"{self.label} · {self.unread_count}{residue}"
         if self.verdict == IN_WORK:
             work = next((item.linked_work for item in self.layers if item.linked_work), "")
-            return f"{self.label} · {work}" if work else self.label
-        return self.label
+            head = f"{self.label} · {work}" if work else self.label
+            return f"{head}{residue}"
+        return f"{self.label}{residue}"
 
 
 def audit_dir(root: Path | str) -> Path:
@@ -157,7 +194,8 @@ def layer_number(name: str) -> Optional[int]:
     return int(name[:-3])
 
 
-def next_layer_number(root: Path | str, directory: Path | str | None = None) -> int:
+def next_layer_number(root: Path | str, directory: Path | str | None = None,
+                      binding_rel: str = "", allocator_rel: str = "") -> int:
     """The lowest free canonical layer number, never overwriting a live one.
 
     Writing over an existing layer is legal in SAIPEN -- same path, changed
@@ -166,8 +204,15 @@ def next_layer_number(root: Path | str, directory: Path | str | None = None) -> 
     nothing and cannot do that.
 
     ``directory`` overrides the canonical ``<root>/audit`` for an operator who
-    renamed the delivery folder; the binding is still consulted, because a
-    number a settled receipt already used must not be handed out again.
+    renamed the delivery folder; the journals are still consulted, because a
+    number already spent must not be handed out again.
+
+    THREE floors, not two. Disk and the capture journal both only know numbers
+    whose bytes exist. An agent that reserves an id before the bytes land has
+    spent numbers that appear in neither -- SAIPEN's allocator held
+    ``next_id: 5`` with layer 4 committed while disk and binding topped out at
+    3, so a two-source floor would have handed out 4 and keyed two different
+    audits on the same ``audit/4.md`` in provenance records.
     """
     highest = 0
     directory = Path(str(directory)) if directory is not None else audit_dir(root)
@@ -181,21 +226,60 @@ def next_layer_number(root: Path | str, directory: Path | str | None = None) -> 
             highest = max(highest, number)
     # A binding record for a layer already deleted still consumes its number:
     # reusing it would rebind fresh bytes onto a settled receipt's path.
-    for rel in (_read_binding(root).get("layers") or {}):
+    for rel in (_read_binding(root, binding_rel).get("layers") or {}):
         name = str(rel).rsplit("/", 1)[-1]
         number = layer_number(name)
         if number is not None:
             highest = max(highest, number)
+    # Reserved-but-unplaced ids live only here.
+    allocator = _read_allocator(root, allocator_rel)
+    try:
+        highest = max(highest, int(allocator.get("next_id") or 0) - 1)
+    except (TypeError, ValueError):
+        pass
+    operations = allocator.get("operations")
+    if isinstance(operations, dict):
+        for record in operations.values():
+            if not isinstance(record, dict):
+                continue
+            try:
+                highest = max(highest, int(record.get("layer") or 0))
+            except (TypeError, ValueError):
+                continue
     return highest + 1
 
 
-def _read_binding(root: Path | str) -> dict[str, Any]:
-    path = Path(str(root)) / BINDING_REL
+def _read_journal(root: Path | str, rel: str, default_rel: str) -> tuple[dict[str, Any], bool]:
+    """One agent journal, or ``({}, False)`` when it must not be parsed.
+
+    The boolean is "readable": absent is fine and simply contributes nothing,
+    but a journal whose ``schema_version`` is not the one this reader was
+    written against is NOT fine. Parsing it anyway would answer confidently
+    from a contract that moved. Callers turn that into UNKNOWN rather than a
+    guess.
+    """
+    path = Path(str(root)) / (str(rel or "").strip() or default_rel)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}, True
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}, False
+    if not isinstance(data, dict):
+        return {}, False
+    if int(data.get("schema_version") or 0) != SUPPORTED_SCHEMA_VERSION:
+        return {}, False
+    return data, True
+
+
+def _read_binding(root: Path | str, binding_rel: str = "") -> dict[str, Any]:
+    return _read_journal(root, binding_rel, BINDING_REL)[0]
+
+
+def _read_allocator(root: Path | str, allocator_rel: str = "") -> dict[str, Any]:
+    return _read_journal(root, allocator_rel, DEFAULT_ALLOCATOR_REL)[0]
 
 
 def _digest(path: Path) -> tuple[str, int]:
@@ -217,13 +301,16 @@ def scan_residue(root: Path | str) -> tuple[list[str], bool]:
     for entry in entries:
         if entry.name.startswith(RESIDUE_EXEMPT_PREFIX):
             continue
-        if entry.is_file() and layer_number(entry.name) is not None:
+        # Name decides. A directory or symlink called `1.md` is a BAD LAYER,
+        # not residue -- calling it residue would have this reader and the
+        # agent disagree about the same entry.
+        if layer_number(entry.name) is not None:
             continue
         names.append(entry.name)
     return names[:RESIDUE_REPORT_CAP], len(names) > RESIDUE_REPORT_CAP
 
 
-def read_inbox(root: Path | str) -> InboxState:
+def read_inbox(root: Path | str, binding_rel: str = "") -> InboxState:
     """What the agent has done with everything delivered to this project."""
     root_path = Path(str(root or ""))
     state = InboxState(root=str(root_path))
@@ -233,7 +320,11 @@ def read_inbox(root: Path | str) -> InboxState:
     if not directory.is_dir():
         return state
 
-    binding = _read_binding(root_path)
+    binding, readable = _read_journal(root_path, binding_rel, BINDING_REL)
+    if not readable:
+        state.verdict = UNKNOWN
+        state.residue, state.residue_truncated = scan_residue(root_path)
+        return state
     bound = binding.get("layers") if isinstance(binding.get("layers"), dict) else {}
     state.has_binding = bool(bound)
     seen: set[str] = set()
@@ -244,10 +335,16 @@ def read_inbox(root: Path | str) -> InboxState:
         entries = []
     for entry in entries:
         number = layer_number(entry.name)
-        if number is None or not entry.is_file():
+        if number is None:
             continue
         rel = f"{AUDIT_DIRNAME}/{entry.name}"
         seen.add(rel)
+        if not entry.is_file():
+            state.layers.append(InboxLayer(
+                rel=rel, layer=number, verdict=BLOCKED,
+                detail="canonical layer name is not a regular file",
+            ))
+            continue
         try:
             digest, size = _digest(entry)
         except OSError:
@@ -299,11 +396,11 @@ def read_inbox(root: Path | str) -> InboxState:
     return state
 
 
-_CACHE: dict[str, tuple[float, tuple, InboxState]] = {}
+_CACHE: dict[tuple[str, str], tuple[float, tuple, InboxState]] = {}
 _CACHE_TTL_SECONDS = 8.0
 
 
-def _inbox_fingerprint(root: Path | str) -> tuple:
+def _inbox_fingerprint(root: Path | str, binding_rel: str = "") -> tuple:
     """Name, size and mtime of every inbox entry, plus the binding's own stamp.
 
     Not the directory's own mtime: on Windows that is too coarse to notice a
@@ -321,14 +418,16 @@ def _inbox_fingerprint(root: Path | str) -> tuple:
     except OSError:
         pass
     try:
-        binding = (Path(str(root)) / BINDING_REL).stat()
-        entries.append((BINDING_REL, int(binding.st_size), int(binding.st_mtime_ns)))
+        rel = str(binding_rel or "").strip() or BINDING_REL
+        binding = (Path(str(root)) / rel).stat()
+        entries.append((rel, int(binding.st_size), int(binding.st_mtime_ns)))
     except OSError:
         pass
     return tuple(entries)
 
 
-def read_inbox_cached(root: Path | str, now: Optional[float] = None) -> InboxState:
+def read_inbox_cached(root: Path | str, now: Optional[float] = None,
+                      binding_rel: str = "") -> InboxState:
     """``read_inbox`` with a bounded cache for repeated dashboard refreshes.
 
     A dashboard reads this every few seconds for every project and each read
@@ -338,14 +437,14 @@ def read_inbox_cached(root: Path | str, now: Optional[float] = None) -> InboxSta
     """
     import time
 
-    key = str(root or "")
-    if not key:
+    if not str(root or ""):
         return InboxState()
+    key = (str(root), str(binding_rel or ""))
     stamp = float(now if now is not None else time.time())
-    fingerprint = _inbox_fingerprint(key)
+    fingerprint = _inbox_fingerprint(key[0], binding_rel)
     hit = _CACHE.get(key)
     if hit and hit[1] == fingerprint and stamp - hit[0] < _CACHE_TTL_SECONDS:
         return hit[2]
-    state = read_inbox(key)
+    state = read_inbox(key[0], binding_rel)
     _CACHE[key] = (stamp, fingerprint, state)
     return state
