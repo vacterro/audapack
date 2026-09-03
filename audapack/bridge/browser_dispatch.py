@@ -294,11 +294,52 @@ def _now() -> float:
     return time.time()
 
 
+#: How long an orphaned temp file must have sat there before a later write
+#: sweeps it. Comfortably longer than any write in flight, so a sweep can never
+#: race a sibling process that is mid-write.
+_TEMP_SWEEP_AGE_SECONDS = 300.0
+
+
 def _atomic_write_json(path: Path, doc: Any) -> None:
+    """Write via a temp file, and do not leave one behind when that fails.
+
+    On Windows the replace fails outright while any reader holds the target
+    open, and the target held open most often is the generation file the GUI
+    both watches and polls. Every failure used to leave its temp file on disk
+    for good: 11 of them were found beside a live state dir, all for that one
+    file and none for jobs.json. Nothing swept them, because nothing knew.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:6]}")
-    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        # The caller still gets the failure; it just does not get a leftover.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    _sweep_stale_temp_files(path)
+
+
+def _sweep_stale_temp_files(path: Path) -> None:
+    """Clear temp files an earlier failed write left beside ``path``.
+
+    Best effort and age-bounded: a temp file younger than the sweep age may
+    belong to a write happening right now in another process.
+    """
+    cutoff = time.time() - _TEMP_SWEEP_AGE_SECONDS
+    try:
+        for stale in path.parent.glob(f"{path.name}.tmp.*"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
 
 
 class BrowserDispatcher:

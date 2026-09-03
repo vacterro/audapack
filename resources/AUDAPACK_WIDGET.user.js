@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.45
+// @version      0.0.46
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -18605,7 +18605,12 @@ let browserWorkerBraveConfirmed = false;
     if (!smartSet(input, '')) return false;
     if (cleanTurnText(composerPlainText(input))) return false;
     appendBridgeDiagnostic('worker_draft_cleared', {
-      severity: 'info',
+      // WARN, not info: this ERASES content. It had fired 21 times at the same
+      // severity as a 20-second heartbeat, and in the window where a lane hung
+      // in START_PREPARED for 155s the whole log held nothing above info -- so
+      // the one event that touched that composer was invisible among 1800
+      // heartbeats. A channel that logs a deletion at info explains nothing.
+      severity: 'warn',
       message: 'cleared an abandoned machine-authored audit prompt from the composer'
     });
     renderAutoAuditState();

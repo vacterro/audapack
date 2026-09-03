@@ -2271,3 +2271,60 @@ def test_two_windows_both_holding_runs_are_both_kept(tmp_path):
     d._workers["w_b"].campaign_run_id = "run-b"
     d.status()
     assert len(d.list_workers()) == 2
+
+
+# ------------------------------------------------- atomic writes leave nothing
+#
+# 11 orphaned temp files were found beside a live state dir, every one for the
+# generation file and none for jobs.json -- the generation file being the one
+# the GUI both watches and polls, so a reader holding it open is exactly when
+# the replace fails on Windows. Nothing swept them.
+
+
+def test_a_failed_write_leaves_no_temp_file_behind(tmp_path):
+    from unittest.mock import patch
+
+    from audapack.bridge.browser_dispatch import _atomic_write_json
+
+    target = tmp_path / "state.json"
+    with patch.object(Path, "replace", side_effect=PermissionError("held open")):
+        with pytest.raises(PermissionError):
+            _atomic_write_json(target, {"a": 1})
+    assert list(tmp_path.glob("state.json.tmp.*")) == []
+
+
+def test_the_caller_still_sees_the_failure(tmp_path):
+    """Cleaning up must not turn a failed write into a silent success."""
+    from unittest.mock import patch
+
+    from audapack.bridge.browser_dispatch import _atomic_write_json
+
+    with patch.object(Path, "replace", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            _atomic_write_json(tmp_path / "state.json", {"a": 1})
+
+
+def test_a_later_write_sweeps_an_older_orphan(tmp_path):
+    import os
+
+    from audapack.bridge.browser_dispatch import _TEMP_SWEEP_AGE_SECONDS, _atomic_write_json
+
+    target = tmp_path / "state.json"
+    orphan = tmp_path / "state.json.tmp.deadbe"
+    orphan.write_text("{}", encoding="utf-8")
+    old = time.time() - (_TEMP_SWEEP_AGE_SECONDS + 60)
+    os.utime(orphan, (old, old))
+
+    _atomic_write_json(target, {"a": 1})
+    assert not orphan.exists()
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
+
+
+def test_the_sweep_never_touches_a_write_in_flight(tmp_path):
+    """A fresh temp file may belong to another process writing right now."""
+    from audapack.bridge.browser_dispatch import _atomic_write_json
+
+    fresh = tmp_path / "state.json.tmp.abc123"
+    fresh.write_text("{}", encoding="utf-8")
+    _atomic_write_json(tmp_path / "state.json", {"a": 1})
+    assert fresh.exists()
