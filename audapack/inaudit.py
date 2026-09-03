@@ -51,9 +51,16 @@ def list_inaudit_layers(project: Project) -> list[InauditLayer]:
                 num = int(p.stem)
                 sz = p.stat().st_size
                 layers.append(InauditLayer(number=num, path=p.resolve(), size_bytes=sz, size_str=_human_size(sz)))
-            except Exception:
+            except (ValueError, OSError):
+                # A non-numeric name is simply not a layer, and a file that
+                # cannot be stat'd is not readable as one. Anything WIDER than
+                # that would disguise a real bug in here as "no layers", which
+                # renders as an empty inbox and no error anywhere.
                 continue
-    except Exception:
+    except OSError:
+        # The directory went away or cannot be read: no layers is the honest
+        # answer. Wider than that and a real bug in the scan renders as an
+        # empty inbox with no error anywhere.
         return []
     layers.sort(key=lambda x: x.number)
     return layers
@@ -80,10 +87,10 @@ def set_inaudit_selected(project: Project, number: Optional[int]) -> None:
         return
     try:
         n = int(number)
-        if n >= 1:
-            _selection[str(project.id)] = n
-    except Exception:
-        pass
+    except (TypeError, ValueError):
+        return
+    if n >= 1:
+        _selection[str(project.id)] = n
 
 def get_active_inaudit_path(project: Project) -> Optional[Path]:
     sel = get_inaudit_selected(project)
@@ -114,7 +121,11 @@ def resolve_inaudit_path(project: Project, number: int) -> Optional[Path]:
 
 def ensure_next_layer(project: Project) -> Path:
     d = inaudit_dir(project)
-    assert d is not None
+    if d is None:
+        # An assert here vanished under python -O and left d.mkdir raising
+        # AttributeError on None -- a confusing error instead of the real one.
+        # The caller shows this text in its status line.
+        raise ValueError("project has no source path, so it has no audit inbox")
     d.mkdir(parents=True, exist_ok=True)
     layers = list_inaudit_layers(project)
     nxt = (max((x.number for x in layers), default=0) + 1)

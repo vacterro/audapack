@@ -294,3 +294,52 @@ def test_unread_outranks_in_work_which_outranks_blocked(tmp_path):
     assert si._VERDICT_URGENCY[si.UNREAD] > si._VERDICT_URGENCY[si.IN_WORK]
     assert si._VERDICT_URGENCY[si.IN_WORK] > si._VERDICT_URGENCY[si.BLOCKED]
     assert si._VERDICT_URGENCY[si.UNKNOWN] > si._VERDICT_URGENCY[si.UNREAD]
+
+
+# ------------------------------------------------------------ T-134 residue
+#
+# An assert on a runtime condition vanishes under python -O, and an
+# `except Exception` around a layer scan disguises a real bug in the scanner
+# as "this project has no layers" -- an empty inbox and no error anywhere.
+
+
+def test_a_project_with_no_source_path_gets_a_real_error():
+    import pytest as _pytest
+
+    from audapack.inaudit import ensure_next_layer
+    from audapack.models import Project
+
+    with _pytest.raises(ValueError, match="no audit inbox"):
+        ensure_next_layer(Project(id="p", display_name="P", source_path=""))
+
+
+def test_a_broken_scanner_is_not_reported_as_an_empty_inbox(tmp_path, monkeypatch):
+    import pytest as _pytest
+
+    from audapack import inaudit
+    from audapack.models import Project
+
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "1.md").write_text("layer", encoding="utf-8")
+    project = Project(id="p", display_name="P", source_path=str(tmp_path))
+    assert len(inaudit.list_inaudit_layers(project)) == 1
+
+    def boom(_n):
+        raise RuntimeError("a real bug in here")
+
+    monkeypatch.setattr(inaudit, "_human_size", boom)
+    with _pytest.raises(RuntimeError):
+        inaudit.list_inaudit_layers(project)
+
+
+def test_a_non_numeric_file_is_simply_not_a_layer(tmp_path):
+    from audapack.inaudit import list_inaudit_layers
+    from audapack.models import Project
+
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "1.md").write_text("layer", encoding="utf-8")
+    (audit_dir / "notes.md").write_text("not a layer", encoding="utf-8")
+    layers = list_inaudit_layers(Project(id="p", display_name="P", source_path=str(tmp_path)))
+    assert [layer.number for layer in layers] == [1]

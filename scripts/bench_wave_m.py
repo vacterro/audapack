@@ -13,7 +13,6 @@ Runs actual timings and counters for:
 import sys
 import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -22,14 +21,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 
-from audapack.audits import AUDIT_COUNTERS, reset_audit_counters
+from audapack.audits import AUDIT_COUNTERS
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import AuditSnapshot, AuditTemperature, Project
-from audapack.services.audit_service import AuditService
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.main_window import MainWindow
 from audapack.ui_qt.models.project_room_model import ProjectRoomModel
-from audapack.ui_qt.task_runner import TaskRunner
 
 
 def run_benchmark():
@@ -55,7 +52,6 @@ def run_benchmark():
 
         t0 = time.perf_counter()
         service_24 = ProjectService(cfg_24, base_dir=tmp_path)
-        t_model_start = time.perf_counter()
         window = MainWindow(service_24)
         t_visible = time.perf_counter()
         window.show()
@@ -84,7 +80,7 @@ def run_benchmark():
 
         # Async persistence
         t_persist_start = time.perf_counter()
-        res = service_24.move_project("p_0", "MAIN0", 4)
+        service_24.move_project("p_0", "MAIN0", 4)
         t_persist_end = time.perf_counter()
         metrics["drop_to_persist_complete_ms"] = (t_persist_end - t_persist_start) * 1000.0
 
@@ -120,7 +116,7 @@ def run_benchmark():
             cfg = AppConfig(audits=AuditsConfig(root=str(tmp_path / "audits")), projects=projs)
             t_s = time.perf_counter()
             svc = ProjectService(cfg, base_dir=tmp_path)
-            mdl = ProjectRoomModel(svc)
+            ProjectRoomModel(svc)  # constructing it is what is timed
             elapsed_ms = (time.perf_counter() - t_s) * 1000.0
             scale_timings[f"{count}_projects_ms"] = elapsed_ms
 

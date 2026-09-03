@@ -1,7 +1,9 @@
 """Icon smoke check: multi-size app icon builds from shipped resources."""
 import os
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import sys
+
 sys.path.insert(0, r"V:\___VAC\__K\__CODE\_PY\_AUDAPACK")
 
 from audapack.ui_qt.app import _build_app_icon

@@ -4,13 +4,20 @@ Writes `.saipen/kitchen/bench_baseline.json`. No telemetry, no fabricated values
 """
 
 import sys
+
 if __name__ == "__main__" and "." not in sys.path:
     sys.path.insert(0, ".")
 
-import json, pathlib, tempfile, shutil, time
+import json
+import pathlib
+import shutil
+import tempfile
+import time
+
 from audapack.config import AppConfig, save_config
-from audapack.services.project_service import ProjectService
 from audapack.services.audit_service import AuditService
+from audapack.services.project_service import ProjectService
+
 
 def _synthetic_config(base, n):
     cfg = AppConfig()
@@ -30,7 +37,7 @@ def bench():
     base = pathlib.Path(tempfile.mkdtemp())
     try:
         _synthetic_config(base, 0)
-        ctrl = AppController(base_dir=base)
+        AppController(base_dir=base)  # constructing it is what is timed
         out["startup_ms"] = round((time.perf_counter()-t0)*1000, 2)
         # single move 24
         base24 = pathlib.Path(tempfile.mkdtemp())
