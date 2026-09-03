@@ -219,3 +219,60 @@ def test_the_desktop_exposes_all_three_profiles_as_peers(tmp_path, qapp):
         assert window.profile_actions["compress"].isChecked() is False
     finally:
         window.close()
+
+
+def test_a_profile_click_never_writes_a_stale_project_registry(tmp_path, qapp):
+    """CORE-002 (audit/1.md): a settings click is not a registry write.
+
+    The click mutated the config snapshot this window loaded and saved the WHOLE
+    object with no lock and no rebase, so a project registered by the Bridge or
+    moved by the CLI in the meantime was silently rolled back by someone
+    choosing an audit profile.
+    """
+    from audapack.config import AppConfig, AuditsConfig, load_config, save_config
+    from audapack.models import Project
+    from audapack.services.project_service import ProjectService
+    from audapack.ui_qt.main_window import MainWindow
+
+    config = AppConfig(audits=AuditsConfig(root=str(tmp_path / "audits"), profile="quick3"))
+    config.projects = [Project(id="old", display_name="Old", source_path=str(tmp_path / "old"))]
+    save_config(config, base_dir=tmp_path)
+
+    window = MainWindow(ProjectService(config, base_dir=tmp_path))
+    try:
+        # Another writer lands between the window opening and the click.
+        newer = load_config(base_dir=tmp_path)
+        newer.projects.append(
+            Project(id="new", display_name="New", source_path=str(tmp_path / "new"))
+        )
+        assert save_config(newer, base_dir=tmp_path)
+
+        window._on_select_audit_profile("compress")
+
+        on_disk = load_config(base_dir=tmp_path)
+        assert on_disk.audits.profile == "compress"
+        assert [p.id for p in on_disk.projects] == ["old", "new"], "the newer registry was rolled back"
+    finally:
+        window.close()
+
+
+def test_a_refused_save_never_announces_the_new_profile(tmp_path, qapp):
+    """The return value of the save used to be discarded entirely."""
+    from unittest.mock import patch
+
+    from audapack.config import AppConfig, AuditsConfig, load_config, save_config
+    from audapack.services.project_service import ProjectService
+    from audapack.ui_qt.main_window import MainWindow
+
+    config = AppConfig(audits=AuditsConfig(root=str(tmp_path / "audits"), profile="quick3"))
+    save_config(config, base_dir=tmp_path)
+    window = MainWindow(ProjectService(config, base_dir=tmp_path))
+    try:
+        with patch("audapack.ui_qt.main_window.scoped_config_write", return_value=False):
+            window._on_select_audit_profile("super10")
+        assert load_config(base_dir=tmp_path).audits.profile == "quick3"
+        assert window._service.config.audits.profile == "quick3"
+        assert window.profile_actions["quick3"].isChecked() is True
+        assert window.profile_actions["super10"].isChecked() is False
+    finally:
+        window.close()

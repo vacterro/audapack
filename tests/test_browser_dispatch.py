@@ -2370,3 +2370,88 @@ def test_the_sweep_never_touches_a_write_in_flight(tmp_path):
     fresh.write_text("{}", encoding="utf-8")
     _atomic_write_json(tmp_path / "state.json", {"a": 1})
     assert fresh.exists()
+
+
+def test_a_display_name_never_closes_another_project_by_its_id(tmp_path):
+    """W2-003 (audit/1.md): id and name are different identity domains.
+
+    Both went into ONE set compared against a set holding each job's id AND
+    name, so a project whose NAME equals another project's ID terminalized that
+    other project's live audit, inherited its handoff as proof of completion and
+    had drift written into its lineage. Measured on the pre-fix code: closing
+    project_id=alpha/name=beta returned 2.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w-alpha"))
+    d.register_worker(supported_worker("w-beta"))
+
+    alpha = d.enqueue_job(dict(job_payload(path), project_id="alpha", project_name="beta"))
+    beta = d.enqueue_job(dict(job_payload(path), project_id="beta", project_name="gamma"))
+    for worker_id, item, run in (("w-alpha", alpha, "run-a"), ("w-beta", beta, "run-b")):
+        lease = d.claim_job(worker_id)
+        assert lease is not None and lease.dispatch_id == item.dispatch_id
+        for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+            d.transition_job(item.dispatch_id, worker_id, lease.lease_id, state,
+                             {"campaign_run_id": run, "start_receipt": f"receipt-{run}"})
+
+    handoff = tmp_path / "alpha__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    closed = d.complete_runs_for_project("alpha", "beta", str(handoff), "deadbeef", "run-a")
+
+    assert closed == 1
+    assert d.get_job(alpha.dispatch_id).state == JOB_COMPLETE
+    survivor = d.get_job(beta.dispatch_id)
+    assert survivor.state == JOB_AUDITING, "a live audit was closed by a name/id collision"
+    assert survivor.final_handoff_path == ""
+    assert survivor.meta_run_id_drift == ""
+
+
+def test_the_reverse_collision_is_equally_refused(tmp_path):
+    """Closing `beta` must not reach the job whose display NAME is beta."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w-alpha"))
+    d.register_worker(supported_worker("w-beta"))
+
+    alpha = d.enqueue_job(dict(job_payload(path), project_id="alpha", project_name="beta"))
+    beta = d.enqueue_job(dict(job_payload(path), project_id="beta", project_name="gamma"))
+    for worker_id, item in (("w-alpha", alpha), ("w-beta", beta)):
+        lease = d.claim_job(worker_id)
+        for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+            d.transition_job(item.dispatch_id, worker_id, lease.lease_id, state,
+                             {"campaign_run_id": f"run-{worker_id}", "start_receipt": "receipt"})
+
+    assert d.complete_runs_for_project("beta", "gamma", "/final.md", "abc") == 1
+    assert d.get_job(beta.dispatch_id).state == JOB_COMPLETE
+    assert d.get_job(alpha.dispatch_id).state == JOB_AUDITING
+
+
+def test_a_legacy_job_with_no_id_is_still_reachable_by_name(tmp_path):
+    """Old records predate the canonical id; the name is all they carry."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "LEGACY"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.get_job(item.dispatch_id).project_id = ""
+
+    assert d.complete_runs_for_project("legacy", "LEGACY", "/final.md", "abc") == 1
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+
+def test_the_id_match_is_case_folded_like_before(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(dict(job_payload(path), project_id="MixedCase", project_name="Mixed Case"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+
+    assert d.complete_runs_for_project("MIXEDCASE", "Mixed Case", "/final.md", "abc") == 1
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE

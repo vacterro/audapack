@@ -493,6 +493,22 @@ def _as_queue_position(value: Any) -> int:
         return -1
 
 
+def _basename_any_platform(value: str) -> str:
+    """The filename inside a path, whichever OS wrote it.
+
+    CORE-003 (audit/1.md): the diagnostics record promises a filename and never
+    a directory, but it used `Path(...).name`, which on POSIX reads the whole
+    `C:\\Users\\Private\\secret-result.md` as ONE filename -- so the Ubuntu half
+    of the CI matrix emitted the operator's full Windows path into a record
+    documented as redacted. The redaction cannot depend on which host is
+    reading the value; both separators are cut here.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    return text.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _actions_for(operator_state: str) -> tuple[str, ...]:
     if operator_state in {"WAITING", "RETRYING"}:
         # Still in the line, so it can still be moved in it. ATTACHING is not:
@@ -1284,7 +1300,7 @@ class AuditRunCoordinator:
             "worker_counts": snapshot.worker_counts,
             "conversation_locator": snapshot.conversation_locator,
             "final_handoff_present": snapshot.handoff_present,
-            "handoff_filename": Path(snapshot.handoff_path).name if snapshot.handoff_path else "",
+            "handoff_filename": _basename_any_platform(snapshot.handoff_path),
             "handoff_sha256": snapshot.handoff_sha256,
             "error": snapshot.error[:500],
             "recovery": snapshot.recovery[:200],

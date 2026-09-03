@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 from audapack.bridge.state import get_generation_file_path, get_generation_info
 from audapack.campaign import get_profile, profile_choices
 from audapack.components.manager import ComponentManager
-from audapack.config import app_dir, save_config
+from audapack.config import app_dir, save_config, scoped_config_write
 from audapack.inaudit import (
     get_active_inaudit_path,
     get_inaudit_selected,
@@ -444,6 +444,22 @@ def _fit_toolbar_to_text(toolbar, available: Optional[int] = None) -> int:
     itself lives in even_layout, which the Settings tab row uses too.
     """
     return fit_toolbar(toolbar, available)
+
+
+def _service_base_dir(service) -> Optional[Path]:
+    """The config root this window's service was built against.
+
+    ProjectService exposes it as `base_dir`; closeEvent had been reading a
+    `_base_dir` that does not exist there, so `None` (the real user runtime
+    root) was passed even from a test operating on a temp directory. One
+    accessor so the geometry write and the profile write can never disagree
+    about which config file they are talking about.
+    """
+    for attribute in ("base_dir", "_base_dir"):
+        value = getattr(service, attribute, None)
+        if value:
+            return value
+    return None
 
 
 def bridge_status_text(browser: dict[str, Any]) -> str:
@@ -867,7 +883,7 @@ QToolTip QLabel {
                 "window_pos": [self.x(), self.y()],
                 "window_maximized": bool(self.isMaximized()),
             }
-            base = getattr(self._service, "_base_dir", None)
+            base = _service_base_dir(self._service)
             lock_path = get_registry_lock_path(base)
             with cross_process_lock(lock_path):
                 latest = load_config(base)
@@ -1466,18 +1482,44 @@ QToolTip QLabel {
         self._start_audit_projects([proj.id], proj.display_name, profile_id=str(profile_id))
 
     def _on_select_audit_profile(self, profile_id: str):
-        """Pick which canonical profile START AUDIT launches."""
+        """Pick which canonical profile START AUDIT launches.
+
+        CORE-002 (audit/1.md): this used to mutate `self._service.config` --
+        the snapshot this window loaded, possibly minutes ago -- and hand the
+        WHOLE object to `save_config()` with no lock and no rebase. A profile
+        click racing a Bridge registration or a CLI move wrote the stale
+        project registry back over the newer one, and the return value was
+        discarded so a refused save still reported the new profile. The same
+        transaction closeEvent already uses is the one to use here: lock, load
+        latest, set only the field this action owns, verify the save.
+        """
         chosen = str(profile_id or "quick3")
         for pid, action in self.profile_actions.items():
             action.setChecked(pid == chosen)
-        if str(getattr(self._service.config.audits, "profile", "")) == chosen:
+        previous = str(getattr(self._service.config.audits, "profile", ""))
+        if previous == chosen:
+            return
+
+        def _set_profile(latest):
+            latest.audits.profile = chosen
+
+        base = _service_base_dir(self._service)
+        try:
+            saved = bool(scoped_config_write(_set_profile, base))
+        except Exception as exc:
+            saved = False
+            reason = str(exc)
+        else:
+            reason = "config was not written"
+        if not saved:
+            # The in-memory value is restored from what is actually on disk:
+            # announcing a profile the next START will not use is the failure
+            # this ticket exists to remove.
+            for pid, action in self.profile_actions.items():
+                action.setChecked(pid == previous)
+            self._flash_status(f"Could not save audit profile: {reason}", "#D66464", duration_ms=6000)
             return
         self._service.config.audits.profile = chosen
-        try:
-            save_config(self._service.config)
-        except Exception as exc:
-            self._flash_status(f"Could not save audit profile: {exc}", "#D66464", duration_ms=6000)
-            return
         try:
             name = get_profile(chosen).display_name
         except Exception:

@@ -1232,3 +1232,21 @@ def test_an_older_bridge_without_the_slot_memory_still_works(tmp_path):
         {"workers": [{"managed_slot": 1, "managed_generation": 1, "last_seen_at": 10.0}]}, 2
     )
     assert launches == [2]
+
+
+def test_the_diagnostics_filename_is_the_filename_on_any_host():
+    r"""CORE-003: the record promises a filename, so it must never leak a path.
+
+    `Path(value).name` on POSIX reads a whole Windows path as ONE filename, so
+    the Ubuntu half of the CI matrix emitted the operator's full
+    C:\Users\<name>\... directory into a record documented as redacted. The
+    redaction cannot depend on which host reads the value.
+    """
+    for raw in (r"C:\Users\Private\secret-result.md", "/home/private/secret-result.md"):
+        snapshot = AuditRunSnapshot(
+            project_id="p1", project_name="Project", operator_state="READY", summary="ready",
+            handoff_path=raw, handoff_sha256="abc", ready=True,
+        )
+        payload = AuditRunCoordinator.diagnostics(snapshot)
+        assert '"handoff_filename": "secret-result.md"' in payload, raw
+        assert "Users" not in payload and "Private" not in payload and "home" not in payload

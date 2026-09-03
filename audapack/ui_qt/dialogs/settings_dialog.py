@@ -920,8 +920,16 @@ class SettingsWidget(QWidget):
             with cross_process_lock(lock_path):
                 try:
                     latest = load_config(base)
-                except Exception:
-                    latest = self._config
+                except Exception as exc:
+                    # CORE-002 (audit/1.md): this used to fall back to
+                    # `self._config` -- the snapshot this tab was built with --
+                    # and save it whole, INCLUDING its project registry, on the
+                    # exact path where the latest state could not be read. Not
+                    # knowing what is on disk is the one moment a merge must not
+                    # happen: fail closed, write nothing.
+                    self.lbl_save_status.setText(f"✗ Save FAILED: cannot read current settings ({exc})")
+                    self.lbl_save_status.setStyleSheet("color: #D9534F; font-size: 10px;")
+                    return False
                 for section, field, value in owned:
                     # Only what the operator actually changed HERE. A field the
                     # dialog renders but nobody touched is not evidence of

@@ -221,3 +221,35 @@ def test_a_field_nobody_touched_is_still_left_to_disk(tmp_path, qapp):
     assert w.show_tooltips.isChecked()  # so the widget disagrees with disk
     w.compact_rows.setChecked(not w.compact_rows.isChecked())  # save something else
     assert load_config(tmp_path).ui.show_tooltips is False, "an untouched field was overwritten"
+
+
+def test_an_unreadable_latest_config_fails_closed_and_writes_nothing(tmp_path, qapp, monkeypatch):
+    """CORE-002 (audit/1.md): not knowing the current state is not permission to guess.
+
+    The fallback was `latest = self._config` -- the snapshot this tab was built
+    with, project registry included -- saved whole on the one path where the
+    newest state could not be read. A settings autosave could therefore roll the
+    project list back precisely when it had least idea what was on disk.
+    """
+    from audapack.models import Project
+
+    cfg = AppConfig()
+    cfg.projects = [Project(id="keep", display_name="Keep", source_path=str(tmp_path / "keep"))]
+    assert save_config(cfg, tmp_path)
+    before = (tmp_path / "config.json").read_bytes()
+
+    w, _cfg = widget(tmp_path, AppConfig())
+    monkeypatch.setattr(
+        "audapack.config.load_config",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated unreadable config")),
+    )
+    saves = []
+    monkeypatch.setattr(
+        "audapack.ui_qt.dialogs.settings_dialog.save_config",
+        lambda *a, **k: saves.append(a) or True,
+    )
+
+    assert w._persist_settings([("ui", "compact_rows", True)]) is False
+    assert saves == [], "a save was attempted with no knowledge of the current state"
+    assert (tmp_path / "config.json").read_bytes() == before
+    assert "FAILED" in w.lbl_save_status.text()

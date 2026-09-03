@@ -272,13 +272,28 @@ _REGISTRY_LOCK_TIMEOUT = 15.0
 _WINDOWS_FILE_RETRY_ATTEMPTS = 6
 
 
+def _retryable_sharing_error(exc: OSError) -> bool:
+    """Is this the "someone else is holding the file right now" class?
+
+    CORE-003 (audit/1.md): the retry was gated on `sys.platform == "win32"`
+    while the three regressions demanded three attempts unconditionally, so the
+    Ubuntu half of the declared CI matrix was deterministically red. The
+    contract is settled as PORTABLE rather than by weakening the tests: the
+    thing being survived is a concurrent holder -- the Bridge daemon, the GUI
+    and the CLI all write this one config -- and a network/dropbox-backed home
+    directory produces EBUSY/EACCES on POSIX too. What is NOT retried is a
+    condition no wait can fix: a missing file or a directory in its place.
+    """
+    return not isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError))
+
+
 def _read_text_with_windows_retry(path: Path, *, encoding: str = "utf-8") -> str:
-    """Read a small config/secret file across transient Windows sharing locks."""
+    """Read a small config/secret file across transient sharing locks."""
     for attempt in range(_WINDOWS_FILE_RETRY_ATTEMPTS):
         try:
             return path.read_text(encoding=encoding)
-        except OSError:
-            if sys.platform != "win32" or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
+        except OSError as exc:
+            if not _retryable_sharing_error(exc) or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
                 raise
             time.sleep(0.01 * (2 ** attempt))
     return ""  # unreachable
@@ -378,13 +393,13 @@ def cross_process_lock(path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
 
 
 def _replace_config_file_with_retry(source: Path, destination: Path) -> None:
-    """Survive brief Windows sharing violations without hiding real failures."""
+    """Survive brief sharing violations without hiding real failures."""
     for attempt in range(_WINDOWS_FILE_RETRY_ATTEMPTS):
         try:
             source.replace(destination)
             return
-        except OSError:
-            if sys.platform != "win32" or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
+        except OSError as exc:
+            if not _retryable_sharing_error(exc) or attempt + 1 >= _WINDOWS_FILE_RETRY_ATTEMPTS:
                 raise
             time.sleep(0.01 * (2 ** attempt))
 

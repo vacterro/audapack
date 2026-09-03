@@ -171,6 +171,34 @@ def set_audit_written_callback(cb: Optional[Callable[[str, str], None]]):
     _ON_AUDIT_WRITTEN = cb
 
 
+def _rollback_error(snapshots, code: str, message: str) -> dict:
+    """Roll back a failed commit and describe what the rollback left behind.
+
+    W2-001 (audit/1.md): `restore_file_snapshots()` reports which paths it could
+    NOT restore, and every caller here discarded that list. A failed campaign
+    index therefore answered an ordinary retriable `campaign_index_failed` --
+    "the transaction failed, nothing was published" -- while a canonical
+    completion artifact it could not unlink was still sitting on disk for the
+    next reader to treat as a finished audit. Same convention as
+    `ingest.py::_ingest_failure`: name the residue, and stop calling an
+    incomplete rollback a clean one.
+    """
+    rollback_errors = restore_file_snapshots(snapshots)
+    if not rollback_errors:
+        return {"ok": False, "error": {"code": code, "message": message, "retriable": True}}
+    residue = "; ".join(rollback_errors)
+    logger.error("rollback incomplete after %s: %s", code, residue)
+    return {
+        "ok": False,
+        "error": {
+            "code": "rollback_incomplete",
+            "message": f"{message}; rollback incomplete, these paths may hold uncommitted state: {residue}",
+            "retriable": False,
+            "rollback_errors": rollback_errors,
+        },
+    }
+
+
 def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, state, resolved_name):
     """Synthesizes and durably writes the canonical campaign final artifacts.
 
@@ -219,6 +247,39 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
         state["campaign_complete"] = True
         state["final_handoff_path"] = str(final_latest)
         state["canonical_campaign_path"] = str(all_latest)
+
+
+def _final_artifact_paths(prof, target_dir: Path, history_dir: Path, dt_str: str, resolved_name: str) -> list[Path]:
+    """Every path `_write_final_artifacts` can write, for this profile.
+
+    W2-001 (audit/1.md): the snapshot list was an `if quick3 else SUPER_AUDIT`
+    branch written before the compress profile existed, so a compress campaign's
+    canonical `__00_COMPRESS_AUDIT.md` was never snapshotted -- and therefore
+    could not be rolled back. Proved by the failed-index regression: the dispatch
+    stayed non-terminal and the uncommitted handoff sat on disk anyway. Derived
+    from the same `canonical_artifact_kind` the writer switches on, so a new
+    profile cannot add an artifact the rollback does not know about.
+    """
+    kind = prof.canonical_artifact_kind
+    if kind == ARTIFACT_KIND_QUICK3_COMBINED:
+        return [
+            target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md",
+            history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md",
+        ]
+    if kind == ARTIFACT_KIND_DIRECT_HANDOFF:
+        basename = prof.canonical_artifact_basename
+        return [
+            target_dir / f"{resolved_name}{basename}.md",
+            history_dir / f"{resolved_name}{basename}__{dt_str}.md",
+        ]
+    return [
+        target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md",
+        target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md",
+        target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
+        history_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL__{dt_str}.md",
+        history_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL__{dt_str}.md",
+        history_dir / "manifest.json",
+    ]
 
 
 def _get_final_handoff_path(prof, state) -> Optional[Path]:
@@ -1337,14 +1398,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                             # ready/completion, and on failure restore the exact
                             # prior artifact/index bytes and return retriable 503.
                             snap_targets = [target_dir / "campaign.json"]
-                            if prof.profile_id == "quick3":
-                                snap_targets.append(target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md")
-                            else:
-                                snap_targets.extend([
-                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md",
-                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md",
-                                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
-                                ])
+                            snap_targets.extend(
+                                _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
+                            )
                             snapshots, snap_err = capture_file_snapshots(snap_targets)
                             if snap_err:
                                 self.send_json(503, {
@@ -1376,22 +1432,16 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                                     final_handoff_path=_get_final_handoff_path(prof, state),
                                 )
                             except Exception as exc:
-                                restore_file_snapshots(snapshots)
-                                self.send_json(503, {
-                                    "ok": False,
-                                    "error": {"code": "campaign_index_failed", "message": str(exc), "retriable": True}
-                                })
+                                self.send_json(503, _rollback_error(
+                                    snapshots, "campaign_index_failed", str(exc)))
                                 return
                             # Persist ready/completion only after the index commit
                             # succeeded; a failure above already rolled back.
                             try:
                                 save_run_state(run_id, state)
                             except RunStatePersistenceError as exc:
-                                restore_file_snapshots(snapshots)
-                                self.send_json(503, {
-                                    "ok": False,
-                                    "error": {"code": "campaign_index_failed", "message": str(exc), "retriable": True}
-                                })
+                                self.send_json(503, _rollback_error(
+                                    snapshots, "campaign_index_failed", str(exc)))
                                 return
                             is_ready = True
                             from audapack.bridge.state import increment_audit_generation
@@ -1533,20 +1583,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             # CORE-003: snapshot all canonical artifact paths before any write
             # so ANY failure below can restore the exact previous state.
             snapshot_paths = [latest_path, history_path, target_dir / "campaign.json"]
-            if prof.profile_id == "quick3":
-                snapshot_paths.extend([
-                    target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md",
-                    history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md",
-                ])
-            else:
-                snapshot_paths.extend([
-                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md",
-                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md",
-                    target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
-                    history_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL__{dt_str}.md",
-                    history_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL__{dt_str}.md",
-                    history_dir / "manifest.json",
-                ])
+            snapshot_paths.extend(
+                _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
+            )
             snapshots, snap_err = capture_file_snapshots(snapshot_paths)
             if snap_err:
                 self.send_json(500, {
@@ -1560,11 +1599,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 atomic_write(history_path, content)
                 atomic_write(latest_path, content)
             except Exception as exc:
-                restore_file_snapshots(snapshots)
-                self.send_json(500, {
-                    "ok": False,
-                    "error": {"code": "atomic_write_failed", "message": str(exc), "retriable": True}
-                })
+                self.send_json(500, _rollback_error(snapshots, "atomic_write_failed", str(exc)))
                 return
 
             if "waves" not in state:
@@ -1599,44 +1634,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     final_handoff_path = _get_final_handoff_path(prof, state)
                     canonical_campaign_path = _get_canonical_path(prof, state)
                     finalization_ok = True
-                    # The lane learns a campaign finished only from the worker's
-                    # terminal ACK, and that ACK is one HTTP call that can fail
-                    # to arrive. Writing the durable handoff IS the finish, and
-                    # here the project, path and digest are all known exactly.
-                    try:
-                        if final_handoff_path:
-                            self._dispatcher().complete_runs_for_project(
-                                str(project_id or ""),
-                                str(resolved_name or ""),
-                                str(final_handoff_path),
-                                hashlib.sha256(Path(final_handoff_path).read_bytes()).hexdigest(),
-                                str(run_id or ""),
-                            )
-                    except Exception as exc:
-                        logger.warning("could not close dispatch lanes for %s: %s", resolved_name, exc)
-                    # Put the finished audit where an agent working inside the
-                    # repo will find it, without it having to know the audit
-                    # root. Best effort: a failed copy must never fail a run
-                    # whose artifacts are already durable in the central root.
-                    try:
-                        from audapack.bridge.storage import mirror_project_audits
-
-                        mirror_project = live_registry.get_project_by_id(str(project_id or ""))
-                        if mirror_project is not None:
-                            mirror_project_audits(
-                                live_cfg,
-                                getattr(mirror_project, "source_path", ""),
-                                target_dir,
-                                final_handoff_path,
-                            )
-                    except Exception as exc:
-                        logger.warning("could not mirror audits into %s: %s", resolved_name, exc)
                 except Exception as exc:
-                    restore_file_snapshots(snapshots)
-                    self.send_json(503, {
-                        "ok": False,
-                        "error": {"code": "finalization_failed", "message": str(exc), "retriable": True}
-                    })
+                    self.send_json(503, _rollback_error(snapshots, "finalization_failed", str(exc)))
                     return
 
             # Live campaign index — only writes COMPLETE when finalization
@@ -1671,11 +1670,12 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 )
             except Exception as ex:
                 if finalization_ok:
-                    restore_file_snapshots(snapshots)
-                self.send_json(503, {
-                    "ok": False,
-                    "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
-                })
+                    self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(ex)))
+                else:
+                    self.send_json(503, {
+                        "ok": False,
+                        "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
+                    })
                 return
 
             # W2-002: persist the pending-publication marker as part of the primary
@@ -1685,11 +1685,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             try:
                 save_run_state(run_id, state)
             except RunStatePersistenceError as exc:
-                restore_file_snapshots(snapshots)
-                self.send_json(500, {
-                    "ok": False,
-                    "error": {"code": "run_state_persistence_failed", "message": str(exc), "retriable": True}
-                })
+                self.send_json(500, _rollback_error(snapshots, "run_state_persistence_failed", str(exc)))
                 return
 
             from audapack.bridge.state import increment_audit_generation
@@ -1734,6 +1730,49 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     )
                 except BrowserDispatchError as exc:
                     logger.warning("dispatch finalization pending for %s/%s: %s", proj.id, run_id, exc)
+
+            # The lane learns a campaign finished only from the worker's terminal
+            # ACK, and that ACK is one HTTP call that can fail to arrive. Writing
+            # the durable handoff IS the finish, and here the project, path and
+            # digest are all known exactly.
+            #
+            # W2-001 (audit/1.md): this used to run INSIDE the finalization
+            # block, before campaign.json and the run state were committed. A
+            # failed index write rolled the handoff back off disk and left the
+            # dispatch COMPLETE pointing at a file that no longer existed, with
+            # its worker freed for the next audit. It belongs here, past the
+            # commit, beside the proof-checked completion above.
+            if campaign_ready and finalization_ok and final_handoff_path:
+                try:
+                    self._dispatcher().complete_runs_for_project(
+                        str(project_id or ""),
+                        str(resolved_name or ""),
+                        str(final_handoff_path),
+                        hashlib.sha256(Path(final_handoff_path).read_bytes()).hexdigest(),
+                        str(run_id or ""),
+                    )
+                except Exception as exc:
+                    logger.warning("could not close dispatch lanes for %s: %s", resolved_name, exc)
+
+            # Put the finished audit where an agent working inside the repo will
+            # find it, without it having to know the audit root. Best effort: a
+            # failed copy must never fail a run whose artifacts are already
+            # durable in the central root -- and it runs after the commit, so a
+            # rolled-back handoff is never mirrored into a project.
+            if campaign_ready and finalization_ok:
+                try:
+                    from audapack.bridge.storage import mirror_project_audits
+
+                    mirror_project = live_registry.get_project_by_id(str(project_id or ""))
+                    if mirror_project is not None:
+                        mirror_project_audits(
+                            live_cfg,
+                            getattr(mirror_project, "source_path", ""),
+                            target_dir,
+                            final_handoff_path,
+                        )
+                except Exception as exc:
+                    logger.warning("could not mirror audits into %s: %s", resolved_name, exc)
 
             files_written = [str(latest_path), str(history_path)]
             if campaign_ready and finalization_ok:

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime
@@ -53,6 +54,15 @@ MANDATORY_EXCLUDES = {
 
 class PackingCancelled(Exception):
     pass
+
+
+# CORE-001 (audit/1.md): moving the previous archive aside is the rollback
+# authority for the whole transaction, so a transient Windows sharing violation
+# on that ONE move must not cost the operator a repack. Same bounded shape as
+# config.py's `_WINDOWS_FILE_RETRY_ATTEMPTS`; retried on every platform because
+# the failure being survived (another process holding the file) is not
+# Windows-only, and a handful of 20-80 ms sleeps cost nothing next to zipping.
+_BACKUP_ESTABLISH_ATTEMPTS = 4
 
 
 # CORE-001: full-transaction cross-process locks keyed by (output_dir, stem).
@@ -566,13 +576,41 @@ def pack_single(
             # partial/failed run can never destroy the last good backup. The diagnostic
             # name uses a dot (not underscore) after the stem so retention globbing
             # (`{stem}_*`) never touches it.
+            #
+            # CORE-001 (audit/1.md): a failure HERE used to be swallowed
+            # (`backup_path = None`) and the pack carried on. create_zip then
+            # atomically replaced the canonical archive, and a later verify
+            # failure unlinked the replacement -- with no backup to restore
+            # from, the operator's last good archive was simply gone. Rollback
+            # authority is a PRECONDITION for replacing the canonical path: no
+            # backup, no replacement.
             backup_path = None
             if delete_old and output_path.exists():
                 backup_path = output_path.with_name(f"{stem}.bak.{uuid.uuid4().hex}.zip")
-                try:
-                    output_path.replace(backup_path)
-                except OSError:
-                    backup_path = None
+                backup_error: Optional[OSError] = None
+                for attempt in range(_BACKUP_ESTABLISH_ATTEMPTS):
+                    try:
+                        output_path.replace(backup_path)
+                        backup_error = None
+                        break
+                    except OSError as exc:
+                        backup_error = exc
+                        if attempt + 1 < _BACKUP_ESTABLISH_ATTEMPTS:
+                            time.sleep(0.02 * (2 ** attempt))
+                if backup_error is not None:
+                    log(f"FAIL {stem}: cannot secure the previous archive: {backup_error}")
+                    return PackResult(
+                        project_id=stem,
+                        name=stem,
+                        source_path=str(source),
+                        output_path=output_path if output_path.exists() else None,
+                        success=False,
+                        error_message=(
+                            f"Could not move the existing archive aside ({backup_error}); "
+                            "refusing to repack because a failure would have nothing to restore. "
+                            "The previous archive is untouched."
+                        ),
+                    )
 
             try:
                 output_dir.mkdir(parents=True, exist_ok=True)

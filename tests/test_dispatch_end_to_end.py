@@ -416,3 +416,144 @@ def test_a_finished_compress_lane_releases_its_window(bridge_server, tmp_path):
     owned = payload.get("owned_job") or {}
     assert owned.get("dispatch_id") == dispatch_id, payload
     assert owned.get("state") == "COMPLETE", owned
+
+
+def _run_compress_to_finalizing(conn, token, project: str, archive: Path, worker: dict, run_id: str) -> str:
+    """Submit, claim, stream and walk one COMPRESS dispatch up to FINALIZING.
+
+    The one-wave profile is used deliberately: delivering its single wave makes
+    the campaign complete, so one /v1/audits call reaches the finalization
+    commit these tests are about.
+    """
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_id": project.lower(), "project_name": project,
+        "archive_path": str(archive), "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size, "profile": "compress",
+    }, token)
+    assert status == 200, payload
+    dispatch_id = payload["dispatch"]["dispatch_id"]
+
+    status, payload = _post(conn, "/v1/browser/poll", worker, token)
+    assert status == 200, payload
+    lease_id = payload["job"]["lease_id"]
+
+    for state, extra in (
+        ("ARTIFACT_FETCHED", {}), ("ATTACHED", {}),
+        ("START_PREPARED", {"campaign_run_id": run_id, "start_receipt": f"startcm-{run_id}"}),
+        ("STARTED", {"campaign_run_id": run_id}),
+        ("AUDITING", {"campaign_run_id": run_id}),
+        ("FINALIZING", {"campaign_run_id": run_id}),
+    ):
+        code, data = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+            "dispatch_id": dispatch_id, "worker_id": worker["worker_id"],
+            "lease_id": lease_id, "state": state, **extra,
+        }, token)
+        assert code == 200, (state, data)
+    return dispatch_id
+
+
+def _deliver_compress_wave(conn, token, project: str, run_id: str) -> tuple[int, dict]:
+    return _post(conn, "/v1/audits", {
+        "run_id": run_id, "project": project, "wave": "compress",
+        "profile_id": "compress", "status": "complete", "api_version": 3,
+        "receipt": f"rcpt-{run_id}",
+        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", project),
+    }, token)
+
+
+def test_a_failed_index_commit_never_leaves_a_complete_dispatch(bridge_server, tmp_path, monkeypatch):
+    """W2-001 (audit/1.md): transport COMPLETE is downstream of the commit.
+
+    The lane was closed inside the finalization block, BEFORE campaign.json and
+    the run state were written. A failed index write rolled the canonical
+    handoff back off disk and left the dispatch COMPLETE pointing at a file that
+    no longer existed, with its worker freed for the next audit.
+    """
+    from audapack.bridge import server as server_mod
+
+    config, base_url = bridge_server
+    archive = tmp_path / "W2ONE.zip"
+    archive.write_bytes(b"PK\x03\x04rollback-order")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    worker = _worker_payload(worker_id="audapack-managed-2-1-w2one", managed_slot=2)
+    run_id = "acb-w2-001-order"
+    dispatch_id = _run_compress_to_finalizing(conn, token, "W2ONE", archive, worker, run_id)
+
+    monkeypatch.setattr(server_mod, "save_live_campaign_index", lambda **kw: (_ for _ in ()).throw(
+        OSError("injected index write failure")))
+
+    status, payload = _deliver_compress_wave(conn, token, "W2ONE", run_id)
+
+    assert status == 503, payload
+    assert payload["error"]["code"] == "campaign_index_failed", payload
+
+    jobs = [item for item in _jobs(conn, token) if item["dispatch_id"] == dispatch_id]
+    assert jobs, "the dispatch disappeared"
+    assert jobs[0]["state"] != "COMPLETE", "a failed commit published transport COMPLETE"
+    assert jobs[0]["final_handoff_path"] == "", jobs[0]
+
+    root = Path(config.audits.root)
+    assert not list(root.rglob("W2ONE__00_COMPRESS_AUDIT.md")), \
+        "an uncommitted canonical handoff survived the rollback"
+
+
+def test_an_incomplete_rollback_is_reported_and_never_called_clean(bridge_server, tmp_path, monkeypatch):
+    """A file the rollback could not remove is still published state.
+
+    Every caller discarded `restore_file_snapshots()`'s error list, so a failed
+    index answered an ordinary retriable `campaign_index_failed` -- "nothing was
+    published" -- while a canonical completion artifact it could not unlink sat
+    on disk for the next reader to treat as a finished audit.
+    """
+    from audapack.bridge import server as server_mod
+
+    config, base_url = bridge_server
+    archive = tmp_path / "W2RES.zip"
+    archive.write_bytes(b"PK\x03\x04rollback-residue")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    worker = _worker_payload(worker_id="audapack-managed-3-1-w2res", managed_slot=3)
+    run_id = "acb-w2-001-residue"
+    _run_compress_to_finalizing(conn, token, "W2RES", archive, worker, run_id)
+
+    monkeypatch.setattr(server_mod, "save_live_campaign_index", lambda **kw: (_ for _ in ()).throw(
+        OSError("injected index write failure")))
+    monkeypatch.setattr(
+        server_mod, "restore_file_snapshots",
+        lambda snapshots: ["W2RES__00_COMPRESS_AUDIT.md: injected unlink failure"],
+    )
+
+    status, payload = _deliver_compress_wave(conn, token, "W2RES", run_id)
+
+    assert status == 503, payload
+    assert payload["error"]["code"] == "rollback_incomplete", payload
+    assert payload["error"]["retriable"] is False
+    assert "W2RES__00_COMPRESS_AUDIT.md" in payload["error"]["message"]
+    assert payload["error"]["rollback_errors"]
+
+
+def test_a_committed_campaign_still_closes_its_lane_and_mirrors(bridge_server, tmp_path):
+    """The safety net moved past the commit -- it must still be there.
+
+    The lane learns a campaign finished from the worker's terminal ACK, and that
+    ACK is one HTTP call that can fail to arrive; writing the durable handoff is
+    the backstop. Moving it after the commit must not have removed it.
+    """
+    config, base_url = bridge_server
+    archive = tmp_path / "W2OK.zip"
+    archive.write_bytes(b"PK\x03\x04commit-then-close")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    worker = _worker_payload(worker_id="audapack-managed-4-1-w2ok", managed_slot=4)
+    run_id = "acb-w2-001-committed"
+    dispatch_id = _run_compress_to_finalizing(conn, token, "W2OK", archive, worker, run_id)
+
+    status, payload = _deliver_compress_wave(conn, token, "W2OK", run_id)
+    assert status == 200, payload
+
+    # No terminal ACK is ever sent: the lane must close on the durable write.
+    jobs = [item for item in _jobs(conn, token) if item["dispatch_id"] == dispatch_id]
+    assert jobs and jobs[0]["state"] == "COMPLETE", jobs
+    assert jobs[0]["final_handoff_path"].endswith("W2OK__00_COMPRESS_AUDIT.md"), jobs[0]
+    assert Path(jobs[0]["final_handoff_path"]).is_file()

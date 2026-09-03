@@ -497,3 +497,99 @@ class TestArchiveWeightExclusions(unittest.TestCase):
         """".git/objects" must not take every directory called "objects"."""
         self.assertFalse(self._excluded("C:/p/src/objects/model.py"))
         self.assertFalse(self._excluded("C:/p/objects/README.md"))
+
+
+class TestBackupIsRollbackAuthority(unittest.TestCase):
+    """CORE-001 (audit/1.md): no backup, no canonical replacement.
+
+    Moving the previous archive aside is the ONLY thing a failed pack can
+    restore from, and a failure on that move used to be swallowed
+    (`backup_path = None`) with the pack carrying on regardless. create_zip
+    then atomically replaced the canonical archive and a later verify failure
+    unlinked the replacement, so the operator's last good archive was gone --
+    reported as an ordinary failed pack.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.source_dir = Path(self.temp_dir) / "src"
+        self.source_dir.mkdir(parents=True)
+        (self.source_dir / "file1.txt").write_text("NEW PAYLOAD", encoding="utf-8")
+        self.output_dir = Path(self.temp_dir) / "out"
+        self.output_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed_previous_archive(self) -> tuple[Path, bytes]:
+        archive = self.output_dir / "Proj.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("old.txt", "OLD_GOOD_ARCHIVE")
+        return archive, archive.read_bytes()
+
+    def _pack(self):
+        return pack_single(
+            source_path=self.source_dir,
+            output_dir=self.output_dir,
+            archive_stem="Proj",
+            excludes=set(),
+            delete_old=True,
+            include_timestamp=False,
+        )
+
+    def test_a_failed_backup_aborts_before_the_canonical_replacement(self):
+        archive, before = self._seed_previous_archive()
+        real_replace = Path.replace
+
+        def refuse_backup(self, destination):
+            if ".bak." in Path(destination).name:
+                raise PermissionError("simulated sharing violation")
+            return real_replace(self, destination)
+
+        with patch.object(Path, "replace", autospec=True, side_effect=refuse_backup), \
+             patch("audapack.packing.create_zip", side_effect=AssertionError("packed without rollback authority")), \
+             patch("time.sleep"):
+            result = self._pack()
+
+        self.assertFalse(result.success)
+        self.assertIn("previous archive is untouched", result.error_message.lower())
+        self.assertTrue(archive.exists(), "the previous archive was destroyed")
+        self.assertEqual(archive.read_bytes(), before, "the previous archive changed")
+
+    def test_a_transient_backup_failure_is_retried_not_fatal(self):
+        archive, before = self._seed_previous_archive()
+        real_replace = Path.replace
+        attempts = {"n": 0}
+
+        def flaky_backup(self, destination):
+            if ".bak." in Path(destination).name:
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise PermissionError("simulated sharing violation")
+            return real_replace(self, destination)
+
+        with patch.object(Path, "replace", autospec=True, side_effect=flaky_backup), \
+             patch("time.sleep"):
+            result = self._pack()
+
+        self.assertEqual(attempts["n"], 3)
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(archive) as zf:
+            self.assertIn("file1.txt", zf.namelist())
+        self.assertNotEqual(archive.read_bytes(), before)
+
+    def test_a_post_commit_verify_failure_restores_the_predecessor_exactly(self):
+        archive, before = self._seed_previous_archive()
+
+        with patch("audapack.packing.verify_zip", side_effect=RuntimeError("simulated verify failure")):
+            result = self._pack()
+
+        self.assertFalse(result.success)
+        self.assertTrue(archive.exists(), "the predecessor was not restored")
+        self.assertEqual(archive.read_bytes(), before, "the restored predecessor is not byte-identical")
+
+    def test_a_first_pack_with_no_predecessor_still_packs(self):
+        """No previous archive means nothing to secure -- and nothing to lose."""
+        result = self._pack()
+        self.assertTrue(result.success, result.error_message)
+        self.assertTrue((self.output_dir / "Proj.zip").exists())

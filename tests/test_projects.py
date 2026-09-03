@@ -300,6 +300,60 @@ class TestRegistryTransactions(unittest.TestCase):
         self.assertIsInstance(loaded, AppConfig)
         self.assertGreaterEqual(attempts, 3)
 
+    def test_the_sharing_retry_is_portable_not_win32_only(self):
+        """CORE-003: those three tests demand three attempts on every host.
+
+        The retry was gated on `sys.platform == "win32"`, so the Ubuntu half of
+        the declared CI matrix could never pass them. The contract is settled as
+        portable rather than by narrowing the tests: the condition being
+        survived is a concurrent holder of the one config file (Bridge daemon,
+        GUI and CLI all write it), which is not a Windows-only situation.
+        """
+        from unittest import mock
+
+        from audapack.config import _read_text_with_windows_retry
+
+        target = self.base_dir / "portable.txt"
+        target.write_text("value", encoding="utf-8")
+        original_read_text = Path.read_text
+        attempts = 0
+
+        def flaky_read(path, *args, **kwargs):
+            nonlocal attempts
+            if path == target:
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated sharing violation")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky_read), \
+             mock.patch.object(Path, "exists", autospec=True, return_value=True), \
+             mock.patch("sys.platform", "linux"), \
+             mock.patch("time.sleep"):
+            self.assertEqual(_read_text_with_windows_retry(target), "value")
+        self.assertEqual(attempts, 3)
+
+    def test_a_missing_file_is_never_retried(self):
+        """No wait fixes absence -- retrying it only delays the real error."""
+        from unittest import mock
+
+        from audapack.config import _read_text_with_windows_retry
+
+        target = self.base_dir / "absent.txt"
+        attempts = 0
+
+        def always_missing(path, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise FileNotFoundError("no such file")
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=always_missing), \
+             mock.patch("time.sleep") as sleep:
+            with self.assertRaises(FileNotFoundError):
+                _read_text_with_windows_retry(target)
+        self.assertEqual(attempts, 1)
+        sleep.assert_not_called()
+
     def test_save_failure_never_reports_success(self):
         from unittest import mock
 

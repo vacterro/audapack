@@ -1598,10 +1598,29 @@ class BrowserDispatcher:
         within a minute of START against handoff files nine hours old, so the
         audits never ran and the board said COMPLETE. Zero means "written just
         now", which is true of the finalization path that writes the file.
+
+        W2-003 (audit/1.md): the id and the display name used to go into ONE
+        set compared against a set holding each job's id AND name, so the two
+        identity domains were interchangeable strings. A project whose NAME
+        equals another project's ID closed that other project's live audit,
+        handed it the wrong handoff as proof and wrote drift into its lineage.
+        Reproduced: project_id=alpha/name=beta closing against a live job with
+        project_id=beta returned 2. A canonical id now matches ids only; the
+        name is a fallback for a legacy record that carries no id at all.
         """
-        wanted = {str(project_id or "").strip().lower(), str(project_name or "").strip().lower()} - {""}
-        if not wanted:
+        wanted_id = str(project_id or "").strip().lower()
+        wanted_name = str(project_name or "").strip().lower()
+        if not (wanted_id or wanted_name):
             return 0
+
+        def _is_target(job: DispatchJob) -> bool:
+            job_id = str(job.project_id or "").strip().lower()
+            if job_id:
+                # Both sides have a canonical id: that is the whole comparison.
+                # Without an id on our side, the name is all there is to go on.
+                return job_id == wanted_id if wanted_id else job_id == wanted_name
+            return bool(wanted_name) and str(job.project_name or "").strip().lower() == wanted_name
+
         with self._lock:
             now = _now()
             closed = 0
@@ -1610,8 +1629,7 @@ class BrowserDispatcher:
                     job.state == JOB_BLOCKED and job.recovery_state in POST_START_STATES
                 ):
                     continue
-                names = {str(job.project_id or "").strip().lower(), str(job.project_name or "").strip().lower()}
-                if not (names & wanted):
+                if not _is_target(job):
                     continue
                 if evidence_at and float(job.created_at or 0.0) > float(evidence_at):
                     continue

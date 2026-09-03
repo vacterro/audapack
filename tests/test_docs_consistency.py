@@ -54,6 +54,20 @@ def test_no_readme_claims_a_test_count(readme):
 
 
 @pytest.mark.parametrize("readme", ["README.md", "README.ru.md"])
+def test_the_readme_release_badge_matches_the_version(readme):
+    """CORE-004 (audit/1.md): README called VERSION canonical and showed 0.2.2.
+
+    VERSION, pyproject and __init__ were reconciled to 0.2.3 by T-135, but both
+    release badges still advertised 0.2.2 -- so the one number a reader actually
+    sees was the stale one.
+    """
+    from audapack import __version__
+
+    badges = set(re.findall(r"badge/(?:release|релиз)-v([0-9][^-]*)-", read(readme)))
+    assert badges == {__version__}, f"{readme} advertises {sorted(badges)}, package is {__version__}"
+
+
+@pytest.mark.parametrize("readme", ["README.md", "README.ru.md"])
 def test_every_wiki_page_is_linked_from_the_readme(readme):
     """Audit-Campaign-Engine.md existed and README.md linked five of six."""
     linked = set(re.findall(r"docs/wiki/([A-Za-z0-9._-]+\.md)", read(readme)))
