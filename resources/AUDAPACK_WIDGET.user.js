@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.43
+// @version      0.0.44
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -38,6 +38,14 @@
 // @grant        GM_addValueChangeListener
 // @connect      127.0.0.1
 // @connect      localhost
+// Tampermonkey's own update check, pointed at the Bridge. Without these
+// there is no auto-update path at all: every version bump needed a manual
+// install through tampermonkey.net/script_installation, which waits on the
+// extension's MV3 service worker to wake and took 1-2 minutes as often as
+// it was instant. With them, a bumped @version is picked up by the
+// interval check with no click. Bridge down just means the check retries.
+// @updateURL    http://127.0.0.1:17843/widget.user.js
+// @downloadURL  http://127.0.0.1:17843/widget.user.js
 // Served by the local AUDAPACK Bridge. Without these a widget build bump
 // locked every worker window out of claiming audits until the operator
 // hand-installed the new script: six idle windows next to a queue that

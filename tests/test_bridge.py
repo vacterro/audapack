@@ -1165,3 +1165,22 @@ def test_a_bridge_that_cannot_bind_never_touches_dispatch_state(monkeypatch):
         assert server_module.run_bridge_server(config) == 1
     finally:
         holder.close()
+
+
+def test_the_widget_declares_an_auto_update_path_at_the_bridge():
+    """Without @updateURL/@downloadURL a version bump needs a manual install.
+
+    That install goes through tampermonkey.net/script_installation, which waits
+    on the extension's MV3 service worker to wake -- observed taking 1-2 minutes
+    as often as it was instant. With the headers, a bumped @version is picked up
+    by Tampermonkey's own interval check and no click is needed. They must point
+    at the same route the Bridge actually serves.
+    """
+    from audapack.components.widget import get_bundled_widget_path
+
+    header = get_bundled_widget_path().read_text(encoding="utf-8")[:6000]
+    assert "// @updateURL" in header
+    assert "// @downloadURL" in header
+    for line in header.splitlines():
+        if line.startswith("// @updateURL") or line.startswith("// @downloadURL"):
+            assert line.rstrip().endswith("/widget.user.js"), line
