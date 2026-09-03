@@ -220,3 +220,43 @@ class TestInstallerDoesNotAddAWindow(unittest.TestCase):
              patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
             manager.trigger_widget_install()
         self.assertTrue(opener.call_args.kwargs["new_window"])
+
+
+class TestManualAuditWindow(unittest.TestCase):
+    """NEW opens a window in the worker profile that no lane owns.
+
+    The dispatcher knows a window only by the slot/generation in its URL, so a
+    window opened without them can never be sent work -- which is the whole
+    point: the operator drops an archive in and runs the audit by hand.
+    """
+
+    @patch("audapack.components.widget._launch_dedicated_chromium")
+    def test_the_manual_window_carries_no_worker_slot(self, launch):
+        from audapack.components.widget import open_manual_chromium_window
+
+        launch.return_value = (True, "", "C:/chrome.exe", Path("C:/profile"))
+        ok, message = open_manual_chromium_window()
+
+        self.assertTrue(ok)
+        target = launch.call_args.args[0]
+        self.assertNotIn("audapack_worker", target)
+        self.assertIn("chatgpt.com", target)
+        self.assertIn("archive", message.lower())
+
+    @patch("audapack.components.widget._launch_dedicated_chromium")
+    def test_it_is_always_its_own_window(self, launch):
+        """A tab added to a lane mid-audit is not a place to drop an archive."""
+        from audapack.components.widget import open_manual_chromium_window
+
+        launch.return_value = (True, "", "C:/chrome.exe", Path("C:/profile"))
+        open_manual_chromium_window()
+        self.assertIs(launch.call_args.kwargs["new_window"], True)
+
+    @patch("audapack.components.widget._launch_dedicated_chromium")
+    def test_a_refused_launch_is_reported_not_swallowed(self, launch):
+        from audapack.components.widget import open_manual_chromium_window
+
+        launch.return_value = (False, "No supported Chromium browser was found.", None, Path("C:/p"))
+        ok, message = open_manual_chromium_window()
+        self.assertFalse(ok)
+        self.assertIn("Chromium", message)

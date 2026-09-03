@@ -19,6 +19,7 @@ from audapack.components.autostart import (
 from audapack.components.migration import detect_legacy_installation, perform_bridge_takeover
 from audapack.components.widget import (
     launch_dedicated_chromium_worker,
+    open_manual_chromium_window,
     open_widget_in_dedicated_chromium,
     read_bundled_widget_metadata,
 )
@@ -163,6 +164,14 @@ class ComponentManager:
             new_window=not live,
         )
         return ok, (message + warmed) if ok else message
+
+    def open_manual_worker_window(self) -> tuple[bool, str]:
+        """A window in the worker profile that no lane owns.
+
+        The dispatcher only knows a window by its slot/generation query params,
+        so one opened without them is the operator's to use by hand.
+        """
+        return open_manual_chromium_window()
 
     def launch_browser_worker(
         self,

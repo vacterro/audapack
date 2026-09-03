@@ -621,6 +621,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         add("WRK", self._on_reopen_workers, "Reopen worker windows that are gone")
+        add("NEW", self._on_new_manual_window, "Open a spare window for a hand-run audit")
         add("ALL", self._on_pack_all, "Pack every configured project")
         add("COPY", self._on_copy_audit, "Copy the verified audit text")
         add("GG", self._on_copy_audit_file_path, "Copy the saipen gg command (Ctrl+C)")
@@ -1508,6 +1509,35 @@ QToolTip QLabel {
         toolbar = getattr(self, "_action_toolbar", None)
         if toolbar is not None:
             _fit_toolbar_to_text(toolbar)
+
+    def _on_new_manual_window(self):
+        """Open an unclaimed window in the worker profile, for a manual audit.
+
+        Signed in like every other window in that profile, but with no slot in
+        its URL -- so the widget never claims it as a lane and the dispatcher
+        never sends work to it. The operator drops an archive in and drives it.
+        """
+        key = "workers:manual"
+        if self.task_runner.is_running(key):
+            self._flash_status("Opening a manual audit window...", "#D4A840")
+            return
+        self._flash_status("Opening a manual audit window...", "#D4A840")
+
+        def _work():
+            return self._comp_mgr.open_manual_worker_window()
+
+        def _done(result):
+            ok, message = result
+            self._flash_status(
+                message if ok else f"NEW window failed: {message}",
+                "#D4A840" if ok else "#D66464",
+                duration_ms=6000 if ok else 8000,
+            )
+
+        def _error(error):
+            self._flash_status(f"NEW window failed: {error}", "#D66464", duration_ms=8000)
+
+        self.task_runner.submit(key, _work, on_success=_done, on_error=_error)
 
     def _on_reopen_workers(self):
         """Reopen every managed worker window that is no longer on screen."""

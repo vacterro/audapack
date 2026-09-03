@@ -644,7 +644,7 @@ def _normalized_hidden_toolbar_buttons(value: Any) -> list[str]:
 #: the button labels, which is what the operator actually sees and names.
 TOOLBAR_BUTTON_KEYS = (
     "PACK", "START", "GRP", "A3", "A10", "CM",
-    "WRK", "ALL", "COPY", "GG", "IA", "IA+", "ZIP", "MRK",
+    "WRK", "NEW", "ALL", "COPY", "GG", "IA", "IA+", "ZIP", "MRK",
 )
 
 #: Hidden until asked for: GG has Ctrl+C, and the two INAUDIT actions live on

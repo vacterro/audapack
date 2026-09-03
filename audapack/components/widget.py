@@ -408,6 +408,30 @@ def launch_dedicated_chromium_worker(
     return True, f"AUDAPACK Chromium started ({_clean_browser_name('', selected)}; profile: {profile})."
 
 
+#: A plain ChatGPT window in the worker profile. No ``audapack_worker_slot``,
+#: so the widget never claims it as a managed lane and the dispatcher never
+#: sends work to it -- it is the operator's own window, signed in like the rest
+#: of the profile, for an audit they drive by hand.
+MANUAL_WINDOW_URL = "https://chatgpt.com/"
+
+
+def open_manual_chromium_window(browser_exe: Optional[str] = None) -> tuple[bool, str]:
+    """Open an unclaimed window in the worker profile for a hand-run audit.
+
+    Always its own window: the point is a place to drop an archive into, and a
+    tab added to a lane that is mid-audit is not that.
+    """
+    ok, error, selected, profile = _launch_dedicated_chromium(
+        MANUAL_WINDOW_URL, browser_exe, new_window=True
+    )
+    if not ok or not selected:
+        return False, error
+    return True, (
+        f"Manual audit window opened in AUDAPACK Chromium "
+        f"({_clean_browser_name('', selected)}; profile: {profile}). Drop an archive into it."
+    )
+
+
 def open_widget_in_dedicated_chromium(
     browser_exe: Optional[str] = None,
     use_bridge: bool = False,
