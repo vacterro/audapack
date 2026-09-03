@@ -129,6 +129,7 @@ class SettingsWidget(QWidget):
         self.audit_root.textChanged.connect(lambda: self._autosave_timer.start())
         self.mirror_into_project.toggled.connect(lambda: self._autosave_timer.start())
         self.mirror_dir_name.textChanged.connect(lambda: self._autosave_timer.start())
+        self.mirror_include_waves.toggled.connect(lambda: self._autosave_timer.start())
         self.host.textChanged.connect(lambda: self._autosave_timer.start())
 
         # Spinboxes -> debounced auto-save
@@ -279,6 +280,13 @@ class SettingsWidget(QWidget):
         self.mirror_dir_name.setPlaceholderText("audit")
         self.mirror_dir_name.setToolTip("Folder created inside the project source path")
         f.addRow("Project folder", self.mirror_dir_name)
+        self.mirror_include_waves = QCheckBox("Also copy the per-wave files beside it")
+        self.mirror_include_waves.setChecked(bool(getattr(self._config.audits, "mirror_include_waves", False)))
+        self.mirror_include_waves.setToolTip(
+            "The agent inbox reads only 1.md, 2.md ... Everything else is residue:\n"
+            "never read, never cleaned up, so a settled inbox still reports dirty."
+        )
+        f.addRow("Per-wave copies", self.mirror_include_waves)
         self.hot = QSpinBox()
         self.hot.setRange(0, 400 * 24 * 3600)
         self.hot.setValue(self._config.audits.hot_seconds)
@@ -725,6 +733,7 @@ class SettingsWidget(QWidget):
         c.audits.root = self.audit_root.text().strip()
         c.audits.mirror_into_project = bool(self.mirror_into_project.isChecked())
         c.audits.mirror_dir_name = self.mirror_dir_name.text().strip() or "audit"
+        c.audits.mirror_include_waves = bool(self.mirror_include_waves.isChecked())
         c.audits.hot_seconds = self.hot.value()
         c.audits.warm_seconds = self.warm.value()
         c.audits.cool_seconds = self.cool.value()

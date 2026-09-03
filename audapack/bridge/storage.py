@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from audapack import saipen_inbox
 from audapack.campaign import (
     ARTIFACT_KIND_DIRECT_HANDOFF,
     ARTIFACT_KIND_QUICK3_COMBINED,
@@ -700,7 +701,7 @@ def generate_canonical_campaign(
     }
 
 
-def mirror_project_audits(config, source_path, audit_dir) -> list[Path]:
+def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=None) -> list[Path]:
     """Copy a finished audit into the audited project's own tree.
 
     The audit root is one central place, which is right for the desktop and
@@ -708,6 +709,15 @@ def mirror_project_audits(config, source_path, audit_dir) -> list[Path]:
     audits live. With the mirror on, every finished audit also lands in
     ``<project>/audit/``, so `cc` in that repo finds it with no configuration
     at all.
+
+    Delivered as a CANONICAL LAYER. SAIPEN's Audit Inbox
+    (``SOURCE-AUDIT-INBOX-01``) reads exactly the direct files matching
+    ``^[1-9][0-9]*\\.md$`` in that folder; everything else is residue it never
+    reads, never captures and never deletes. Mirroring the whole run under its
+    own long filenames therefore delivered nothing at all -- the folder looked
+    full and the agent's inbox was empty. One completed run is one layer,
+    allocated forward so a layer the agent may be working right now is never
+    rewritten, and skipped entirely when those exact bytes are already there.
 
     A copy, never a move. The central root stays the index the desktop reads,
     so nothing about READY, history or retention changes. History is not
@@ -737,15 +747,41 @@ def mirror_project_audits(config, source_path, audit_dir) -> list[Path]:
         return []
 
     copied: list[Path] = []
-    for item in sorted(src.iterdir()):
-        if not item.is_file() or item.name.startswith((".", "_history")):
-            continue
-        if item.suffix.lower() not in {".md", ".json"}:
-            continue
-        target = dest / item.name
+
+    # The canonical layer: the one document the agent is meant to work from.
+    handoff = Path(str(final_handoff_path)) if str(final_handoff_path or "").strip() else None
+    if handoff is not None and handoff.is_file():
         try:
-            target.write_bytes(item.read_bytes())
+            payload = handoff.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            # Redelivering the same bytes must not create a second unread layer:
+            # the operator would be told the agent owes work it already has.
+            already = any(
+                saipen_inbox.layer_number(item.name) is not None
+                and item.is_file()
+                and hashlib.sha256(item.read_bytes()).hexdigest() == digest
+                for item in dest.iterdir()
+            )
+            if not already:
+                target = dest / f"{saipen_inbox.next_layer_number(root, dest)}.md"
+                target.write_bytes(payload)
+                copied.append(target)
         except OSError:
-            continue
-        copied.append(target)
+            pass
+
+    # Everything else is residue to the inbox: it is never read and never
+    # cleaned up, so a settled inbox would report dirty forever. Off unless the
+    # operator asks for the per-wave detail inside the repo.
+    if getattr(config.audits, "mirror_include_waves", False):
+        for item in sorted(src.iterdir()):
+            if not item.is_file() or item.name.startswith((".", "_history")):
+                continue
+            if item.suffix.lower() not in {".md", ".json"}:
+                continue
+            target = dest / item.name
+            try:
+                target.write_bytes(item.read_bytes())
+            except OSError:
+                continue
+            copied.append(target)
     return copied

@@ -17,7 +17,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from audapack import saipen_inbox
 from audapack.services.audit_run_service import MAX_AUDIT_LANES, AuditRunSnapshot
+
+
+def agent_inbox_suffix(runs) -> str:
+    """What the agent still owes, counted once per project.
+
+    An audit that reached READY and was never read is invisible work: the
+    station looks finished and the same audit gets ordered again. Residue is
+    counted too -- files the inbox will never read and never clean up, which is
+    exactly what AUDAPACK used to deliver.
+    """
+    unread: set[str] = set()
+    working: set[str] = set()
+    residue: set[str] = set()
+    for run in runs:
+        project = str(getattr(run, "project_id", "") or "")
+        if not project:
+            continue
+        state = str(getattr(run, "agent_state", "") or "")
+        if state == saipen_inbox.UNREAD:
+            unread.add(project)
+        elif state == saipen_inbox.IN_WORK:
+            working.add(project)
+        if int(getattr(run, "agent_residue", 0) or 0):
+            residue.add(project)
+    parts = []
+    if unread:
+        parts.append(f"{len(unread)} unread by agent")
+    if working:
+        parts.append(f"{len(working)} in agent")
+    if residue:
+        parts.append(f"{len(residue)} with residue")
+    return (" · " + " · ".join(parts)) if parts else ""
 
 
 class AuditRunsWidget(QWidget):
@@ -81,15 +114,19 @@ class AuditRunsWidget(QWidget):
 
         history_label = QLabel("RECENT", self)
         layout.addWidget(history_label)
-        self.history = QTableWidget(0, 4, self)
-        self.history.setHorizontalHeaderLabels(("PROJECT", "RESULT", "RUN", "FINISHED"))
+        # AGENT: READY only says the station finished. Whether anyone READ the
+        # result is a different fact, and it is the one that decides whether to
+        # press START AUDIT again -- so it gets its own column beside RESULT.
+        self.history = QTableWidget(0, 5, self)
+        self.history.setHorizontalHeaderLabels(("PROJECT", "RESULT", "AGENT", "RUN", "FINISHED"))
         self.history.verticalHeader().setVisible(False)
         self.history.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.history.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.history.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.history.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.history.setMaximumHeight(150)
         layout.addWidget(self.history)
         self._sync_actions()
@@ -124,7 +161,10 @@ class AuditRunsWidget(QWidget):
         active = sum(run.operator_state not in {"READY", "FAILED", "CANCELLED"} for run in latest)
         ready = sum(run.ready for run in latest)
         attention = sum(run.operator_state in {"FAILED", "BLOCKED_PRE_START", "BLOCKED_POST_START", "RECOVERY"} for run in latest)
-        self.summary.setText(f"AUDIT RUNS · {active} active · {ready} ready · {attention} attention · max {MAX_AUDIT_LANES}")
+        self.summary.setText(
+            f"AUDIT RUNS · {active} active · {ready} ready · {attention} attention"
+            f" · max {MAX_AUDIT_LANES}{agent_inbox_suffix(self._runs)}"
+        )
 
         self.lanes.blockSignals(True)
         self.lanes.clearContents()
@@ -165,11 +205,15 @@ class AuditRunsWidget(QWidget):
             values = (
                 run.project_name,
                 run.operator_state,
+                run.agent_summary or "—",
                 run.campaign_run_id or run.dispatch_id or run.intent_id,
                 self._time_label(run.completed_at or run.updated_at),
             )
             for column, value in enumerate(values):
-                self.history.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column == 2 and run.agent_guidance:
+                    item.setToolTip(run.agent_guidance)
+                self.history.setItem(row, column, item)
         self._sync_actions()
 
     def _selected(self) -> AuditRunSnapshot | None:

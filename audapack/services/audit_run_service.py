@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from audapack import saipen_inbox
 from audapack.config import cross_process_lock, get_state_dir
 from audapack.models import AuditSnapshot
 
@@ -97,6 +98,14 @@ class AuditRunSnapshot:
     updated_at: float = 0.0
     completed_at: float = 0.0
     actions: tuple[str, ...] = ()
+    #: What the agent did with what we delivered, read from SAIPEN's Audit
+    #: Inbox binding. READY means the station is finished; it says nothing
+    #: about whether anyone read the result, and that is the question the
+    #: operator actually has before pressing START AUDIT again.
+    agent_state: str = saipen_inbox.NO_INBOX
+    agent_summary: str = ""
+    agent_guidance: str = ""
+    agent_residue: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -956,6 +965,27 @@ class AuditRunCoordinator:
             actions=_actions_for(operator),
         )
 
+    def _stamp_agent_state(self, snapshot: AuditRunSnapshot) -> AuditRunSnapshot:
+        """Answer 'has the agent read this yet' from the project's own inbox.
+
+        Best effort by design: a project with no SAIPEN, no mirror or an
+        unreadable tree simply reads NO_INBOX. A dashboard field must never be
+        able to fail a refresh.
+        """
+        try:
+            project = self.projects.get_project(str(snapshot.project_id))
+            root = str(getattr(project, "source_path", "") or "") if project else ""
+            if not root:
+                return snapshot
+            state = saipen_inbox.read_inbox_cached(root)
+            snapshot.agent_state = state.verdict
+            snapshot.agent_summary = state.summary()
+            snapshot.agent_guidance = state.guidance
+            snapshot.agent_residue = len(state.residue)
+        except Exception:
+            pass
+        return snapshot
+
     def refresh_runs(self, project_ids: Optional[Iterable[str]] = None) -> list[AuditRunSnapshot]:
         selected = {str(value) for value in project_ids} if project_ids is not None else None
         jobs_response = self.bridge.browser_jobs()
@@ -993,6 +1023,7 @@ class AuditRunCoordinator:
                 audit_cache[project_id] = self.audits.refresh_project(project_id)
             intent = by_dispatch.get(str(job.get("dispatch_id") or ""))
             snapshot = self._snapshot(job, intent, audit_cache[project_id], labels, bridge_context)
+            self._stamp_agent_state(snapshot)
             snapshots.append(snapshot)
             if intent:
                 seen_intents.add(str(intent.get("intent_id")))
@@ -1022,7 +1053,7 @@ class AuditRunCoordinator:
                 continue
             if selected is not None and str(intent.get("project_id")) not in selected:
                 continue
-            snapshots.append(self._intent_snapshot(intent))
+            snapshots.append(self._stamp_agent_state(self._intent_snapshot(intent)))
         return snapshots[:RUN_HISTORY_BOUND]
 
     def latest_by_project(self, project_ids: Optional[Iterable[str]] = None) -> dict[str, AuditRunSnapshot]:

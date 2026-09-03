@@ -463,6 +463,11 @@ class AuditsConfig:
     mirror_into_project: bool = False
     #: Folder name used for that copy, created inside the project source path.
     mirror_dir_name: str = "audit"
+    #: Also copy the per-wave artifacts beside the canonical layer. They are
+    #: RESIDUE to SAIPEN's Audit Inbox: never read, never captured and never
+    #: deleted, so an inbox the agent has fully settled still reports dirty.
+    #: Off by default -- the central audit root already keeps every wave.
+    mirror_include_waves: bool = False
     hot_seconds: int = 6 * 3600           # <= 6 hours
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
@@ -1082,6 +1087,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         profile=_normalized_audit_profile(audits_raw.get("profile")),
         mirror_into_project=bool(audits_raw.get("mirror_into_project", False)),
         mirror_dir_name=str(audits_raw.get("mirror_dir_name") or "audit").strip() or "audit",
+        mirror_include_waves=bool(audits_raw.get("mirror_include_waves", False)),
     )
 
     bridge_raw = data.get("bridge", {})

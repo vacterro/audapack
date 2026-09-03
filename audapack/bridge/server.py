@@ -1611,6 +1611,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                                 live_cfg,
                                 getattr(mirror_project, "source_path", ""),
                                 target_dir,
+                                final_handoff_path,
                             )
                     except Exception as exc:
                         logger.warning("could not mirror audits into %s: %s", resolved_name, exc)
