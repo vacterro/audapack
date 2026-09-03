@@ -937,7 +937,14 @@ QToolTip QLabel {
     def _refresh_audit_runs_async(self):
         """Refresh composite run state without blocking the Qt thread."""
         def _load():
-            return self._audit_runs.refresh_runs(), self._bridge.runtime_status()
+            # PERF-002: `runtime_status()` asks the Bridge for
+            # /v1/browser/status, and `refresh_runs()` asked for the SAME
+            # snapshot again -- two identical requests per repaint, on a
+            # four-second cadence while a run is live. One snapshot now feeds
+            # both.
+            status = self._bridge.runtime_status()
+            browser_response = {"ok": bool(status.get("healthy")), "dispatch": status.get("browser") or {}}
+            return self._audit_runs.refresh_runs(status_response=browser_response), status
 
         def _apply(result):
             runs, status = result

@@ -219,6 +219,47 @@ class AuditStartIntentStore:
             _atomic_write_json(self.path, doc)
             return dict(target)
 
+    def reconcile(self, updates: dict[str, dict[str, Any]]) -> int:
+        """Apply many intent updates under ONE lock, writing at most once.
+
+        PERF-002 (audit/1.md): the dashboard called `update()` once per matched
+        job, and every call reacquired the cross-process lock and reparsed the
+        WHOLE journal before it could discover the values were already correct.
+        Measured: 101 journal reads and ~3 MB of repeated JSON parsing for one
+        refresh of 100 runs that had not changed at all. Same normalization and
+        the same completed_at semantics as `update()`; the write happens only if
+        something actually moved.
+        """
+        if not updates:
+            return 0
+        now = time.time()
+        with cross_process_lock(self.lock_path):
+            doc = self._read_unlocked()
+            changed = 0
+            for target in doc["intents"]:
+                changes = updates.get(str(target.get("intent_id") or ""))
+                if not changes:
+                    continue
+                normalized = {
+                    key: value for key, value in changes.items()
+                    if key not in {"intent_id", "project_id", "created_at"}
+                }
+                if "status" in normalized:
+                    normalized["phase"] = normalized["status"]
+                if all(target.get(key) == value for key, value in normalized.items()):
+                    continue
+                target.update(normalized)
+                target["updated_at"] = now
+                if str(target.get("status")) in {"READY", "FAILED", "CANCELLED"} and not target.get("completed_at"):
+                    target["completed_at"] = now
+                changed += 1
+            if not changed:
+                return 0
+            doc["intents"] = doc["intents"][-self.history_bound:]
+            doc["updated_at"] = now
+            _atomic_write_json(self.path, doc)
+            return changed
+
     def find_for_dispatch(self, dispatch_id: str) -> Optional[dict[str, Any]]:
         return next((item for item in reversed(self.list()) if item.get("dispatch_id") == dispatch_id), None)
 
@@ -1197,12 +1238,23 @@ class AuditRunCoordinator:
             pass
         return snapshot
 
-    def refresh_runs(self, project_ids: Optional[Iterable[str]] = None) -> list[AuditRunSnapshot]:
+    def refresh_runs(
+        self,
+        project_ids: Optional[Iterable[str]] = None,
+        status_response: Optional[dict[str, Any]] = None,
+    ) -> list[AuditRunSnapshot]:
+        """The dashboard's composite view of every run.
+
+        ``status_response`` lets a caller that already asked the Bridge for
+        `/v1/browser/status` hand that snapshot in instead of causing a second
+        identical request for the same repaint (PERF-002).
+        """
         selected = {str(value) for value in project_ids} if project_ids is not None else None
         jobs_response = self.bridge.browser_jobs()
         if not jobs_response.get("ok"):
             return [self._intent_snapshot(item) for item in reversed(self.intents.list()) if selected is None or str(item.get("project_id")) in selected]
-        status_response = self.bridge.browser_status()
+        if status_response is None:
+            status_response = self.bridge.browser_status()
         workers = (status_response.get("dispatch") or {}).get("workers", []) if status_response.get("ok") else []
         labels: dict[str, str] = {}
         counts: dict[str, int] = {}
@@ -1224,6 +1276,7 @@ class AuditRunCoordinator:
         by_dispatch = {str(item.get("dispatch_id")): item for item in intents if item.get("dispatch_id")}
         seen_intents: set[str] = set()
         audit_cache: dict[str, Optional[AuditSnapshot]] = {}
+        intent_updates: dict[str, dict[str, Any]] = {}
         snapshots: list[AuditRunSnapshot] = []
         jobs = sorted(jobs_response.get("jobs", []), key=lambda item: float(item.get("updated_at") or 0.0), reverse=True)
         for job in jobs:
@@ -1231,7 +1284,16 @@ class AuditRunCoordinator:
             if selected is not None and project_id not in selected:
                 continue
             if project_id not in audit_cache:
-                audit_cache[project_id] = self.audits.refresh_project(project_id)
+                # PERF-002: `refresh_project()` means force_rescan, which
+                # INVALIDATES the AuditIndexer before scanning -- so the periodic
+                # dashboard threw away a working directory-signature cache on
+                # every tick and re-read every wave file of every project with a
+                # retained job, changed or not. Measured over 100 settled
+                # projects: 44.18 ms and 300 file reads forced, versus 2.87 ms
+                # and zero reads cached. Real audit writes still arrive: the
+                # indexer's signature check sees them, and generation/watcher
+                # events invalidate the exact project that changed.
+                audit_cache[project_id] = self.audits.get_snapshot(project_id)
             intent = by_dispatch.get(str(job.get("dispatch_id") or ""))
             snapshot = self._snapshot(job, intent, audit_cache[project_id], labels, bridge_context)
             self._stamp_agent_state(snapshot)
@@ -1254,11 +1316,13 @@ class AuditRunCoordinator:
                     intent_state = "BLOCKED"
                 elif snapshot.operator_state == "BLOCKED_POST_START":
                     intent_state = "RECOVERY_NEEDED"
-                self.intents.update(
-                    str(intent["intent_id"]), status=intent_state,
-                    campaign_run_id=snapshot.campaign_run_id,
-                    error=snapshot.error,
-                )
+                intent_updates[str(intent["intent_id"])] = {
+                    "status": intent_state,
+                    "campaign_run_id": snapshot.campaign_run_id,
+                    "error": snapshot.error,
+                }
+        # One lock, one parse, and a write only if a status actually moved.
+        self.intents.reconcile(intent_updates)
         for intent in reversed(intents):
             if str(intent.get("intent_id")) in seen_intents:
                 continue

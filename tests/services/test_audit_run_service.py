@@ -47,9 +47,18 @@ class FakePacking:
 class FakeAudits:
     def __init__(self):
         self.snapshots = {}
+        #: PERF-002 counting: the dashboard must stop invalidating a working
+        #: audit cache on every tick.
+        self.rescans = 0
+
+    def get_snapshot(self, project_id, force_rescan=False):
+        if force_rescan:
+            self.rescans += 1
+        return self.snapshots.get(project_id)
 
     def refresh_project(self, project_id):
-        return self.snapshots.get(project_id)
+        return self.get_snapshot(project_id, force_rescan=True)
+
 
 
 class FakeBridge:
@@ -60,6 +69,9 @@ class FakeBridge:
         self.cancel_error = ""
         self.abandon_error = ""
         self.submits = 0
+        #: PERF-002 counting: how many times this tick asked for /v1/browser/status.
+        self.status_calls = 0
+
 
     def runtime_status(self):
         return {"healthy": self.healthy, "browser": self._status()}
@@ -78,7 +90,9 @@ class FakeBridge:
         }
 
     def browser_status(self):
+        self.status_calls = getattr(self, "status_calls", 0) + 1
         return {"ok": True, "dispatch": self._status()}
+
 
     def browser_jobs(self, project_id=None):
         jobs = self.jobs
@@ -1250,3 +1264,83 @@ def test_the_diagnostics_filename_is_the_filename_on_any_host():
         payload = AuditRunCoordinator.diagnostics(snapshot)
         assert '"handoff_filename": "secret-result.md"' in payload, raw
         assert "Users" not in payload and "Private" not in payload and "home" not in payload
+
+
+def test_a_repeat_refresh_never_invalidates_the_audit_cache(tmp_path):
+    """PERF-002 (audit/1.md): settled history is not live state.
+
+    refresh_runs called `refresh_project()` for every project with a retained
+    job, which means force_rescan -- it INVALIDATES the AuditIndexer before it
+    scans. So the periodic dashboard threw away a working directory-signature
+    cache and re-read every wave file of every project on every tick. Measured
+    over 100 settled projects: 44.18 ms and 300 file reads forced versus 2.87 ms
+    and zero reads cached.
+    """
+    service, bridge, audits = coordinator(tmp_path)
+    service.start_batch(["p1"])  # a retained job is what made the old path pay
+    for _ in range(3):
+        service.refresh_runs()
+    assert audits.rescans == 0, "the periodic refresh invalidated the audit cache"
+
+
+
+def test_one_composite_refresh_asks_for_browser_status_once(tmp_path):
+    """The GUI asked for /v1/browser/status twice per repaint: once inside
+    refresh_runs, once via runtime_status on the same tick."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.refresh_runs(status_response={"ok": True, "dispatch": bridge._status()})
+    assert bridge.status_calls == 0, "the handed-in snapshot was ignored"
+
+
+def test_a_handed_in_status_snapshot_still_fills_the_readout(tmp_path):
+    """Passing the snapshot in is an optimization, not a weaker readout."""
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start_batch(["p1"])
+    bridge.workers = [{"worker_id": "w1", "browser_name": "Chrome", "state": "FREE"}]
+    runs = service.refresh_runs(status_response={"ok": True, "dispatch": bridge._status()})
+    assert runs and runs[0].worker_counts["active"] == 1, runs[0].worker_counts
+
+
+
+def test_unchanged_intents_cost_one_journal_read_and_no_write(tmp_path):
+    """PERF-002: `update()` per job is N lock acquisitions and N re-parses.
+
+    Measured for 100 unchanged runs: 101 journal reads and ~3 MB of repeated
+    JSON parsing, to discover nothing had moved.
+    """
+    reads = {"count": 0}
+
+    service, bridge, _audits = coordinator(tmp_path)
+    store = service.intents
+    real_read = store._read_unlocked
+
+    def counting_read():
+        reads["count"] += 1
+        return real_read()
+
+    store._read_unlocked = counting_read
+    intent, _created = store.begin("p1", "P1", "quick3")
+    service.start_batch(["p1"])
+    runs = [run for run in service.refresh_runs() if run.dispatch_id]
+    assert runs, "no dispatch reached the intent reconciliation"
+
+    before = (store.path.read_text(encoding="utf-8") if store.path.exists() else "")
+    reads["count"] = 0
+    service.refresh_runs()
+    service.refresh_runs()
+
+    assert reads["count"] <= 6, f"{reads['count']} journal reads for two unchanged passes"
+    assert (store.path.read_text(encoding="utf-8") if store.path.exists() else "") == before, \
+        "a no-op reconciliation wrote the journal anyway"
+
+
+def test_a_changed_intent_status_is_still_persisted(tmp_path):
+    """The batch merge must not become a silent no-op."""
+    service, bridge, _audits = coordinator(tmp_path)
+    intent, _created = service.intents.begin("p1", "P1", "quick3")
+    service.start_batch(["p1"])
+    service.refresh_runs()
+
+    stored = next(item for item in service.intents.list() if item["intent_id"] == intent["intent_id"])
+    assert stored["status"] != "PREPARING", "the intent never advanced"
+    assert stored["dispatch_id"], "the dispatch was never bound to its intent"
