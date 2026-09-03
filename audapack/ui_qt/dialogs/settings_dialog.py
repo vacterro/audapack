@@ -37,6 +37,7 @@ from audapack.config import (
 from audapack.services.bridge_service import BridgeService
 from audapack.ui_qt.dialogs.launcher_dialog import LauncherEditDialog
 from audapack.ui_qt.even_layout import EvenTabBar
+from audapack.window_layout import LAYOUT_CASCADE, LAYOUT_GRID, list_monitors
 
 
 def short_worker_label(worker: dict) -> str:
@@ -157,6 +158,10 @@ class SettingsWidget(QWidget):
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
         self.compact_rows.toggled.connect(lambda: self._save())
+        self.arrange_workers.toggled.connect(lambda: self._save())
+        self.worker_minimized.toggled.connect(lambda: self._save())
+        self.worker_layout.currentIndexChanged.connect(lambda: self._save())
+        self.worker_monitor.currentIndexChanged.connect(lambda: self._save())
         for _box in self.toolbar_button_checks.values():
             _box.toggled.connect(lambda: self._save())
         self.flash_duration.valueChanged.connect(lambda: self._autosave_timer.start())
@@ -314,6 +319,49 @@ class SettingsWidget(QWidget):
             "and can claim an audit -- including your own Brave or Chrome tab."
         )
         f.addRow("Worker pool", self.dedicated_profile_only)
+
+        # Where the six worker windows go. Windows opens them wherever it
+        # likes -- stacked, half of them on the wrong display -- and they were
+        # dragged into place by hand after every restart.
+        self.arrange_workers = QCheckBox("Put worker windows on one display when they open")
+        self.arrange_workers.setChecked(bool(getattr(self._config.ui, "arrange_worker_windows", True)))
+        f.addRow("Window layout", self.arrange_workers)
+
+        self.worker_layout = QComboBox()
+        self.worker_layout.addItem("Grid — tiled edge to edge (six become 3x2)", LAYOUT_GRID)
+        self.worker_layout.addItem("Cascade — overlapped, each title bar reachable", LAYOUT_CASCADE)
+        current_layout = str(getattr(self._config.ui, "worker_window_layout", LAYOUT_GRID))
+        self.worker_layout.setCurrentIndex(max(0, self.worker_layout.findData(current_layout)))
+        f.addRow("Arrangement", self.worker_layout)
+
+        self.worker_monitor = QComboBox()
+        self.worker_monitor.addItem("Primary display", -1)
+        for monitor in list_monitors():
+            self.worker_monitor.addItem(f"Display {monitor.label}", monitor.index)
+        wanted = int(getattr(self._config.ui, "worker_window_monitor", -1))
+        # A display unplugged since the setting was saved must not vanish from
+        # the list silently: it is added back so the choice is still visible.
+        if self.worker_monitor.findData(wanted) < 0:
+            self.worker_monitor.addItem(f"Display {wanted + 1} (not connected)", wanted)
+        self.worker_monitor.setCurrentIndex(max(0, self.worker_monitor.findData(wanted)))
+        f.addRow("Display", self.worker_monitor)
+
+        self.worker_minimized = QCheckBox("Minimize them after arranging")
+        self.worker_minimized.setChecked(bool(getattr(self._config.ui, "worker_windows_minimized", True)))
+        self.worker_minimized.setToolTip(
+            "Safe for a worker: the dedicated profile runs with occlusion detection\n"
+            "and every backgrounding throttle off, so a minimized audit keeps running."
+        )
+        f.addRow("Minimized", self.worker_minimized)
+
+        self.arrange_now_btn = QPushButton("Arrange worker windows now")
+        self.arrange_now_btn.clicked.connect(self._on_arrange_worker_windows)
+        f.addRow("", self.arrange_now_btn)
+        self.lbl_arrange_state = QLabel("")
+        self.lbl_arrange_state.setStyleSheet("color: #9C9371; font-size: 10px;")
+        self.lbl_arrange_state.setWordWrap(True)
+        f.addRow("", self.lbl_arrange_state)
+
         self.hot = QSpinBox()
         self.hot.setRange(0, 400 * 24 * 3600)
         self.hot.setValue(self._config.audits.hot_seconds)
@@ -635,6 +683,16 @@ class SettingsWidget(QWidget):
         layout.addWidget(btn_row)
         return w
 
+    def _on_arrange_worker_windows(self):
+        """Arrange now, whatever the checkbox says -- pressing it IS the intent."""
+        # Save first: the arrangement reads the config, not the widgets.
+        self._save()
+        ok, message = self._comp_mgr.arrange_worker_windows(force=True)
+        self.lbl_arrange_state.setText(message)
+        self.lbl_arrange_state.setStyleSheet(
+            f"color: {'#4A7A20' if ok else '#D9534F'}; font-size: 10px;"
+        )
+
     def _on_launcher_letters_toggled(self, checked: bool):
         self._config.ui.launcher_letters = bool(checked)
         # Migrate labels to match mode for next save
@@ -802,6 +860,10 @@ class SettingsWidget(QWidget):
         owned.append(("audits", "mirror_include_waves", bool(self.mirror_include_waves.isChecked())))
         owned.append(("audits", "autopack_before_audit", bool(self.autopack_before_audit.isChecked())))
         owned.append(("audits", "dedicated_profile_only", bool(self.dedicated_profile_only.isChecked())))
+        owned.append(("ui", "arrange_worker_windows", bool(self.arrange_workers.isChecked())))
+        owned.append(("ui", "worker_window_layout", str(self.worker_layout.currentData() or LAYOUT_GRID)))
+        owned.append(("ui", "worker_window_monitor", int(self.worker_monitor.currentData() if self.worker_monitor.currentData() is not None else -1)))
+        owned.append(("ui", "worker_windows_minimized", bool(self.worker_minimized.isChecked())))
         owned.append(("audits", "hot_seconds", self.hot.value()))
         owned.append(("audits", "warm_seconds", self.warm.value()))
         owned.append(("audits", "cool_seconds", self.cool.value()))

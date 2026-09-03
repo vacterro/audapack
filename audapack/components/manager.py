@@ -165,6 +165,56 @@ class ComponentManager:
         )
         return ok, (message + warmed) if ok else message
 
+    #: How long to keep looking for windows that a just-issued launch has not
+    #: put on screen yet. Chrome takes seconds to show one.
+    ARRANGE_SETTLE_SECONDS = 6.0
+
+    def arrange_worker_windows(
+        self, *, force: bool = False, settle_seconds: float = 0.0
+    ) -> tuple[bool, str]:
+        """Put every window of the worker profile on the configured monitor.
+
+        ``force`` runs the arrangement even when the setting is off, which is
+        what an explicit "arrange now" press means. ``settle_seconds`` keeps
+        looking while a launch is still opening windows, because a Chromium
+        asked to open a window has not opened it by the time the call returns.
+        """
+        import time
+
+        from audapack.components.widget import get_dedicated_chromium_profile_dir
+        from audapack.window_layout import (
+            arrange_windows,
+            find_profile_windows,
+            layout_geometry,
+            list_monitors,
+            resolve_monitor,
+        )
+
+        ui = self.config.ui
+        if not force and not bool(getattr(ui, "arrange_worker_windows", True)):
+            return False, "Worker window arrangement is switched off."
+
+        monitor = resolve_monitor(list_monitors(), int(getattr(ui, "worker_window_monitor", -1)))
+        if monitor is None:
+            return False, "No display could be read; no window was moved."
+
+        profile = get_dedicated_chromium_profile_dir()
+        handles = find_profile_windows(profile)
+        deadline = time.time() + max(0.0, float(settle_seconds))
+        while not handles and time.time() < deadline:
+            time.sleep(0.5)
+            handles = find_profile_windows(profile)
+        if not handles:
+            return False, "No worker window is open, so there was nothing to arrange."
+
+        layout = str(getattr(ui, "worker_window_layout", "grid"))
+        minimized = bool(getattr(ui, "worker_windows_minimized", True))
+        moved = arrange_windows(handles, layout_geometry(layout, len(handles), monitor), minimized)
+        if not moved:
+            return False, f"{len(handles)} worker window(s) found, none could be moved."
+        tail = ", minimized" if minimized else ""
+        return True, f"Arranged {moved} worker window(s) as {layout} on display {monitor.index + 1}{tail}."
+
     def open_manual_worker_window(self) -> tuple[bool, str]:
         """A window in the worker profile that no lane owns.
 

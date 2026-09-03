@@ -1510,6 +1510,30 @@ QToolTip QLabel {
         if toolbar is not None:
             _fit_toolbar_to_text(toolbar)
 
+    def _arrange_worker_windows_async(self, settle_seconds: float = 0.0):
+        """Put the worker windows on the configured display, off the GUI thread.
+
+        Called after anything that OPENS one. Never on a timer: re-arranging
+        windows the operator has since moved themselves is not a service.
+        """
+        if not bool(getattr(self._service.config.ui, "arrange_worker_windows", True)):
+            return
+        key = "workers:arrange"
+        if self.task_runner.is_running(key):
+            return
+
+        def _work():
+            return self._comp_mgr.arrange_worker_windows(settle_seconds=settle_seconds)
+
+        def _done(result):
+            ok, message = result
+            # Only a real move is worth a flash: "nothing to arrange" is the
+            # ordinary answer whenever no worker happens to be open.
+            if ok:
+                self._flash_status(message, "#D4A840", duration_ms=4000)
+
+        self.task_runner.submit(key, _work, on_success=_done, on_error=lambda _e: None)
+
     def _on_new_manual_window(self):
         """Open an unclaimed window in the worker profile, for a manual audit.
 
@@ -1533,6 +1557,8 @@ QToolTip QLabel {
                 "#D4A840" if ok else "#D66464",
                 duration_ms=6000 if ok else 8000,
             )
+            if ok:
+                self._arrange_worker_windows_async(self._comp_mgr.ARRANGE_SETTLE_SECONDS)
 
         def _error(error):
             self._flash_status(f"NEW window failed: {error}", "#D66464", duration_ms=8000)
@@ -1571,6 +1597,8 @@ QToolTip QLabel {
                 self._flash_status(
                     f"Reopened {len(reopened)} worker window(s) [{slots}]", "#D4A840", duration_ms=5000
                 )
+            if reopened:
+                self._arrange_worker_windows_async(self._comp_mgr.ARRANGE_SETTLE_SECONDS)
 
         def _error(error):
             self._flash_status(f"Reopen workers failed: {error}", "#D66464", duration_ms=7000)
@@ -1678,6 +1706,10 @@ QToolTip QLabel {
         def _finish():
             self._audit_start_inflight.clear()
             self._refresh_audit_runs_async()
+            # A batch provisions lanes, which opens windows: this is the other
+            # moment worth arranging, and the only one the operator did not
+            # press a button for.
+            self._arrange_worker_windows_async(self._comp_mgr.ARRANGE_SETTLE_SECONDS)
             if self._audit_start_pending:
                 self._audit_start_debounce.start()
 

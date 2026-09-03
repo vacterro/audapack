@@ -640,6 +640,21 @@ def _normalized_hidden_toolbar_buttons(value: Any) -> list[str]:
     return seen
 
 
+def _as_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _normalized_worker_layout(value: Any) -> str:
+    """An unknown layout name means grid, not a crash on the next arrange."""
+    from audapack.window_layout import LAYOUT_GRID, LAYOUTS
+
+    name = str(value).strip().lower()
+    return name if name in LAYOUTS else LAYOUT_GRID
+
+
 #: Every action on the bottom toolbar, in the order it is built. The keys are
 #: the button labels, which is what the operator actually sees and names.
 TOOLBAR_BUTTON_KEYS = (
@@ -671,6 +686,20 @@ class UIConfig:
     #: the few actions that already have a keyboard or context-menu route are
     #: hidden by default rather than spending width nobody asked for.
     hidden_toolbar_buttons: list[str] = field(default_factory=lambda: list(DEFAULT_HIDDEN_TOOLBAR_BUTTONS))
+
+    #: Where the six worker windows go. Windows opens them wherever it likes --
+    #: stacked, and half of them on the wrong display -- and they were dragged
+    #: into place by hand after every restart.
+    arrange_worker_windows: bool = True
+    #: "grid" tiles them edge to edge (six become 3x2); "cascade" overlaps them.
+    worker_window_layout: str = "grid"
+    #: Zero-based display index; -1 means whichever one is primary right now.
+    worker_window_monitor: int = -1
+    #: Minimize after arranging. Safe: the worker profile runs with occlusion
+    #: detection and every backgrounding throttle switched off, which is what
+    #: those launch flags are for -- the audit keeps running, the desktop comes
+    #: back, and a restored window is where it was put.
+    worker_windows_minimized: bool = True
 
 
 @dataclass
@@ -1151,6 +1180,10 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         hidden_toolbar_buttons=_normalized_hidden_toolbar_buttons(
             ui_raw.get("hidden_toolbar_buttons", DEFAULT_HIDDEN_TOOLBAR_BUTTONS)
         ),
+        arrange_worker_windows=bool(ui_raw.get("arrange_worker_windows", True)),
+        worker_window_layout=_normalized_worker_layout(ui_raw.get("worker_window_layout", "grid")),
+        worker_window_monitor=_as_int(ui_raw.get("worker_window_monitor", -1), -1),
+        worker_windows_minimized=bool(ui_raw.get("worker_windows_minimized", True)),
     )
 
     launchers_raw = data.get("launchers")
