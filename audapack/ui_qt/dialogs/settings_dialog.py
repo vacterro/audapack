@@ -588,7 +588,7 @@ class SettingsWidget(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
 
-        lbl = QLabel("Agent launchers shown as [N] buttons on each project row. Drag to reorder.", w)
+        lbl = QLabel("Agent launchers shown as [N] buttons on each project row. Tick to show, untick to hide. Drag to reorder.", w)
         lbl.setStyleSheet("color: #9C9371; font-size: 10px;")
         layout.addWidget(lbl)
 
@@ -601,6 +601,7 @@ class SettingsWidget(QWidget):
         self.launcher_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.launcher_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.launcher_list.model().rowsMoved.connect(self._on_launcher_rows_moved)
+        self.launcher_list.itemChanged.connect(self._on_launcher_item_changed)
         layout.addWidget(self.launcher_list)
 
         self._refresh_launcher_list()
@@ -644,14 +645,40 @@ class SettingsWidget(QWidget):
         self._refresh_launcher_list()
 
     def _refresh_launcher_list(self):
-        self.launcher_list.clear()
-        for lc in self._config.launchers:
-            status = "✓" if lc.enabled else "✗"
-            limit = int(getattr(lc, "max_instances", 0) or 0)
-            limit_text = f" · max {limit}" if limit else " · unlimited"
-            item = QListWidgetItem(f"{status}  [{lc.short_label}] {lc.name}  ({lc.id}){limit_text}")
-            item.setData(Qt.ItemDataRole.UserRole, lc.id)
-            self.launcher_list.addItem(item)
+        # Repopulating sets check states, and every one of those emits
+        # itemChanged. Without the guard the first refresh would write the
+        # config back over itself launcher by launcher.
+        self._launcher_list_loading = True
+        try:
+            self.launcher_list.clear()
+            for lc in self._config.launchers:
+                limit = int(getattr(lc, "max_instances", 0) or 0)
+                limit_text = f" · max {limit}" if limit else " · unlimited"
+                item = QListWidgetItem(f"[{lc.short_label}] {lc.name}  ({lc.id}){limit_text}")
+                item.setData(Qt.ItemDataRole.UserRole, lc.id)
+                # A tick is how you turn a launcher off and back on. Remove used
+                # to be the only way, and it left no way back to the button.
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked if lc.enabled else Qt.CheckState.Unchecked
+                )
+                self.launcher_list.addItem(item)
+        finally:
+            self._launcher_list_loading = False
+
+    def _on_launcher_item_changed(self, item):
+        """Tick / untick a launcher -- shows or hides its row button."""
+        if getattr(self, "_launcher_list_loading", False):
+            return
+        lid = item.data(Qt.ItemDataRole.UserRole)
+        lc = next((launcher for launcher in self._config.launchers if launcher.id == lid), None)
+        if lc is None:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        if bool(lc.enabled) == enabled:
+            return
+        lc.enabled = enabled
+        self._save()
 
     def _on_launcher_rows_moved(self, *_args):
         """Sync config.launchers order after InternalMove drag-drop in QListWidget."""

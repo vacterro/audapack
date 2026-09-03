@@ -372,3 +372,27 @@ def test_probe_source_mtime_incomplete_yields_source_older_none(model_fixture, m
     assert entry["exists"] is True, "archive must be found"
     # With >1000 files the scan is incomplete -> source_older must be None.
     assert entry["source_older"] is None, "incomplete scan must not claim source is older"
+
+
+def test_archive_age_reads_the_cached_mtime_and_a_live_clock(model_fixture):
+    """Freshness says fresh/stale/old; age says by how much.
+
+    The age must not be baked into the cache entry, or it would freeze at
+    whatever it was when the TTL last expired and read "10m" for an hour.
+    """
+    import time
+
+    model, _service, _config, _tmp = model_fixture
+    g0 = model.index(0, 0, QModelIndex())
+    idx = model.index(0, 0, g0)
+
+    model._archive_fresh_cache["p1"] = {
+        "computed_at": time.time(), "exists": True, "path": Path("x.zip"),
+        "mtime": time.time() - 3600 * 3, "size_str": "1 MB", "created_str": "",
+        "temperature": AuditTemperature.NONE, "sync_status": "SYNCED",
+        "source_mtime": None, "source_older": False, "freshness_short": "stale",
+    }
+    assert model.data(idx, model.ROLES["archive_age_str"]) == "3h"
+
+    model._archive_fresh_cache["p1"]["mtime"] = None
+    assert model.data(idx, model.ROLES["archive_age_str"]) == ""

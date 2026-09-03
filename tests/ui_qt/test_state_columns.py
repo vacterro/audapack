@@ -33,9 +33,35 @@ def test_cells_are_contiguous_and_never_overlap():
 
 
 def test_the_grid_fits_the_compact_state_column_exactly():
-    # col_w for compact rows is 198 in the delegate; a grid wider than the
-    # column would silently clip the last field on every row.
-    assert sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS) == 198
+    """The delegate reserves exactly COMPACT_STATE_WIDTH, no separate literal.
+
+    They used to be two numbers that had to agree; widening one cell clipped
+    the last field on every row and nothing said so.
+    """
+    from audapack.ui_qt.models.project_delegate import COMPACT_STATE_WIDTH
+
+    assert sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS) == COMPACT_STATE_WIDTH
+
+
+def test_the_archive_cell_shows_age_and_verdict_together():
+    """A bare mark cannot tell one stale archive from another."""
+    from audapack.ui_qt.models.project_delegate import compact_archive_cell
+
+    assert compact_archive_cell(False, "", "none", None) == "—"
+    assert compact_archive_cell(True, "16m", "fresh", False) == "16m ✓"
+    assert compact_archive_cell(True, "2d 7h", "old", False) == "2d7h !"
+    assert compact_archive_cell(True, "1d", "stale", False) == "1d ·"
+    # A source that moved on outranks any freshness verdict: repack first.
+    assert compact_archive_cell(True, "1d", "fresh", True) == "1d ▲"
+
+
+def test_the_archive_cell_survives_packing_owning_the_zip_cell():
+    """Packing borrows ZIP and a COMPLETE badge never gives it back.
+
+    That is why archive age got its own cell instead of sharing ZIP: on a
+    packed project -- which is most of them -- ZIP reads "[OK]" forever.
+    """
+    assert "arc" in dict(COMPACT_STATE_CELL_WIDTHS)
 
 
 def test_no_column_is_reserved_for_the_pack_badge():

@@ -90,6 +90,10 @@ class ProjectRoomModel(QAbstractItemModel):
         "audit_run_state": Qt.ItemDataRole.UserRole + 41,
         "audit_run_summary": Qt.ItemDataRole.UserRole + 42,
         "audit_run_ready": Qt.ItemDataRole.UserRole + 43,
+        # How OLD the archive is, formatted like the audit age ("16m", "2d7h").
+        # freshness_short says fresh/stale/old against the thresholds; this says
+        # by how much, which is what tells one stale archive from another.
+        "archive_age_str": Qt.ItemDataRole.UserRole + 44,
     }
 
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None, parent: Optional[QObject] = None):
@@ -614,6 +618,8 @@ class ProjectRoomModel(QAbstractItemModel):
             return self._source_older_than_archive(proj)
         if role == self.ROLES["archive_freshness_short"]:
             return self._get_archive_freshness_short(proj)
+        if role == self.ROLES["archive_age_str"]:
+            return self._get_archive_age_str(proj)
 
         # Pack state role
         if role == self.ROLES["pack_state"]:
@@ -880,6 +886,18 @@ class ProjectRoomModel(QAbstractItemModel):
 
     def _get_source_dir_mtime(self, proj: Project) -> Optional[float]:
         return self._get_archive_fresh(proj)["source_mtime"]
+
+    def _get_archive_age_str(self, proj: Project) -> str:
+        """Archive age in the same shape as the audit age -- "16m", "2d 7h".
+
+        Reads the cached mtime, so it costs no stat on paint. The clock is read
+        live rather than baked into the cache entry, or the age would freeze at
+        whatever it was when the TTL last expired.
+        """
+        mtime = self._get_archive_fresh(proj)["mtime"]
+        if not mtime:
+            return ""
+        return format_age_str(max(0.0, time.time() - float(mtime)))
 
     def _source_older_than_archive(self, proj: Project) -> Optional[bool]:
         return self._get_archive_fresh(proj)["source_older"]

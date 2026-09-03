@@ -121,3 +121,47 @@ def test_settings_autosave_does_not_revert_a_change_made_elsewhere(qapp, tmp_pat
     reloaded = load_config()
     assert reloaded.audits.dedicated_profile_only is True, "an outside change must survive autosave"
     assert reloaded.audits.hot_seconds == 111, "and the dialog's own fields still persist"
+
+
+def test_a_launcher_is_turned_off_and_back_on_with_its_tick(tmp_path, qapp):
+    """Remove used to be the only way off, and it left no way back."""
+    from PySide6.QtCore import Qt
+
+    w, cfg = widget(tmp_path)
+    item = w.launcher_list.item(1)
+    launcher_id = item.data(Qt.ItemDataRole.UserRole)
+    assert item.checkState() == Qt.CheckState.Checked
+    assert item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+
+    def saved_state() -> bool:
+        loaded = load_config(tmp_path)
+        return next(lc.enabled for lc in loaded.launchers if lc.id == launcher_id)
+
+    item.setCheckState(Qt.CheckState.Unchecked)
+    assert saved_state() is False
+
+    item.setCheckState(Qt.CheckState.Checked)
+    assert saved_state() is True
+
+
+def test_building_the_launcher_tab_does_not_write_anything(tmp_path, qapp):
+    """Every setCheckState emits itemChanged; the load must not save back."""
+    saves = []
+    w, _cfg = widget(tmp_path)
+    w._save = lambda: saves.append(1)
+    w._refresh_launcher_list()
+    assert saves == []
+
+
+def test_a_disabled_launcher_has_no_row_button(tmp_path, qapp):
+    from PySide6.QtCore import QRect
+
+    from audapack.ui_qt.models.project_delegate import compute_row_button_rects
+
+    _w, cfg = widget(tmp_path)
+    row = QRect(0, 0, 640, 22)
+    before, _ = compute_row_button_rects(row, cfg.launchers)
+    cfg.launchers[0].enabled = False
+    after, _ = compute_row_button_rects(row, cfg.launchers)
+    assert len(after) == len(before) - 1
+    assert all(lc.id != cfg.launchers[0].id for lc, _rect in after)

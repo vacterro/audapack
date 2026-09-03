@@ -79,7 +79,36 @@ FIXED_ACTIONS_WIDTH = 150
 #: that do not depend on the value of any other field. Concatenating them into
 #: one string made every field start wherever the previous one happened to end,
 #: so nothing lined up down the list.
-COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 74))
+#: "arc" is the archive's own age plus its freshness mark. Packing borrows the
+#: ZIP cell while it runs, and a COMPLETE pack badge sits there for good --
+#: which left compact rows showing "[OK]" forever and never a word about how
+#: old the archive under it actually is.
+COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 58), ("arc", 52))
+
+#: Width of the whole compact state grid. Derived, so a cell cannot be widened
+#: without the column growing to match and silently clipping the last field.
+COMPACT_STATE_WIDTH = sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS)
+
+
+def compact_archive_cell(
+    exists: bool,
+    age_str: str,
+    freshness_short: str,
+    source_older: Optional[bool],
+) -> str:
+    """Text of the compact ARC cell: how old the archive is, and its verdict.
+
+    A bare "2d" cannot be read without knowing the thresholds, and a bare mark
+    cannot tell one stale archive from another. Both, or nothing.
+    """
+    if not exists:
+        return "—"
+    if source_older is True:
+        mark = "▲"  # source moved on since the pack -- repack before auditing
+    else:
+        mark = {"fresh": "✓", "stale": "·", "old": "!"}.get(freshness_short, "")
+    age = age_str.replace(" ", "")
+    return f"{age} {mark}".strip() if age else mark
 
 
 def compact_state_columns(col_x: int) -> dict[str, tuple[int, int]]:
@@ -270,7 +299,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
         # Full mode gives the state column room for the aligned sub-columns
         # (RUN | WAVES | AGE / ZIP | PACK); compact keeps its one wide line.
-        col_w = 198 if compact_rows else 175
+        col_w = COMPACT_STATE_WIDTH if compact_rows else 175
         col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
 
         # Data used by the column
@@ -285,6 +314,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         pack_percent = index.data(Qt.ItemDataRole.UserRole + 27)
         archive_fresh_short = index.data(Qt.ItemDataRole.UserRole + 31) or "none"
         source_older = index.data(Qt.ItemDataRole.UserRole + 30)
+        archive_age_str = index.data(Qt.ItemDataRole.UserRole + 44) or ""
 
         TC = TEMP_COLORS
 
@@ -423,22 +453,34 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 freshness_tag = "  [\u00B7]"
             elif archive_fresh_short == "old":
                 freshness_tag = "  [!]"
+            # The creation stamp says WHEN; the age says how long ago, which is
+            # what actually answers "is this archive still worth auditing".
+            # Age wins the room when both cannot fit.
+            age_part = f" {archive_age_str}" if archive_age_str else ""
             if arc_created:
-                zip_full = f"ZIP: {size_str} {arc_created}{freshness_tag}"
-                zip_full_nofresh = f"ZIP: {size_str} {arc_created}"
-                if painter.fontMetrics().horizontalAdvance(zip_full) <= col_w:
-                    zip_text = zip_full
-                elif painter.fontMetrics().horizontalAdvance(zip_full_nofresh) <= col_w:
-                    zip_text = zip_full_nofresh
-                else:
-                    zip_text = f"ZIP: {size_str}"
+                candidates = [
+                    f"ZIP: {size_str}{age_part} {arc_created}{freshness_tag}",
+                    f"ZIP: {size_str}{age_part}{freshness_tag}",
+                    f"ZIP: {size_str}{age_part}",
+                    f"ZIP: {size_str}",
+                ]
             else:
-                zip_text = f"ZIP: {size_str}{freshness_tag}"
+                candidates = [
+                    f"ZIP: {size_str}{age_part}{freshness_tag}",
+                    f"ZIP: {size_str}{age_part}",
+                    f"ZIP: {size_str}",
+                ]
+            zip_text = candidates[-1]
+            for candidate in candidates:
+                if painter.fontMetrics().horizontalAdvance(candidate) <= col_w:
+                    zip_text = candidate
+                    break
             if compact_rows:
-                # Full mode keeps creation/freshness details; compact mode
-                # keeps the essential archive size inline on the one row.
+                # Compact mode keeps the size in the ZIP cell and gives age and
+                # freshness their own cell -- packing borrows the ZIP cell and a
+                # COMPLETE badge never leaves it, so anything sharing that cell
+                # is invisible on a packed project, which is most of them.
                 zip_text = f"ZIP {size_str.replace(' ', '')}"
-                freshness_tag = ""
         else:
             arc_color = QColor(PALETTE["textMuted"])
             zip_text = "ZIP \u2014" if compact_rows else "\u2014"
@@ -496,6 +538,10 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 _draw_cell(zip_cx, C_ZIP, packing, pack_color)
             else:
                 _draw_cell(zip_cx, C_ZIP, zip_text, arc_color)
+            arc_cx, C_ARC = cells["arc"]
+            _draw_cell(arc_cx, C_ARC, compact_archive_cell(
+                arc_exists, archive_age_str, archive_fresh_short, source_older,
+            ), arc_color)
         else:
             # Full mode: each state field is a fixed-width column so every row
             # aligns vertically -- RUN | WAVES | AGE on line 0, ZIP | PACK on
