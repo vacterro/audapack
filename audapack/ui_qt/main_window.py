@@ -1508,8 +1508,13 @@ QToolTip QLabel {
         """
         super().resizeEvent(event)
         toolbar = getattr(self, "_action_toolbar", None)
-        if toolbar is not None:
-            _fit_toolbar_to_text(toolbar)
+        if toolbar is None:
+            return
+        _fit_toolbar_to_text(toolbar)
+        # And once more after the layout settles. During a resize the toolbar
+        # can still be reporting the width it had, and a fit against a stale
+        # width is how the row ended up one button too wide for itself.
+        QTimer.singleShot(0, lambda: _fit_toolbar_to_text(toolbar))
 
     def _arrange_worker_windows_async(self, settle_seconds: float = 0.0):
         """Put the worker windows on the configured display, off the GUI thread.

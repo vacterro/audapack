@@ -70,6 +70,10 @@ def _row_width(bar):
     return sum(bar.widgetForAction(a).width() for a in visible)
 
 
+def _visible_buttons(bar):
+    return [bar.widgetForAction(a) for a in bar.actions() if a.text() and a.isVisible()]
+
+
 def test_the_action_row_fills_the_window_at_any_width(window, qapp):
     bar = _action_bar(window)
     for width in (TIGHT, 900, ROOMY):
@@ -77,8 +81,50 @@ def test_the_action_row_fills_the_window_at_any_width(window, qapp):
         qapp.processEvents()
         used = _row_width(bar)
         assert used <= width, f"the row overflows {width}px: {used}px"
-        # Padding, spacing and one separator are the only slack allowed.
-        assert used >= width - 40, f"{width - used}px of dead surface at {width}px"
+        # Padding, spacing, one separator and the reserved chevron width are
+        # the only slack allowed.
+        assert used >= width - 48, f"{width - used}px of dead surface at {width}px"
+
+
+def test_the_row_never_grows_a_second_line_for_one_button(window, qapp):
+    """It did, and the arithmetic test above still passed while it happened.
+
+    Filling the row to the last pixel SUMMONS QToolBar's overflow chevron: it
+    has nowhere to sit, so it takes a button with it and the row becomes two
+    lines for a single stray action. Only real geometry catches that, so this
+    reads where the buttons actually landed.
+    """
+    bar = _action_bar(window)
+    single_row_height = None
+    for width in (TIGHT, 665, 700, 900, 1100, ROOMY, 1920):
+        window.resize(width, 600)
+        qapp.processEvents()
+        buttons = _visible_buttons(bar)
+        assert buttons, "the action row is empty"
+        right = max(button.x() + button.width() for button in buttons)
+        assert right <= bar.width(), (
+            f"a button runs past the bar at {width}px: {right} > {bar.width()}"
+        )
+        tops = {button.y() for button in buttons}
+        assert len(tops) == 1, f"the row wrapped at {width}px: button tops {sorted(tops)}"
+        single_row_height = single_row_height or bar.height()
+        assert bar.height() == single_row_height, (
+            f"the toolbar grew from {single_row_height}px to {bar.height()}px at {width}px"
+        )
+
+
+def test_every_button_stays_in_the_row_and_none_is_hidden_in_the_chevron(window, qapp):
+    """A button pushed into the overflow menu is a button nobody can find."""
+    bar = _action_bar(window)
+    window.resize(665, 600)
+    qapp.processEvents()
+    expected = {a.text() for a in bar.actions() if a.text() and a.isVisible()}
+    placed = {
+        bar.actionAt(button.geometry().center()).text()
+        for button in _visible_buttons(bar)
+        if bar.actionAt(button.geometry().center()) is not None
+    }
+    assert placed == expected, f"missing from the row: {expected - placed}"
 
 
 def test_a_wide_row_spells_the_actions_out(window, qapp):

@@ -61,6 +61,13 @@ def natural_button_width(button, text: str) -> int:
     ).width()
 
 
+#: Room left for the extension chevron QToolBar puts up when its items do not
+#: fit. Filling the row to the last pixel is what SUMMONED it: the chevron then
+#: had nowhere to sit, so one button was pushed into it and the row grew a
+#: second line for a single button. Reserving its width means it never appears.
+TOOLBAR_OVERFLOW_GUARD = 16
+
+
 def _toolbar_overhead(toolbar, item_count: int) -> int:
     """Everything in the row that is not a button: padding, spacing, separators."""
     layout = toolbar.layout()
@@ -74,7 +81,7 @@ def _toolbar_overhead(toolbar, item_count: int) -> int:
         widget = toolbar.widgetForAction(action)
         if widget is not None:
             separators += max(widget.sizeHint().width(), 1)
-    return padding + separators + spacing * max(0, item_count - 1)
+    return padding + separators + spacing * max(0, item_count - 1) + TOOLBAR_OVERFLOW_GUARD
 
 
 def distribute_row(available: int, naturals: list[int]) -> list[int]:
