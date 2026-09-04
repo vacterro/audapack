@@ -4,7 +4,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from audapack.single_instance import SingleInstance
+from audapack.single_instance import GuardEstablishmentError, SingleInstance
 
 
 class TestSingleInstance(unittest.TestCase):
@@ -195,3 +195,105 @@ class TestLauncherStandsDownForALiveOwner(unittest.TestCase):
             code = app_mod.main([])
         run_gui.assert_called_once()
         self.assertEqual(code, 0)
+
+
+class TestRecoveryKeepsThePrimaryNamespace(unittest.TestCase):
+    """W2-004 (audit/2.md): recovery must take over, not sidestep.
+
+    The recovering launcher CLOSED its handle to the existing primary mutex and
+    kept only a separate `_RECOVERY_MUTEX`. So once the zombie finally exited,
+    the primary named object disappeared with it -- a third launcher saw no
+    primary mutex, created a fresh one, never consulted the recovery mutex, and
+    was admitted as a second full GUI. Reproduced with a faithful named-object
+    lifetime model: `C allowed? False` on the pre-fix code.
+    """
+
+    def test_the_recovering_instance_holds_the_primary_handle(self):
+        held = SingleInstance("TEST_SI_PRIMARY_HELD")
+        recovering = SingleInstance("TEST_SI_PRIMARY_HELD")
+        try:
+            self.assertFalse(held.is_already_running())
+            with patch.object(recovering, "_find_window_hwnd", return_value=None), \
+                 patch("audapack.single_instance._process_is_alive", return_value=False):
+                self.assertFalse(recovering.is_already_running())
+
+            if sys.platform == "win32":
+                self.assertIsNotNone(
+                    recovering._primary_mutex,
+                    "the recovered instance dropped the primary namespace",
+                )
+                self.assertIsNotNone(recovering._recovery_mutex)
+                self.assertIsNot(
+                    recovering._primary_mutex, recovering._recovery_mutex,
+                    "primary and recovery must be tracked separately",
+                )
+        finally:
+            held.release()
+            recovering.release()
+
+    @unittest.skipUnless(sys.platform == "win32", "named-mutex continuity is Win32-only")
+    def test_a_third_launcher_is_refused_after_the_zombie_exits(self):
+        zombie = SingleInstance("TEST_SI_CONTINUITY")
+        recovering = SingleInstance("TEST_SI_CONTINUITY")
+        third = SingleInstance("TEST_SI_CONTINUITY")
+        try:
+            self.assertFalse(zombie.is_already_running())
+            with patch.object(recovering, "_find_window_hwnd", return_value=None), \
+                 patch("audapack.single_instance._process_is_alive", return_value=False):
+                self.assertFalse(recovering.is_already_running())
+
+            # The zombie finally dies. Its handle goes; the recovered instance's
+            # handle to the same object must keep the namespace alive.
+            zombie.release()
+
+            # The recovered GUI is up but its window is not answering yet, and
+            # its owner record is live -- the worst window for a third launch.
+            with patch.object(third, "_find_window_hwnd", return_value=None), \
+                 patch("audapack.single_instance._process_is_alive", return_value=True):
+                self.assertTrue(
+                    third.is_already_running(),
+                    "a third GUI was admitted after the zombie exited",
+                )
+        finally:
+            recovering.release()
+            third.release()
+
+    @unittest.skipUnless(sys.platform == "win32", "named-mutex continuity is Win32-only")
+    def test_a_clean_release_lets_the_next_launcher_in(self):
+        first = SingleInstance("TEST_SI_CONTINUITY_RELEASE")
+        recovering = SingleInstance("TEST_SI_CONTINUITY_RELEASE")
+        self.assertFalse(first.is_already_running())
+        with patch.object(recovering, "_find_window_hwnd", return_value=None), \
+             patch("audapack.single_instance._process_is_alive", return_value=False):
+            self.assertFalse(recovering.is_already_running())
+        first.release()
+        recovering.release()
+
+        after = SingleInstance("TEST_SI_CONTINUITY_RELEASE")
+        try:
+            self.assertFalse(
+                after.is_already_running(),
+                "both guards were released, so a new instance must be admitted",
+            )
+        finally:
+            after.release()
+
+    @unittest.skipUnless(sys.platform == "win32", "named-mutex continuity is Win32-only")
+    def test_a_second_recovery_launcher_is_refused_while_one_is_recovering(self):
+        zombie = SingleInstance("TEST_SI_ONE_RECOVERY")
+        first_recovery = SingleInstance("TEST_SI_ONE_RECOVERY")
+        second_recovery = SingleInstance("TEST_SI_ONE_RECOVERY")
+        try:
+            self.assertFalse(zombie.is_already_running())
+            with patch.object(first_recovery, "_find_window_hwnd", return_value=None), \
+                 patch("audapack.single_instance._process_is_alive", return_value=False):
+                self.assertFalse(first_recovery.is_already_running())
+
+            with patch.object(second_recovery, "_find_window_hwnd", return_value=None), \
+                 patch("audapack.single_instance._process_is_alive", return_value=False):
+                with self.assertRaises(GuardEstablishmentError):
+                    second_recovery.is_already_running()
+        finally:
+            zombie.release()
+            first_recovery.release()
+            second_recovery.release()

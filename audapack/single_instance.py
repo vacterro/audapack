@@ -102,6 +102,9 @@ class SingleInstance:
     def __init__(self, name: str = "AUDAPACK_GUI"):
         self.name = name
         self._mutex = None
+        #: The handle to the PRIMARY named object, kept for this instance's whole
+        #: life so the namespace survives the zombie it recovered from (W2-004).
+        self._primary_mutex = None
         self._recovery_mutex = None
         self._file_handle = None
         self._is_already_running = False
@@ -247,14 +250,18 @@ class SingleInstance:
                     # handle and report False so a new instance can open.
                     hwnd = self._find_window_hwnd("AUDAPACK")
                     if hwnd is None:
-                        primary = self._mutex
-                        try:
-                            ctypes.windll.kernel32.CloseHandle(primary)
-                        except Exception as exc:
-                            raise GuardEstablishmentError(
-                                f"Could not release stale primary mutex handle: {exc}"
-                            ) from exc
-                        self._mutex = None
+                        # W2-004 (audit/2.md): the primary handle is KEPT.
+                        # Closing it made the recovered GUI stop holding the
+                        # primary namespace, so once the zombie finally exited
+                        # the named object disappeared with it -- a third
+                        # launcher then saw no primary mutex at all, created a
+                        # fresh one, never consulted the recovery mutex, and was
+                        # admitted as a second full GUI. Our handle to the
+                        # EXISTING object keeps that object alive for exactly as
+                        # long as this instance lives, which is what continuity
+                        # means; the recovery mutex only serializes competing
+                        # recovery launchers.
+                        self._primary_mutex = self._mutex
                         recovery_name = f"Local\\{self.name}_RECOVERY_MUTEX"
                         recovery = ctypes.windll.kernel32.CreateMutexW(None, False, recovery_name)
                         if not recovery:
@@ -268,13 +275,13 @@ class SingleInstance:
                                 "Another launcher is already recovering a windowless instance"
                             )
                         self._recovery_mutex = recovery
-                        self._mutex = recovery
                         atexit.register(self.release)
                         self._write_owner_record()
                         self._is_already_running = False
                         return False
                     self._is_already_running = True
                     return True
+                self._primary_mutex = self._mutex
                 atexit.register(self.release)
                 self._write_owner_record()
                 return False
@@ -313,15 +320,24 @@ class SingleInstance:
                 return True
 
     def release(self):
-        if sys.platform == "win32" and self._mutex:
-            try:
-                import ctypes
+        if sys.platform == "win32":
+            # W2-004: primary and recovery are tracked separately and each is
+            # closed exactly once. `_mutex` is an alias for whichever handle
+            # this instance created first, so it is never closed twice.
+            handles = []
+            for handle in (self._primary_mutex, self._recovery_mutex):
+                if handle and handle not in handles:
+                    handles.append(handle)
+            for handle in handles:
+                try:
+                    import ctypes
 
-                ctypes.windll.kernel32.CloseHandle(self._mutex)
-                self._mutex = None
-                self._recovery_mutex = None
-            except Exception:
-                pass
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+            self._mutex = None
+            self._primary_mutex = None
+            self._recovery_mutex = None
         elif self._file_handle:
             try:
                 import fcntl
