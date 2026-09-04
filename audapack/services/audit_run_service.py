@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,8 @@ from typing import Any, Callable, Iterable, Optional
 from audapack import agent_inbox
 from audapack.config import cross_process_lock, get_state_dir
 from audapack.models import AuditSnapshot
+
+logger = logging.getLogger(__name__)
 
 MAX_AUDIT_LANES = 6
 RUN_HISTORY_BOUND = 100
@@ -280,16 +283,74 @@ class ManagedWorkerSupervisor:
         self.cooldown_seconds = max(1.0, float(cooldown_seconds))
 
     def _load(self) -> dict[str, Any]:
+        doc, _corrupt = self._load_checked()
+        return doc
+
+    def _load_checked(self) -> tuple[dict[str, Any], bool]:
+        """The worker ledger, and whether the file on disk was unusable.
+
+        W2-005 (audit/3.md): unreadable JSON, a wrong schema or a non-dict all
+        became a fresh `{generation: 1, slots: {}}`. That is not an empty pool,
+        it is an UNKNOWN pool: every slot reads as vacant, so the next pass
+        launches windows on slots that already have one, and generation 1 makes
+        the era collide with the very first pool the install ever had. Corruption
+        is reported to the caller, which quarantines the bytes and rebuilds from
+        the workers that are actually registered.
+        """
+        empty = {"schema_version": 1, "generation": 1, "slots": {}}
         if not self.path.exists():
-            return {"schema_version": 1, "generation": 1, "slots": {}}
+            return empty, False
         try:
             doc = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            return {"schema_version": 1, "generation": 1, "slots": {}}
+            return empty, True
         if not isinstance(doc, dict) or doc.get("schema_version") != 1:
-            return {"schema_version": 1, "generation": 1, "slots": {}}
+            return empty, True
+        if not isinstance(doc.get("slots", {}), dict):
+            return empty, True
         doc.setdefault("generation", 1)
         doc.setdefault("slots", {})
+        return doc, False
+
+    def _rebuild_from_workers(self, workers: list[dict[str, Any]], now: float) -> dict[str, Any]:
+        """Reconstruct the ledger from the pool that demonstrably exists.
+
+        A registered worker proves its slot AND its generation, which is exactly
+        what the lost file held. Generation never goes backwards: it becomes the
+        highest era any live window reports.
+        """
+        quarantine = self.path.with_name(f"{self.path.name}.corrupt.{uuid.uuid4().hex[:8]}")
+        try:
+            if self.path.exists():
+                self.path.replace(quarantine)
+        except OSError:
+            quarantine = self.path
+        generation = 1
+        slots: dict[str, Any] = {}
+        for worker in workers:
+            try:
+                slot = int(worker.get("managed_slot", 0) or 0)
+                worker_generation = int(worker.get("managed_generation", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= slot <= MAX_AUDIT_LANES):
+                continue
+            generation = max(generation, worker_generation)
+            slots[str(slot)] = {
+                "state": "HEARTBEAT",
+                "launch_attempts": 0,
+                "last_seen_at": float(worker.get("last_seen_at", now) or now),
+                "cooldown_until": 0.0,
+            }
+        doc = {
+            "schema_version": 1,
+            "generation": max(1, generation),
+            "slots": slots,
+            "recovered_from": quarantine.name,
+            "recovered_at": now,
+            "updated_at": now,
+        }
+        _atomic_write_json(self.path, doc)
         return doc
 
     def ensure_capacity(self, dispatch: dict[str, Any], demand: int) -> dict[str, Any]:
@@ -297,7 +358,10 @@ class ManagedWorkerSupervisor:
         workers = dispatch.get("workers", []) if isinstance(dispatch, dict) else []
         now = time.time()
         with cross_process_lock(self.lock_path):
-            doc = self._load()
+            doc, corrupt = self._load_checked()
+            if corrupt:
+                logger.warning("managed worker ledger was unreadable; rebuilding from live workers")
+                doc = self._rebuild_from_workers(list(workers), now)
             generation = max(1, int(doc.get("generation", 1)))
             registered = {
                 int(worker.get("managed_slot"))
@@ -319,13 +383,16 @@ class ManagedWorkerSupervisor:
                 if str(slot).isdigit() and 1 <= int(slot) <= MAX_AUDIT_LANES
             }
             # A window that was launched but has not registered yet still
-            # occupies its slot and one lane.
+            # occupies its slot and one lane. RESERVED counts too (W2-005): a
+            # crash between the reservation and the spawn must not let the next
+            # pass open a second window on that slot, and the boot grace expires
+            # the reservation if the launch never happened.
             pending = {
                 int(slot_id)
                 for slot_id, slot_state in doc["slots"].items()
                 if str(slot_id).isdigit()
                 and int(slot_id) not in registered
-                and str(slot_state.get("state")) == "LAUNCHING"
+                and str(slot_state.get("state")) in {"LAUNCHING", "RESERVED"}
                 and now - float(slot_state.get("launched_at", 0.0) or 0.0) < WORKER_LAUNCH_BOOT_GRACE_SECONDS
             }
             launched: list[dict[str, Any]] = []
@@ -376,6 +443,26 @@ class ManagedWorkerSupervisor:
                     continue
                 if len(registered) + len(pending) + len(launched) >= desired:
                     break
+                # W2-005 (audit/3.md): the reservation is durable BEFORE the
+                # irreversible spawn. It used to launch first and record after,
+                # so a failed ledger write lost all knowledge of an already-open
+                # browser and the retry opened the same slot again -- measured:
+                # launches [(1,1)] with no journal, then [(1,1),(1,1)] on retry.
+                # A reservation that outlives a crash is what makes the retry
+                # safe: `RESERVED` is treated as occupied by `pending` below, and
+                # its cooldown expires it if the launch never happened.
+                doc["slots"][str(slot)] = {
+                    "state": "RESERVED",
+                    "launch_attempts": attempts + 1,
+                    "launched_at": now,
+                    "attempts_expire_at": now + WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS,
+                    "cooldown_until": now + WORKER_LAUNCH_BOOT_GRACE_SECONDS,
+                    "message": "reserved before launch",
+                }
+                doc["desired"] = desired
+                doc["updated_at"] = now
+                _atomic_write_json(self.path, doc)
+
                 ok, message = self.launch_worker(slot, generation)
                 doc["slots"][str(slot)] = {
                     "state": "LAUNCHING" if ok else "LAUNCH_FAILED",
@@ -404,7 +491,10 @@ class ManagedWorkerSupervisor:
         workers = dispatch.get("workers", []) if isinstance(dispatch, dict) else []
         now = time.time()
         with cross_process_lock(self.lock_path):
-            doc = self._load()
+            doc, corrupt = self._load_checked()
+            if corrupt:
+                logger.warning("managed worker ledger was unreadable; rebuilding from live workers")
+                doc = self._rebuild_from_workers(list(workers), now)
             generation = max(1, int(doc.get("generation", 1)))
             live = any(
                 int(worker.get("managed_slot", 0) or 0) == slot
@@ -413,6 +503,18 @@ class ManagedWorkerSupervisor:
             )
             if live:
                 return {"slot": slot, "generation": generation, "launched": False, "message": "slot already has a live worker"}
+            # W2-005: durable reservation before the spawn, here too.
+            doc["slots"][str(slot)] = {
+                "state": "RESERVED",
+                "launch_attempts": 1,
+                "launched_at": now,
+                "attempts_expire_at": now + WORKER_LAUNCH_ATTEMPT_DECAY_SECONDS,
+                "cooldown_until": now + WORKER_LAUNCH_BOOT_GRACE_SECONDS,
+                "message": "reserved before launch",
+            }
+            doc["updated_at"] = now
+            _atomic_write_json(self.path, doc)
+
             ok, message = self.launch_worker(slot, generation)
             doc["slots"][str(slot)] = {
                 "state": "LAUNCHING" if ok else "LAUNCH_FAILED",

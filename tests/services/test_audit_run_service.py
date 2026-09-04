@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from audapack.models import AuditSnapshot, Project
 from audapack.services.audit_run_service import (
     AuditRunCoordinator,
@@ -1415,3 +1417,100 @@ def test_redaction_happens_before_truncation():
     out = _redact_diagnostic_text(text, 500)
     assert "SUPERSECRETVALUE" not in out
     assert "[redacted]" in out
+
+
+def _supervisor(tmp_path, launches, ok=True):
+    return ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append((slot, generation)) or (ok, "started")),
+        tmp_path / "workers.json",
+    )
+
+
+def test_a_launch_reservation_is_durable_before_the_spawn(tmp_path):
+    """W2-005 (audit/3.md): the irreversible effect came before the record.
+
+    `ensure_capacity()` spawned the browser and only then wrote the LAUNCHING
+    row, so a failed ledger write lost all knowledge of an already-open window
+    and the retry opened the same slot again. Measured: launches [(1,1)] with no
+    journal on disk, then [(1,1),(1,1)] once persistence was restored.
+    """
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    seen: list[str] = []
+
+    def record_then_fail_after_spawn(path, value):
+        state = str(((value.get("slots") or {}).get("1") or {}).get("state") or "")
+        seen.append(state)
+        if state != "RESERVED":
+            raise OSError("injected ledger write failure after the spawn")
+        return _real_atomic_write(path, value)
+
+    from audapack.services import audit_run_service as ars
+
+    _real_atomic_write = ars._atomic_write_json
+    ars._atomic_write_json = record_then_fail_after_spawn
+    try:
+        with pytest.raises(OSError):
+            supervisor.ensure_capacity({"workers": []}, 1)
+    finally:
+        ars._atomic_write_json = _real_atomic_write
+
+    assert launches == [(1, 1)], launches
+    assert seen[0] == "RESERVED", f"the spawn happened before any record: {seen}"
+    assert supervisor.path.exists(), "the reservation was not durable"
+
+    # The retry sees the reservation and does NOT open a second window.
+    supervisor.ensure_capacity({"workers": []}, 1)
+    assert launches == [(1, 1)], f"the same slot was launched twice: {launches}"
+
+
+def test_a_failure_before_the_spawn_opens_no_window(tmp_path):
+    from audapack.services import audit_run_service as ars
+
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    real = ars._atomic_write_json
+    ars._atomic_write_json = lambda path, value: (_ for _ in ()).throw(OSError("injected"))
+    try:
+        with pytest.raises(OSError):
+            supervisor.ensure_capacity({"workers": []}, 1)
+    finally:
+        ars._atomic_write_json = real
+    assert launches == [], "a browser was opened with no durable reservation"
+
+
+def test_a_corrupt_ledger_is_quarantined_not_treated_as_an_empty_pool(tmp_path):
+    """Unreadable state is an UNKNOWN pool, not an empty one.
+
+    Every slot read as vacant, so the next pass launched windows onto slots that
+    already had one, and generation 1 made the era collide with the install's
+    first pool.
+    """
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    supervisor.path.parent.mkdir(parents=True, exist_ok=True)
+    supervisor.path.write_text("{ this is not json", encoding="utf-8")
+
+    workers = [
+        {"managed_slot": 1, "managed_generation": 4, "last_seen_at": time.time()},
+        {"managed_slot": 2, "managed_generation": 4, "last_seen_at": time.time()},
+    ]
+    supervisor.ensure_capacity({"workers": workers}, 2)
+
+    assert launches == [], f"duplicate windows for slots that already had one: {launches}"
+    doc = json.loads(supervisor.path.read_text(encoding="utf-8"))
+    assert doc["generation"] == 4, "the generation went backwards through corruption"
+    assert set(doc["slots"]) == {"1", "2"}
+    assert doc.get("recovered_from"), "the corrupt bytes were destroyed instead of quarantined"
+    quarantined = list(supervisor.path.parent.glob("workers.json.corrupt.*"))
+    assert quarantined, "the corrupt file was not kept for inspection"
+
+
+def test_a_corrupt_ledger_with_no_live_worker_still_provisions(tmp_path):
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    supervisor.path.parent.mkdir(parents=True, exist_ok=True)
+    supervisor.path.write_text('{"schema_version": 99}', encoding="utf-8")
+
+    supervisor.ensure_capacity({"workers": []}, 1)
+    assert launches == [(1, 1)], launches
