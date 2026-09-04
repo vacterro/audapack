@@ -237,3 +237,74 @@ def test_relaunch_succeeds_even_when_dispatcher_status_is_broken():
     assert result["success"] is False
     assert "relaunch preparation failed" in result["message"]
     assert workers.resets == [2]
+
+
+def test_stop_waits_for_a_running_pass():
+    """W2-006 (audit/2.md): stop() must be a barrier, not a hint.
+
+    It only set the event and returned, so run_bridge_server went straight on to
+    server_close() and PID removal while a tick was still inside
+    ensure_capacity(). Measured: the launch completed AFTER shutdown was
+    requested -- which recreates the orphan-browser lifecycle this supervisor
+    exists to control.
+    """
+    import threading
+    import time as _time
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingWorkers(FakeWorkerSupervisor):
+        def ensure_capacity(self, dispatch, desired):
+            entered.set()
+            release.wait(timeout=10)
+            finished.set()
+            return super().ensure_capacity(dispatch, desired)
+
+    dispatcher = FakeDispatcher(queued_jobs=1, active_workers=0, free_workers=0)
+    sup = DispatchSupervisor(
+        dispatcher,
+        worker_supervisor=BlockingWorkers(),
+        interval_seconds=1.0,
+    )
+    assert sup.start() is True
+    assert entered.wait(timeout=15), "the pass never reached provisioning"
+
+    stopper = {"result": None}
+    thread = threading.Thread(target=lambda: stopper.__setitem__("result", sup.stop(timeout=15)))
+    thread.start()
+    _time.sleep(0.3)
+    assert stopper["result"] is None, "stop() returned while a launch-capable tick was active"
+
+    release.set()
+    thread.join(timeout=20)
+    assert stopper["result"] is True
+    assert finished.is_set()
+    assert sup._thread is None, "a dead thread handle must not block a restart"
+
+
+def test_a_stopped_supervisor_can_start_again():
+    """`_thread` stayed non-None forever, so start() returned a silent False."""
+    sup = DispatchSupervisor(
+        FakeDispatcher(queued_jobs=0),
+        worker_supervisor=FakeWorkerSupervisor(),
+        interval_seconds=1.0,
+    )
+    assert sup.start() is True
+    assert sup.stop(timeout=15) is True
+    assert sup.start() is True, "the object refused to run again after a clean stop"
+    assert sup.stop(timeout=15) is True
+
+
+def test_a_pass_that_sees_stop_never_launches():
+    """The one irreversible side effect is gated on the stop event."""
+    workers = FakeWorkerSupervisor()
+    sup = supervisor(FakeDispatcher(queued_jobs=3, active_workers=0, free_workers=0), workers)
+    sup.stop(timeout=1)
+    result = sup.tick()
+
+    assert workers.calls == [], "a browser was launched after shutdown was requested"
+    assert result["skipped"] == "stopping"
+    # Reconciliation still ran: it only touches state that already exists.
+    assert result["requeued"] == 0

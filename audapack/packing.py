@@ -197,6 +197,42 @@ def generate_manifest_data(
     return meta
 
 
+def eligible_source_files(source: Path, excludes: set[str]):
+    """Yield exactly the files a pack of ``source`` would put in the archive.
+
+    One traversal contract for both the packer and anything that has to reason
+    about pack inputs. PERF-004 (audit/2.md): `ensure_fresh_archive()` walked the
+    tree WITHOUT the exclusion matcher and stat'ed every file below the project
+    root, so deciding whether an archive could be reused traversed precisely the
+    generated/cache/object trees that packing excludes for performance --
+    measured 0.13 ms with nothing excluded, 38.27 ms at 5,000 excluded files,
+    141.25 ms at 20,000, and the same existing archive was reused every time.
+    Sharing the matcher is also what stops the two algorithms drifting apart
+    again.
+
+    Symlinks are skipped exactly as `create_zip` skips them: a link can point
+    outside the source root and bypass name-based exclusion.
+    """
+    matcher = _build_exclusion_matcher(set(excludes) | MANDATORY_EXCLUDES)
+    if source.is_file():
+        if not source.is_symlink() and not matcher(source):
+            yield source
+        return
+    for root, dirs, files in os.walk(source):
+        base = Path(root)
+        # Exclusion is a pure name/path test and is checked FIRST: an excluded
+        # directory must not even be stat'ed for the symlink question.
+        dirs[:] = [
+            name for name in dirs
+            if not matcher(base / name) and not (base / name).is_symlink()
+        ]
+        for name in files:
+            path = base / name
+            if matcher(path) or path.is_symlink():
+                continue
+            yield path
+
+
 def create_zip(
     source_dir: str | Path,
     output_zip: Path,

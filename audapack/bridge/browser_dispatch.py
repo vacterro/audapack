@@ -375,12 +375,26 @@ class BrowserDispatcher:
         self._generation_pending = False
         self._expired_worker_count = 0
         self._campaign_probe: Optional[Any] = None
+        # W2-005 (audit/2.md): the durable generation MUST be loaded before
+        # anything can publish. `_load_jobs()` is exactly the code that
+        # rewrites recovered jobs and calls `_persist_jobs()`, which increments
+        # the CURRENT in-memory value -- and that value used to still be 0 here,
+        # so a restart doing the recovery it was designed for republished at
+        # generation 1. Measured: a LEASED job persisted at generation 2 came
+        # back QUEUED at generation 1, and MainWindow only refreshes when
+        # `dispatch_gen > _last_dispatch_generation`, so a UI that had seen 2
+        # ignored the recovery and every state change after it. Monotonic, per
+        # restart, always.
+        self._generation = self._read_persisted_generation()
         self._load_jobs()
         self._committed_jobs = self._job_state_snapshot()
+
+    def _read_persisted_generation(self) -> int:
         try:
-            self._generation = int(json.loads(self.generation_file.read_text(encoding="utf-8")).get("generation", 0))
+            value = json.loads(self.generation_file.read_text(encoding="utf-8")).get("generation", 0)
+            return max(0, int(value))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            self._generation = 0
+            return 0
 
     # ------------------------------------------------------------------ #
     # persistence
@@ -469,7 +483,10 @@ class BrowserDispatcher:
                 self._restore_job_state(self._committed_jobs)
                 raise
             self._committed_jobs = doc["jobs"]
-            self._generation += 1
+            # W2-005: another process may have advanced the counter while this
+            # one held its own value. Under the same lock the jobs write takes,
+            # so a concurrent Bridge cannot regress it either.
+            self._generation = max(self._generation, self._read_persisted_generation()) + 1
             try:
                 _atomic_write_json(self.generation_file, {
                     "generation": self._generation,

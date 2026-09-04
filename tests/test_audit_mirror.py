@@ -224,3 +224,112 @@ def test_an_existing_gitignore_is_left_alone(tmp_path):
     src = _audit_dir(tmp_path)
     mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, src, _handoff(src))
     assert (project / "audit" / ".gitignore").read_text(encoding="utf-8") == "# mine\n"
+
+
+def test_two_writers_never_lose_a_layer_to_the_same_number(tmp_path):
+    """W2-002 (audit/2.md): the project audit inbox has multiple writers.
+
+    `next_layer_number()` OBSERVES the free number, it does not reserve it, and
+    publication then used plain `write_bytes()`. Two finalizations -- or one
+    racing an INAUDIT assignment, a genuinely independent writer into the same
+    folder -- both picked the same number and the second silently truncated the
+    first. Measured: both reported delivering `1.md`, one payload survived, and
+    the other audit was gone from the project's queue with both producers
+    claiming success.
+    """
+    import threading
+
+    from audapack import agent_inbox
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    src = _audit_dir(tmp_path)
+    config = _config(tmp_path, mirror_into_project=True)
+
+    first = src / "PROJ__00_AUDIT_ALL_3.md"
+    second = src / "PROJ__00_COMPRESS_AUDIT.md"
+    first.write_text("AUDIT_ONE", encoding="utf-8")
+    second.write_text("AUDIT_TWO", encoding="utf-8")
+
+    # Both writers observe the free number, then both publish: the exact window
+    # the reproduction used.
+    gate = threading.Barrier(2)
+    real_next = agent_inbox.next_layer_number
+    seen = []
+
+    def synchronized_next(*args, **kwargs):
+        number = real_next(*args, **kwargs)
+        if len(seen) < 2:
+            seen.append(number)
+            try:
+                gate.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+        return number
+
+    agent_inbox.next_layer_number = synchronized_next
+    try:
+        results: dict[str, list] = {}
+        threads = [
+            threading.Thread(target=lambda: results.__setitem__(
+                "a", mirror_project_audits(config, project, src, first))),
+            threading.Thread(target=lambda: results.__setitem__(
+                "b", mirror_project_audits(config, project, src, second))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+    finally:
+        agent_inbox.next_layer_number = real_next
+
+    assert seen[:2] == [seen[0], seen[0]], f"the race never happened: {seen}"
+    layers = sorted(
+        path for path in (project / "audit").iterdir()
+        if agent_inbox.layer_number(path.name) is not None
+    )
+    payloads = sorted(path.read_text(encoding="utf-8") for path in layers)
+    assert payloads == ["AUDIT_ONE", "AUDIT_TWO"], f"a delivery was overwritten: {payloads}"
+    assert len(layers) == 2, [path.name for path in layers]
+    assert results["a"] and results["b"], results
+
+
+def test_a_layer_taken_between_look_and_write_is_stepped_over(tmp_path):
+    """The loser of the race takes the NEXT free number, not a failure."""
+    from audapack import agent_inbox
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    src = _audit_dir(tmp_path, "MINE")
+    config = _config(tmp_path, mirror_into_project=True)
+
+    real_next = agent_inbox.next_layer_number
+    stolen = {"done": False}
+
+    def steal_then_answer(root, directory, *args, **kwargs):
+        number = real_next(root, directory, *args, **kwargs)
+        if not stolen["done"]:
+            stolen["done"] = True
+            (Path(directory) / f"{number}.md").write_text("SOMEONE ELSE", encoding="utf-8")
+        return number
+
+    agent_inbox.next_layer_number = steal_then_answer
+    try:
+        copied = mirror_project_audits(config, project, src, _handoff(src))
+    finally:
+        agent_inbox.next_layer_number = real_next
+
+    assert copied, "publication gave up instead of taking the next number"
+    assert copied[0].read_text(encoding="utf-8") == "MINE"
+    assert (project / "audit" / "1.md").read_text(encoding="utf-8") == "SOMEONE ELSE"
+
+
+def test_redelivering_identical_bytes_still_adds_no_layer(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    src = _audit_dir(tmp_path)
+    config = _config(tmp_path, mirror_into_project=True)
+
+    first = mirror_project_audits(config, project, src, _handoff(src))
+    again = mirror_project_audits(config, project, src, _handoff(src))
+    assert first and again == []

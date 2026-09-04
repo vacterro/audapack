@@ -701,6 +701,57 @@ def generate_canonical_campaign(
     }
 
 
+#: Candidate layer numbers one publication will try before giving up. Each
+#: attempt is a distinct free number, so this is a collision budget, not a
+#: retry-the-same-thing budget.
+_LAYER_PUBLISH_ATTEMPTS = 12
+
+
+def _publish_canonical_layer(
+    dest: Path, root: Path, binding_rel: str, allocator_rel: str, payload: bytes
+) -> Optional[Path]:
+    """Write one canonical `<N>.md` layer, never over another writer's.
+
+    W2-002 (audit/2.md): `next_layer_number()` OBSERVES the free number, it does
+    not reserve it, and publication then used plain `write_bytes()`. Two
+    finalizations -- or a finalization racing an INAUDIT assignment, which is a
+    genuinely independent writer into the same folder -- both picked the same
+    free layer and the second silently truncated the first. Measured: both
+    writers reported delivering `1.md`, only one payload survived, and the other
+    audit was gone from the project's work queue while both producers claimed
+    success.
+
+    No shared lock is required for correctness here: `O_CREAT | O_EXCL` makes the
+    creation itself the arbiter, so the loser sees EEXIST and takes the next free
+    number. The allocator/binding floors are still consulted, so a number that
+    was spent and deleted is never handed out again.
+    """
+    for _ in range(_LAYER_PUBLISH_ATTEMPTS):
+        number = agent_inbox.next_layer_number(root, dest, binding_rel, allocator_rel)
+        target = dest / f"{number}.md"
+        try:
+            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Somebody else took this number between the observation and the
+            # create. Ask again -- the answer has moved on.
+            continue
+        except OSError:
+            return None
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        return target
+    return None
+
+
 def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=None) -> list[Path]:
     """Copy a finished audit into the audited project's own tree.
 
@@ -765,9 +816,9 @@ def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=Non
             if not already:
                 probe = str(getattr(config.audits, "agent_receipt_path", "") or "")
                 spent = str(getattr(config.audits, "agent_allocator_path", "") or "")
-                target = dest / f"{agent_inbox.next_layer_number(root, dest, probe, spent)}.md"
-                target.write_bytes(payload)
-                copied.append(target)
+                target = _publish_canonical_layer(dest, root, probe, spent, payload)
+                if target is not None:
+                    copied.append(target)
         except OSError:
             pass
 

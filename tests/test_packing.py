@@ -593,3 +593,142 @@ class TestBackupIsRollbackAuthority(unittest.TestCase):
         result = self._pack()
         self.assertTrue(result.success, result.error_message)
         self.assertTrue((self.output_dir / "Proj.zip").exists())
+
+
+class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
+    """PERF-004 (audit/2.md): reuse must not traverse what packing excludes.
+
+    `ensure_fresh_archive()` walked the tree with NO exclusion matcher and
+    stat'ed every file below the project root, so deciding an archive could be
+    reused traversed exactly the generated/cache/object trees the archive omits.
+    Measured: 0.13 ms with nothing excluded, 38.27 ms at 5,000 excluded files,
+    141.25 ms at 20,000 -- and the same archive was reused in every case.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "proj"
+        self.source.mkdir(parents=True)
+        (self.source / "main.py").write_text("print('x')", encoding="utf-8")
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _service(self):
+        from audapack.config import AppConfig, PackingConfig
+        from audapack.models import Project
+        from audapack.services.packing_service import PackingService
+
+        config = AppConfig(packing=PackingConfig(output_dir=str(self.output_dir), delete_old=True))
+        config.projects = [Project(
+            id="proj", display_name="proj", source_path=str(self.source), archive_name="proj",
+        )]
+        service = PackingService(config, base_dir=self.root)
+        return service
+
+    def _seed_archive(self, newer_by: float = 60.0) -> Path:
+        import os as _os
+
+        archive = self.output_dir / "proj.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("main.py", "print('x')")
+        newest = max(path.stat().st_mtime for path in self.source.rglob("*") if path.is_file())
+        stamp = newest + newer_by
+        _os.utime(archive, (stamp, stamp))
+        return archive
+
+    def test_excluded_weight_is_never_stat_ed(self):
+        heavy = self.source / "node_modules" / "pkg"
+        heavy.mkdir(parents=True)
+        for index in range(30):
+            (heavy / f"chunk{index}.js").write_text("x", encoding="utf-8")
+        archive = self._seed_archive()
+
+        stats = []
+        real_stat = Path.stat
+
+        def counting_stat(self, *args, **kwargs):
+            stats.append(str(self))
+            return real_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", autospec=True, side_effect=counting_stat):
+            result = self._service().ensure_fresh_archive("proj")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.output_path, archive, "the fresh archive was not reused")
+        touched = [path for path in stats if "node_modules" in path]
+        self.assertEqual(touched, [], f"excluded weight was stat'ed: {touched[:3]}")
+
+    def test_a_changed_included_file_still_forces_a_repack(self):
+        import os as _os
+
+        self._seed_archive()
+        included = self.source / "main.py"
+        stamp = self.output_dir.joinpath("proj.zip").stat().st_mtime + 120
+        _os.utime(included, (stamp, stamp))
+
+        packed = []
+        service = self._service()
+        service.pack_project = lambda project_id, **kw: packed.append(project_id) or PackResult(
+            project_id=project_id, name=project_id, source_path=str(self.source), success=True,
+        )
+        service.ensure_fresh_archive("proj")
+        self.assertEqual(packed, ["proj"], "a newer included file did not invalidate the archive")
+
+    def test_a_change_under_an_excluded_directory_never_repacks(self):
+        import os as _os
+
+        archive = self._seed_archive()
+        heavy = self.source / ".venv" / "lib"
+        heavy.mkdir(parents=True)
+        stamp = archive.stat().st_mtime + 500
+        target = heavy / "site.py"
+        target.write_text("x", encoding="utf-8")
+        _os.utime(target, (stamp, stamp))
+
+        packed = []
+        service = self._service()
+        service.pack_project = lambda project_id, **kw: packed.append(project_id)
+        result = service.ensure_fresh_archive("proj")
+
+        self.assertEqual(packed, [], "an excluded file forced a repack it cannot affect")
+        self.assertTrue(result.success)
+        self.assertEqual(result.output_path, archive)
+
+    def test_no_existing_archive_packs_without_a_freshness_walk(self):
+        walks = []
+        real_walk = __import__("os").walk
+
+        def counting_walk(*args, **kwargs):
+            walks.append(args[0])
+            return real_walk(*args, **kwargs)
+
+        packed = []
+        service = self._service()
+        service.pack_project = lambda project_id, **kw: packed.append(project_id)
+        with patch("os.walk", side_effect=counting_walk):
+            service.ensure_fresh_archive("proj")
+
+        self.assertEqual(packed, ["proj"])
+        self.assertEqual(walks, [], "a first pack walked the tree to prove nothing")
+
+    def test_the_eligible_walk_matches_what_packing_would_include(self):
+        from audapack.packing import eligible_source_files
+
+        (self.source / "node_modules").mkdir()
+        (self.source / "node_modules" / "big.js").write_text("x", encoding="utf-8")
+        (self.source / "debug.log").write_text("noise", encoding="utf-8")
+        (self.source / "README.md").write_text("docs", encoding="utf-8")
+
+        from audapack.config import DEFAULT_EXCLUDES
+
+        names = sorted(
+            path.name for path in eligible_source_files(self.source, set(DEFAULT_EXCLUDES))
+        )
+        self.assertIn("main.py", names)
+        self.assertIn("README.md", names)
+        self.assertNotIn("big.js", names)
+        self.assertNotIn("debug.log", names)

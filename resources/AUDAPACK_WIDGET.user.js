@@ -38,18 +38,20 @@
 // @grant        GM_addValueChangeListener
 // @connect      127.0.0.1
 // @connect      localhost
-// Tampermonkey's own update check, pointed at the Bridge. Without these
-// there is no auto-update path at all: every version bump needed a manual
-// install through tampermonkey.net/script_installation, which waits on the
-// extension's MV3 service worker to wake and took 1-2 minutes as often as
-// it was instant. With them, a bumped @version is picked up by the
-// interval check with no click. Bridge down just means the check retries.
-// @updateURL    http://127.0.0.1:17843/widget.user.js
-// @downloadURL  http://127.0.0.1:17843/widget.user.js
-// Served by the local AUDAPACK Bridge. Without these a widget build bump
-// locked every worker window out of claiming audits until the operator
-// hand-installed the new script: six idle windows next to a queue that
-// never moved. Tampermonkey now picks the update up on its own.
+// Tampermonkey's own update check, pointed at the Bridge. Without these there
+// is no auto-update path at all: every version bump needed a manual install
+// through tampermonkey.net/script_installation, which waits on the extension's
+// MV3 service worker to wake and took 1-2 minutes as often as it was instant.
+// With them, a bumped @version is picked up by the interval check with no
+// click, and a build bump stops locking every worker window out of claiming
+// audits. Bridge down just means the check retries.
+//
+// CORE-001 (audit/2.md): the port here is the DEFAULT, not the contract. The
+// Bridge port is operator-configurable, so `GET /widget.user.js` rewrites both
+// directives to the endpoint it is actually being served from -- an operator
+// who moves the Bridge installs a script whose update check follows it. There
+// is exactly ONE pair of these directives on purpose: two copies drift, and
+// Tampermonkey persists whichever it read last.
 // @updateURL    http://127.0.0.1:17843/widget.user.js
 // @downloadURL  http://127.0.0.1:17843/widget.user.js
 // @run-at       document-start

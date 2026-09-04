@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Callable, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
 from audapack.models import PackResult
-from audapack.packing import find_archive_for_project, pack_single, resolve_output_dir
+from audapack.packing import (
+    eligible_source_files,
+    find_archive_for_project,
+    pack_single,
+    resolve_output_dir,
+)
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
 
@@ -68,24 +72,35 @@ class PackingService:
             return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), success=False, error_message="Project source path is missing")
         output_dir = resolve_output_dir(source, self.config.packing, fallback=app_dir(), group=proj.priority_group, project=proj)
         existing = find_archive_for_project(proj, output_dir)
-        source_mtime = 0.0
+        if not (existing and existing.is_file()):
+            # Nothing to reuse means nothing to prove: the freshness walk's whole
+            # purpose is comparing against an existing archive.
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
         try:
-            if source.is_file():
-                source_mtime = source.stat().st_mtime
-            else:
-                source_mtime = source.stat().st_mtime
-                for root, _dirs, files in os.walk(source):
-                    for name in files:
-                        try:
-                            source_mtime = max(source_mtime, (Path(root) / name).stat().st_mtime)
-                        except OSError:
-                            continue
+            archive_mtime = existing.stat().st_mtime
         except OSError:
-            source_mtime = float("inf")
-        if existing and existing.is_file():
-            try:
-                if existing.stat().st_mtime >= source_mtime:
-                    return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), output_path=existing, success=True)
-            except OSError:
-                pass
-        return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+
+        # PERF-004 (audit/2.md): only files that can actually enter the archive
+        # count, and the first one newer than the archive already settles it.
+        # This walked the WHOLE tree, unpruned and unstat-filtered, so reusing an
+        # archive traversed exactly the node_modules/.venv/.git/objects weight
+        # that packing excludes for performance.
+        excludes = set(self.config.packing.excludes)
+        try:
+            if source.stat().st_mtime > archive_mtime:
+                return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+            for candidate in eligible_source_files(source, excludes):
+                try:
+                    if candidate.stat().st_mtime > archive_mtime:
+                        return self.pack_project(
+                            project_id, cancel_event=cancel_event, log_callback=log_callback
+                        )
+                except OSError:
+                    # An unreadable eligible file cannot be proven unchanged.
+                    return self.pack_project(
+                        project_id, cancel_event=cancel_event, log_callback=log_callback
+                    )
+        except OSError:
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+        return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), output_path=existing, success=True)

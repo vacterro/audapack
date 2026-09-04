@@ -1,5 +1,6 @@
 """Unit tests for Component Center and Widget metadata."""
 
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -114,10 +115,6 @@ class TestComponents(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestWidgetInstallWarmsTheProfile(unittest.TestCase):
     """Tampermonkey's install page waits on the extension's MV3 service worker.
 
@@ -177,7 +174,84 @@ class TestWidgetInstallWarmsTheProfile(unittest.TestCase):
         self.assertFalse(opener.call_args.kwargs["use_bridge"])
 
 
+class TestProfileLivenessIsAboutTheProfile(unittest.TestCase):
+    """CORE-005 (audit/2.md): worker registration is not profile liveness.
+
+    `_worker_profile_is_live()` answered `dispatch.active_workers > 0`, which is
+    a different invariant and wrong in both directions. False positive:
+    `dedicated_profile_only` is off by default, so an operator's own widget-
+    carrying tab satisfied it while the dedicated profile was not running at
+    all. False negative, the one that hurt: on a fresh profile the userscript is
+    not installed yet, so the window CANNOT register -- the installer waited the
+    full 25 s for an impossible condition and then opened a second window
+    anyway, defeating its own purpose.
+    """
+
+    def _manager(self):
+        from audapack.components.manager import ComponentManager
+        from audapack.config import AppConfig
+
+        return ComponentManager(AppConfig())
+
+    @unittest.skipUnless(sys.platform == "win32", "window enumeration is Win32-only")
+    def test_a_foreign_worker_does_not_make_the_dedicated_profile_live(self):
+        from audapack.components import manager as mgr
+        from audapack.services.bridge_service import BridgeService
+
+        manager = self._manager()
+        with patch("audapack.window_layout.find_profile_windows", return_value=[]), \
+             patch.object(BridgeService, "browser_status", return_value={
+                 "ok": True, "dispatch": {"active_workers": 4}}):
+            self.assertFalse(
+                manager._worker_profile_is_live(),
+                "a foreign registered worker was read as the dedicated profile being up",
+            )
+        self.assertTrue(mgr is not None)
+
+    @unittest.skipUnless(sys.platform == "win32", "window enumeration is Win32-only")
+    def test_a_running_profile_with_no_registration_is_live(self):
+        from audapack.services.bridge_service import BridgeService
+
+        manager = self._manager()
+        with patch("audapack.window_layout.find_profile_windows", return_value=[4242]), \
+             patch.object(BridgeService, "browser_status", return_value={
+                 "ok": True, "dispatch": {"active_workers": 0}}):
+            self.assertTrue(
+                manager._worker_profile_is_live(),
+                "a fresh profile cannot register before the widget is installed",
+            )
+
+    @unittest.skipUnless(sys.platform == "win32", "window enumeration is Win32-only")
+    def test_a_live_profile_costs_no_warmup_and_no_second_window(self):
+        from audapack.components import manager as mgr
+        from audapack.services.bridge_service import BridgeService
+
+        manager = self._manager()
+        launches = []
+        manager.launch_browser_worker = lambda **kw: (launches.append(kw) or (True, "started"))
+        with patch("audapack.window_layout.find_profile_windows", return_value=[99]), \
+             patch.object(BridgeService, "browser_status", return_value={"ok": False}), \
+             patch.object(mgr, "is_bridge_healthy", return_value=True), \
+             patch.object(mgr, "open_widget_in_dedicated_chromium", return_value=(True, "opened")) as opener:
+            ok, message = manager.trigger_widget_install()
+
+        self.assertTrue(ok)
+        self.assertEqual(launches, [], "the profile was already up")
+        self.assertIn("already live", message)
+        self.assertIs(opener.call_args.kwargs["new_window"], False)
+
+    def test_the_bridge_answer_remains_the_fallback_off_windows(self):
+        from audapack.services.bridge_service import BridgeService
+
+        manager = self._manager()
+        with patch("sys.platform", "linux"), \
+             patch.object(BridgeService, "browser_status", return_value={
+                 "ok": True, "dispatch": {"active_workers": 2}}):
+            self.assertTrue(manager._worker_profile_is_live())
+
+
 class TestInstallerDoesNotAddAWindow(unittest.TestCase):
+
     """One press had started opening two windows: a warmed one and the installer.
 
     A worker lane wants its own window. The installer does not -- when the
@@ -260,3 +334,58 @@ class TestManualAuditWindow(unittest.TestCase):
         ok, message = open_manual_chromium_window()
         self.assertFalse(ok)
         self.assertIn("Chromium", message)
+
+
+class TestDirectDiscoveryRunsEveryClass(unittest.TestCase):
+    """CORE-004 (audit/2.md): the guard sat in the MIDDLE of the module.
+
+    `if __name__ == "__main__": unittest.main()` was at line 118, BEFORE three
+    later test classes were even defined, so `python tests/test_components.py`
+    started discovery against a half-built module and silently omitted them. A
+    ship gate cannot say whether a change is verified if the runner can skip the
+    tests that verify it.
+    """
+
+    def test_the_unittest_guard_is_the_last_statement(self):
+        # Parsed, not string-searched: this module's own source mentions the
+        # guard in prose and in assertions, and a substring count would trip
+        # over those instead of over a real misplacement.
+        import ast
+
+        module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        guards = [
+            index for index, node in enumerate(module.body)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+        ]
+        self.assertEqual(len(guards), 1, "more than one entry guard")
+        after = module.body[guards[0] + 1:]
+        classes = [node.name for node in after if isinstance(node, ast.ClassDef)]
+        self.assertEqual(
+            classes, [],
+            f"defined after the unittest.main() guard, so direct discovery skips them: {classes}",
+        )
+
+
+    def test_every_class_in_this_module_is_discoverable(self):
+        loader = unittest.TestLoader()
+        import tests.test_components as module
+
+        names = {
+            type(case).__name__
+            for suite in loader.loadTestsFromModule(module)
+            for case in suite
+        }
+        for expected in (
+            "TestComponents",
+            "TestWidgetInstallWarmsTheProfile",
+            "TestInstallerDoesNotAddAWindow",
+            "TestManualAuditWindow",
+        ):
+            self.assertIn(expected, names)
+
+
+if __name__ == "__main__":
+    unittest.main()

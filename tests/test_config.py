@@ -161,11 +161,33 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(redact_legacy_source_config(already_clean))
 
     def test_legacy_token_acceptance_marker_roundtrip(self):
+        """W2-007 (audit/2.md): this test used to contaminate every later one.
+
+        It patched LOCALAPPDATA, but `get_user_runtime_dir()` prefers
+        AUDAPACK_RUNTIME_DIR -- which conftest sets once for the whole SESSION.
+        So the revocation marker landed in the shared canonical secrets
+        directory and stayed there, and
+        `AudapackBridgeHandler._legacy_token_candidates()` returns an empty list
+        whenever it exists. Measured: running this test before
+        `test_legacy_candidates_env_based_and_revocable` made that test fail;
+        reversing the order made both pass. A green result depended on
+        collection order, not on behaviour. The runtime directory this test
+        mutates is now its own.
+        """
         fake_local = Path(self.temp_dir) / "LOCALAPPDATA"
-        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(fake_local)}):
+        fake_runtime = Path(self.temp_dir) / "runtime"
+        with mock.patch.dict(os.environ, {
+            "LOCALAPPDATA": str(fake_local),
+            "AUDAPACK_RUNTIME_DIR": str(fake_runtime),
+        }):
             self.assertFalse(legacy_token_acceptance_revoked())
             self.assertTrue(revoke_legacy_token_acceptance())
             self.assertTrue(legacy_token_acceptance_revoked())
+            # The marker is under THIS test's runtime, not the session's.
+            self.assertTrue(any(fake_runtime.rglob("*")), fake_runtime)
+
+        # And it left nothing behind for the next test to inherit.
+        self.assertFalse(legacy_token_acceptance_revoked())
 
 
 if __name__ == "__main__":

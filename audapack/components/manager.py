@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -114,7 +115,32 @@ class ComponentManager:
     WIDGET_INSTALL_WARMUP_SECONDS = 25.0
 
     def _worker_profile_is_live(self) -> bool:
-        """True when a window already exists in the dedicated worker profile."""
+        """True when a WINDOW exists in the dedicated worker profile.
+
+        CORE-005 (audit/2.md): this used to answer `dispatch.active_workers > 0`,
+        which is audit-lane registration -- a different invariant entirely, and
+        wrong in both directions. False positive: `dedicated_profile_only` is off
+        by default, so an operator's own Chromium/Brave tab carrying the widget
+        satisfies it while the dedicated profile is not running at all. False
+        negative, and the one that hurts: on a genuinely fresh profile the
+        userscript is not installed yet, so the window CANNOT register as a
+        worker -- the installer waited the full 25 s for a condition that was
+        impossible by construction and then opened a second window anyway,
+        defeating its own "warm it first" purpose.
+
+        The profile's `--user-data-dir` is what actually distinguishes a worker
+        window, and `find_profile_windows` already matches on it. Off Windows
+        there is no window enumeration, so the Bridge answer stays the fallback
+        rather than a hard False.
+        """
+        try:
+            from audapack.components.widget import get_dedicated_chromium_profile_dir
+            from audapack.window_layout import find_profile_windows
+
+            if sys.platform == "win32":
+                return bool(find_profile_windows(get_dedicated_chromium_profile_dir()))
+        except Exception:
+            pass
         try:
             from audapack.services.bridge_service import BridgeService
 

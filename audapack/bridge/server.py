@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -57,6 +58,7 @@ from audapack.campaign import (
 from audapack.components.widget import get_bundled_widget_path
 from audapack.config import (
     AppConfig,
+    get_token_file_path,
     get_user_runtime_dir,
     legacy_token_acceptance_revoked,
     load_config,
@@ -161,6 +163,100 @@ def _get_widget_bundle_info() -> tuple[str, str]:
             _WIDGET_BUNDLE_CACHE.clear()
             _WIDGET_BUNDLE_CACHE[key] = (widget_version, sha256)
     return widget_version, sha256
+
+_WIDGET_UPDATE_DIRECTIVE_RE = re.compile(
+    rb"^(//\s*@(?:updateURL|downloadURL)\s+)\S+", re.MULTILINE
+)
+
+
+def _widget_endpoint_authority(host_header: Optional[str], config: AppConfig) -> str:
+    """Where this Bridge is actually reachable, for the update directives.
+
+    The Host header is the authority the client used to get here, which is
+    exactly the one its update check should keep using. Loopback binding is
+    already enforced for every other route, so a Host is only trusted when it
+    resolves to a loopback name; anything else falls back to the configured
+    host/port rather than baking a foreign authority into the script.
+    """
+    host = str(host_header or "").strip()
+    if host and ":" in host:
+        name = host.rsplit(":", 1)[0]
+    else:
+        name = host
+    if name.strip("[]").lower() in {"127.0.0.1", "localhost", "::1"} and host:
+        return host
+    configured_host = normalize_bridge_host(config.bridge.host) or "127.0.0.1"
+    return f"{configured_host}:{int(config.bridge.port)}"
+
+
+def _widget_source_for_endpoint(content: bytes, host_header: Optional[str], config: AppConfig) -> bytes:
+    """Serve the userscript with its update endpoint pointing at THIS Bridge.
+
+    CORE-001 (audit/2.md): the bundled `@updateURL`/`@downloadURL` hardcode
+    127.0.0.1:17843, while `BridgeConfig.port` is operator-configurable and
+    Settings exposes it as an editable 1..65535 field. An operator who moved the
+    port could install the widget through the configured URL and then silently
+    lose auto-update forever, because Tampermonkey persists the endpoint from the
+    metadata block and kept checking 17843 -- reintroducing the manual-install
+    outage those headers were added to remove.
+
+    Rewritten at serve time rather than at build time: the file on disk stays one
+    canonical artifact, and the same bundle is correct on every port.
+    """
+    authority = _widget_endpoint_authority(host_header, config)
+    replacement = rb"\1http://" + authority.encode("ascii", "ignore") + b"/widget.user.js"
+    return _WIDGET_UPDATE_DIRECTIVE_RE.sub(replacement, content)
+
+
+#: The live token, keyed on the signature of the files it comes from
+#: (PERF-002). One entry: there is one canonical token file per runtime.
+_AUTH_TOKEN_CACHE: dict[str, Any] = {}
+
+
+def _file_signature(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _live_bridge_token() -> str:
+    """The current canonical Bridge token, read only when its file moves.
+
+    PERF-002 (audit/2.md): `check_auth()` called `load_config()` on EVERY
+    authenticated request just to obtain a second token candidate -- and
+    `load_config()` is not a credential read: it parses the whole config,
+    migrates it, calls `ensure_token()`, then walks every registered project
+    through source-path healing, which stats project paths on disk. Measured:
+    0.327 ms/load at 12 projects, 0.972 ms at 60, 8.124 ms at 300 -- so the cost
+    of comparing a local bearer token grew with registry size and inherited
+    project-storage latency, on every worker heartbeat and every 4-second UI
+    cycle.
+
+    Rotation still takes effect with no restart: the token file's
+    (mtime_ns, size) is the cache key, so a rewritten token is picked up on the
+    very next request.
+    """
+    try:
+        token_file = get_token_file_path()
+    except Exception:
+        return ""
+    signature = _file_signature(token_file)
+    if signature is None:
+        _AUTH_TOKEN_CACHE.clear()
+        return ""
+    key = (str(token_file), signature)
+    if _AUTH_TOKEN_CACHE.get("key") == key:
+        return str(_AUTH_TOKEN_CACHE.get("token") or "")
+    try:
+        token = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    _AUTH_TOKEN_CACHE.clear()
+    _AUTH_TOKEN_CACHE.update(key=key, token=token)
+    return token
+
 
 # Global callback for notifying UI of new audits or auto-registered projects
 _ON_AUDIT_WRITTEN: Optional[Callable[[str, str], None]] = None
@@ -454,12 +550,20 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         valid_tokens = set()
         if self.config and self.config.bridge and self.config.bridge.token:
             valid_tokens.add(self.config.bridge.token)
-        try:
-            live = load_config()
-            if live and live.bridge and live.bridge.token:
-                valid_tokens.add(live.bridge.token)
-        except Exception:
-            pass
+        # PERF-002: the canonical token file, not a full config reconstruction.
+        # Rotation is still picked up on the next request -- the file's
+        # (mtime_ns, size) is the cache key.
+        if self.test_base_dir:
+            try:
+                live = load_config(self.test_base_dir)
+                if live and live.bridge and live.bridge.token:
+                    valid_tokens.add(live.bridge.token)
+            except Exception:
+                pass
+        else:
+            live_token = _live_bridge_token()
+            if live_token:
+                valid_tokens.add(live_token)
 
         for candidate_path in self._legacy_token_candidates():
             if candidate_path.exists():
@@ -522,7 +626,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/widget.user.js":
             w_path = get_bundled_widget_path()
             if w_path.exists():
-                content = w_path.read_bytes()
+                content = _widget_source_for_endpoint(
+                    w_path.read_bytes(), self.headers.get("Host"), self.config
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
@@ -2225,7 +2331,11 @@ def run_bridge_server(config: AppConfig) -> int:
         pass
     finally:
         if supervisor is not None:
-            supervisor.stop()
+            # W2-006: the supervisor may be mid-pass, and a pass can LAUNCH a
+            # browser window. Finish its shutdown before the server and the PID
+            # file go, or a window opens against a Bridge that no longer exists.
+            if not supervisor.stop():
+                logger.warning("bridge supervisor was still running at shutdown")
         server.server_close()
         remove_pid(expected_pid=os.getpid(), expected_nonce=INSTANCE_NONCE)
     return 0

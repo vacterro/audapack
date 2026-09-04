@@ -34,6 +34,10 @@ LAUNCH_GRACE_SECONDS = 45.0
 #: Consecutive launches that produced no new registered worker before the
 #: supervisor gives up and waits for the operator (or a worker) to change something.
 MAX_UNPRODUCTIVE_LAUNCHES = 3
+#: How long `stop()` waits for the running pass to finish before reporting that
+#: it did not (W2-006). A pass is one dispatcher sweep plus at most one browser
+#: launch, so this only has to outlast a slow launch, not a whole audit.
+STOP_JOIN_TIMEOUT_SECONDS = 20.0
 
 
 def _default_launch_worker(slot: int, generation: int) -> tuple[bool, str]:
@@ -198,6 +202,14 @@ class DispatchSupervisor:
         # is prevented by ManagedWorkerSupervisor counting slots that are still
         # booting, so asking for the full figure here is safe.
         desired = min(MAX_AUDIT_LANES, max(1, active_workers + queued))
+        if self._stop.is_set():
+            # W2-006: checked immediately before the one irreversible side
+            # effect in this pass. Everything above is reconciliation of state
+            # that already exists; opening a browser window is not, and a
+            # window launched after shutdown was requested is exactly the
+            # orphan this supervisor exists to prevent.
+            result["skipped"] = "stopping"
+            return result
         try:
             outcome = self.workers.ensure_capacity(status, desired)
         except Exception as exc:
@@ -248,7 +260,7 @@ class DispatchSupervisor:
     # -- thread lifecycle ------------------------------------------------- #
 
     def start(self) -> bool:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return False
         self._stop.clear()
         self._thread = threading.Thread(
@@ -259,12 +271,43 @@ class DispatchSupervisor:
         self._thread.start()
         return True
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = STOP_JOIN_TIMEOUT_SECONDS) -> bool:
+        """Set the stop event and WAIT for the running pass to finish.
+
+        W2-006 (audit/2.md): `stop()` only set the event and returned, so
+        `run_bridge_server()` went straight on to `server_close()` and PID
+        removal while a tick was still inside `ensure_capacity()` -- measured:
+        the launch completed AFTER shutdown was requested, which can recreate
+        the very orphan-browser lifecycle this supervisor exists to control.
+
+        It also left `_thread` non-None forever, so `start()` refused to run
+        again on the same object and returned a silent False. `start()` now
+        looks at liveness, and the finalizer clears the handle.
+
+        Returns True when no supervisor thread is left running. Never joins
+        itself: a stop originating on the supervisor thread would deadlock.
+        """
         self._stop.set()
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(max(0.0, float(timeout)))
+        alive = thread.is_alive()
+        if alive:
+            logger.warning("dispatch supervisor did not finish its pass within %.1fs", timeout)
+        return not alive
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
-            try:
-                self.tick()
-            except Exception as exc:
-                logger.warning("dispatch supervisor pass failed: %s", exc)
+        try:
+            while not self._stop.wait(self.interval_seconds):
+                try:
+                    self.tick()
+                except Exception as exc:
+                    logger.warning("dispatch supervisor pass failed: %s", exc)
+        finally:
+            # Cleared here, not in stop(): the handle is meaningless once this
+            # thread has actually exited, and clearing it in stop() would lie
+            # while a pass was still running.
+            self._thread = None

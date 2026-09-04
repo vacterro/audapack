@@ -1184,3 +1184,167 @@ def test_the_widget_declares_an_auto_update_path_at_the_bridge():
     for line in header.splitlines():
         if line.startswith("// @updateURL") or line.startswith("// @downloadURL"):
             assert line.rstrip().endswith("/widget.user.js"), line
+
+
+def test_exactly_one_update_and_one_download_directive():
+    """CORE-001 (audit/2.md): two copies of a directive drift.
+
+    The metadata block carried the pair TWICE, so a later edit could move one
+    and leave the other -- and Tampermonkey persists whichever it read last.
+    """
+    from audapack.components.widget import get_bundled_widget_path
+
+    header = get_bundled_widget_path().read_text(encoding="utf-8")[:6000]
+    block = header.split("==/UserScript==")[0]
+    assert block.count("// @updateURL") == 1, "more than one @updateURL to drift apart"
+    assert block.count("// @downloadURL") == 1, "more than one @downloadURL to drift apart"
+
+
+def test_the_served_widget_points_its_update_check_at_this_bridge():
+    """CORE-001: the bundled port is a default, not the contract.
+
+    BridgeConfig.port is operator-configurable and Settings exposes it as an
+    editable field, but the bundled directives hardcode 17843 -- so an operator
+    who moved the port installed through the configured URL and then silently
+    lost auto-update forever, because Tampermonkey kept checking 17843. That is
+    the manual-install outage these headers exist to remove.
+    """
+    from audapack.bridge.server import _widget_source_for_endpoint
+    from audapack.components.widget import get_bundled_widget_path
+
+    source = get_bundled_widget_path().read_bytes()
+    config = AppConfig()
+    config.bridge.host = "127.0.0.1"
+    config.bridge.port = 18765
+
+    served = _widget_source_for_endpoint(source, "127.0.0.1:18765", config).decode("utf-8")
+    directives = [
+        line.strip() for line in served.split("==/UserScript==")[0].splitlines()
+        if line.strip().startswith(("// @updateURL", "// @downloadURL"))
+    ]
+    assert len(directives) == 2, directives
+    for line in directives:
+        assert line.endswith("http://127.0.0.1:18765/widget.user.js"), line
+    assert "17843" not in "".join(directives)
+
+
+def test_a_foreign_host_header_never_reaches_the_served_script():
+    """The endpoint is loopback by contract; a Host claiming otherwise is not it."""
+    from audapack.bridge.server import _widget_source_for_endpoint
+    from audapack.components.widget import get_bundled_widget_path
+
+    source = get_bundled_widget_path().read_bytes()
+    config = AppConfig()
+    config.bridge.host = "127.0.0.1"
+    config.bridge.port = 19999
+
+    served = _widget_source_for_endpoint(source, "evil.example.com", config).decode("utf-8")
+    assert "evil.example.com" not in served.split("==/UserScript==")[0]
+    assert "http://127.0.0.1:19999/widget.user.js" in served
+
+
+def test_the_default_port_is_unchanged_by_the_rewrite():
+    from audapack.bridge.server import _widget_source_for_endpoint
+    from audapack.components.widget import get_bundled_widget_path
+
+    source = get_bundled_widget_path().read_bytes()
+    config = AppConfig()
+    config.bridge.host = "127.0.0.1"
+    config.bridge.port = 17843
+
+    served = _widget_source_for_endpoint(source, "127.0.0.1:17843", config)
+    assert served == source, "the default endpoint must not rewrite anything"
+
+
+def test_authentication_never_rebuilds_the_whole_config(monkeypatch, tmp_path):
+    """PERF-002 (audit/2.md): comparing a bearer token is not a config load.
+
+    `check_auth()` called `load_config()` on every authenticated request just to
+    get a second token candidate -- and that parses the config, migrates it,
+    calls ensure_token() and walks every registered project through source-path
+    healing, which stats project paths. Measured: 0.327 ms/load at 12 projects,
+    0.972 ms at 60, 8.124 ms at 300, paid on every worker heartbeat and every
+    4-second UI cycle.
+    """
+    from audapack.bridge import server as server_module
+
+    monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
+    server_module._AUTH_TOKEN_CACHE.clear()
+    token_file = server_module.get_token_file_path()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("canonical-token-value-0001\n", encoding="utf-8")
+
+    loads = {"count": 0}
+    real_load = server_module.load_config
+
+    def counting_load(*args, **kwargs):
+        loads["count"] += 1
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(server_module, "load_config", counting_load)
+
+    handler = server_module.AudapackBridgeHandler.__new__(server_module.AudapackBridgeHandler)
+    handler.test_base_dir = None
+    handler.config = AppConfig()
+    handler.config.bridge.token = "in-memory-token-value-0002"
+    handler.headers = {"X-ACB-Token": "canonical-token-value-0001"}
+    monkeypatch.setattr(
+        server_module.AudapackBridgeHandler, "_legacy_token_candidates", lambda self: []
+    )
+
+    for _ in range(25):
+        assert handler.check_auth() is True
+
+    assert loads["count"] == 0, f"{loads['count']} full config loads for 25 authenticated requests"
+
+
+def test_a_rotated_token_takes_effect_with_no_restart(monkeypatch, tmp_path):
+    """Caching a credential must not outlive the credential."""
+    from audapack.bridge import server as server_module
+
+    monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
+    server_module._AUTH_TOKEN_CACHE.clear()
+    token_file = server_module.get_token_file_path()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("first-token-value-000000001\n", encoding="utf-8")
+
+    handler = server_module.AudapackBridgeHandler.__new__(server_module.AudapackBridgeHandler)
+    handler.test_base_dir = None
+    handler.config = AppConfig()
+    handler.config.bridge.token = ""
+    monkeypatch.setattr(
+        server_module.AudapackBridgeHandler, "_legacy_token_candidates", lambda self: []
+    )
+    refusals = []
+    monkeypatch.setattr(
+        server_module.AudapackBridgeHandler, "send_json",
+        lambda self, status, payload: refusals.append(status),
+    )
+
+    handler.headers = {"X-ACB-Token": "first-token-value-000000001"}
+    assert handler.check_auth() is True
+
+    token_file.write_text("second-token-value-00000002\n", encoding="utf-8")
+    handler.headers = {"X-ACB-Token": "second-token-value-00000002"}
+    assert handler.check_auth() is True, "a rotated token was refused without a restart"
+
+    handler.headers = {"X-ACB-Token": "first-token-value-000000001"}
+    assert handler.check_auth() is False, "the retired token still authenticates"
+    assert refusals and refusals[-1] == 403
+
+
+def test_a_revocation_marker_written_at_runtime_stops_legacy_credentials(monkeypatch, tmp_path):
+    from audapack.bridge import server as server_module
+    from audapack.config import revoke_legacy_token_acceptance
+
+    monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
+    legacy_root = tmp_path / "legacy"
+    (legacy_root / "ACBBridge").mkdir(parents=True)
+    (legacy_root / "ACBBridge" / "token.txt").write_text("legacy-token-value-00001\n", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(legacy_root))
+
+    handler = server_module.AudapackBridgeHandler.__new__(server_module.AudapackBridgeHandler)
+    assert [path.name for path in handler._legacy_token_candidates()] == ["token.txt", "token.txt"]
+
+    assert revoke_legacy_token_acceptance() is True
+    assert handler._legacy_token_candidates() == [], "the marker did not take effect immediately"

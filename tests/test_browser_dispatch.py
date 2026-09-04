@@ -2549,3 +2549,66 @@ def test_cancelling_an_already_cancelled_dispatch_is_idempotent(tmp_path):
     assert d.cancel_job(item.dispatch_id) is True
     assert d.cancel_job(item.dispatch_id) is True
     assert d.get_job(item.dispatch_id).state == JOB_CANCELLED
+
+
+def test_restart_recovery_never_regresses_the_generation(tmp_path):
+    """W2-005 (audit/2.md): the UI only refreshes on a HIGHER generation.
+
+    `_load_jobs()` is exactly the code that rewrites recovered jobs and calls
+    `_persist_jobs()`, and the persisted generation was read AFTER it -- so the
+    in-memory value was still 0 and a restart doing its designed recovery
+    republished at generation 1. Measured: a LEASED job persisted at generation 2
+    came back QUEUED at generation 1, and MainWindow, which refreshes only when
+    `dispatch_gen > _last_dispatch_generation`, ignored the recovery and every
+    state change after it.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "GENPROJ"))
+    d.claim_job("w1")
+    assert d.get_job(item.dispatch_id).state == JOB_LEASED
+
+    before = json.loads(d.generation_file.read_text(encoding="utf-8"))["generation"]
+    assert before >= 2, f"the fixture needs a generation above 1, got {before}"
+
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    after = json.loads(reloaded.generation_file.read_text(encoding="utf-8"))["generation"]
+
+    assert reloaded.get_job(item.dispatch_id).state == JOB_QUEUED, "the pre-START job was not requeued"
+    assert after > before, f"generation regressed across restart recovery: {before} -> {after}"
+
+
+def test_a_post_start_recovery_also_publishes_forward(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "GENPOST"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+    before = json.loads(d.generation_file.read_text(encoding="utf-8"))["generation"]
+
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    after = json.loads(reloaded.generation_file.read_text(encoding="utf-8"))["generation"]
+
+    assert reloaded.get_job(item.dispatch_id).state == JOB_BLOCKED
+    assert after > before, f"generation regressed: {before} -> {after}"
+
+
+def test_the_generation_never_decreases_across_repeated_reloads(tmp_path):
+    """An invariant, not one scenario: monotonic across every reload cycle."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    d.enqueue_job(job_payload(path, "MONO"))
+
+    seen = [json.loads(d.generation_file.read_text(encoding="utf-8"))["generation"]]
+    for index in range(4):
+        reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+        reloaded.enqueue_job(job_payload(path, f"MONO{index}"))
+        seen.append(json.loads(reloaded.generation_file.read_text(encoding="utf-8"))["generation"])
+
+    assert seen == sorted(seen), f"generation went backwards somewhere: {seen}"
+    assert len(set(seen)) == len(seen), f"generation repeated a value: {seen}"
