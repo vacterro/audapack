@@ -21,7 +21,7 @@ from audapack.campaign import (
     get_profile,
     load_profiles,
 )
-from audapack.config import AppConfig
+from audapack.config import AppConfig, open_new_temp_file
 from audapack.models import Project
 from audapack.projects import ProjectRegistry
 
@@ -96,9 +96,11 @@ def ensure_contained(path: Path, root: Path) -> Path:
 def atomic_write(filepath: Path, content: str):
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = filepath.parent / f".{filepath.name}.tmp.{os.getpid()}.{hashlib.sha256(content.encode('utf-8')).hexdigest()[:6]}"
+    # The name carried the pid and a hash of the content, both guessable, and
+    # a plain open() follows whatever entry is already there.
+    fd, tmp_path = open_new_temp_file(filepath.parent, filepath.name)
     try:
-        with open(tmp_path, "wb") as f:
+        with os.fdopen(fd, "wb") as f:
             norm_content = content.replace("\r\n", "\n")
             f.write(norm_content.encode("utf-8"))
             f.flush()

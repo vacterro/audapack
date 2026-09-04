@@ -507,3 +507,37 @@ def test_scenario_14_quick3_profile_non_regression(tmp_path, quick3_profile):
     assert res["active_wave_id"] == "performance"
     assert res["active_wave_index"] == 3
     assert res["completed_count"] == 2
+
+
+def test_a_failed_campaign_index_write_leaves_no_orphan_tmp(tmp_path, monkeypatch):
+    """Review of the open_new_temp_file adoption: campaign.py was the one
+    consumer of five without a cleanup path. state.py, storage.py and
+    instances.py unlink their temp on failure; this one left the orphan sitting
+    next to the real campaign.json forever."""
+
+    from audapack import campaign as campaign_mod
+    from audapack.campaign import save_live_campaign_index
+
+    profile = campaign_mod.get_profile("quick3")
+    campaign_root = tmp_path / "campaign"
+    campaign_root.mkdir(parents=True)
+
+    import os as _os
+
+    monkeypatch.setattr(_os, "replace", lambda a, b: (_ for _ in ()).throw(OSError("injected replace failure")))
+
+
+    with pytest.raises(OSError):
+        save_live_campaign_index(
+            campaign_root=campaign_root,
+            profile=profile,
+            run_id="acb-run",
+            project_name="PROJ",
+            parsed_waves={},
+            completed_waves=[],
+            active_wave_id="core",
+            status="READY_FOR_WAVE",
+        )
+
+    orphans = list(campaign_root.glob(".campaign.json.tmp.*"))
+    assert orphans == [], f"an orphan temp survived the failed write: {orphans}"

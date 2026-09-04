@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from audapack.config import open_new_temp_file
+
 
 @dataclass
 class WaveDefinition:
@@ -699,13 +701,25 @@ def save_live_campaign_index(
     target_file = campaign_root / "campaign.json"
     content_str = json.dumps(payload, indent=2, ensure_ascii=False)
 
-    # Safe atomic write
-    tmp_path = campaign_root / f".campaign.json.tmp.{os.getpid()}.{hashlib.sha256(content_str.encode('utf-8')).hexdigest()[:6]}"
-    with open(tmp_path, "wb") as f:
-        f.write(content_str.encode("utf-8"))
-        f.flush()
-        os.fsync(f.fileno())
-    tmp_path.replace(target_file)
+    # Safe atomic write. The name used to carry the pid and a hash of the
+    # content -- both guessable -- and a plain open() follows whatever entry is
+    # already sitting there.
+    fd, tmp_path = open_new_temp_file(campaign_root, "campaign.json")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content_str.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(target_file)
+    except Exception:
+        # Same contract as every other consumer of open_new_temp_file: a failed
+        # write must not leave the orphan it created behind, next to the real
+        # campaign.json, forever.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return target_file
 
 

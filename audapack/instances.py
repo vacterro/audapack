@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol, Sequence
 
-from audapack.config import get_state_dir
+from audapack.config import get_state_dir, open_new_temp_file
 
 
 @dataclass(frozen=True)
@@ -438,10 +438,11 @@ class InstanceMonitor:
 
     def _save_records(self) -> None:
         self.record_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.record_path.with_name(f".{self.record_path.name}.tmp.{os.getpid()}")
+        fd, temp = open_new_temp_file(self.record_path.parent, self.record_path.name)
         payload = [asdict(record) for record in sorted(self.records.values(), key=lambda item: item.pid)]
         try:
-            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             os.replace(temp, self.record_path)
         finally:
             try:

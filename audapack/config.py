@@ -168,6 +168,30 @@ DEFAULT_PROJECT_TEMPLATES = [
 ]
 
 
+def open_new_temp_file(directory: Path, basename: str) -> tuple[int, Path]:
+    """Create a temp file nobody can have planted, and return (fd, path).
+
+    A predictable temp name plus a plain open() is a write primitive. Anyone
+    who can create an entry in the directory puts a hardlink there first -- and
+    on Windows a hardlink to a file you can read needs no privilege at all --
+    and the write lands in whatever that link points at, with the writing
+    process's permissions, outside the directory entirely.
+
+    Two things close it, and both are needed. The name carries a uuid4, so it
+    cannot be guessed and planted ahead of time. And O_EXCL refuses an entry
+    that already exists instead of following it, so a lucky guess still fails.
+    The caller owns the fd and must close it.
+
+    Mode 0o600 is advisory on Windows and correct everywhere else.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)  # POSIX only; O_EXCL covers Windows
+    path = directory / f".{basename}.tmp.{uuid.uuid4().hex}"
+    return os.open(path, flags, 0o600), path
+
+
 @lru_cache(maxsize=1)
 def app_dir() -> Path:
     """Return root directory of AUDAPACK source installation.

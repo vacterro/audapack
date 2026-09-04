@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from audapack.config import cross_process_lock, get_state_dir
+from audapack.config import cross_process_lock, get_state_dir, open_new_temp_file
 
 _GLOBAL_STATE_LOCK = threading.Lock()
 # PERF-004: weak values so the in-process lock registry stays bounded by live
@@ -157,9 +157,11 @@ def save_run_state(run_id: str, state: dict[str, Any], base_dir: Optional[Path] 
     """
     state_dir = get_bridge_state_dir(base_dir)
     state_file = get_run_state_file(run_id, base_dir)
-    tmp_file = state_dir / f".{state_file.name}.tmp.{os.getpid()}"
+    # Unpredictable name + O_EXCL: a predictable temp opened with a plain
+    # open() is a write primitive for anyone who can plant a link here first.
+    fd, tmp_file = open_new_temp_file(state_dir, state_file.name)
     try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
             f.write("\n")
             f.flush()
@@ -225,9 +227,9 @@ def increment_audit_generation(
             "last_wave": wave,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        tmp_file = g_file.with_name(f".generation.tmp.{os.getpid()}")
+        fd, tmp_file = open_new_temp_file(g_file.parent, g_file.name)
         try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(new_data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
