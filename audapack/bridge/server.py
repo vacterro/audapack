@@ -240,6 +240,12 @@ def _live_bridge_token() -> str:
 # Global callback for notifying UI of new audits or auto-registered projects
 _ON_AUDIT_WRITTEN: Optional[Callable[[str, str], None]] = None
 
+#: Retained INAUDIT stores, keyed on the custom base dir (PERF-002). One store
+#: per Bridge lifetime per runtime root: crash recovery runs once at first use,
+#: not once per endpoint call.
+_INAUDIT_STORES: dict[str, Any] = {}
+_INAUDIT_STORE_LOCK = threading.Lock()
+
 
 def set_audit_written_callback(cb: Optional[Callable[[str, str], None]]):
     global _ON_AUDIT_WRITTEN
@@ -932,7 +938,30 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         return parts[3], parts[4] if len(parts) == 5 else ""
 
     def _inaudit_store(self):
-        return store_for_config(self.get_live_config(), base_dir=self.get_custom_base_dir())
+        """The retained server-owned INAUDIT store.
+
+        PERF-002 (audit/4.md): this called `store_for_config(...)` per ENDPOINT
+        CALL, and every `InauditCaptureStore.__init__` runs crash recovery --
+        `_pair_fragments()` walks inbox/archive/recovery and `_pair_is_intact()`
+        reads and SHA-256s every body. So even a read-only GET reconstructed and
+        integrity-checked the whole lifecycle store first; measured ~40 ms per
+        construction on a 400-record/25 MiB corpus, under the store lock, so
+        growing history also serialized concurrent INAUDIT operations.
+
+        One store per (base_dir, runtime root) is retained instead: recovery
+        runs once per Bridge lifetime at that construction, exactly where the
+        W2 recovery guarantees belong. Distinct base dirs still get distinct
+        stores -- the isolation the old per-call construction provided for
+        tests is preserved by keying on the same inputs.
+        """
+        base_dir = self.get_custom_base_dir()
+        key = str(base_dir) if base_dir else "<runtime>"
+        with _INAUDIT_STORE_LOCK:
+            store = _INAUDIT_STORES.get(key)
+            if store is None:
+                store = store_for_config(self.get_live_config(), base_dir=base_dir)
+                _INAUDIT_STORES[key] = store
+            return store
 
     def _send_inaudit_error(self, exc: InauditCaptureError) -> None:
         self.send_json(
