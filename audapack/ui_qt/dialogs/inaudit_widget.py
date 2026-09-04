@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -30,6 +31,7 @@ from audapack.inaudit import (
     get_inaudit_selected,
     inaudit_dir,
     list_inaudit_layers,
+    rename_inaudit_layer,
     set_inaudit_selected,
     validate_inaudit_path,
 )
@@ -115,12 +117,15 @@ class InauditWidget(QWidget):
         self.btn_plus = QPushButton("+", btn_row)
         self.btn_plus.setToolTip("Create next numbered layer")
         self.btn_plus.clicked.connect(self._on_plus)
+        self.btn_rename = QPushButton("Rename", btn_row)
+        self.btn_rename.setToolTip("Move this layer to a different free number (never overwrites)")
+        self.btn_rename.clicked.connect(self._on_rename_layer)
         self.btn_delete = QPushButton("Delete", btn_row)
         self.btn_delete.setToolTip("Delete the selected layer (also: Del key on the list). No renumbering.")
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_refresh = QPushButton("Refresh", btn_row)
         self.btn_refresh.clicked.connect(self.refresh)
-        for b in (self.btn_open, self.btn_ia, self.btn_gg, self.btn_cc, self.btn_plus, self.btn_delete, self.btn_refresh):
+        for b in (self.btn_open, self.btn_ia, self.btn_gg, self.btn_cc, self.btn_plus, self.btn_rename, self.btn_delete, self.btn_refresh):
             bl.addWidget(b)
         bl.addStretch(1)
         layers.addWidget(btn_row)
@@ -205,6 +210,15 @@ class InauditWidget(QWidget):
         action_layout.setSpacing(2)
         self.btn_assign = QPushButton("Assign", actions)
         self.btn_assign.clicked.connect(lambda: self._on_assign_capture(""))
+        self.btn_pin = QPushButton("Pin project", actions)
+        self.btn_pin.setToolTip(
+            "Record the project this capture belongs to, without creating its layer yet.\n"
+            "Clears the pin when no project is selected."
+        )
+        self.btn_pin.clicked.connect(self._on_pin_project)
+        self.btn_rename_capture = QPushButton("Rename", actions)
+        self.btn_rename_capture.setToolTip("Give this capture a title you will recognise")
+        self.btn_rename_capture.clicked.connect(self._on_rename_capture)
         self.btn_assign_gg = QPushButton("Assign + GG", actions)
         self.btn_assign_gg.clicked.connect(lambda: self._on_assign_capture("GG"))
         self.btn_assign_cc = QPushButton("Assign + CC", actions)
@@ -221,6 +235,8 @@ class InauditWidget(QWidget):
             self.btn_assign,
             self.btn_assign_gg,
             self.btn_assign_cc,
+            self.btn_pin,
+            self.btn_rename_capture,
             self.btn_capture_copy,
             self.btn_open_source,
             self.btn_archive_capture,
@@ -298,7 +314,10 @@ class InauditWidget(QWidget):
         for row, record in enumerate(self._inbox_records):
             confidence = float(record.get("classification_confidence") or 0.0)
             confidence_text = f"{round(confidence * 100):02d}%" if confidence else " ? "
-            project = record.get("suggested_project_name") or "UNASSIGNED"
+            # A pin is the operator's answer; mark it so the row does not read as
+            # a classifier guess (T-145).
+            pinned = str(record.get("target_project_name") or "")
+            project = f"*{pinned}" if pinned else (record.get("suggested_project_name") or "UNASSIGNED")
             item = QListWidgetItem(f"{record.get('status', 'NEW'):<9} {confidence_text:>3}  {project:<16} {record.get('title', '')}")
             item.setData(Qt.ItemDataRole.UserRole, record.get("capture_id"))
             self.inbox_list.addItem(item)
@@ -317,11 +336,15 @@ class InauditWidget(QWidget):
         self.inbox_project.blockSignals(True)
         self.inbox_project.clear()
         self.inbox_project.addItem("Select project…", "")
-        suggested_id = str(record.get("suggested_project_id") or "") if record else ""
+        # A pinned project is the operator's own answer and outranks the
+        # classifier's guess (T-145).
+        wanted_id = str(
+            (record.get("target_project_id") or record.get("suggested_project_id") or "") if record else ""
+        )
         selected_index = 0
         for index, project in enumerate(self._projects(), start=1):
             self.inbox_project.addItem(project.display_name, project.id)
-            if project.id == suggested_id:
+            if project.id == wanted_id:
                 selected_index = index
         self.inbox_project.setCurrentIndex(selected_index)
         self.inbox_project.blockSignals(False)
@@ -349,6 +372,7 @@ class InauditWidget(QWidget):
             f"Captured: {record.get('created_at', '')}\n"
             f"Source: {record.get('source', '')} · {record.get('browser_name', '')}\n"
             f"Suggested: {record.get('suggested_project_name') or '?'} {round(confidence * 100)}%\n"
+            f"Pinned: {record.get('target_project_name') or '-'}\n"
             f"Destination: {assigned or '?'}\n"
             f"Evidence:\n{evidence}\n\n--- TEXT ---\n{preview}"
         )
@@ -440,6 +464,44 @@ class InauditWidget(QWidget):
         except Exception:
             pass
 
+    def _on_pin_project(self):
+        """Record the project by hand, without creating the layer yet (T-145)."""
+        record = self._selected_capture()
+        if record is None:
+            self.inbox_status.setText("Select one capture first")
+            return
+        project_id = str(self.inbox_project.currentData() or "")
+        try:
+            updated = self._capture_store.set_target_project(
+                str(record["capture_id"]), project_id, self._projects()
+            )
+        except (InauditCaptureError, OSError) as exc:
+            self.inbox_status.setText(f"Pin failed: {exc}")
+            return
+        name = str(updated.get("target_project_name") or "")
+        self.inbox_status.setText(
+            f"Pinned to {name}; Assign will use it" if name else "Pin cleared; the suggestion applies again"
+        )
+        self.refresh_inbox()
+
+    def _on_rename_capture(self):
+        record = self._selected_capture()
+        if record is None:
+            self.inbox_status.setText("Select one capture first")
+            return
+        title, ok = QInputDialog.getText(
+            self, "Rename INAUDIT capture", "Title:", text=str(record.get("title") or "")
+        )
+        if not ok:
+            return
+        try:
+            self._capture_store.rename(str(record["capture_id"]), title)
+        except (InauditCaptureError, OSError) as exc:
+            self.inbox_status.setText(f"Rename failed: {exc}")
+            return
+        self.inbox_status.setText("Capture renamed")
+        self.refresh_inbox()
+
     def _on_copy_capture(self):
         record = self._selected_capture()
         if record is None:
@@ -512,6 +574,10 @@ class InauditWidget(QWidget):
         for button in (self.btn_assign, self.btn_assign_gg, self.btn_assign_cc):
             button.setEnabled(has and not assigned and not archived and has_project)
         self.btn_capture_copy.setEnabled(has)
+        # Pinning is allowed while the capture is still unassigned, including
+        # with no project selected -- that is how a pin is cleared.
+        self.btn_pin.setEnabled(has and not assigned)
+        self.btn_rename_capture.setEnabled(has)
         self.btn_open_source.setEnabled(bool(record and record.get("source_url")))
         self.btn_archive_capture.setEnabled(has and not archived)
         self.btn_delete_capture.setEnabled(has)
@@ -733,6 +799,49 @@ class InauditWidget(QWidget):
         except Exception as exc:
             self.status.setText(f"Create failed: {exc}")
 
+    def _on_rename_layer(self):
+        """Move the selected layer to a different free number (T-144).
+
+        The canonical name IS the number, so renaming here means renumbering, and
+        a taken number is refused rather than overwritten -- another agent may be
+        working that layer right now.
+        """
+        if self._project is None:
+            self.status.setText("Select a project first")
+            return
+        item = self.list.currentItem()
+        if item is None:
+            self.status.setText("Select a layer first")
+            return
+        current = int(item.data(Qt.ItemDataRole.UserRole))
+        taken = sorted(layer.number for layer in list_inaudit_layers(self._project))
+        proposal = next(n for n in range(1, (max(taken) if taken else 0) + 2) if n not in taken)
+        number, ok = QInputDialog.getInt(
+            self,
+            "Rename INAUDIT layer",
+            f"Move layer {current} to number (taken: {', '.join(str(n) for n in taken) or 'none'}):",
+            proposal,
+            1,
+            9999,
+        )
+        if not ok or number == current:
+            return
+        reason = rename_inaudit_layer(self._project, current, number)
+        if reason:
+            self.status.setText(f"Rename failed: {reason}")
+            return
+        self.status.setText(f"Layer {current} is now {number}.md")
+        self.refresh()
+        for row in range(self.list.count()):
+            if self.list.item(row).data(Qt.ItemDataRole.UserRole) == number:
+                self.list.setCurrentRow(row)
+                break
+        try:
+            if self._on_changed_cb:
+                self._on_changed_cb(self._project)
+        except Exception:
+            pass
+
     def _on_delete(self):
         """Deletes the currently selected layer.
 
@@ -782,5 +891,6 @@ class InauditWidget(QWidget):
         for b in (self.btn_open, self.btn_ia, self.btn_gg, self.btn_cc, self.btn_save, self.btn_reload):
             b.setEnabled(has if b not in (self.btn_plus, self.btn_refresh) else True)
         self.btn_plus.setEnabled(self._project is not None)
+        self.btn_rename.setEnabled(has)
         self.btn_delete.setEnabled(has)
         self.editor.setEnabled(has or self._project is not None)

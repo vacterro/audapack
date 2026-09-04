@@ -21,13 +21,11 @@ def _widget(tmp_path: Path) -> tuple[InauditWidget, InauditCaptureStore, Project
     widget.set_project(project)
     return widget, store, project
 
-
 def test_inaudit_has_layers_and_inbox_tabs(qapp, tmp_path: Path):
     widget, _store, _project = _widget(tmp_path)
     assert [widget.mode_tabs.tabText(index) for index in range(widget.mode_tabs.count())] == ["Layers", "Inbox"]
     assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
     widget.deleteLater()
-
 
 def test_ia_plus_captures_clipboard_through_canonical_store(qapp, tmp_path: Path):
     widget, store, _project = _widget(tmp_path)
@@ -39,7 +37,6 @@ def test_ia_plus_captures_clipboard_through_canonical_store(qapp, tmp_path: Path
     assert store.get(records[0]["capture_id"])["text"] == "# Clipboard audit\nExact clipboard body"
     assert "durable Inbox write verified" in widget.inbox_status.text()
     widget.deleteLater()
-
 
 def test_assign_plus_gg_copies_only_canonical_assigned_path(qapp, tmp_path: Path, monkeypatch):
     widget, store, project = _widget(tmp_path)
@@ -60,7 +57,6 @@ def test_assign_plus_gg_copies_only_canonical_assigned_path(qapp, tmp_path: Path
     assert store.get(payload["capture_id"])["record"]["assigned_path"] == str(assigned)
     widget.deleteLater()
 
-
 def test_inbox_detail_shows_suggestion_evidence_and_destination(qapp, tmp_path: Path):
     widget, store, project = _widget(tmp_path)
     payload = {
@@ -77,7 +73,6 @@ def test_inbox_detail_shows_suggestion_evidence_and_destination(qapp, tmp_path: 
     assert "exact path" in detail
     assert str(Path(project.source_path) / "audit" / "1.md") in detail
     widget.deleteLater()
-
 
 def test_unassigned_capture_requires_explicit_project_choice(qapp, tmp_path: Path):
     widget, store, project = _widget(tmp_path)
@@ -99,7 +94,6 @@ def test_unassigned_capture_requires_explicit_project_choice(qapp, tmp_path: Pat
     assert str(Path(project.source_path) / "audit" / "1.md") in widget.inbox_detail.toPlainText()
     widget.deleteLater()
 
-
 def test_inbox_counter_excludes_assigned_history(qapp, tmp_path: Path):
     widget, store, project = _widget(tmp_path)
     payload = {
@@ -113,4 +107,168 @@ def test_inbox_counter_excludes_assigned_history(qapp, tmp_path: Path):
     widget.refresh_inbox()
     assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
     assert "ASSIGNED" in widget.inbox_list.item(0).text()
+    widget.deleteLater()
+
+def _capture(widget, store, text="# pinned capture"):
+    widget.inbox_project.setCurrentIndex(0)
+    widget._capture_store.capture(
+        {
+            "capture_id": str(uuid.uuid4()),
+            "text": text,
+            "capture_kind": "response",
+            "source": "widget-test",
+            "project_hints": [],
+        },
+        [],
+    )
+    widget.refresh_inbox()
+    assert store.list_records()
+    return store.list_records()[0]["capture_id"]
+
+def test_pin_records_the_hand_chosen_project_durably(qapp, tmp_path: Path):
+    """T-145: the operator's answer, not the classifier's guess."""
+    widget, store, project = _widget(tmp_path)
+    capture_id = _capture(widget, store)
+
+    index = widget.inbox_project.findData(project.id)
+    assert index > 0
+    widget.inbox_project.setCurrentIndex(index)
+    widget._on_pin_project()
+
+    reread = store.get(capture_id)["record"]
+    assert reread["target_project_id"] == project.id
+    assert reread["target_project_name"] == "AUDAPACK"
+    assert "pinned" in widget.inbox_status.text().lower() or "Pinned" in widget.inbox_status.text()
+    rows = [
+        widget.inbox_list.item(row).text()
+        for row in range(widget.inbox_list.count())
+    ]
+    assert any("*AUDAPACK" in text for text in rows), rows
+
+    widget.deleteLater()
+
+def test_pin_selects_the_project_like_a_suggestion_did(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    _capture(widget, store)
+
+    # The classifier suggested nothing; the combo starts blank.
+    assert widget.inbox_project.currentData() == ""
+
+
+    widget.inbox_project.setCurrentIndex(widget.inbox_project.findData(project.id))
+    widget._on_pin_project()
+    widget.refresh_inbox()
+
+    # And the row now opens with the pinned project preselected.
+    assert widget.inbox_project.currentData() == project.id
+    widget.deleteLater()
+
+def test_a_pin_is_cleared_by_pinning_nothing(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    capture_id = _capture(widget, store)
+
+    widget.inbox_project.setCurrentIndex(widget.inbox_project.findData(project.id))
+    widget._on_pin_project()
+    assert store.get(capture_id)["record"]["target_project_id"] == project.id
+
+    widget.inbox_project.setCurrentIndex(0)
+    widget._on_pin_project()
+    assert store.get(capture_id)["record"]["target_project_id"] == ""
+    widget.deleteLater()
+
+def test_a_capture_title_is_renamed_through_the_ui(qapp, tmp_path: Path, monkeypatch):
+    widget, store, _project = _widget(tmp_path)
+    capture_id = _capture(widget, store)
+    monkeypatch.setattr(
+        "audapack.ui_qt.dialogs.inaudit_widget.QInputDialog.getText",
+        lambda *args, **kwargs: ("A title I will recognise", True),
+    )
+    widget._on_rename_capture()
+
+    assert store.get(capture_id)["record"]["title"] == "A title I will recognise"
+    rows = [
+        widget.inbox_list.item(row).text()
+        for row in range(widget.inbox_list.count())
+    ]
+    assert any("A title I will recognise" in text for text in rows), rows
+    widget.deleteLater()
+
+def test_a_layer_is_renumbered_onto_a_free_number(qapp, tmp_path: Path, monkeypatch):
+    from audapack.inaudit import list_inaudit_layers
+
+    widget, _store, project = _widget(tmp_path)
+    source = tmp_path / "AUDAPACK" / "audit"
+    source.mkdir(parents=True)
+    (source / "1.md").write_text("first", encoding="utf-8")
+    (source / "2.md").write_text("second", encoding="utf-8")
+    widget.refresh()
+
+    widget.list.setCurrentRow(0)
+    monkeypatch.setattr(
+        "audapack.ui_qt.dialogs.inaudit_widget.QInputDialog.getInt",
+        lambda *args, **kwargs: (5, True),
+    )
+    widget._on_rename_layer()
+
+    assert sorted(item.number for item in list_inaudit_layers(project)) == [2, 5]
+    assert (source / "5.md").read_text(encoding="utf-8") == "first"
+    assert widget.status.text() == "Layer 1 is now 5.md"
+    widget.deleteLater()
+
+def test_a_layer_is_never_renumbered_onto_a_taken_number(qapp, tmp_path: Path, monkeypatch):
+    from audapack.inaudit import list_inaudit_layers
+
+    widget, _store, project = _widget(tmp_path)
+    source = tmp_path / "AUDAPACK" / "audit"
+    source.mkdir(parents=True)
+    (source / "1.md").write_text("first", encoding="utf-8")
+    (source / "2.md").write_text("second", encoding="utf-8")
+    widget.refresh()
+
+    widget.list.setCurrentRow(0)
+    monkeypatch.setattr(
+        "audapack.ui_qt.dialogs.inaudit_widget.QInputDialog.getInt",
+        lambda *args, **kwargs: (2, True),
+    )
+    widget._on_rename_layer()
+
+    assert sorted(item.number for item in list_inaudit_layers(project)) == [1, 2]
+    assert (source / "1.md").read_text(encoding="utf-8") == "first"
+    assert (source / "2.md").read_text(encoding="utf-8") == "second"
+    assert "failed" in widget.status.text().lower()
+    widget.deleteLater()
+
+def test_assign_uses_the_pinned_project(qapp, tmp_path: Path):
+    """The pin is what Assign acts on: no second decision to get wrong."""
+    other_root = tmp_path / "OTHER"
+    other_root.mkdir()
+    widget, store, project = _widget(tmp_path)
+    other = Project(id="other", display_name="OTHER", source_path=str(other_root))
+    config = AppConfig(projects=[project, other])
+    widget._config_provider = lambda: config
+
+    capture_id = _capture(widget, store, "# goes to OTHER")
+    widget.inbox_project.setCurrentIndex(widget.inbox_project.findData(other.id))
+    widget._on_pin_project()
+    widget.refresh_inbox()
+
+    # Nothing re-chosen: the row opened with the pin already selected.
+    assert widget.inbox_project.currentData() == other.id
+    widget._on_assign_capture("")
+
+    assigned = store.get(capture_id)["record"].get("assigned_path") or ""
+    assert assigned, widget.inbox_status.text()
+    assert str(other_root) in assigned, assigned
+    assert (other_root / "audit" / "1.md").read_text(encoding="utf-8") == "# goes to OTHER"
+    widget.deleteLater()
+
+def test_a_pin_is_refused_once_the_capture_is_assigned(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    capture_id = _capture(widget, store, "# already placed")
+    widget.inbox_project.setCurrentIndex(widget.inbox_project.findData(project.id))
+    widget._on_assign_capture("")
+    assert store.get(capture_id)["record"].get("assigned_path")
+
+    widget._on_pin_project()
+    assert "failed" in widget.inbox_status.text().lower(), widget.inbox_status.text()
     widget.deleteLater()

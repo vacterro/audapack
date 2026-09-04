@@ -2696,9 +2696,22 @@ QToolTip QLabel {
         proj = self.model.project_at(group, slot)
         if proj:
             self._active_project = proj
-            self._show_instance_manager(proj)
+            self._show_project_inbox(proj)
         else:
             self._on_add_project(default_group=group, default_slot=slot)
+
+    def _show_project_inbox(self, proj: Project):
+        """Open the INAUDIT view bound to this project (T-143).
+
+        Double-click used to open the Instances tab, which answers a different
+        question -- how many windows this project has -- while the thing an
+        operator wants to see on a project is its audit inbox. Instances is still
+        one right-click away, and the toolbar still has it.
+        """
+        self.inaudit_widget.set_project(proj)
+        self.tabs.setCurrentWidget(self.inaudit_widget)
+        self.inaudit_widget.mode_tabs.setCurrentWidget(self.inaudit_widget.layers_page)
+        self.inaudit_widget.setFocus()
 
     def _on_tree_context_menu(self, pos):
         """Rich Win95 context menu on right-click."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -198,4 +199,71 @@ def delete_inaudit_layer(project: Project, number: int) -> str:
         return f"cannot delete {cand.name}: {exc}"
     if get_inaudit_selected(project) == n:
         set_inaudit_selected(project, None)
+    return ""
+
+
+def rename_inaudit_layer(project: Project, number: int, new_number: int) -> str:
+    """Move one canonical layer onto a DIFFERENT free number.
+
+    The canonical name IS the number -- SAIPEN's audit inbox reads exactly
+    `^[1-9][0-9]*\\.md$` -- so "rename" in this namespace means renumber, and the
+    one thing it must never do is land on a layer somebody is working. Creation
+    is exclusive: a taken number is refused rather than overwritten, which is the
+    same rule the Bridge's own layer publication uses.
+
+    Returns "" on success, or a short human-readable reason.
+    """
+    d = inaudit_dir(project)
+    if d is None:
+        return "project has no source path"
+    try:
+        old = int(number)
+        new = int(new_number)
+    except (TypeError, ValueError):
+        return "invalid layer number"
+    if old < 1 or new < 1:
+        return "invalid layer number"
+    if old == new:
+        return ""
+    source = (d / f"{old}.md").resolve()
+    target = (d / f"{new}.md").resolve()
+    try:
+        root = d.resolve()
+        source.relative_to(root)
+        target.relative_to(root)
+    except Exception:
+        return "path is outside the audit directory"
+    if not INAUDIT_RE.match(source.name) or not INAUDIT_RE.match(target.name):
+        return "not a canonical numbered layer"
+    if not source.is_file():
+        return f"layer {old} does not exist"
+    if target.exists():
+        return f"layer {new} already exists; pick a free number"
+    try:
+        # O_EXCL, then copy-and-remove: os.replace would silently overwrite a
+        # layer created between the check above and the move.
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except FileExistsError:
+        return f"layer {new} was just taken; pick a free number"
+    except OSError as exc:
+        return f"cannot create {target.name}: {exc}"
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(source.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return f"cannot write {target.name}: {exc}"
+    try:
+        source.unlink()
+    except OSError as exc:
+        # The new layer is durable; the old one is still there. Reported rather
+        # than silently leaving two copies the operator cannot see.
+        return f"copied to {target.name} but could not remove {source.name}: {exc}"
+    if get_inaudit_selected(project) == old:
+        set_inaudit_selected(project, new)
     return ""

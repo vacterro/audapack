@@ -336,8 +336,11 @@ def test_main_window_enforces_limit_and_project_click_opens_manager(tmp_path, qa
         assert window.tabs.count() >= 2
         window.tabs.setCurrentIndex(0)
         window._on_tree_double_clicked(index)
-        assert window.tabs.currentWidget() is window._instance_manager
-        assert window._instance_manager.project is p2
+        # T-143: a double-click on a project opens ITS audit inbox. Instances
+        # answers a different question -- how many windows this project has --
+        # and is still reachable from the context menu and the toolbar.
+        assert window.tabs.currentWidget() is window.inaudit_widget
+        assert window.inaudit_widget._project is p2
 
         index = window.model.index_for_project_id(p1.id)
         with patch.object(window, "_show_instance_manager") as show_manager:

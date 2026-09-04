@@ -228,3 +228,106 @@ def test_an_archive_that_cannot_finish_leaves_the_source_intact(tmp_path: Path):
     fetched = InauditCaptureStore(tmp_path).get(capture_id)
     assert fetched["record"]["status"] == "NEW", "a failed archive published its status anyway"
     assert fetched["text"] == "unmoved"
+
+
+def test_a_capture_title_can_be_renamed_without_touching_its_body(tmp_path: Path):
+    """T-144: the INAUDIT counterpart of the Layers rename."""
+    import hashlib
+
+    store = InauditCaptureStore(tmp_path)
+    payload = _payload("exact body bytes")
+    store.capture(payload, [])
+
+    before = store.get(payload["capture_id"])
+    store.rename(payload["capture_id"], "A title I will recognise")
+
+    after = store.get(payload["capture_id"])
+    assert after["record"]["title"] == "A title I will recognise"
+    assert after["text"] == "exact body bytes"
+    assert after["record"]["content_sha256"] == before["record"]["content_sha256"]
+    assert hashlib.sha256(after["text"].encode("utf-8")).hexdigest() == after["record"]["content_sha256"]
+
+
+def test_an_empty_rename_is_refused(tmp_path: Path):
+    from audapack.inaudit_capture import InauditCaptureError
+
+    store = InauditCaptureStore(tmp_path)
+    payload = _payload("keep me")
+    store.capture(payload, [])
+    with pytest.raises(InauditCaptureError):
+        store.rename(payload["capture_id"], "   ")
+    assert store.get(payload["capture_id"])["record"]["title"] != ""
+
+
+def test_an_unknown_capture_is_still_not_found(tmp_path: Path):
+    import uuid as _uuid
+
+    from audapack.inaudit_capture import InauditCaptureError
+
+    store = InauditCaptureStore(tmp_path)
+    with pytest.raises(InauditCaptureError):
+        store.rename(str(_uuid.uuid4()), "nothing there")
+    with pytest.raises(InauditCaptureError):
+        store.set_target_project(str(_uuid.uuid4()), "", [])
+
+
+def test_a_pin_is_durable_and_beats_the_suggestion(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    other = Project(id="other", display_name="OTHER", source_path=str(tmp_path / "other"))
+    store.capture(_payload("goes elsewhere"), [])
+    capture_id = store.list_records()[0]["capture_id"]
+    before = store.get(capture_id)["record"].get("suggested_project_id") or ""
+
+    pinned = store.set_target_project(capture_id, "other", [other])
+    assert pinned["target_project_id"] == "other"
+    assert pinned["target_project_name"] == "OTHER"
+    reread = InauditCaptureStore(tmp_path).get(capture_id)["record"]
+    assert reread["target_project_id"] == "other"
+    assert before != "other" or reread["target_project_id"] == "other"
+
+
+def test_a_pin_to_an_unknown_project_is_refused(tmp_path: Path):
+    from audapack.inaudit_capture import InauditCaptureError
+
+    store = InauditCaptureStore(tmp_path)
+    store.capture(_payload("nowhere"), [])
+    capture_id = store.list_records()[0]["capture_id"]
+    with pytest.raises(InauditCaptureError):
+        store.set_target_project(capture_id, "ghost", [Project(id="p", display_name="P", source_path=str(tmp_path))])
+    assert store.get(capture_id)["record"].get("target_project_id") in (None, "")
+
+
+def test_a_pin_survives_assign_and_is_consumed_by_it(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    project = Project(id="mine", display_name="MINE", source_path=str(tmp_path / "mine"))
+    store.capture(_payload("the payload"), [project])
+    capture_id = store.list_records()[0]["capture_id"]
+    store.set_target_project(capture_id, "mine", [project])
+
+    result = store.assign(capture_id, "mine", [project])
+    recorded = store.get(capture_id)["record"]
+    assert recorded["assigned_project_id"] == "mine"
+    assert Path(str(result["assigned_path"])).read_text(encoding="utf-8") == "the payload"
+
+
+def test_an_assigned_capture_cannot_be_repinned(tmp_path: Path):
+    from audapack.inaudit_capture import InauditCaptureError
+
+    store = InauditCaptureStore(tmp_path)
+    project = Project(id="mine", display_name="MINE", source_path=str(tmp_path / "mine"))
+    store.capture(_payload("stays"), [project])
+    capture_id = store.list_records()[0]["capture_id"]
+    store.assign(capture_id, "mine", [project])
+    with pytest.raises(InauditCaptureError):
+        store.set_target_project(capture_id, "mine", [project])
+
+
+def test_a_pin_uses_the_pinned_project_path_for_assignment(tmp_path: Path):
+    """Assign with no explicit project still knows where the capture belongs."""
+    store = InauditCaptureStore(tmp_path)
+    other = Project(id="other", display_name="OTHER", source_path=str(tmp_path / "other"))
+    store.capture(_payload("pinned payload"), [])
+    capture_id = store.list_records()[0]["capture_id"]
+    store.set_target_project(capture_id, "other", [other])
+    after = store.assign(capture_id, "", [other])
+    assert Path(str(after["assigned_path"])).read_text(encoding="utf-8") == "pinned payload"

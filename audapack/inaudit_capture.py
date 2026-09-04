@@ -662,6 +662,65 @@ class InauditCaptureStore:
             raise InauditCaptureError("invalid_project_path", "audit directory escapes project root") from exc
         return root, audit_dir
 
+    def rename(self, capture_id: str, title: str) -> dict[str, Any]:
+        """Give a capture a title the operator chose.
+
+        The title is what the Inbox list shows, and it was derived from the
+        captured text -- fine for a pasted audit, useless for one that opens with
+        a code fence. Metadata only: the body, its digest and the capture id are
+        untouched, so nothing downstream can tell the difference.
+        """
+        capture_id = _safe_uuid(capture_id)
+        clean = _bounded_text(title, "title", maximum=512)
+        if not clean:
+            raise InauditCaptureError("invalid_metadata", "title cannot be empty")
+        with _LOCAL_LOCK, cross_process_lock(self.lock_path):
+            for directory in self._lifecycle_dirs():
+                meta_path = self._meta_path(capture_id, directory)
+                record = self._read_json(meta_path)
+                if record is None:
+                    continue
+                record["title"] = clean
+                record["updated_at"] = utc_now()
+                self._atomic_json(meta_path, record)
+                self._signal(capture_id, "rename")
+                return record
+        raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
+
+    def set_target_project(
+        self, capture_id: str, project_id: str, projects: Iterable[Project]
+    ) -> dict[str, Any]:
+        """Pin the project this capture belongs to, before anything is moved.
+
+        The classifier's guess is a SUGGESTION, and the operator often knows the
+        answer at capture time. Pinning records that decision durably so the
+        Inbox stops asking, and `assign()` later uses it -- without touching the
+        body or creating a layer, which is what `assign()` is for. An empty
+        project id clears the pin and hands the row back to the suggestion.
+        """
+        capture_id = _safe_uuid(capture_id)
+        wanted = _bounded_text(project_id, "project_id", maximum=256)
+        project = self._registered_project(projects, wanted) if wanted else None
+        with _LOCAL_LOCK, cross_process_lock(self.lock_path):
+            for directory in self._lifecycle_dirs():
+                meta_path = self._meta_path(capture_id, directory)
+                record = self._read_json(meta_path)
+                if record is None:
+                    continue
+                if record.get("assigned_project_id"):
+                    raise InauditCaptureError(
+                        "already_assigned",
+                        "this capture is already assigned to a project layer",
+                        status=409,
+                    )
+                record["target_project_id"] = project.id if project is not None else ""
+                record["target_project_name"] = project.display_name if project is not None else ""
+                record["updated_at"] = utc_now()
+                self._atomic_json(meta_path, record)
+                self._signal(capture_id, "target")
+                return record
+        raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
+
     def assign(
         self,
         capture_id: str,
@@ -671,7 +730,20 @@ class InauditCaptureStore:
         action: str = "",
         after_assign: Callable[[str, Path], Any] | None = None,
     ) -> dict[str, Any]:
+        # T-145: a pin is the operator's answer given ahead of time. An explicit
+        # project still wins; otherwise the pin fills the gap, and only an
+        # unpinned capture with no project falls into the registry's own
+        # decision.
         capture_id = _safe_uuid(capture_id)
+        if not _bounded_text(project_id, "project_id", maximum=256).strip():
+            known: dict[str, Any] | None = None
+            for directory in self._lifecycle_dirs():
+                known = self._read_json(self._meta_path(capture_id, directory))
+                if known is not None:
+                    break
+            pinned = str((known or {}).get("target_project_id") or "")
+            if pinned:
+                project_id = pinned
         project = self._registered_project(projects, _bounded_text(project_id, "project_id", maximum=256))
         action = action.upper().strip()
         if action not in {"", "GG", "CC"}:
