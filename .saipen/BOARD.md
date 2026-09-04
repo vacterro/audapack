@@ -3,8 +3,12 @@
 ## DOING
 
 ## TODO
+- [ ] T-145 [P1] An INAUDIT capture can be pinned to a project by hand before it is assigned | verify: pinning writes the operator's chosen project onto the capture record durably, the Inbox list and the combo show it instead of the classifier suggestion, and Assign uses the pinned project
+- [ ] T-144 [P1] INAUDIT can rename what it shows: a capture title in the Inbox and a layer number in Layers | verify: renaming a capture changes its title durably and the list reflects it; moving a layer onto a FREE number succeeds and onto a taken number is refused without overwriting; the selected-layer pointer follows the move
+- [ ] T-143 [P1] Double-clicking a project opens its INAUDIT view, not the Instances tab | verify: a double-click on a project row selects it, switches to the INAUDIT tab and binds that project; the group-header toggle and the empty-slot add-folder behaviours are unchanged
 
 ## DONE
+- [x] T-142 [P1] Execute external audit inbox layer audit/3.md (SRC-033) | verify: every actionable clause of SRC-033 is terminal with evidence; linked Work DONE; source closure succeeds; audit/3.md consumed by the journaled audit inbox cleanup | source_receipts: SRC-033 | owner: opencode | claim_time: 2026-09-04T16:12:19Z
 - [x] T-141 [P1] Execute external audit inbox layer audit/2.md (SRC-032) | verify: every actionable clause of SRC-032 is terminal with evidence; linked Work DONE; source closure succeeds; audit/2.md consumed by the journaled audit inbox cleanup | source_receipts: SRC-032 | owner: opencode | claim_time: 2026-09-04T02:18:06Z
 - [x] T-139 [P1] Execute external audit inbox layer audit/1.md (SRC-031) | verify: every actionable clause of SRC-031 is terminal with evidence; linked Work DONE; source closure succeeds; audit/1.md consumed by the journaled audit inbox cleanup | source_receipts: SRC-031 | owner: opencode | claim_time: 2026-09-04T01:00:57Z
 - [x] T-140 [P1] The Bridge stops re-reading 841 KB to learn a version it already knows: read_bundled_widget_metadata caches on (path, mtime_ns, size), the same key the server bundle cache already uses | verify: a six-worker status/poll reads the userscript once per file revision instead of once per worker per call; a replaced bundle changes the required build with no Bridge restart; every stale-widget classification and reload regression stays green | owner: opencode | claim_time: 2026-09-03T21:10:45Z
