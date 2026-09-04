@@ -219,3 +219,64 @@ test('W5-001: block scope sends block only and retry exhaustion becomes terminal
     [2000, 5000, 15000, 30000, 60000, 300000]
   );
 });
+
+test('PERF-001 (audit/1.md): global offline probes once, not once per due capture', async () => {
+  const { h, api } = setup();
+  const spool = memorySpool();
+  api.setInauditSpoolBackendForTest(spool.backend);
+
+  // Seed 20 due captures.
+  for (let i = 0; i < 20; i++) {
+    const cid = `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+    spool.records.set(cid, {
+      capture_id: cid,
+      payload: { capture_id: cid, text: `item ${i}`, capture_kind: 'response' },
+      created_at_ms: i,
+      attempts: 1,
+      next_retry_at: 0,
+      terminal: false
+    });
+  }
+
+  let requests = 0;
+  api.setInauditBridgeRequestForTest(() => {
+    requests++;
+    return { ok: false, status: 0, errorCode: 'bridge_offline', message: 'offline' };
+  });
+
+  await api.flushInauditCaptureSpool();
+
+  // Exactly one probe, not 20 requests (at the 200 cap that was 40 minutes).
+  assert.equal(requests, 1, 'global offline must probe once, not per capture');
+
+  // The probed record really was sent, so it spends an attempt. The other 19
+  // were never attempted and must not be charged for a failure they had no
+  // part in.
+  const attempts = Array.from(spool.records.values()).map(record => Number(record.attempts));
+  assert.equal(attempts.filter(value => value === 2).length, 1, 'only the probed record may spend an attempt');
+  assert.equal(attempts.filter(value => value === 1).length, 19, 'unattempted records were charged a failure');
+  for (const record of spool.records.values()) {
+    assert.ok(record.next_retry_at > Date.now(), 'retry was not scheduled');
+    assert.equal(record.terminal, false, 'an offline endpoint is never a permanent rejection');
+  }
+});
+
+test('PERF-001: putInauditSpool preserves stored size and does not reserialize', async () => {
+  const { h, api } = setup();
+  const spool = memorySpool();
+  api.setInauditSpoolBackendForTest(spool.backend);
+
+  const cid = '00000000-0000-4000-8000-000000000042';
+  const record = {
+    capture_id: cid,
+    payload: { capture_id: cid, text: 'exact text', capture_kind: 'response' },
+    created_at_ms: 1,
+    attempts: 1,
+    next_retry_at: 0,
+    terminal: false
+  };
+
+  const saved = await api.putInauditSpool(record);
+  assert.ok(saved.size_bytes > 0);
+  assert.equal(saved.size_bytes, spool.records.get(cid).size_bytes);
+});

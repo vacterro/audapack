@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.46
+// @version      0.0.47
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -161,6 +161,11 @@
   let inauditCaptureObserver = null;
   let inauditCaptureObserverRoot = null;
   let inauditCaptureAttachTimer = 0;
+  //: Assistant turns a mutation touched since the last attach pass (PERF-003).
+  //: A Set of live elements, cleared every pass, so it holds at most the turns
+  //: one burst touched -- never the whole conversation.
+  const inauditDirtyTurns = new Set();
+  let inauditAttachFullScanPending = false;
   let inauditCaptureFlushTimer = 0;
   let inauditCaptureFlushInFlight = false;
   let inauditSpoolBackendOverride = null;
@@ -5743,16 +5748,33 @@ ordinal/name of the entrypoint file.`;
     return encodeURIComponent(serialized).replace(/%[0-9A-F]{2}|./gi, 'x').length;
   }
 
+  // PERF-001: each record carries its serialized size from the moment it is
+  // written, so admission checks and retry bookkeeping never re-stringify the
+  // whole queue to learn a number that only changes for the record being
+  // updated. A record persisted by an older build falls back to computing it.
+  function inauditRecordBytes(record) {
+    const stored = Number(record?.size_bytes || 0);
+    if (Number.isFinite(stored) && stored > 0) return stored;
+    return inauditCaptureBytes(record);
+  }
+
+  function withSpoolSize(record) {
+    const sized = { ...record };
+    sized.size_bytes = inauditCaptureBytes(sized);
+    return sized;
+  }
+
   async function putInauditSpool(record) {
     const backend = inauditSpoolBackend();
+    const sized = withSpoolSize(record);
     const current = await backend.list();
-    const others = (Array.isArray(current) ? current : []).filter(item => item.capture_id !== record.capture_id);
-    const totalBytes = others.reduce((sum, item) => sum + inauditCaptureBytes(item), 0) + inauditCaptureBytes(record);
+    const others = (Array.isArray(current) ? current : []).filter(item => item.capture_id !== sized.capture_id);
+    const totalBytes = others.reduce((sum, item) => sum + inauditRecordBytes(item), 0) + sized.size_bytes;
     if (others.length + 1 > INAUDIT_CAPTURE_MAX_RECORDS || totalBytes > INAUDIT_CAPTURE_MAX_BYTES) {
       throw new Error('INAUDIT spool is full; existing queued captures were preserved');
     }
-    await backend.put(record);
-    return record;
+    await backend.put(sized);
+    return sized;
   }
 
   async function listInauditSpool() {
@@ -5919,7 +5941,8 @@ ordinal/name of the entrypoint file.`;
       attempts: 1,
       next_retry_at: now + inauditCaptureRetryDelay(1),
       last_error: String(failure?.message || failure?.errorCode || 'Bridge unavailable').slice(0, 320),
-      terminal: false
+      terminal: false,
+      size_bytes: inauditCaptureBytes(payload)
     };
     await putInauditSpool(record);
     scheduleInauditCaptureFlush(inauditCaptureRetryDelay(1));
@@ -5987,37 +6010,100 @@ ordinal/name of the entrypoint file.`;
     return button;
   }
 
-  function attachInauditActions(root = document) {
-    if (detectSite().key !== 'chatgpt') return 0;
+  function attachInauditActionsToTurn(turn) {
+    if (!turn || !assistantStableForInaudit(turn)) return 0;
     let attached = 0;
-    const turns = Array.from(root.querySelectorAll?.('[data-message-author-role="assistant"]') || []);
-    for (const turn of turns) {
-      if (!assistantStableForInaudit(turn)) continue;
-      const actions = turn.querySelector(ASSISTANT_RESPONSE_ACTIONS_SELECTOR) ||
-        turn.querySelector('button[data-testid="copy-turn-action-button"]')?.parentNode;
-      if (actions && !actions.querySelector('[data-acb-inaudit-scope="response"]')) {
-        actions.appendChild(createInauditActionButton(turn, 'response'));
-        attached += 1;
-      }
-      for (const block of Array.from(turn.querySelectorAll('pre'))) {
-        const host = block.parentNode || turn;
-        const existing = Array.from(host.querySelectorAll('[data-acb-inaudit-scope="block"]'))
-          .find(button => button.__acbInauditTarget === block);
-        if (existing) continue;
-        const button = createInauditActionButton(turn, 'block', block);
-        button.__acbInauditTarget = block;
-        host.appendChild(button);
-        attached += 1;
-      }
+    const actions = turn.querySelector(ASSISTANT_RESPONSE_ACTIONS_SELECTOR) ||
+      turn.querySelector('button[data-testid="copy-turn-action-button"]')?.parentNode;
+    if (actions && !actions.querySelector('[data-acb-inaudit-scope="response"]')) {
+      actions.appendChild(createInauditActionButton(turn, 'response'));
+      attached += 1;
+    }
+    for (const block of Array.from(turn.querySelectorAll('pre'))) {
+      const host = block.parentNode || turn;
+      const existing = Array.from(host.querySelectorAll('[data-acb-inaudit-scope="block"]'))
+        .find(button => button.__acbInauditTarget === block);
+      if (existing) continue;
+      const button = createInauditActionButton(turn, 'block', block);
+      button.__acbInauditTarget = block;
+      host.appendChild(button);
+      attached += 1;
     }
     return attached;
   }
 
-  function scheduleInauditActionAttach(delay = 150) {
+  function attachInauditActions(root = document) {
+    if (detectSite().key !== 'chatgpt') return 0;
+    let attached = 0;
+    const turns = Array.from(root.querySelectorAll?.('[data-message-author-role="assistant"]') || []);
+    for (const turn of turns) attached += attachInauditActionsToTurn(turn);
+    return attached;
+  }
+
+  // PERF-003 (audit/1.md): the MutationObserver already knows WHICH subtree
+  // changed, and that locality was thrown away -- every relevant mutation burst
+  // re-ran `attachInauditActions(document)`, which revisits every historical
+  // assistant turn: `assistantStableForInaudit`, the response-action lookup, a
+  // `querySelectorAll('pre')` and a per-block existing-button scan. Measured
+  // with IA controls ALREADY attached, so every call added nothing: 20 turns =
+  // 162 selector calls, 100 turns = 802, 300 turns = 2402 and 116.9 ms. Cost
+  // grew with the length of the conversation, on the browser main thread,
+  // competing with ChatGPT's own rendering.
+  //
+  // Locality, not a "processed" flag: React replaces action bars and code-block
+  // wrappers, so a turn must stay revisitable. A mutation inside an old turn
+  // marks that turn dirty and it is scanned again.
+  function inauditTurnFor(node) {
+    const element = node?.nodeType === 1 ? node : node?.parentNode;
+    if (!element || element.nodeType !== 1) return null;
+    if (element.matches?.('[data-message-author-role="assistant"]')) return element;
+    return element.closest?.('[data-message-author-role="assistant"]') || null;
+  }
+
+  function markInauditTurnsDirty(records) {
+    let sawForeignRoot = false;
+    for (const record of Array.from(records || [])) {
+      const target = record.target?.nodeType === 1 ? record.target : record.target?.parentNode;
+      if (target?.closest?.('.acb-inaudit-action')) continue;
+      const turn = inauditTurnFor(record.target);
+      if (turn) inauditDirtyTurns.add(turn);
+      for (const added of Array.from(record.addedNodes || [])) {
+        const addedTurn = inauditTurnFor(added);
+        if (addedTurn) {
+          inauditDirtyTurns.add(addedTurn);
+          continue;
+        }
+        // A container carrying turns inside it (route hydration, virtualized
+        // re-mount): those turns are dirty too.
+        if (added?.nodeType === 1) {
+          const nested = Array.from(added.querySelectorAll?.('[data-message-author-role="assistant"]') || []);
+          for (const child of nested) inauditDirtyTurns.add(child);
+          if (nested.length === 0) sawForeignRoot = true;
+        }
+      }
+      if (!turn && record.addedNodes?.length === 0) sawForeignRoot = true;
+    }
+    return { dirty: inauditDirtyTurns.size, sawForeignRoot };
+  }
+
+  function scheduleInauditActionAttach(delay = 150, { fullScan = false } = {}) {
+    if (fullScan) inauditAttachFullScanPending = true;
     clearTimeout(inauditCaptureAttachTimer);
     inauditCaptureAttachTimer = setTimeout(() => {
       inauditCaptureAttachTimer = 0;
-      attachInauditActions(document);
+      if (inauditAttachFullScanPending || inauditDirtyTurns.size === 0) {
+        inauditAttachFullScanPending = false;
+        inauditDirtyTurns.clear();
+        attachInauditActions(document);
+        return;
+      }
+      const turns = Array.from(inauditDirtyTurns);
+      inauditDirtyTurns.clear();
+      for (const turn of turns) {
+        // A turn React removed is not an error, just nothing left to attach to.
+        if (turn?.isConnected === false) continue;
+        attachInauditActionsToTurn(turn);
+      }
     }, Math.max(50, Number(delay) || 150));
   }
 
@@ -6028,15 +6114,22 @@ ordinal/name of the entrypoint file.`;
     if (inauditCaptureObserver && inauditCaptureObserverRoot === root && root.isConnected) return true;
     if (inauditCaptureObserver) inauditCaptureObserver.disconnect();
     inauditCaptureObserverRoot = root;
+    inauditDirtyTurns.clear();
     inauditCaptureObserver = new MutationObserver(records => {
       const external = Array.from(records || []).some(record => {
         const target = record.target?.nodeType === 1 ? record.target : record.target?.parentNode;
         return !target?.closest?.('.acb-inaudit-action');
       });
-      if (external) scheduleInauditActionAttach(200);
+      if (!external) return;
+      const { dirty, sawForeignRoot } = markInauditTurnsDirty(records);
+      // Nothing resolvable to a turn: fall back to the full scan rather than
+      // silently skipping a change (initial hydration looks like this).
+      scheduleInauditActionAttach(200, { fullScan: dirty === 0 && sawForeignRoot });
     });
     inauditCaptureObserver.observe(root, { childList: true, subtree: true });
-    scheduleInauditActionAttach(50);
+    // A new root is a new conversation: one full scan attaches to everything
+    // already stable in it.
+    scheduleInauditActionAttach(50, { fullScan: true });
     return true;
   }
 
@@ -6049,16 +6142,60 @@ ordinal/name of the entrypoint file.`;
       const records = await listInauditSpool();
       const now = Date.now();
       let nextDelay = 300000;
-      for (const record of records) {
-        if (record.terminal || Number(record.attempts || 0) >= INAUDIT_CAPTURE_MAX_ATTEMPTS) continue;
-        if (Number(record.next_retry_at || 0) > now) {
-          nextDelay = Math.min(nextDelay, Number(record.next_retry_at) - now);
-          continue;
+      // Records already past their retry window, in FIFO order. Terminal and
+      // not-yet-due records are carried over untouched.
+      const due = records
+        .filter(record =>
+          !record.terminal &&
+          Number(record.attempts || 0) < INAUDIT_CAPTURE_MAX_ATTEMPTS &&
+          Number(record.next_retry_at || 0) <= now)
+        .sort((a, b) => Number(a.created_at_ms || 0) - Number(b.created_at_ms || 0));
+
+      if (due.length === 0) {
+        if (records.some(record => !record.terminal)) scheduleInauditCaptureFlush(Math.max(2000, nextDelay));
+        return true;
+      }
+
+      // PERF-001: a transport-wide failure means the Bridge is unreachable, not
+      // that every individual capture failed. Probe once; if it is down, set the
+      // retry window on the due records WITHOUT consuming their attempts and
+      // without issuing N identical requests (at the documented 200-record cap
+      // that would be 200 × 12 s = 40 minutes inside one flush). A retriable
+      // probe error and a non-retriable one both mean "do not send more right
+      // now": the per-record request below is the only place an individual
+      // capture is judged permanent.
+      const probe = await inauditCaptureRequest('POST', '/v1/inaudit/captures', due[0].payload);
+      if (!probe?.ok) {
+        // Probe was attempted for due[0]: increment its attempts and record error.
+        due[0].attempts = Number(due[0].attempts || 0) + 1;
+        due[0].last_error = String(probe?.message || probe?.errorCode || 'Bridge unavailable').slice(0, 320);
+        if (!inauditCaptureFailureRetriable(probe) || due[0].attempts >= INAUDIT_CAPTURE_MAX_ATTEMPTS) {
+          due[0].terminal = true;
+          due[0].next_retry_at = 0;
+        } else {
+          due[0].next_retry_at = now + inauditCaptureRetryDelay(due[0].attempts);
+          nextDelay = Math.min(nextDelay, due[0].next_retry_at - now);
         }
-        const result = await inauditCaptureRequest('POST', '/v1/inaudit/captures', record.payload);
+        await putInauditSpool(due[0]);
+
+        // Remaining due records were NOT sent: defer their retry without
+        // consuming attempts.
+        for (let i = 1; i < due.length; i++) {
+          const record = due[i];
+          record.next_retry_at = now + inauditCaptureRetryDelay(Number(record.attempts || 0) || 1);
+          nextDelay = Math.min(nextDelay, Number(record.next_retry_at) - now);
+          await putInauditSpool(record);
+        }
+        scheduleInauditCaptureFlush(Math.max(2000, nextDelay));
+        return true;
+      }
+
+      // Endpoint reachable: `probe` was already the first send of due[0].
+      // Process probe's outcome for due[0], then send the rest.
+      const handleResult = async (record, result) => {
         if (result?.ok && result.data?.durable === true && result.data?.record?.capture_id === record.capture_id) {
           await inauditSpoolBackend().delete(record.capture_id);
-          continue;
+          return;
         }
         record.attempts = Number(record.attempts || 0) + 1;
         record.last_error = String(result?.message || result?.errorCode || 'Bridge unavailable').slice(0, 320);
@@ -6071,6 +6208,13 @@ ordinal/name of the entrypoint file.`;
           nextDelay = Math.min(nextDelay, delay);
         }
         await putInauditSpool(record);
+      };
+
+      await handleResult(due[0], probe);
+      for (let i = 1; i < due.length; i++) {
+        const record = due[i];
+        const result = await inauditCaptureRequest('POST', '/v1/inaudit/captures', record.payload);
+        await handleResult(record, result);
       }
       const remaining = await listInauditSpool();
       if (remaining.some(record => !record.terminal)) scheduleInauditCaptureFlush(Math.max(2000, nextDelay));
@@ -19145,6 +19289,10 @@ let browserWorkerBraveConfirmed = false;
         persistInauditCapture,
         captureInauditTarget,
         attachInauditActions,
+        attachInauditActionsToTurn,
+        markInauditTurnsDirty,
+        scheduleInauditActionAttach,
+        get inauditDirtyTurns() { return inauditDirtyTurns; },
         ensureInauditCaptureObserver,
         putInauditSpool,
         listInauditSpool,
