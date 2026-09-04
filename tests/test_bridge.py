@@ -1379,3 +1379,110 @@ def test_a_same_length_rotation_inside_one_timestamp_tick_is_seen(monkeypatch, t
     assert token_file.stat().st_mtime_ns == stat.st_mtime_ns
 
     assert server_module._live_bridge_token() == second, "a rotated token was served stale"
+
+
+class TestPidOwnershipIsAtomicAndBound(unittest.TestCase):
+    """W2-004 (audit/4.md): bridge.pid is an ownership token, not a diary.
+
+    write_pid wrote straight onto the file (a transient partial read was
+    possible mid-write), and remove_pid only rejected mismatches when the
+    current value was TRUTHY -- so an unreadable identity AUTHORIZED deletion.
+    Measured: remove_pid(expected_pid=111) deleted a file whose reread returned
+    `{}`. And stop_bridge read the PID file AFTER the endpoint went offline, so
+    a successor Bridge starting in that gap had its record deleted by the
+    retiring controller.
+    """
+
+    def _lifecycle(self):
+        import audapack.bridge.lifecycle as lc
+
+        return lc
+
+    def test_an_unreadable_pid_file_fails_closed(self):
+        lc = self._lifecycle()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pid_file = base / "bridge.pid"
+            pid_file.write_text("{ not json", encoding="utf-8")
+            lc.remove_pid(base, expected_pid=111, expected_nonce="n-1")
+            self.assertTrue(pid_file.exists(), "an unreadable identity authorized deletion")
+            pid_file.write_text(json.dumps({"pid": "", "nonce": ""}), encoding="utf-8")
+            lc.remove_pid(base, expected_pid=111, expected_nonce="n-1")
+            self.assertTrue(pid_file.exists(), "an empty identity authorized deletion")
+
+    def test_a_matching_identity_still_removes_the_record(self):
+        lc = self._lifecycle()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pid_file = base / "bridge.pid"
+            pid_file.write_text(json.dumps({"pid": 111, "nonce": "n-1"}), encoding="utf-8")
+            lc.remove_pid(base, expected_pid=111, expected_nonce="n-1")
+            self.assertFalse(pid_file.exists())
+
+    def test_a_foreign_identity_is_never_removed(self):
+        lc = self._lifecycle()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pid_file = base / "bridge.pid"
+            pid_file.write_text(json.dumps({"pid": 222, "nonce": "n-2"}), encoding="utf-8")
+            lc.remove_pid(base, expected_pid=111, expected_nonce="n-1")
+            self.assertTrue(pid_file.exists(), "A's cleanup erased B's record")
+            self.assertEqual(json.loads(pid_file.read_text(encoding="utf-8"))["pid"], 222)
+
+    def test_a_concurrent_publication_survives_a_concurrent_delete(self):
+        """write_pid(B) landing between remove_pid(A)'s read and unlink must
+        not erase B: publication and deletion share one cross-process lock."""
+        import threading
+
+        import audapack.bridge.lifecycle as lc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pid_file = base / "bridge.pid"
+            pid_file.write_text(json.dumps({"pid": 111, "nonce": "n-A"}), encoding="utf-8")
+
+            opened = threading.Event()
+            real_open = lc.open_new_temp_file
+
+            def gate(directory, basename):
+                handle, path = real_open(directory, basename)
+                if "bridge.pid" in basename:
+                    opened.set()
+                    import time as _time
+
+                    _time.sleep(0.4)
+                return handle, path
+
+            from unittest.mock import patch as _patch
+            with _patch.object(lc, "open_new_temp_file", side_effect=gate):
+                writer = threading.Thread(
+                    target=lambda: (opened.wait(timeout=5), lc.write_pid(base)),
+                )
+                writer.start()
+                opened.wait(timeout=5)
+                lc.remove_pid(base, expected_pid=111, expected_nonce="n-A")
+                writer.join(timeout=10)
+
+
+            current = lc.read_pid(base)
+            self.assertNotEqual(
+                int(current.get("pid") or 0), 111,
+                "A's compare-and-delete ran against B's freshly published record",
+            )
+
+    def test_write_pid_is_atomic_and_durable(self):
+        import os as _os
+
+        import audapack.bridge.lifecycle as lc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            lc.write_pid(base)
+            current = lc.read_pid(base)
+            self.assertEqual(int(current.get("pid") or 0), _os.getpid())
+            self.assertEqual(current.get("nonce"), lc.INSTANCE_NONCE)
+            self.assertFalse(list(base.glob(".bridge.pid.tmp.*")), "an orphan temp survived")
+
+
+if __name__ == "__main__":
+    unittest.main()

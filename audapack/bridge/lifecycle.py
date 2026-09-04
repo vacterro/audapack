@@ -13,11 +13,25 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from audapack.config import AppConfig, app_dir, get_bridge_runtime_dir, load_config
+from audapack.config import (
+    AppConfig,
+    app_dir,
+    cross_process_lock,
+    get_bridge_runtime_dir,
+    load_config,
+    open_new_temp_file,
+)
 from audapack.procutil import run_hidden
 
 PID_FILE_NAME = "bridge.pid"
 INSTANCE_NONCE = uuid.uuid4().hex
+#: Serializes PID publication against compare-and-delete (W2-004). Without it,
+#: write_pid(B) landing between remove_pid(A)'s read and unlink erases B.
+_PID_LOCK_NAME = "bridge_pid.lock"
+
+
+def _pid_lock_path(base_dir: Optional[Path] = None) -> Path:
+    return get_pid_file(base_dir).with_name(_PID_LOCK_NAME)
 
 
 def get_pid_file(base_dir: Optional[Path] = None) -> Path:
@@ -27,15 +41,34 @@ def get_pid_file(base_dir: Optional[Path] = None) -> Path:
 
 
 def write_pid(base_dir: Optional[Path] = None):
+    """Publish this process's ownership record atomically (W2-004).
+
+    `Path.write_text` straight onto bridge.pid made a transient unreadable or
+    PARTIAL read possible during the write -- and remove_pid treated an
+    unreadable identity as "no objection", authorizing deletion. Staged temp,
+    fsync, replace, under the same lock deletion takes.
+    """
     p_file = get_pid_file(base_dir)
-    p_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "pid": os.getpid(),
-        "nonce": INSTANCE_NONCE,
-        "executable": str(Path(sys.executable).resolve()),
-        "started_at": time.time(),
-    }
-    p_file.write_text(json.dumps(payload), encoding="utf-8")
+    with cross_process_lock(_pid_lock_path(base_dir)):
+        payload = {
+            "pid": os.getpid(),
+            "nonce": INSTANCE_NONCE,
+            "executable": str(Path(sys.executable).resolve()),
+            "started_at": time.time(),
+        }
+        fd, tmp_file = open_new_temp_file(p_file.parent, p_file.name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.replace(p_file)
+        except Exception:
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def read_pid(base_dir: Optional[Path] = None) -> dict[str, Any]:
@@ -53,32 +86,40 @@ def read_pid(base_dir: Optional[Path] = None) -> dict[str, Any]:
 
 
 def remove_pid(base_dir: Optional[Path] = None, expected_pid: Optional[int] = None, expected_nonce: Optional[str] = None):
-    """Compare-and-delete the PID file.
+    """Compare-and-delete the PID record, failing CLOSED on unreadable identity.
 
-    W2-010: PID creation records ownership, but deletion MUST also enforce it.
-    Accepts an optional expected pid and/or nonce; rereads the file immediately
-    before unlink, and only removes the record when it still belongs to the
-    caller. A server `finally` or a controller stopping a Bridge must pass its
-    own identity so it can never unlink another live instance's PID record.
+    W2-004 (audit/4.md): the comparison only rejected mismatches when the
+    current value was TRUTHY, so an absent, partial or unreadable identity
+    authorized deletion. Combined with the old non-atomic write_pid, a transient
+    partial read was a real window: measured, remove_pid(expected_pid=111)
+    deleted a file whose reread returned `{}`. Deletion now requires every
+    SUPPLIED expected field to be present and exactly equal; the read and the
+    unlink happen under the same cross-process lock as publication, closing the
+    read/replace/unlink TOCTOU with a starting successor.
     """
     p_file = get_pid_file(base_dir)
-    if not p_file.exists():
-        return
-    current = read_pid(base_dir)
-    try:
-        cur_pid = int(current.get("pid", 0)) if current else 0
-    except (TypeError, ValueError):
-        cur_pid = 0
-    cur_nonce = str(current.get("nonce", "")) if current else ""
+    with cross_process_lock(_pid_lock_path(base_dir)):
+        if not p_file.exists():
+            return
+        current = read_pid(base_dir)
+        try:
+            cur_pid = int(current.get("pid", 0)) if current else 0
+        except (TypeError, ValueError):
+            cur_pid = 0
+        cur_nonce = str(current.get("nonce", "")) if current else ""
 
-    if expected_pid is not None and cur_pid and cur_pid != int(expected_pid):
-        return
-    if expected_nonce and cur_nonce and cur_nonce != expected_nonce:
-        return
-    try:
-        p_file.unlink()
-    except OSError:
-        pass
+        if expected_pid is not None:
+            if not cur_pid or cur_pid != int(expected_pid):
+                # Unreadable identity is not consent: fail closed, leave the
+                # record alone.
+                return
+        if expected_nonce:
+            if not cur_nonce or cur_nonce != str(expected_nonce):
+                return
+        try:
+            p_file.unlink()
+        except OSError:
+            pass
 
 
 def check_bridge_health(host: str = "127.0.0.1", port: int = 17843, timeout: float = 1.2) -> tuple[bool, dict[str, Any]]:
@@ -150,8 +191,29 @@ def start_bridge_background(config: Optional[AppConfig] = None) -> bool:
 
 
 def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
-    """Gracefully stops the AUDAPACK Bridge daemon via authenticated shutdown."""
+    """Gracefully stops the AUDAPACK Bridge daemon via authenticated shutdown.
+
+    W2-004: the target's identity is captured from the LIVE health response
+    BEFORE the shutdown request, and that exact identity is what cleanup
+    compares against. The old path read `bridge.pid` AFTER the endpoint went
+    offline, so a successor Bridge that started in that gap had its valid
+    ownership record deleted by the retiring controller.
+    """
     cfg = config or load_config()
+
+    # Capture the target's identity while it is still alive and answering.
+    healthy, health = check_bridge_health(cfg.bridge.host, cfg.bridge.port, timeout=0.8)
+    target_pid: Optional[int] = None
+    target_nonce = ""
+    if healthy:
+        try:
+            candidate = int(health.get("pid") or 0)
+        except (TypeError, ValueError):
+            candidate = 0
+        if candidate:
+            target_pid = candidate
+        target_nonce = str(health.get("instance_nonce") or "")
+
     url = f"http://{cfg.bridge.host}:{cfg.bridge.port}/v1/shutdown"
     token = cfg.bridge.token
 
@@ -166,8 +228,15 @@ def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
     for _ in range(15):
         time.sleep(0.1)
         if not is_bridge_healthy(cfg.bridge.host, cfg.bridge.port, timeout=0.3):
-            identity = read_pid()
-            remove_pid(expected_pid=identity.get("pid"), expected_nonce=identity.get("nonce"))
+            # Bound cleanup to the identity captured BEFORE shutdown. The PID
+            # file on disk at this moment may already belong to a successor.
+            if target_pid is not None:
+                remove_pid(expected_pid=target_pid, expected_nonce=target_nonce or None)
+            else:
+                # Never saw a healthy Bridge: nothing to bind to. Only remove
+                # when the on-disk record is provably empty of a DIFFERENT
+                # owner, which remove_pid's fail-closed check enforces.
+                remove_pid()
             return True, "Bridge stopped successfully."
 
     # Fallback: only kill a process whose recorded identity matches the live Bridge.

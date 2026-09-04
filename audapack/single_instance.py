@@ -28,14 +28,22 @@ OWNER_WINDOW_GRACE_SECONDS = 6.0
 
 
 def _process_is_alive(pid: int) -> bool:
-    """Is this PID a live process right now?
+    """Is this PID a live process right now? Total over every parsed integer.
 
-    W2-005 (audit/1.md): the guard decided the mutex owner was a zombie from the
-    ABSENCE OF A WINDOW, and a process between `CreateMutexW` and
-    `window.show()` looks exactly like a dead one. Liveness is a question about
-    the process, so it is asked about the process.
+    W2-005 (audit/4.md): `os.kill(pid, 0)` raises OverflowError for a value
+    beyond the platform's signed-int range -- measured with 4,000,000,000 on
+    POSIX -- and nothing caught it, so a corrupt owner record could crash the
+    launcher's second-instance handling instead of producing a decision. An
+    unqueryable PID cannot be proven dead, and "dead" is the only answer that
+    ever authorizes a second GUI.
     """
-    if pid <= 0 or pid == os.getpid():
+    if pid is None:
+        return False
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if pid_int <= 0 or pid_int == os.getpid():
         return False
     if sys.platform == "win32":
         try:
@@ -44,7 +52,7 @@ def _process_is_alive(pid: int) -> bool:
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             STILL_ACTIVE = 259
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int & 0xFFFFFFFF)
             if not handle:
                 return False
             try:
@@ -60,8 +68,11 @@ def _process_is_alive(pid: int) -> bool:
             # answer that authorizes a second GUI.
             return True
     try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
+        os.kill(pid_int, 0)
+    except (ProcessLookupError, OverflowError):
+        # OverflowError: no signal can be sent to a value this large, which is
+        # proof enough that it is not one of OUR processes (PIDs are bounded far
+        # below it), and definitely not a live owner.
         return False
     except PermissionError:
         return True

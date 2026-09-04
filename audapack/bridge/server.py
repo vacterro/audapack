@@ -595,6 +595,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "manifest_hash": get_canonical_manifest_hash(),
                 "instance_id": f"audapack_{os.getpid()}",
                 "instance_nonce": INSTANCE_NONCE,
+                # W2-004: stop_bridge binds cleanup to the identity it captured
+                # from a LIVE /health, so this must carry the PID as well as the
+                # nonce.
+                "pid": os.getpid(),
                 "registry_revision": len(live_cfg.projects),
                 "build_id": build_id,
                 "source_revision": source_revision,

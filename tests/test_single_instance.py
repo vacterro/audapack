@@ -4,7 +4,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from audapack.single_instance import GuardEstablishmentError, SingleInstance
+from audapack.single_instance import GuardEstablishmentError, SingleInstance, _process_is_alive
 
 
 class TestSingleInstance(unittest.TestCase):
@@ -297,3 +297,41 @@ class TestRecoveryKeepsThePrimaryNamespace(unittest.TestCase):
             zombie.release()
             first_recovery.release()
             second_recovery.release()
+
+
+class TestLivenessProbeIsTotal(unittest.TestCase):
+    """W2-005 (audit/4.md): the probe must answer, never raise.
+
+    `os.kill(pid, 0)` raises OverflowError for a value beyond the platform's
+    signed-int range -- measured with 4,000,000,000 on POSIX -- and nothing
+    caught it, so a corrupt owner record could crash the launcher's
+    second-instance handling. An unqueryable PID is treated as alive, because
+    "dead" is the only answer that ever authorizes a second GUI.
+    """
+
+    def test_out_of_range_and_malformed_pids_never_raise(self):
+
+        for value in (0, -1, -10**12, 4_000_000_000, 10**30, float(10**15), None):
+            with self.subTest(value=value):
+                try:
+                    _process_is_alive(value)
+                except Exception as exc:
+                    self.fail(f"_process_is_alive({value!r}) raised {type(exc).__name__}: {exc}")
+
+    def test_a_garbage_owner_record_fails_closed(self):
+        self.assertTrue(
+            _process_is_alive("garbage"),
+            "an unparseable PID must not read as a dead owner",
+        )
+
+    def test_our_own_pid_is_not_another_owner(self):
+        import os as _os
+
+        self.assertFalse(_process_is_alive(_os.getpid()))
+
+    def test_a_real_live_process_reports_alive(self):
+        import os as _os
+
+        parent = _os.getppid()
+        if parent > 0:
+            self.assertTrue(_process_is_alive(parent))
