@@ -74,7 +74,7 @@ class TestPackingEngine(unittest.TestCase):
     def test_create_zip_and_verify(self):
         out_zip = self.output_dir / "test.zip"
         excludes = {"node_modules", "*.log"}
-        added, raw_b, skipped, errors = create_zip(
+        stats = create_zip(
             self.source_dir,
             out_zip,
             excludes,
@@ -84,7 +84,7 @@ class TestPackingEngine(unittest.TestCase):
         self.assertFalse(out_zip.with_name(out_zip.name + ".part").exists())
 
         # Verify entry count (3 files + 1 manifest = 4)
-        count = verify_zip(out_zip, added)
+        count = verify_zip(out_zip, stats.files_added)
         self.assertEqual(count, 4)
 
         # Check zip entries
@@ -100,12 +100,12 @@ class TestPackingEngine(unittest.TestCase):
     def test_single_file_pack(self):
         file_path = self.source_dir / "file1.txt"
         out_zip = self.output_dir / "single.zip"
-        added, raw_b, skipped, errors = create_zip(
+        stats = create_zip(
             file_path,
             out_zip,
             excludes=set(),
         )
-        self.assertEqual(added, 1)
+        self.assertEqual(stats.files_added, 1)
         self.assertTrue(out_zip.exists())
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()

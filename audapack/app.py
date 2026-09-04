@@ -77,6 +77,7 @@ def run_silent_pack_all() -> int:
             include_timestamp=getattr(config.packing, "include_timestamp", True),
             log_callback=log,
             manifest_meta={"project_name": p.display_name, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
+            packing=config.packing,
         )
         if not res.success:
             all_success = False
@@ -125,6 +126,7 @@ def run_pack_path(path_str: str) -> int:
         delete_old=config.packing.delete_old,
         include_timestamp=getattr(config.packing, "include_timestamp", True),
         manifest_meta={"project_name": stem, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
+        packing=config.packing,
     )
     if res.success:
         print(f"Successfully packed {target} -> {res.output_path}")
@@ -176,6 +178,7 @@ def run_pack_project(project_id: str) -> int:
         delete_old=config.packing.delete_old,
         include_timestamp=getattr(config.packing, "include_timestamp", True),
         manifest_meta={"project_name": stem, "extra_meta": extra_meta} if config.packing.manifest_enabled else None,
+        packing=config.packing,
     )
     if res.success:
         print(f"Successfully packed {source} -> {res.output_path}")

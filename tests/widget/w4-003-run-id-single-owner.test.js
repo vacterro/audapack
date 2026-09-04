@@ -11,8 +11,8 @@
 //      disagrees with the durable record already on disk.
 //   2. bridgeJobRequest emits payload.run_id that matches the CAMPAIGN_RUN_ID
 //      header embedded in the queued content.
-//   3. deliverBridgeJob refuses to POST a payload whose content's
-//      CAMPAIGN_RUN_ID disagrees with the queued run_id.
+//   3. deliverBridgeJob patches a payload whose content's CAMPAIGN_RUN_ID
+//      disagrees with the queued run_id before POSTing it.
 
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -99,7 +99,7 @@ test('W4-003: bridgeJobRequest payload.run_id matches content CAMPAIGN_RUN_ID', 
 });
 
 test('W4-003: deliverBridgeJob patches content CAMPAIGN_RUN_ID to match transport run_id', async () => {
-  const { api } = setup();
+  const { h, api } = setup();
   api.state.bridgeEnabled = true;
   api.state.autoSaveAuditFiles = true;
   api.state.auditProfile = 'quick3';
@@ -142,14 +142,34 @@ test('W4-003: deliverBridgeJob patches content CAMPAIGN_RUN_ID to match transpor
   };
   assert.strictEqual(api.saveBridgeJob(tampered, { signal: false }), true);
 
+  // PERF-003: drop the canonical record so the permanent job keeps its own
+  // content (never compact or discard the sole surviving copy). That keeps the
+  // patched body directly observable on the job, which is what proves the
+  // run-id reconciliation actually rewrote the content.
+  for (const [key, raw] of Array.from(h.gmStore.entries())) {
+    try {
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && parsed.version === 1 && parsed.conversationKey === record.conversationKey && parsed.kind === 'core') {
+        h.gmStore.delete(key);
+      }
+    } catch (_) { /* not a JSON record */ }
+  }
+  assert.strictEqual(api.readAuditResultFresh('core', record.conversationKey), null,
+    'no canonical record may back this delivery');
+
   const delivered = await api.deliverBridgeJob(api.readBridgeJob(tampered.jobId));
   assert.strictEqual(delivered, false, 'delivery fails because Bridge is fake');
 
   const patched = api.readBridgeJob(tampered.jobId);
+  assert.ok(patched, 'job must remain after the failed delivery');
+  // The run-id reconciliation patched the content to the transport run id and
+  // delivery proceeded; it failed only because no Bridge token is configured.
+  assert.strictEqual(patched.errorCode, 'invalid_auth', 'the failure must come from the Bridge request');
+  assert.notStrictEqual(patched.errorCode, 'run_id_mismatch', 'must not be a run_id_mismatch failure');
+  assert.notStrictEqual(patched.contentOmitted, true,
+    'without canonical proof the permanent job must keep its own body');
   assert.ok(
     /^CAMPAIGN_RUN_ID:\s*run-canonical-001\s*$/m.test(patched.content),
     'content CAMPAIGN_RUN_ID must be patched to match transport run_id'
   );
-  assert.notStrictEqual(patched.errorCode, 'run_id_mismatch', 'must not be a run_id_mismatch failure');
-  assert.ok(patched.permanent || patched.lastError, 'failure from Bridge request, not from mismatch guard');
 });

@@ -34,6 +34,7 @@ from audapack.config import (
     normalize_output_layout,
     save_config,
 )
+from audapack.fidelity import PROFILES, normalize_fidelity_profile
 from audapack.services.bridge_service import BridgeService
 from audapack.ui_qt.dialogs.launcher_dialog import LauncherEditDialog
 from audapack.ui_qt.even_layout import EvenTabBar
@@ -158,6 +159,12 @@ class SettingsWidget(QWidget):
         self.delete_old.toggled.connect(lambda: self._save())
         self.include_timestamp.toggled.connect(lambda: self._save())
         self.manifest.toggled.connect(lambda: self._save())
+        self.fidelity_profile.currentIndexChanged.connect(lambda: self._save())
+        self.fidelity_max_mb.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.fidelity_media_samples.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.fidelity_media_bytes.valueChanged.connect(lambda: self._autosave_timer.start())
+        self.always_include.textChanged.connect(lambda: self._autosave_timer.start())
+        self.always_exclude.textChanged.connect(lambda: self._autosave_timer.start())
         self.autostart.toggled.connect(self._on_autostart_toggled)
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
@@ -278,6 +285,40 @@ class SettingsWidget(QWidget):
         self.manifest = QCheckBox()
         self.manifest.setChecked(self._config.packing.manifest_enabled)
         f.addRow("Include manifest", self.manifest)
+        # T-147: audit-fidelity profiles. STANDARD is the default; FULL is the
+        # only profile that claims a complete snapshot.
+        self.fidelity_profile = QComboBox()
+        current_profile = normalize_fidelity_profile(getattr(self._config.packing, "fidelity_profile", "standard"))
+        for _p in PROFILES:
+            self.fidelity_profile.addItem(_p.upper(), userData=_p)
+        _idx = self.fidelity_profile.findData(current_profile)
+        if _idx >= 0:
+            self.fidelity_profile.setCurrentIndex(_idx)
+        f.addRow("Fidelity profile", self.fidelity_profile)
+        self.fidelity_max_mb = QSpinBox()
+        self.fidelity_max_mb.setRange(0, 10000)
+        self.fidelity_max_mb.setValue(int(getattr(self._config.packing, "fidelity_max_mb", 0) or 0))
+        self.fidelity_max_mb.setSpecialValueText("profile default")
+        self.fidelity_max_mb.setToolTip("Soft budget override in MB. 0 = profile default. Never trims source/tests/configs/docs.")
+        f.addRow("Max archive MB (0=default)", self.fidelity_max_mb)
+        self.fidelity_media_samples = QSpinBox()
+        self.fidelity_media_samples.setRange(0, 1000)
+        self.fidelity_media_samples.setValue(int(getattr(self._config.packing, "fidelity_media_samples", 0) or 0))
+        self.fidelity_media_samples.setSpecialValueText("profile default")
+        self.fidelity_media_samples.setToolTip("Representative media files kept per media-heavy directory. 0 = profile default.")
+        f.addRow("Media samples per dir (0=default)", self.fidelity_media_samples)
+        self.fidelity_media_bytes = QSpinBox()
+        self.fidelity_media_bytes.setRange(0, 100000)
+        self.fidelity_media_bytes.setValue(int(getattr(self._config.packing, "fidelity_media_bytes", 0) or 0))
+        self.fidelity_media_bytes.setSpecialValueText("profile default")
+        self.fidelity_media_bytes.setToolTip("Byte cap per media-heavy directory. 0 = profile default.")
+        f.addRow("Media bytes per dir (0=default)", self.fidelity_media_bytes)
+        self.always_include = QLineEdit(", ".join(getattr(self._config.packing, "always_include", None) or []))
+        self.always_include.setPlaceholderText("fixtures/**, Sounds/success.wav")
+        f.addRow("Always include", self.always_include)
+        self.always_exclude = QLineEdit(", ".join(getattr(self._config.packing, "always_exclude", None) or []))
+        self.always_exclude.setPlaceholderText("References/raw/**")
+        f.addRow("Always exclude", self.always_exclude)
         return w
 
     def _build_audit(self) -> QWidget:
@@ -867,6 +908,12 @@ class SettingsWidget(QWidget):
         owned.append(("packing", "delete_old", self.delete_old.isChecked()))
         owned.append(("packing", "include_timestamp", self.include_timestamp.isChecked()))
         owned.append(("packing", "manifest_enabled", self.manifest.isChecked()))
+        owned.append(("packing", "fidelity_profile", str(self.fidelity_profile.currentData() or "standard")))
+        owned.append(("packing", "fidelity_max_mb", int(self.fidelity_max_mb.value())))
+        owned.append(("packing", "fidelity_media_samples", int(self.fidelity_media_samples.value())))
+        owned.append(("packing", "fidelity_media_bytes", int(self.fidelity_media_bytes.value())))
+        owned.append(("packing", "always_include", [p.strip() for p in self.always_include.text().split(",") if p.strip()]))
+        owned.append(("packing", "always_exclude", [p.strip() for p in self.always_exclude.text().split(",") if p.strip()]))
         owned.append(("ui", "hidden_toolbar_buttons", [
             key for key, box in self.toolbar_button_checks.items() if not box.isChecked()
         ]))

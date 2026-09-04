@@ -143,6 +143,10 @@
   const BRIDGE_QUEUE_SIGNAL_KEY = 'ai_chatbuttons_bridge_queue_signal_v1';
   const BRIDGE_DIAGNOSTIC_LOG_KEY = 'ai_chatbuttons_bridge_diagnostic_log_v1';
   const BRIDGE_DIAGNOSTIC_LOG_MAX = 80;
+  // PERF-003: explicit retention bound for terminal/permanent Bridge-job
+  // metadata. Only jobs already compacted against a durable audit record that
+  // still proves their identity are ever reclaimed past this count.
+  const BRIDGE_PERMANENT_JOBS_MAX = 400;
   const BRIDGE_FLUSH_LEASE_KEY = 'ai_chatbuttons_bridge_flush_lease_v1';
   const BRIDGE_FLUSH_LEASE_MS = 30000;
   const BRIDGE_REQUEST_TIMEOUT_MS = 12000;
@@ -6289,12 +6293,24 @@ ordinal/name of the entrypoint file.`;
   }
 
   function updateBridgeJobIndex(jobId, remove = false) {
+    // PERF-003 (audit/4.md): membership changes only. This ran for EVERY
+    // saveBridgeJob -- including plain state updates to an already-indexed id
+    // -- and each run reread, parsed, filtered, deduplicated and rewrote the
+    // whole id array, so repeated updates accumulated O(n)-sized index writes
+    // and growing a queue by insertion was O(n^2) aggregate. Callers now pass
+    // update=false for an id they know is already indexed; only create and
+    // delete touch the array.
     try {
       const raw = GM_getValue(BRIDGE_JOB_INDEX_KEY, null);
       const ids = raw ? JSON.parse(raw) : [];
-      const next = Array.isArray(ids) ? ids.filter(id => id !== jobId) : [];
-      if (!remove) next.push(jobId);
-      GM_setValue(BRIDGE_JOB_INDEX_KEY, JSON.stringify([...new Set(next)]));
+      const known = Array.isArray(ids) && ids.includes(jobId);
+      if (remove) {
+        if (!known) return;
+        GM_setValue(BRIDGE_JOB_INDEX_KEY, JSON.stringify(ids.filter(id => id !== jobId)));
+        return;
+      }
+      if (known) return;
+      GM_setValue(BRIDGE_JOB_INDEX_KEY, JSON.stringify([...(Array.isArray(ids) ? ids : []), jobId]));
     } catch (_) { }
   }
 
@@ -6655,6 +6671,8 @@ ordinal/name of the entrypoint file.`;
       const payload = JSON.stringify(job);
       GM_setValue(key, payload);
       if (GM_getValue(key, null) !== payload) throw new Error('bridge queue read-back mismatch');
+      // PERF-003: updateBridgeJobIndex is a membership no-op for an
+      // already-indexed id, so state updates stop rewriting the id array.
       updateBridgeJobIndex(job.jobId);
       if (options.signal !== false) signalBridgeQueueChange();
       return true;
@@ -7009,16 +7027,98 @@ ordinal/name of the entrypoint file.`;
     };
   }
 
+  // PERF-003: the durable audit-result record is the canonical copy of a
+  // delivered audit body. A permanent Bridge job may drop its duplicated
+  // `content` only when that record can prove the same identity (run id, and
+  // profile when both sides name one), and may later be rebuilt from it when a
+  // retry needs the payload again. Wave + conversation identity is inherent:
+  // readAuditResultFresh(kind, conversationKey) only returns a record whose
+  // kind and conversationKey both match the job. A job whose canonical
+  // identity cannot be proven keeps its full content as the sole surviving
+  // copy and is never silently discarded.
+  function bridgeCanonicalProofHolds(job, canonical) {
+    if (!canonical || typeof canonical.text !== 'string' || !canonical.text) return false;
+    const expectedRunId = String(job?.sourceRunId || job?.runId || '');
+    if (expectedRunId && String(canonical.runId || '') !== expectedRunId) return false;
+    const expectedProfile = String(job?.profileId || '');
+    const canonicalProfile = String(canonical.profileId || '');
+    if (expectedProfile && canonicalProfile && expectedProfile !== canonicalProfile) return false;
+    return true;
+  }
+
+  // Shared canonical-reconstruction helper (PERF-003): manual Retry and
+  // automatic token-replacement recovery both rebuild a compacted job's
+  // byte-identical payload from the durable audit record through this one
+  // verified path. Returns null when identity cannot be proven so callers keep
+  // the stored job permanent instead of ever sending an empty body.
+  function reconstructBridgeJobContent(job) {
+    const content = String(job?.content || '');
+    if (content && !job.contentOmitted) return { content, contentOmitted: false };
+    const canonical = readAuditResultFresh(job.wave, job.conversationKey);
+    if (!bridgeCanonicalProofHolds(job, canonical)) return null;
+    return { content: String(canonical.text), contentOmitted: false };
+  }
+
+  // PERF-003: terminal/permanent Bridge jobs get an explicit count bound.
+  // Growth beyond BRIDGE_PERMANENT_JOBS_MAX is reclaimed only from jobs whose
+  // body was already compacted against a durable audit record that still
+  // proves their identity -- never from the sole surviving copy of an
+  // undelivered payload, which stays available for diagnosis or manual retry.
+  function pruneBridgePermanentJobs() {
+    let pruned = 0;
+    try {
+      // Never pay for a full queue re-list below the bound: the membership
+      // index is small, so check its length first. Every markBridgeJobPermanent
+      // calls this, and the failing-delivery path is exactly where PERF-003
+      // forbids quadratic re-parsing of the whole queue.
+      const rawIndex = GM_getValue(BRIDGE_JOB_INDEX_KEY, null);
+      const indexed = rawIndex ? JSON.parse(rawIndex) : [];
+      if (!Array.isArray(indexed) || indexed.length <= BRIDGE_PERMANENT_JOBS_MAX) return 0;
+
+      const permanent = listBridgeJobs().filter(job => job.permanent);
+      if (permanent.length <= BRIDGE_PERMANENT_JOBS_MAX) return 0;
+      // Only jobs compacted at mark time are candidates, and only the oldest
+      // are reclaimed. Verify each victim against its durable audit record
+      // right before deletion -- one read per eviction, never a sweep over the
+      // whole permanent set on every call.
+      const overshoot = permanent.length - BRIDGE_PERMANENT_JOBS_MAX;
+      const candidates = permanent
+        .filter(job => job.contentOmitted)
+        .sort((a, b) => Number(a.updatedAt || 0) - Number(b.updatedAt || 0));
+      let remaining = overshoot;
+      for (const victim of candidates) {
+        if (remaining <= 0) break;
+        const canonical = readAuditResultFresh(victim.wave, victim.conversationKey);
+        if (!bridgeCanonicalProofHolds(victim, canonical)) continue;
+        if (deleteBridgeJob(victim.jobId, { signal: false })) {
+          pruned += 1;
+          remaining -= 1;
+        }
+      }
+    } catch (_) {
+      // Pruning is best-effort; storage pressure must never break delivery.
+    }
+    if (pruned) {
+      // deleteBridgeJob ran with signal:false, so repopulate the cache or the
+      // next list within the 500 ms TTL would still return evicted jobs.
+      bridgeJobsCache = null;
+      bridgeJobsCacheAt = 0;
+      appendBridgeDiagnostic('job_pruned', {
+        severity: 'info',
+        message: `Permanent Bridge-job metadata pruned to the ${BRIDGE_PERMANENT_JOBS_MAX}-job bound; audit bodies remain in their durable records.`
+      });
+    }
+    return pruned;
+  }
+
   function markBridgeJobPermanent(job, response) {
     const latest = readBridgeJob(job?.jobId || job?.receipt || '');
     if (!latest) return false;
     const errorCode = response.errorCode || `http_${response.status || 0}`;
-    const canonical = readAuditResultFresh(latest.wave, latest.conversationKey);
-    const canCompact =
-      errorCode !== 'invalid_auth' &&
-      canonical &&
-      String(canonical.runId || '') === String(latest.sourceRunId || latest.runId || '') &&
-      Boolean(canonical.text);
+    // invalid_auth is as recoverable as any other permanent failure once a
+    // replacement token is saved, so it compacts under the same proof as the
+    // rest. A job whose canonical identity cannot be proven keeps its content.
+    const canCompact = bridgeCanonicalProofHolds(latest, readAuditResultFresh(latest.wave, latest.conversationKey));
     const next = {
       ...latest,
       permanent: true,
@@ -7041,6 +7141,7 @@ ordinal/name of the entrypoint file.`;
       record.bridgeError = next.lastError;
       record.saveError = next.lastError;
     }, latest.conversationKey, { expectedRunId: String(latest.sourceRunId || latest.runId || '') });
+    pruneBridgePermanentJobs();
     return true;
   }
 
@@ -7426,8 +7527,22 @@ ordinal/name of the entrypoint file.`;
       if (!job.permanent) continue;
       if (errorCode && job.errorCode !== errorCode) continue;
       if (!errorCode && !retryableFailures.has(String(job.errorCode || '').toLowerCase())) continue;
+      // A compacted job is only safe to republish when the durable audit
+      // record still proves its identity; otherwise keep it permanent instead
+      // of ever sending an empty body (PERF-003).
+      const rebuilt = reconstructBridgeJobContent(job);
+      if (!rebuilt) {
+        appendBridgeDiagnostic('recovery_skipped', {
+          severity: 'error',
+          code: 'retry_content_unavailable',
+          message: 'Automatic recovery could not rebuild a compacted job from the matching durable audit record; the stored copy was retained.',
+          job
+        });
+        continue;
+      }
       const next = {
         ...job,
+        ...rebuilt,
         permanent: false,
         attempts: 0,
         errorCode: '',
@@ -7448,27 +7563,21 @@ ordinal/name of the entrypoint file.`;
     const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
     for (const job of listBridgeJobs()) {
       if (!job.permanent) continue;
-      let content = String(job.content || '');
-      let canonical = null;
-      if (!content || job.contentOmitted) {
-        canonical = readAuditResultFresh(job.wave, job.conversationKey);
-        const expectedRunId = String(job.sourceRunId || job.runId || '');
-        if (
-          !canonical?.text ||
-          (expectedRunId && String(canonical.runId || '') !== expectedRunId)
-        ) {
-          skipped += 1;
-          appendBridgeDiagnostic('manual_retry_skipped', {
-            severity: 'error',
-            code: 'retry_content_unavailable',
-            message: 'Manual retry could not rebuild the compacted payload from the matching durable audit record.',
-            job
-          });
-          continue;
-        }
-        content = String(canonical.text);
+      const rebuilt = reconstructBridgeJobContent(job);
+      if (!rebuilt) {
+        skipped += 1;
+        appendBridgeDiagnostic('manual_retry_skipped', {
+          severity: 'error',
+          code: 'retry_content_unavailable',
+          message: 'Manual retry could not rebuild the compacted payload from the matching durable audit record.',
+          job
+        });
+        continue;
       }
-
+      const content = rebuilt.content;
+      const canonical = (!content || job.contentOmitted)
+        ? readAuditResultFresh(job.wave, job.conversationKey)
+        : null;
       const profileId = String(
         job.profileId ||
         canonical?.profileId ||
@@ -19227,6 +19336,7 @@ let browserWorkerBraveConfirmed = false;
            BRIDGE_QUEUE_SIGNAL_KEY,
            BRIDGE_DIAGNOSTIC_LOG_KEY,
            BRIDGE_DIAGNOSTIC_LOG_MAX,
+           BRIDGE_PERMANENT_JOBS_MAX,
            INAUDIT_CAPTURE_MAX_RECORDS,
            INAUDIT_CAPTURE_MAX_BYTES,
            INAUDIT_CAPTURE_MAX_ATTEMPTS,
@@ -19312,6 +19422,7 @@ let browserWorkerBraveConfirmed = false;
          deliverBridgeJob,
          resetBridgeFailedJobs,
          retryAllBridgeFailedJobs,
+         pruneBridgePermanentJobs,
          readBridgeDiagnosticLog,
          appendBridgeDiagnostic,
          bridgeDiagnosticsText,

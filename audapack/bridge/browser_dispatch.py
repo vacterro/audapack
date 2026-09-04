@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from audapack.campaign import STATUS_CAMPAIGN_COMPLETE
 from audapack.config import cross_process_lock, get_state_dir
 
 logger = logging.getLogger(__name__)
@@ -1915,7 +1916,12 @@ class BrowserDispatcher:
                     continue
                 if not isinstance(campaign, dict):
                     continue
-                if campaign.get("campaign_status") != "COMPLETE":
+                # W2-001 (audit/4.md): the canonical campaign writer emits
+                # STATUS_CAMPAIGN_COMPLETE ("CAMPAIGN_COMPLETE"). Matching the
+                # parallel literal "COMPLETE" meant a real finished campaign
+                # was never reconciled by restart -- it stayed FINALIZING and
+                # emitted false "dispatch finalization pending" warnings.
+                if campaign.get("campaign_status") != STATUS_CAMPAIGN_COMPLETE:
                     continue
                 if str(campaign.get("campaign_run_id") or "") != str(job.campaign_run_id):
                     continue
@@ -1980,8 +1986,12 @@ class BrowserDispatcher:
                 campaign = json.loads(Path(campaign_path).read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError) as exc:
                 raise DispatchError("campaign_unreadable", str(exc), retriable=True) from exc
-            if not isinstance(campaign, dict) or campaign.get("campaign_status") != "COMPLETE":
-                raise DispatchError("campaign_incomplete", "campaign.json is not COMPLETE", retriable=True)
+            if not isinstance(campaign, dict) or campaign.get("campaign_status") != STATUS_CAMPAIGN_COMPLETE:
+                raise DispatchError(
+                    "campaign_incomplete",
+                    f"campaign.json is not {STATUS_CAMPAIGN_COMPLETE}",
+                    retriable=True,
+                )
             if str(campaign.get("campaign_run_id") or "") != str(campaign_run_id):
                 raise DispatchError("run_id_conflict", "campaign.json run id does not match dispatch", retriable=False)
             wave_count = int(expected_wave_count or campaign.get("wave_count") or 0)

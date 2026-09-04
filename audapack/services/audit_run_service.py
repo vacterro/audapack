@@ -15,7 +15,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -1365,12 +1365,27 @@ class AuditRunCoordinator:
             actions=_actions_for(operator),
         )
 
-    def _stamp_agent_state(self, snapshot: AuditRunSnapshot) -> AuditRunSnapshot:
+    def _stamp_agent_state(
+        self,
+        snapshot: AuditRunSnapshot,
+        memo: Optional[dict[tuple[str, str], Any]] = None,
+    ) -> AuditRunSnapshot:
         """Answer 'has the agent read this yet' from the project's own inbox.
 
         Best effort by design: a project with no SAIPEN, no mirror or an
         unreadable tree simply reads NO_INBOX. A dashboard field must never be
         able to fail a refresh.
+
+        PERF-005 (audit/4.md): ``memo`` is a request-local cache keyed by
+        (root, binding). A composite refresh can hold several retained records
+        of the same project, and stamping each one used to re-run the identical
+        filesystem fingerprint. The caller passes one memo for the whole
+        refresh so a project's inbox is read once; the key includes the root
+        and binding so one project's verdict is never reused for another.
+
+        AuditRunSnapshot is frozen by design, so the verdict is applied with
+        ``dataclasses.replace`` and the enriched copy is returned -- callers
+        must use the return value, never assume the input was mutated.
         """
         try:
             project = self.projects.get_project(str(snapshot.project_id))
@@ -1379,14 +1394,21 @@ class AuditRunCoordinator:
                 return snapshot
             audits = getattr(getattr(self.projects, "config", None), "audits", None)
             binding = str(getattr(audits, "agent_receipt_path", "") or "")
-            state = agent_inbox.read_inbox_cached(root, binding_rel=binding)
-            snapshot.agent_state = state.verdict
-            snapshot.agent_summary = state.summary()
-            snapshot.agent_guidance = state.guidance
-            snapshot.agent_residue = len(state.residue)
+            key = (root, binding)
+            state = memo.get(key) if memo is not None else None
+            if state is None:
+                state = agent_inbox.read_inbox_cached(root, binding_rel=binding)
+                if memo is not None:
+                    memo[key] = state
+            return replace(
+                snapshot,
+                agent_state=state.verdict,
+                agent_summary=state.summary(),
+                agent_guidance=state.guidance,
+                agent_residue=len(state.residue),
+            )
         except Exception:
-            pass
-        return snapshot
+            return snapshot
 
     def refresh_runs(
         self,
@@ -1428,6 +1450,10 @@ class AuditRunCoordinator:
         audit_cache: dict[str, Optional[AuditSnapshot]] = {}
         intent_updates: dict[str, dict[str, Any]] = {}
         snapshots: list[AuditRunSnapshot] = []
+        # PERF-005: one agent-inbox read per (root, binding) per refresh -- not
+        # one per retained record. Multiple rows of the same project all want
+        # the same current verdict.
+        agent_memo: dict[tuple[str, str], Any] = {}
         jobs = sorted(jobs_response.get("jobs", []), key=lambda item: float(item.get("updated_at") or 0.0), reverse=True)
         for job in jobs:
             project_id = str(job.get("project_id") or "")
@@ -1446,7 +1472,7 @@ class AuditRunCoordinator:
                 audit_cache[project_id] = self.audits.get_snapshot(project_id)
             intent = by_dispatch.get(str(job.get("dispatch_id") or ""))
             snapshot = self._snapshot(job, intent, audit_cache[project_id], labels, bridge_context)
-            self._stamp_agent_state(snapshot)
+            snapshot = self._stamp_agent_state(snapshot, agent_memo)
             snapshots.append(snapshot)
             if intent:
                 seen_intents.add(str(intent.get("intent_id")))
@@ -1478,7 +1504,7 @@ class AuditRunCoordinator:
                 continue
             if selected is not None and str(intent.get("project_id")) not in selected:
                 continue
-            snapshots.append(self._stamp_agent_state(self._intent_snapshot(intent)))
+            snapshots.append(self._stamp_agent_state(self._intent_snapshot(intent), agent_memo))
         return snapshots[:RUN_HISTORY_BOUND]
 
     def latest_by_project(self, project_ids: Optional[Iterable[str]] = None) -> dict[str, AuditRunSnapshot]:

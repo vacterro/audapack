@@ -31,6 +31,7 @@ from audapack.bridge.browser_dispatch import (
     BrowserDispatcher,
     DispatchError,
 )
+from audapack.campaign import STATUS_CAMPAIGN_COMPLETE
 
 
 def archive(tmp_path: Path, name="project.zip") -> Path:
@@ -358,7 +359,6 @@ def test_full_lifecycle_frees_worker(tmp_path):
     assert d.status()["free_workers"] == 1
 
 
-
 def test_illegal_transition_rejected(tmp_path):
     d = dispatcher(tmp_path)
     path = archive(tmp_path)
@@ -459,7 +459,7 @@ def test_finalizing_requires_durable_campaign_proof(tmp_path):
     final.write_text("final", encoding="utf-8")
     campaign = tmp_path / "campaign.json"
     campaign.write_text(json.dumps({
-        "campaign_status": "COMPLETE",
+        "campaign_status": STATUS_CAMPAIGN_COMPLETE,
         "campaign_run_id": "run",
         "wave_count": 3,
         "completed_count": 3,
@@ -1031,7 +1031,7 @@ def test_complete_for_run_reconciles_blocked_post_start(tmp_path):
     final.write_text("final", encoding="utf-8")
     campaign = tmp_path / "campaign.json"
     campaign.write_text(json.dumps({
-        "campaign_status": "COMPLETE",
+        "campaign_status": STATUS_CAMPAIGN_COMPLETE,
         "campaign_run_id": "run",
         "wave_count": 3,
         "completed_count": 3,
@@ -1058,7 +1058,7 @@ def test_complete_for_run_rejects_blocked_without_recovery_state(tmp_path):
     final.write_text("final", encoding="utf-8")
     campaign = tmp_path / "campaign.json"
     campaign.write_text(json.dumps({
-        "campaign_status": "COMPLETE",
+        "campaign_status": STATUS_CAMPAIGN_COMPLETE,
         "campaign_run_id": "run",
         "wave_count": 3,
         "completed_count": 3,
@@ -1345,7 +1345,6 @@ def test_a_started_run_can_complete_directly(tmp_path):
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
 
 
-
 def test_recovery_survives_a_runtime_that_re_derived_its_run_id(tmp_path):
     """The lease is the ownership proof, not an echoed campaign run id.
 
@@ -1403,7 +1402,7 @@ def test_a_finished_campaign_completes_a_run_whose_ack_never_landed(tmp_path):
     campaign_dir.mkdir()
     (campaign_dir / "campaign.json").write_text(_json.dumps({
         "campaign_run_id": "acb-done",
-        "campaign_status": "COMPLETE",
+        "campaign_status": STATUS_CAMPAIGN_COMPLETE,
         "profile_id": "quick3",
         "wave_count": 3,
         "completed_count": 3,

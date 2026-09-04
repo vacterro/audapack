@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
+from audapack.fidelity import build_plan_from_config
 from audapack.models import PackResult
 from audapack.packing import (
-    eligible_source_files,
     find_archive_for_project,
     pack_single,
     resolve_output_dir,
@@ -55,6 +55,7 @@ class PackingService:
             log_callback=log_callback,
             progress_callback=progress_callback,
             manifest_meta={"project_name": proj.display_name, "extra_meta": extra_meta} if self.config.packing.manifest_enabled else None,
+            packing=self.config.packing,
         )
 
     def ensure_fresh_archive(self, project_id: str, *, cancel_event=None, log_callback=None):
@@ -87,20 +88,26 @@ class PackingService:
         # archive traversed exactly the node_modules/.venv/.git/objects weight
         # that packing excludes for performance.
         excludes = set(self.config.packing.excludes)
+        # T-147: the source-root mtime alone settles the common repack case, so
+        # it is checked BEFORE the plan build (a full walk) -- a changed root
+        # must not pay for a walk the pack is about to repeat anyway.
         try:
             if source.stat().st_mtime > archive_mtime:
                 return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
-            for candidate in eligible_source_files(source, excludes):
-                try:
-                    if candidate.stat().st_mtime > archive_mtime:
-                        return self.pack_project(
-                            project_id, cancel_event=cancel_event, log_callback=log_callback
-                        )
-                except OSError:
-                    # An unreadable eligible file cannot be proven unchanged.
-                    return self.pack_project(
-                        project_id, cancel_event=cancel_event, log_callback=log_callback
-                    )
         except OSError:
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+        # T-147 freshness fusion: the plan walk IS the freshness walk. It sees
+        # the SAME decisions as the packer (sampled-out media can never force
+        # endless repacks), stats every file once for size AND mtime, and only
+        # INCLUDED files newer than the archive invalidate it. A traversal or
+        # stat failure (plan.failed > 0) means freshness cannot be proven, so
+        # we repack rather than reuse an archive that may miss changed files.
+        try:
+            plan = build_plan_from_config(
+                source, self.config.packing, excludes, newer_than_mtime=archive_mtime
+            )
+        except OSError:
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
+        if plan.failed > 0 or plan.newer_found:
             return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
         return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), output_path=existing, success=True)

@@ -1124,6 +1124,49 @@ def test_an_a10_lane_shows_ten_waves_not_three(tmp_path):
     assert "0/10" in run.summary
 
 
+def test_agent_state_is_read_once_per_project_per_refresh(tmp_path, monkeypatch):
+    """PERF-005 (audit/4.md): a composite refresh fingerprints one project once.
+
+    Two retained records of the same project used to each re-run the identical
+    agent-inbox fingerprint; the request-local memo must collapse them to one
+    read while still keeping distinct projects distinct.
+    """
+    import audapack.agent_inbox as agent_inbox_module
+
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+    assert len(bridge.jobs) == 1
+    # A second retained record for the same project (e.g. an older wave's job
+    # still in history) plus one for another project.
+    second_p1 = dict(bridge.jobs[0])
+    second_p1["dispatch_id"] = "dsp-second"
+    bridge.jobs.append(second_p1)
+    p2 = dict(bridge.jobs[0])
+    p2.update({"dispatch_id": "dsp-p2", "project_id": "p2", "project_name": "Project p2"})
+    bridge.jobs.append(p2)
+    service.projects.values["p2"] = project("p2")
+
+    reads = []
+
+    def counting(root, binding_rel=None, **_kwargs):
+        reads.append(str(root))
+        return SimpleNamespace(
+            verdict="EMPTY", guidance="", residue=[], summary=lambda: "empty inbox",
+        )
+
+    monkeypatch.setattr(agent_inbox_module, "read_inbox_cached", counting)
+    runs = service.refresh_runs()
+    # Two records of p1, one of p2: p1 must be fingerprinted once, p2 once.
+    p1_snaps = [r for r in runs if r.project_id == "p1"]
+    p2_snaps = [r for r in runs if r.project_id == "p2"]
+    assert len(p1_snaps) >= 2
+    assert len(p2_snaps) >= 1
+    assert len(reads) == 2, f"expected one read per project, got {len(reads)}"
+    assert sorted(set(reads)) == ["C:/p1", "C:/p2"]
+    assert all(r.agent_state == "EMPTY" for r in runs if r.project_id in ("p1", "p2"))
+    assert agent_inbox_module.read_inbox_cached is counting, "monkeypatch must still be live"
+
+
 def test_quick3_still_shows_three(tmp_path):
     service, bridge, audits = coordinator(tmp_path)
     service.start("p1", "quick3")

@@ -164,8 +164,20 @@ class PackResult:
     output_path: Optional[Path] = None
     success: bool = False
     files_added: int = 0
+    # T-147: source files actually written to the archive. files_added also
+    # counts generated entries (e.g. the manifest), so the audit invariant
+    # discovered == files_included + files_excluded + files_failed uses this.
+    files_included: int = 0
     raw_bytes: int = 0
     archive_bytes: int = 0
     skipped_files: int = 0
     walk_errors: int = 0
     error_message: str = ""
+    # Truthful accounting (T-147): a file is either included, excluded with a
+    # reason, or failed. discovered == included + excluded + failed.
+    files_discovered: int = 0
+    files_excluded: int = 0
+    files_failed: int = 0
+    excluded_bytes: int = 0
+    fidelity_profile: str = ""
+    archive_semantics: str = ""

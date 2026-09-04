@@ -40,7 +40,13 @@
     ],
     "manifest_enabled": true,
     "include_timestamp": true,
-    "output_layout": "single_folder"
+    "output_layout": "single_folder",
+    "fidelity_profile": "standard",
+    "fidelity_max_mb": 0,
+    "fidelity_media_samples": 0,
+    "fidelity_media_bytes": 0,
+    "always_include": ["fixtures/**"],
+    "always_exclude": []
   },
   "audits": {
     "root": "PATH_TO_AUDITING_IMPLEMENTATION",

@@ -497,6 +497,23 @@ class PackingConfig:
     # treated as single_folder (the old behaviour) so migration is a no-op.
     output_layout: str = DEFAULT_OUTPUT_LAYOUT
     include_timestamp: bool = True
+    # Fidelity profiles (T-147): what kind of archive a pack represents.
+    #: compact|standard|deep|full. STANDARD is the default: a normal deep AI
+    #: audit with media sampling, so media-heavy projects cannot produce
+    #: absurd archives. FULL is the only profile that claims a full snapshot.
+    fidelity_profile: str = "standard"
+    #: Soft budget override in MB (0 = profile default). Never trims mandatory
+    #: audit material or dependency-referenced assets.
+    fidelity_max_mb: int = 0
+    #: Representative media files physically kept per media-heavy directory
+    #: (0 = profile default). Inventory still records every discovered file.
+    fidelity_media_samples: int = 0
+    #: Byte cap per media-heavy directory for kept samples (0 = profile default).
+    fidelity_media_bytes: int = 0
+    #: User overrides: these win over the profile but never over safety policy
+    #: (mandatory secret exclusions always win).
+    always_include: list[str] = field(default_factory=list)
+    always_exclude: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -545,6 +562,17 @@ class AuditsConfig:
     warm_seconds: int = 24 * 3600         # <= 24 hours
     cool_seconds: int = 72 * 3600         # <= 72 hours
     cold_seconds: int = 7 * 86400         # <= 7 days
+
+
+def _normalized_fidelity_profile(value: Any) -> str:
+    """Keep the persisted pack profile inside the known fidelity set.
+
+    An unknown value falls back to STANDARD (the declared default), so an old
+    config without the field keeps producing honest standard archives.
+    """
+    from audapack.fidelity import normalize_fidelity_profile
+
+    return normalize_fidelity_profile(value)
 
 
 def _normalized_audit_profile(value: Any) -> str:
@@ -1182,6 +1210,12 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         manifest_enabled=bool(packing_raw.get("manifest_enabled", data.get("manifest_enabled", True))),
         output_layout=normalize_output_layout(packing_raw.get("output_layout", DEFAULT_OUTPUT_LAYOUT)),
         include_timestamp=bool(packing_raw.get("include_timestamp", True)),
+        fidelity_profile=_normalized_fidelity_profile(packing_raw.get("fidelity_profile")),
+        fidelity_max_mb=_as_int(packing_raw.get("fidelity_max_mb", 0), 0),
+        fidelity_media_samples=_as_int(packing_raw.get("fidelity_media_samples", 0), 0),
+        fidelity_media_bytes=_as_int(packing_raw.get("fidelity_media_bytes", 0), 0),
+        always_include=list(packing_raw.get("always_include", []) or []),
+        always_exclude=list(packing_raw.get("always_exclude", []) or []),
     )
 
     audits_raw = data.get("audits", {})

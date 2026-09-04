@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-09-05
+
+### Added
+- Audit fidelity profiles. Packing now runs under one of four declared profiles — COMPACT, STANDARD (default), DEEP, FULL — each with a soft byte budget (10 / 30 / 100 MB, uncapped) and per-directory media sampling. An archive is now explicitly either an *audit representation* (COMPACT/STANDARD/DEEP) or a *full snapshot* (FULL), and the manifest says which: `fidelity_profile`, `archive_semantics`, `budget_bytes`, `budget_met`, per-reason exclusion totals, `largest_omitted`, `pruned_directories` and a `media_inventory` that lists every media file it saw, included or not. Profile, byte cap, sample counts and `always_include`/`always_exclude` overrides are configurable (`config.example.json`, Settings dialog).
+- The budget is deliberately soft: mandatory audit material (code, tests, configs, manifests, schemas, build/runtime-referenced assets and anything named in `always_include`) is never trimmed to reach a target. A source-heavy project overshoots its profile budget and the manifest declares `budget_met: false` rather than silently dropping source.
+
+### Fixed
+- Packing accounting no longer goes quietly false on an unusual tree. The identity `discovered == included + excluded + failed` now holds across symlinked files, unreadable entries and untraversable directories, and a partly enumerated tree is declared with `walk_incomplete` instead of being presented as complete accounting. The symlink probe is itself a `stat`, so before this an EACCES file escaped the per-file guard, ended the whole walk, and reported an empty tree as a valid audit representation.
+- Bridge status endpoints stop re-deriving per-request state: the agent-state stamp uses a request-local `(root, binding)` memo, `invalid_auth` compaction runs under canonical proof with byte-identical token-replacement recovery, index writes are membership-only, and job pruning keeps sole copies under a 400-job bound.
+
 ## [0.2.3] - 2026-09-01
 
 ### Fixed
