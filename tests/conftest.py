@@ -62,8 +62,19 @@ def pytest_sessionfinish(session, exitstatus):
             reporter.write_line(f"  {nodeid} -> {exe}", red=True)
 
 
-@pytest.fixture(autouse=True, scope="session")
+@pytest.fixture(autouse=True)
 def isolate_audapack_runtime():
+    """A fresh runtime per test, not per session.
+
+    W2-009 (audit/3.md): this was session-scoped, so a test that writes durable
+    security state -- the legacy-token revocation marker -- leaked it into every
+    later test in the process, and
+    `test_legacy_token_acceptance_marker_roundtrip` before
+    `test_legacy_candidates_env_based_and_revocable` failed only because of
+    collection order. A per-test runtime costs one mkdtemp per test and removes
+    the whole class: nothing can leak in either direction, and no test can ever
+    inspect or mutate the operator's real runtime directory.
+    """
     temp_dir = tempfile.mkdtemp(prefix="audapack_test_runtime_")
     old_val = os.environ.get("AUDAPACK_RUNTIME_DIR")
     os.environ["AUDAPACK_RUNTIME_DIR"] = temp_dir
