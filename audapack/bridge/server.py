@@ -208,21 +208,8 @@ def _widget_source_for_endpoint(content: bytes, host_header: Optional[str], conf
     return _WIDGET_UPDATE_DIRECTIVE_RE.sub(replacement, content)
 
 
-#: The live token, keyed on the signature of the files it comes from
-#: (PERF-002). One entry: there is one canonical token file per runtime.
-_AUTH_TOKEN_CACHE: dict[str, Any] = {}
-
-
-def _file_signature(path: Path) -> Optional[tuple[int, int]]:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return (stat.st_mtime_ns, stat.st_size)
-
-
 def _live_bridge_token() -> str:
-    """The current canonical Bridge token, read only when its file moves.
+    """The current canonical Bridge token, read straight from its file.
 
     PERF-002 (audit/2.md): `check_auth()` called `load_config()` on EVERY
     authenticated request just to obtain a second token candidate -- and
@@ -234,28 +221,20 @@ def _live_bridge_token() -> str:
     project-storage latency, on every worker heartbeat and every 4-second UI
     cycle.
 
-    Rotation still takes effect with no restart: the token file's
-    (mtime_ns, size) is the cache key, so a rewritten token is picked up on the
-    very next request.
+    The token file is a few dozen bytes and is NOT cached: a first attempt keyed
+    it on (mtime_ns, size) like the widget bundle, and a rotation to a
+    same-length value inside one filesystem timestamp tick was then invisible --
+    which is a stale credential, the one thing this must never be. Dropping
+    `load_config()` is the whole win; re-reading 40 bytes is not a cost.
     """
     try:
         token_file = get_token_file_path()
     except Exception:
         return ""
-    signature = _file_signature(token_file)
-    if signature is None:
-        _AUTH_TOKEN_CACHE.clear()
-        return ""
-    key = (str(token_file), signature)
-    if _AUTH_TOKEN_CACHE.get("key") == key:
-        return str(_AUTH_TOKEN_CACHE.get("token") or "")
     try:
-        token = token_file.read_text(encoding="utf-8").strip()
+        return token_file.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
-    _AUTH_TOKEN_CACHE.clear()
-    _AUTH_TOKEN_CACHE.update(key=key, token=token)
-    return token
 
 
 # Global callback for notifying UI of new audits or auto-registered projects

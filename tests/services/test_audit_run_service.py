@@ -1344,3 +1344,74 @@ def test_a_changed_intent_status_is_still_persisted(tmp_path):
     stored = next(item for item in service.intents.list() if item["intent_id"] == intent["intent_id"])
     assert stored["status"] != "PREPARING", "the intent never advanced"
     assert stored["dispatch_id"], "the dispatch was never bound to its intent"
+
+
+def _diagnostic(**overrides):
+    fields = {
+        "project_id": "p1", "project_name": "Project", "operator_state": "BLOCKED_POST_START",
+        "summary": "blocked", "handoff_sha256": "abc",
+    }
+    fields.update(overrides)
+    return json.loads(AuditRunCoordinator.diagnostics(AuditRunSnapshot(**fields)))
+
+
+def test_diagnostics_strip_credentials_from_worker_error_text():
+    r"""CORE-006 (audit/3.md): the record promises "never tokens or content".
+
+    `error` and `recovery` were copied verbatim, and browser_dispatch accepts
+    worker-supplied payload["error"] straight into durable job state -- so that
+    text is arbitrary. Reproduced: `Bearer TOPSECRET token=abc123
+    /home/private/raw.txt` and a Windows path all survived into the JSON the UI
+    offers the operator to copy as a safe diagnostic.
+    """
+    doc = _diagnostic(
+        error="Bearer TOPSECRET token=abc123 while reading /home/private/raw.txt",
+        recovery=r"authorization: Basic Zm9v at C:\Users\Private\notes.md",
+    )
+    blob = json.dumps(doc)
+    for marker in ("TOPSECRET", "abc123", "Zm9v", "/home/private", "Users", "Private"):
+        assert marker not in blob, f"{marker} survived into a redacted diagnostic"
+    # The filename survives: it is the part that helps a support reader.
+    assert "raw.txt" in doc["error"]
+    assert "notes.md" in doc["recovery"]
+
+
+def test_diagnostics_reduce_paths_on_either_platform_grammar():
+    doc = _diagnostic(
+        handoff_path=r"C:\Users\Private\secret-result.md",
+        error=r"copy failed: \\FILESRV\share\audit\out.md -> /var/tmp/staging/out.md",
+    )
+    assert doc["handoff_filename"] == "secret-result.md"
+    assert "FILESRV" not in json.dumps(doc)
+    assert "/var/tmp" not in json.dumps(doc)
+    assert "out.md" in doc["error"]
+
+
+def test_diagnostics_keep_the_identifiers_support_actually_needs():
+    doc = _diagnostic(
+        dispatch_id="dsp-0123456789abcdef",
+        campaign_run_id="acb-run-0001",
+        intent_id="int-abc",
+        handoff_sha256="deadbeef",
+        worker_counts={"active": 6, "clean": 2},
+        operator_state="READY",
+        ready=True,
+    )
+    assert doc["dispatch_id"] == "dsp-0123456789abcdef"
+    assert doc["campaign_run_id"] == "acb-run-0001"
+    assert doc["intent_id"] == "int-abc"
+    assert doc["handoff_sha256"] == "deadbeef"
+    assert doc["worker_counts"] == {"active": 6, "clean": 2}
+    assert doc["operator_state"] == "READY"
+    assert doc["ready"] is True
+
+
+def test_redaction_happens_before_truncation():
+    """A limit must never cut a marker in half and leave the secret behind it."""
+    from audapack.services.audit_run_service import _redact_diagnostic_text
+
+    padding = "x" * 480
+    text = f"{padding} token=SUPERSECRETVALUE trailing"
+    out = _redact_diagnostic_text(text, 500)
+    assert "SUPERSECRETVALUE" not in out
+    assert "[redacted]" in out

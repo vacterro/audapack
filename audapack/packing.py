@@ -289,6 +289,19 @@ def create_zip(
                 # chosen source and can pull in arbitrary external data.
                 if source.is_symlink():
                     raise ValueError(f"Refusing to package symlink source: {source}")
+                # CORE-003 (audit/3.md): the mandatory-secret boundary existed
+                # only for directory traversal. `--pack <file>` and the Explorer
+                # context menu route straight here, so selecting a file named
+                # `token.txt` produced a perfectly successful ZIP containing the
+                # secret -- reproduced: success=True, entries ['token.txt'],
+                # payload SECRET. These archives exist to be uploaded to an AI
+                # auditor, which makes that a disclosure path, not a nuisance.
+                # Refused loudly rather than packed empty: an empty successful
+                # archive is a worse answer than an error.
+                if _path_is_excluded_normalized(source, normalized_excludes):
+                    raise ValueError(
+                        f"Refusing to package an excluded file: {source.name} matches an exclusion rule"
+                    )
                 arcname = source.name
                 zinfo = zipfile.ZipInfo.from_file(source, arcname, strict_timestamps=False)
                 zinfo.compress_type = zipfile.ZIP_DEFLATED
@@ -467,14 +480,32 @@ def find_latest_archive(output_dir: Path, stem: str) -> Optional[Path]:
 
 
 def find_archive_for_project(project: "Project", output_dir: Path) -> Optional[Path]:
-    """Resolve latest archive for registered project using one directory index."""
-    stems = {safe_archive_stem(stem or "") for stem in (
-        project.archive_name, project.display_name, project.id
-    )}
-    stems.discard("")
-    for _mtime, path in _archive_directory_index(output_dir):
-        if any(archive_belongs_to_stem(Path(path).name, stem) for stem in stems):
-            return Path(path)
+    """The canonical archive for a project, by explicit identity first.
+
+    CORE-005 (audit/3.md): every alias went into ONE unordered set, and blank
+    values were passed through `safe_archive_stem()` -- which maps "" to the
+    literal fallback `"Archive"`. Two consequences, both reproduced: a project
+    with no `archive_name` matched a stray generic `Archive.zip` in the output
+    directory, and a NEWER display-name archive won over the explicitly
+    configured `archive_name` because the scan was global newest-first. This
+    resolver feeds packing freshness and Bridge artifact ownership, so it decided
+    those on the wrong ZIP.
+
+    Ordered phases now: the configured `archive_name` family, then the display
+    name, then the id. Newest-within-a-family is unchanged -- that is the history
+    behaviour timestamped archives depend on. A blank value contributes no alias
+    at all, because it is not an identity.
+    """
+    index = _archive_directory_index(output_dir)
+    for raw in (project.archive_name, project.display_name, project.id):
+        if not str(raw or "").strip():
+            continue
+        stem = safe_archive_stem(str(raw))
+        if not stem:
+            continue
+        for _mtime, path in index:
+            if archive_belongs_to_stem(Path(path).name, stem):
+                return Path(path)
     return None
 
 

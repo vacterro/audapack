@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -548,6 +549,53 @@ def _basename_any_platform(value: str) -> str:
     if not text:
         return ""
     return text.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+#: Anything shaped like a filesystem path, on either platform, including UNC.
+_DIAGNOSTIC_PATH_RE = re.compile(
+    r"""(?:[A-Za-z]:[\\/]|\\\\[^\s\\]+\\|/)(?:[^\s'"<>|]*)""",
+)
+#: Authorization material an operator would not expect to hand out. Values only:
+#: the KEY stays so the reader can see that something was removed. The value
+#: alternation takes a scheme prefix too, or `authorization: Basic Zm9v` loses
+#: only the word "Basic" and leaves the credential standing next to it.
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \b(?:bearer|basic)\s+\S+
+      | \b(?:token|secret|password|passwd|pwd|api[_-]?key|authorization|auth)\b
+        \s*[:=]\s*
+        (?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+\S+|\S+)
+    )
+    """,
+)
+
+
+def _redact_diagnostic_text(value: str, limit: int) -> str:
+    """Free text from a worker, with paths and credentials removed.
+
+    CORE-006 (audit/3.md): `diagnostics()` promises "identities and state only,
+    never tokens or content", then copied `snapshot.error` and
+    `snapshot.recovery` verbatim -- and `browser_dispatch` accepts
+    worker-supplied `payload["error"]` straight into durable job state, so that
+    text is arbitrary. Reproduced: `Bearer TOPSECRET token=abc123
+    /home/private/raw.txt` in error and a Windows path plus SECRET_CONTENT in
+    recovery all survived into the purportedly redacted JSON, which the UI
+    offers the operator to copy.
+
+    Paths become their basename rather than vanishing: the filename is the part
+    that helps a support reader, and the directory is the part that identifies
+    the operator. Redaction happens BEFORE truncation, so a limit can never cut
+    a marker in half and leave the secret behind it.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    text = _DIAGNOSTIC_SECRET_RE.sub("[redacted]", text)
+    text = _DIAGNOSTIC_PATH_RE.sub(
+        lambda match: _basename_any_platform(match.group(0)) or "[path]", text
+    )
+    return text[:limit]
 
 
 def _actions_for(operator_state: str) -> tuple[str, ...]:
@@ -1366,8 +1414,8 @@ class AuditRunCoordinator:
             "final_handoff_present": snapshot.handoff_present,
             "handoff_filename": _basename_any_platform(snapshot.handoff_path),
             "handoff_sha256": snapshot.handoff_sha256,
-            "error": snapshot.error[:500],
-            "recovery": snapshot.recovery[:200],
+            "error": _redact_diagnostic_text(snapshot.error, 500),
+            "recovery": _redact_diagnostic_text(snapshot.recovery, 200),
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "completed_at": snapshot.completed_at,

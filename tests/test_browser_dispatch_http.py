@@ -107,8 +107,10 @@ def test_dispatch_jobs_submit_then_claim(bridge_server, tmp_path):
     lease_id = payload["job"]["lease_id"]
 
     # Worker transitions through the lifecycle
+    handoff = tmp_path / "DISPATCH_A__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
     for to_state in ("ARTIFACT_FETCHED", "ATTACHED", "START_PREPARED", "STARTED", "AUDITING", "COMPLETE"):
-        status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+        body = {
             "dispatch_id": dispatch_id,
             "worker_id": "w_alpha",
             "lease_id": lease_id,
@@ -116,7 +118,12 @@ def test_dispatch_jobs_submit_then_claim(bridge_server, tmp_path):
             "campaign_run_id": "runX",
             "conversation_id": "cX",
             "start_receipt": "receipt-start-1",
-        }, config.bridge.token)
+        }
+        if to_state == "COMPLETE":
+            # W2-004: terminal COMPLETE carries proof, or it is held at
+            # FINALIZING for the Bridge's own reconciliation.
+            body["final_handoff_path"] = str(handoff)
+        status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", body, config.bridge.token)
         assert status == 200, (to_state, payload)
     assert payload["job"]["state"] == "COMPLETE"
 

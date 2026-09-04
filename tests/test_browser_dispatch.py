@@ -26,6 +26,7 @@ from audapack.bridge.browser_dispatch import (
     POST_START_RECOVERY_GRACE_SECONDS,
     TERMINAL_ACK_WINDOW_SECONDS,
     WORKER_AUDITING,
+    WORKER_FREE,
     WORKER_TTL_SECONDS,
     BrowserDispatcher,
     DispatchError,
@@ -344,10 +345,18 @@ def test_full_lifecycle_frees_worker(tmp_path):
     d.register_worker(worker("w1"))
     item = d.enqueue_job(job_payload(path))
     lease = d.claim_job("w1")
+    handoff = tmp_path / "PROJECT__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
     for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING, JOB_COMPLETE):
-        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt-start"})
+        # W2-004: terminal COMPLETE needs proof. A worker ACK carrying a handoff
+        # that exists is proof; an empty one is not (see the tests below).
+        extra = {"campaign_run_id": "run", "start_receipt": "receipt-start"}
+        if state == JOB_COMPLETE:
+            extra["final_handoff_path"] = str(handoff)
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, extra)
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
     assert d.status()["free_workers"] == 1
+
 
 
 def test_illegal_transition_rejected(tmp_path):
@@ -1319,6 +1328,7 @@ def test_a_lost_auditing_ack_never_blocks_a_finished_audit(tmp_path):
 
 
 def test_a_started_run_can_complete_directly(tmp_path):
+    """The legacy STARTED -> COMPLETE edge, WITH the proof W2-004 now requires."""
     d = dispatcher(tmp_path)
     path = archive(tmp_path)
     d.register_worker(supported_worker("w1"))
@@ -1327,8 +1337,13 @@ def test_a_started_run_can_complete_directly(tmp_path):
     for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
         d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
                          {"campaign_run_id": "run", "start_receipt": "receipt"})
-    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {"campaign_run_id": "run"})
+    handoff = tmp_path / "PROJECT__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "campaign_run_id": "run", "final_handoff_path": str(handoff),
+    })
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
 
 
 def test_recovery_survives_a_runtime_that_re_derived_its_run_id(tmp_path):
@@ -2612,3 +2627,220 @@ def test_the_generation_never_decreases_across_repeated_reloads(tmp_path):
 
     assert seen == sorted(seen), f"generation went backwards somewhere: {seen}"
     assert len(set(seen)) == len(seen), f"generation repeated a value: {seen}"
+
+
+def test_a_failed_claim_leaves_the_worker_free_too(tmp_path, monkeypatch):
+    """W2-003 (audit/3.md): the job half was restored, the worker half was not.
+
+    `claim_job()` sets job=LEASED and worker=RESERVED, then persists. On a failed
+    write the job was rolled back but the worker stayed RESERVED, so the lane was
+    held for a claim that never happened -- memory said reserved, disk said
+    QUEUED/FREE. Measured: memory job=LEASED, memory worker=RESERVED, durable
+    job=QUEUED.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, "CLAIMFAIL"))
+
+    real_write = bd._atomic_write_json
+
+    def refuse_jobs(target, value):
+        if Path(target).name == "jobs.json":
+            raise OSError("injected jobs.json replace failure")
+        return real_write(target, value)
+
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_jobs)
+    with pytest.raises(OSError):
+        d.claim_job("w1")
+    monkeypatch.undo()
+
+    assert d.get_job(item.dispatch_id).state == JOB_QUEUED
+    worker = {w.worker_id: w for w in d.list_workers()}["w1"]
+    assert worker.state == WORKER_FREE, "the lane stayed reserved for a claim that never committed"
+    assert d.get_job(item.dispatch_id).assigned_worker_id == ""
+
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    assert reloaded.get_job(item.dispatch_id).state == JOB_QUEUED
+
+    # And the same worker can still claim once the disk is writable again.
+    lease = d.claim_job("w1")
+    assert lease is not None and lease.dispatch_id == item.dispatch_id
+
+
+def test_a_failed_enqueue_leaves_no_durable_hidden_job(tmp_path, monkeypatch):
+    """A caller told its enqueue failed must not find the job queued later."""
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+
+    real_write = bd._atomic_write_json
+
+    def refuse_jobs(target, value):
+        if Path(target).name == "jobs.json":
+            raise OSError("injected jobs.json replace failure")
+        return real_write(target, value)
+
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_jobs)
+    with pytest.raises(OSError):
+        d.enqueue_job(job_payload(path, "GHOST"))
+    monkeypatch.undo()
+
+    assert d.list_jobs() == [], "a refused enqueue left the job in memory"
+    reloaded = BrowserDispatcher(state_dir=tmp_path / "dispatch")
+    assert reloaded.list_jobs() == [], "a refused enqueue left a durable hidden job"
+
+
+def test_a_heartbeat_survives_a_failed_job_write(tmp_path, monkeypatch):
+    """Rollback restores OWNERSHIP, not liveness: the window really did report."""
+    import audapack.bridge.browser_dispatch as bd
+
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    d.enqueue_job(job_payload(path, "HEARTBEAT"))
+    before = {w.worker_id: w for w in d.list_workers()}["w1"].last_seen_at
+
+    real_write = bd._atomic_write_json
+
+    def refuse_jobs(target, value):
+        if Path(target).name == "jobs.json":
+            raise OSError("injected failure")
+        return real_write(target, value)
+
+    time.sleep(0.01)
+    monkeypatch.setattr(bd, "_atomic_write_json", refuse_jobs)
+    with pytest.raises(OSError):
+        d.claim_job("w1")
+    monkeypatch.undo()
+
+    after = {w.worker_id: w for w in d.list_workers()}["w1"].last_seen_at
+    assert after >= before, "a rollback erased a real heartbeat"
+
+
+def _to_started(d, tmp_path, name="UNPROVEN"):
+    path = archive(tmp_path, f"{name}.zip")
+    d.register_worker(supported_worker("w1"))
+    item = d.enqueue_job(job_payload(path, name))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": f"run-{name}", "start_receipt": "receipt"})
+    return item, lease
+
+
+def test_an_unproven_direct_complete_never_terminalizes_a_run(tmp_path):
+    """W2-004 (audit/3.md): a worker cannot mint terminal state.
+
+    STARTED/AUDITING -> COMPLETE required NO proof: an empty payload
+    terminalized the job, freed the lane, and a second audit for the same project
+    was then accepted while the first may still have been running. Measured:
+    terminal_state=COMPLETE, handoff_path='', worker FREE, re-enqueue accepted.
+    """
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path)
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {})
+
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_FINALIZING, "an unproven ACK terminalized the run"
+    assert job.final_handoff_path == ""
+    assert job.assigned_worker_id == "w1", "the lane was released without proof"
+    worker = {w.worker_id: w for w in d.list_workers()}["w1"]
+    assert worker.state != WORKER_FREE, "the window was freed for the next audit"
+
+
+def test_a_forged_handoff_path_is_not_proof(tmp_path):
+    """Copying the fields whenever present makes them a claim, not proof."""
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "FORGED")
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "final_handoff_path": str(tmp_path / "does-not-exist.md"),
+        "final_handoff_sha256": "deadbeef",
+    })
+    assert d.get_job(item.dispatch_id).state == JOB_FINALIZING
+
+
+def test_a_wrong_digest_is_not_proof(tmp_path):
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "BADSHA")
+    handoff = tmp_path / "BADSHA__00_AUDIT_ALL_3.md"
+    handoff.write_text("real bytes", encoding="utf-8")
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": "0" * 64,
+    })
+    assert d.get_job(item.dispatch_id).state == JOB_FINALIZING
+
+
+def test_a_real_handoff_with_a_matching_digest_closes_the_lane(tmp_path):
+    import hashlib
+
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "GOODSHA")
+    handoff = tmp_path / "GOODSHA__00_AUDIT_ALL_3.md"
+    payload = b"final handoff bytes"
+    handoff.write_bytes(payload)
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(payload).hexdigest(),
+    })
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_COMPLETE
+    assert job.final_handoff_path == str(handoff)
+    worker = {w.worker_id: w for w in d.list_workers()}["w1"]
+    assert worker.state == WORKER_FREE
+
+
+def test_the_bridges_own_campaign_probe_is_proof_enough(tmp_path):
+    """The Bridge can confirm independently of the worker's word."""
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "PROBED")
+    handoff = tmp_path / "PROBED__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    d.set_campaign_probe(lambda project_id, project_name: {
+        "complete": True,
+        "handoff_path": str(handoff),
+        "handoff_sha256": "abc123",
+        "campaign_run_id": "run-PROBED",
+        "handoff_written_at": 0.0,
+    })
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {})
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_COMPLETE
+    assert job.final_handoff_path == str(handoff)
+
+
+def test_a_probe_that_says_unfinished_keeps_the_lane(tmp_path):
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "NOTDONE")
+    d.set_campaign_probe(lambda project_id, project_name: {"complete": False})
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {})
+    assert d.get_job(item.dispatch_id).state == JOB_FINALIZING
+
+
+def test_an_already_complete_dispatch_acks_idempotently(tmp_path):
+    """The normal path arrives here already COMPLETE; a re-ACK is a no-op."""
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "REACK")
+    handoff = tmp_path / "REACK__00_AUDIT_ALL_3.md"
+    handoff.write_text("final", encoding="utf-8")
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "final_handoff_path": str(handoff),
+    })
+    assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
+
+    # Same ACK again, now with nothing in the payload at all.
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {})
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_COMPLETE
+    assert job.final_handoff_path == str(handoff)

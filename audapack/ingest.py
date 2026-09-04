@@ -355,6 +355,31 @@ def ingest_audit_text(
         latest_filename = f"{resolved_name}__{w_def.number}_{w_def.slug}.md"
         prepared.append((wid, latest_filename, chunk_clean))
 
+    # CORE-004 (audit/3.md): cross-wave run-id equality is a pure function of
+    # the pasted text, and it used to run AFTER project registration and
+    # directory creation. So an unknown project pasting two waves with different
+    # CAMPAIGN_RUN_IDs was refused -- with "all ingest writes rolled back" --
+    # having already created config.json, a durable registry entry ('new_bad',
+    # 'NEW_BAD') and audits/SIDE1/NEW_BAD on disk. Registration is COMMIT;
+    # anything decidable without it belongs here, in prepare.
+    canonical_run_ids: set[str] = set()
+    for _wid, _filename, chunk_clean in prepared:
+        rid = _extract_campaign_run_id(chunk_clean)
+        if rid:
+            canonical_run_ids.add(rid)
+    if len(canonical_run_ids) > 1:
+        return IngestResult(
+            ok=False,
+            project_name=resolved_name,
+            profile_id=profile.profile_id,
+            error=(
+                "Multiple campaign run IDs detected across waves: "
+                + ", ".join(sorted(canonical_run_ids))
+                + ". All waves in a single ingest must share one CAMPAIGN_RUN_ID."
+                + " Nothing was written and no project was registered."
+            ),
+        )
+
     if proj is None:
         try:
             proj, _created = registry.resolve_or_register_project(target_project_name)
@@ -411,29 +436,14 @@ def ingest_audit_text(
     all3_path = None
 
     try:
-        # W4-003: derive the canonical campaign run id from the wave content
+        # W4-003: the canonical campaign run id comes from the wave content
         # itself, so the same id flows through the wave files, the synthesized
         # __00_AUDIT_ALL_3.md, the campaign.json index, and the Bridge payload
-        # that will carry them. Two patches above this line already extracted
-        # the `campaign_run_id` value via parse_wave; reading the raw header
-        # from each chunk is the most robust way to enforce cross-wave
-        # equality and to detect a third-party paste that swapped the id
-        # mid-campaign. The mint-only legacy path is preserved for ingest
-        # calls that supply no CAMPAIGN_RUN_ID header at all.
-        canonical_run_ids: set[str] = set()
-        for _wid, _path, chunk_clean in prepared:
-            rid = _extract_campaign_run_id(chunk_clean)
-            if rid:
-                canonical_run_ids.add(rid)
-        if len(canonical_run_ids) > 1:
-            return _ingest_failure(
-                resolved_name,
-                profile.profile_id,
-                "Multiple campaign run IDs detected across waves: "
-                + ", ".join(sorted(canonical_run_ids))
-                + ". All waves in a single ingest must share one CAMPAIGN_RUN_ID.",
-                snapshots,
-            )
+        # that will carry them. Cross-wave equality was already proven in
+        # prepare, before any registration or directory creation (CORE-004);
+        # what remains here is choosing the id and, below, comparing it against
+        # a campaign already on disk -- which needs target_dir and therefore
+        # cannot move earlier.
         if len(canonical_run_ids) == 1:
             ingest_run_id = next(iter(canonical_run_ids))
         else:

@@ -370,8 +370,10 @@ class BrowserDispatcher:
         self._widget_reload_asked: dict[str, str] = {}
         self._jobs: dict[str, DispatchJob] = {}
         #: The job list as last written to disk, and whether the generation
-        #: notification for it still needs publishing (W2-004).
+        #: notification for it still needs publishing (W2-004). The worker
+        #: ownership that went with that write is snapshotted too (W2-003).
         self._committed_jobs: list[dict[str, Any]] = []
+        self._committed_workers: dict[str, dict[str, Any]] = {}
         self._generation_pending = False
         self._expired_worker_count = 0
         self._campaign_probe: Optional[Any] = None
@@ -453,6 +455,33 @@ class BrowserDispatcher:
             for job in self._jobs.values()
         ]
 
+    #: Worker fields a job mutation owns. Liveness (last_seen_at) is NOT one of
+    #: them: a heartbeat is a fact about the window and must survive a failed
+    #: job write.
+    _OWNED_WORKER_FIELDS = ("state", "last_assigned_at", "campaign_run_id")
+
+    def _worker_state_snapshot(self) -> dict[str, dict[str, Any]]:
+        return {
+            worker_id: {name: getattr(worker, name) for name in self._OWNED_WORKER_FIELDS}
+            for worker_id, worker in self._workers.items()
+        }
+
+    def _restore_worker_state(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        """Put worker OWNERSHIP back where the last durable write left it.
+
+        W2-003 (audit/3.md): a failed `claim_job()` persist left memory holding
+        job=LEASED and worker=RESERVED while disk still said QUEUED -- the job
+        half was restored, the worker half was not, so the lane stayed reserved
+        for a claim that never happened. A worker that has since disappeared is
+        simply not restored; one that appeared is left alone.
+        """
+        for worker_id, fields in snapshot.items():
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                continue
+            for name, value in fields.items():
+                setattr(worker, name, value)
+
     def _restore_job_state(self, snapshot: list[dict[str, Any]]) -> None:
         """Put memory back exactly where the last durable write left it.
 
@@ -479,10 +508,13 @@ class BrowserDispatcher:
                 _atomic_write_json(self.jobs_file, doc)
             except Exception:
                 # The authoritative document did not move, so neither may
-                # memory. The caller still sees the failure.
+                # memory -- job state OR the worker ownership that came with it
+                # (W2-003). The caller still sees the failure.
                 self._restore_job_state(self._committed_jobs)
+                self._restore_worker_state(self._committed_workers)
                 raise
             self._committed_jobs = doc["jobs"]
+            self._committed_workers = self._worker_state_snapshot()
             # W2-005: another process may have advanced the counter while this
             # one held its own value. Under the same lock the jobs write takes,
             # so a concurrent Bridge cannot regress it either.
@@ -1314,6 +1346,51 @@ class BrowserDispatcher:
             self._persist_jobs()
             return job
 
+    def _durable_campaign_verdict(self, job: DispatchJob) -> Optional[dict[str, Any]]:
+        """Ask the Bridge's own campaign probe whether this run really finished.
+
+        W2-004: the Bridge is the party that can answer independently of the
+        worker's word -- the same probe `reconcile_finished_campaigns()` uses. It
+        is lent to the dispatcher, so it may be absent (unit tests, an older
+        Bridge); absent is "cannot confirm", never "confirmed".
+        """
+        probe = getattr(self, "_campaign_probe", None)
+        if probe is None:
+            return None
+        try:
+            verdict = probe(job.project_id, job.project_name)
+        except Exception as exc:
+            logger.debug("campaign probe failed for %s: %s", job.project_name, exc)
+            return None
+        if not verdict or not verdict.get("complete"):
+            return None
+        return dict(verdict)
+
+    @staticmethod
+    def _completion_proof_holds(payload: dict[str, Any]) -> bool:
+        """Does this ACK carry a handoff that actually exists and hashes right?
+
+        W2-004 (audit/3.md): the fields were copied whenever present, which makes
+        them a claim rather than proof. A path is only proof if the file is there,
+        and a digest is only proof if the bytes produce it.
+        """
+        raw_path = str(payload.get("final_handoff_path") or "").strip()
+        if not raw_path:
+            return False
+        candidate = Path(raw_path)
+        try:
+            if not candidate.is_file():
+                return False
+            data = candidate.read_bytes()
+        except OSError:
+            return False
+        declared = str(payload.get("final_handoff_sha256") or "").strip().lower()
+        if not declared:
+            # A real file with no digest is weak proof, but it is still a file
+            # the Bridge can read and reconcile against; the lane may close.
+            return True
+        return hashlib.sha256(data).hexdigest() == declared
+
     def _require_owner(
         self,
         job: DispatchJob,
@@ -1431,10 +1508,49 @@ class BrowserDispatcher:
                     worker.state = WORKER_AUDITING
                     worker.campaign_run_id = job.campaign_run_id
             elif to_state == JOB_COMPLETE:
-                # Durable completion is normally performed by
-                # complete_for_run() after Bridge persistence. Direct legacy
-                # COMPLETE remains accepted for old clients, but cannot carry
-                # terminal proof unless supplied.
+                # W2-004 (audit/3.md): a worker cannot mint terminal state.
+                # STARTED/AUDITING -> COMPLETE is on the wire for older clients,
+                # and it required NO proof: an empty payload terminalized the
+                # job, freed the lane and let a second audit for the same
+                # project be accepted while the first may still have been
+                # running -- measured: terminal_state=COMPLETE, handoff_path='',
+                # worker FREE, re-enqueue accepted.
+                #
+                # Terminal COMPLETE belongs to the Bridge, after its own durable
+                # campaign commit (complete_for_run / complete_runs_for_project
+                # set final_handoff_path themselves, so the normal path arrives
+                # here already COMPLETE and is a no-op re-ACK). An ACK with no
+                # proof is verified INDEPENDENTLY -- against a handoff file that
+                # exists, or against the durable campaign probe -- and if neither
+                # answers, it is honoured as what it actually means: "I finished
+                # sending". That lands on FINALIZING, so the run keeps its worker
+                # and its lane and reconciliation closes it against the real
+                # artifact instead of the board claiming an audit that never
+                # finished.
+                proven = bool(job.final_handoff_path) or self._completion_proof_holds(payload)
+                verdict = None if proven else self._durable_campaign_verdict(job)
+                if verdict:
+                    proven = True
+                    job.final_handoff_path = str(verdict.get("handoff_path") or job.final_handoff_path)
+                    job.final_handoff_sha256 = str(verdict.get("handoff_sha256") or job.final_handoff_sha256)
+                if not proven:
+                    logger.warning(
+                        "unproven direct COMPLETE for %s from %s: holding at FINALIZING",
+                        job.dispatch_id, job.state,
+                    )
+                    job.state = JOB_FINALIZING
+                    worker = self._workers.get(worker_id)
+                    if worker:
+                        worker.state = WORKER_AUDITING
+                        worker.campaign_run_id = job.campaign_run_id
+                    job.result = str(payload.get("result") or job.result)
+                    self._generation_context = {
+                        "dispatch_id": job.dispatch_id,
+                        "project_id": job.project_id,
+                        "state": job.state,
+                    }
+                    self._persist_jobs()
+                    return job
                 worker = self._workers.get(worker_id)
                 if worker:
                     worker.state = WORKER_FREE

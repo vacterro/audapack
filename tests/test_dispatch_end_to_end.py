@@ -127,14 +127,27 @@ def test_a_dispatch_reaches_complete_through_the_real_protocol(bridge_server, tm
     assert status == 200, payload
     assert payload.get("ok") is True
 
+    # One of three quick3 waves is delivered, so the campaign is NOT finished --
+    # and W2-004 (audit/3.md) makes that the deciding fact rather than the
+    # worker's word. An unproven COMPLETE is honoured as "I finished sending" and
+    # holds at FINALIZING, keeping the lane owned for reconciliation instead of
+    # letting the board claim an audit that never completed.
     transition("COMPLETE", campaign_run_id=run_id)
-
     status, payload = _post(conn, "/v1/browser/poll", _worker_payload(
         clean_for_audit=False, url_path="/c/e2e",
     ), token)
     assert status == 200, payload
     jobs = [job for job in _jobs(conn, token) if job["dispatch_id"] == dispatch_id]
+    assert jobs and jobs[0]["state"] == "FINALIZING", jobs
+
+    # With the handoff on disk the same ACK is proof, and the lane closes.
+    handoff = Path(config.audits.root) / "E2EPROJ__00_AUDIT_ALL_3.md"
+    handoff.parent.mkdir(parents=True, exist_ok=True)
+    handoff.write_bytes(b"final handoff bytes")
+    transition("COMPLETE", campaign_run_id=run_id, final_handoff_path=str(handoff))
+    jobs = [job for job in _jobs(conn, token) if job["dispatch_id"] == dispatch_id]
     assert jobs and jobs[0]["state"] == "COMPLETE", jobs
+    assert jobs[0]["final_handoff_path"] == str(handoff)
 
     written = list(Path(config.audits.root).rglob("*AUDIT_CORE.md"))
     assert written, f"the audit was never written under {config.audits.root}"
@@ -379,7 +392,12 @@ def test_a_compress_dispatch_reaches_complete_through_the_real_protocol(bridge_s
 
 
 def test_a_finished_compress_lane_releases_its_window(bridge_server, tmp_path):
-    """A window that cannot see its run end never rejoins the pool."""
+    """A window that cannot see its run end never rejoins the pool.
+
+    The compress campaign is really delivered here, so the Bridge's own probe
+    confirms it -- which is what W2-004 requires before a lane may close. The
+    worker's ACK is the trigger; the proof is the Bridge's.
+    """
     config, base_url = bridge_server
     archive = tmp_path / "CMFREE.zip"
     archive.write_bytes(b"PK\x03\x04compress-release")
@@ -401,13 +419,22 @@ def test_a_finished_compress_lane_releases_its_window(bridge_server, tmp_path):
         ("START_PREPARED", {"campaign_run_id": run_id, "start_receipt": "r"}),
         ("STARTED", {"campaign_run_id": run_id}),
         ("AUDITING", {"campaign_run_id": run_id}),
-        ("COMPLETE", {"campaign_run_id": run_id}),
     ):
         code, data = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
             "dispatch_id": dispatch_id, "worker_id": worker["worker_id"],
             "lease_id": lease_id, "state": state, **extra,
         }, token)
         assert code == 200, (state, data)
+
+    # The single compress wave IS the campaign, so delivering it finishes the run.
+    status, payload = _deliver_compress_wave(conn, token, "CMFREE", run_id)
+    assert status == 200, payload
+
+    code, data = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+        "dispatch_id": dispatch_id, "worker_id": worker["worker_id"],
+        "lease_id": lease_id, "state": "COMPLETE", "campaign_run_id": run_id,
+    }, token)
+    assert code == 200, data
 
     # The next poll has to carry the terminal state back, or the window keeps
     # its lease and `lease-still-owned` pins it out of the clean pool forever.
@@ -416,6 +443,7 @@ def test_a_finished_compress_lane_releases_its_window(bridge_server, tmp_path):
     owned = payload.get("owned_job") or {}
     assert owned.get("dispatch_id") == dispatch_id, payload
     assert owned.get("state") == "COMPLETE", owned
+
 
 
 def _run_compress_to_finalizing(conn, token, project: str, archive: Path, worker: dict, run_id: str) -> str:

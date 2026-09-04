@@ -203,3 +203,79 @@ CORE_DONE_WHEN: done
         self.assertEqual(gen_diff, 1, "terminal ingest must emit exactly one generation")
         self.assertTrue(r3.all3_path.exists())
         self.assertIn("00_AUDIT_ALL_3.md", r3.all3_path.name)
+
+    def test_an_unknown_project_with_conflicting_run_ids_leaves_no_trace(self):
+        """CORE-004 (audit/3.md): registration is COMMIT, not preparation.
+
+        Cross-wave run-id equality is a pure function of the pasted text, yet it
+        ran AFTER `resolve_or_register_project()` and `target_dir.mkdir()`. So an
+        unknown project pasting two waves with different CAMPAIGN_RUN_IDs was
+        refused -- saying "all ingest writes rolled back" -- having already
+        written config.json, a durable registry entry ('new_bad', 'NEW_BAD') and
+        an audits/SIDE1/NEW_BAD directory. Ghost projects from invalid text.
+        """
+        from audapack.config import config_path, load_config
+
+        content = (
+            "PROJECT_NAME: NEW_BAD\nCAMPAIGN_RUN_ID: run-A\n"
+            "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [CORE-001] a.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nCORE_DONE_WHEN: done\n\n"
+            "PROJECT_NAME: NEW_BAD\nCAMPAIGN_RUN_ID: run-B\n"
+            "WAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [W2-001] b.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nSECOND_WAVE_DONE_WHEN: done\n"
+        )
+        cfg_file = config_path(self.root)
+        before = cfg_file.read_bytes() if cfg_file.exists() else None
+
+        result = ingest_audit_text(content, self.config, base_dir=self.root)
+
+        self.assertFalse(result.ok)
+        self.assertIn("Multiple campaign run IDs", result.error)
+        after = cfg_file.read_bytes() if cfg_file.exists() else None
+        self.assertEqual(after, before, "the registry was mutated by a rejected ingest")
+        if after is not None:
+            names = [p.display_name for p in load_config(self.root).projects]
+            self.assertNotIn("NEW_BAD", names, "a ghost project was registered")
+        self.assertEqual(
+            list(self.root.rglob("NEW_BAD")), [],
+            "a ghost audit directory survived a rejected ingest",
+        )
+
+    def test_a_known_project_with_conflicting_run_ids_writes_nothing(self):
+        content_ok = (
+            "PROJECT_NAME: KNOWN_RUN\nCAMPAIGN_RUN_ID: run-one\n"
+            "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [CORE-001] a.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nCORE_DONE_WHEN: done\n"
+        )
+        self.assertTrue(ingest_audit_text(content_ok, self.config, base_dir=self.root).ok)
+        project_dir = next(self.root.rglob("KNOWN_RUN__01_AUDIT_CORE.md")).parent
+        before = sorted(p.name for p in project_dir.iterdir())
+
+        conflicting = (
+            "PROJECT_NAME: KNOWN_RUN\nCAMPAIGN_RUN_ID: run-two\n"
+            "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [CORE-001] a.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nCORE_DONE_WHEN: done\n\n"
+            "PROJECT_NAME: KNOWN_RUN\nCAMPAIGN_RUN_ID: run-three\n"
+            "WAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [W2-001] b.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nSECOND_WAVE_DONE_WHEN: done\n"
+        )
+        result = ingest_audit_text(conflicting, self.config, base_dir=self.root)
+        self.assertFalse(result.ok)
+        self.assertEqual(sorted(p.name for p in project_dir.iterdir()), before)
+
+    def test_a_valid_unknown_project_still_registers_once(self):
+        content = (
+            "PROJECT_NAME: NEW_GOOD\nCAMPAIGN_RUN_ID: run-same\n"
+            "WAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [CORE-001] a.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nCORE_DONE_WHEN: done\n\n"
+            "PROJECT_NAME: NEW_GOOD\nCAMPAIGN_RUN_ID: run-same\n"
+            "WAVE: AUDIT SECOND WAVE\nSTATUS: SECOND_WAVE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [W2-001] b.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nSECOND_WAVE_DONE_WHEN: done\n"
+        )
+        from audapack.config import load_config
+
+        result = ingest_audit_text(content, self.config, base_dir=self.root)
+        self.assertTrue(result.ok, result.error)
+        names = [p.display_name for p in load_config(self.root).projects]
+        self.assertEqual(names.count("NEW_GOOD"), 1)
+        self.assertEqual(sorted(result.saved_waves), ["core", "second"])

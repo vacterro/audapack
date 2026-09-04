@@ -1269,7 +1269,6 @@ def test_authentication_never_rebuilds_the_whole_config(monkeypatch, tmp_path):
     from audapack.bridge import server as server_module
 
     monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
-    server_module._AUTH_TOKEN_CACHE.clear()
     token_file = server_module.get_token_file_path()
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text("canonical-token-value-0001\n", encoding="utf-8")
@@ -1303,7 +1302,6 @@ def test_a_rotated_token_takes_effect_with_no_restart(monkeypatch, tmp_path):
     from audapack.bridge import server as server_module
 
     monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
-    server_module._AUTH_TOKEN_CACHE.clear()
     token_file = server_module.get_token_file_path()
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text("first-token-value-000000001\n", encoding="utf-8")
@@ -1348,3 +1346,36 @@ def test_a_revocation_marker_written_at_runtime_stops_legacy_credentials(monkeyp
 
     assert revoke_legacy_token_acceptance() is True
     assert handler._legacy_token_candidates() == [], "the marker did not take effect immediately"
+
+
+def test_a_same_length_rotation_inside_one_timestamp_tick_is_seen(monkeypatch, tmp_path):
+    """A credential read must not be cached on a coarse signature.
+
+    The first attempt at PERF-002 keyed the token on (mtime_ns, size) like the
+    widget bundle. A rotation to a same-length value inside one filesystem
+    timestamp tick was then invisible -- a stale credential, which is the one
+    thing an auth path must never serve. The 40-byte read is not the cost;
+    `load_config()` was.
+    """
+    from audapack.bridge import server as server_module
+
+    monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path))
+    token_file = server_module.get_token_file_path()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    first = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    second = "bbbbbbbbbbbbbbbbbbbbbbbb"
+    assert len(first) == len(second)
+
+    token_file.write_text(first + "\n", encoding="utf-8")
+    stat = token_file.stat()
+    assert server_module._live_bridge_token() == first
+
+    token_file.write_text(second + "\n", encoding="utf-8")
+    import os as _os
+
+    # Force the exact adversarial case: identical size AND identical mtime.
+    _os.utime(token_file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert token_file.stat().st_size == stat.st_size
+    assert token_file.stat().st_mtime_ns == stat.st_mtime_ns
+
+    assert server_module._live_bridge_token() == second, "a rotated token was served stale"

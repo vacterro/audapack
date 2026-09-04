@@ -732,3 +732,171 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
         self.assertIn("README.md", names)
         self.assertNotIn("big.js", names)
         self.assertNotIn("debug.log", names)
+
+
+class TestSingleFileSecretBoundary(unittest.TestCase):
+    """CORE-003 (audit/3.md): the mandatory-secret rule was directory-only.
+
+    `create_zip()` merges MANDATORY_EXCLUDES ("must never be packaged":
+    token.txt, *.token, *.secret, *.secrets, secrets) and the directory walk
+    applies them -- but the single-file branch checked cancellation and symlink
+    status and then wrote the file straight in. `--pack <file>` and the Explorer
+    context menu route there, so selecting `token.txt` produced success=True and
+    an archive containing the secret. These ZIPs exist to be uploaded to an AI
+    auditor, which makes it a disclosure path.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _pack_file(self, name: str, excludes=None):
+        target = self.root / name
+        target.write_text("SECRET", encoding="utf-8")
+        return target, pack_single(
+            source_path=target,
+            output_dir=self.output_dir,
+            archive_stem=target.stem,
+            excludes=set(excludes or ()),
+            delete_old=True,
+            include_timestamp=False,
+        )
+
+    def test_a_mandatory_excluded_file_is_refused_not_packed(self):
+        for name in ("token.txt", "deploy.token", "prod.secret", "app.secrets"):
+            with self.subTest(name=name):
+                _target, result = self._pack_file(name)
+                self.assertFalse(result.success, f"{name} was packed")
+                self.assertIn("exclud", (result.error_message or "").lower())
+                produced = list(self.output_dir.glob("*.zip"))
+                self.assertEqual(produced, [], f"{name} produced {produced}")
+
+    def test_a_user_configured_exclusion_is_refused_too(self):
+        _target, result = self._pack_file("private.env", excludes={"*.env"})
+        self.assertFalse(result.success)
+        self.assertEqual(list(self.output_dir.glob("*.zip")), [])
+
+    def test_an_ordinary_single_file_still_packs(self):
+        target, result = self._pack_file("notes.md")
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as zf:
+            self.assertEqual(zf.namelist(), ["notes.md"])
+        self.assertTrue(target.exists())
+
+    def test_the_same_secret_inside_a_directory_is_still_skipped(self):
+        source = self.root / "proj"
+        source.mkdir()
+        (source / "main.py").write_text("print('x')", encoding="utf-8")
+        (source / "token.txt").write_text("SECRET", encoding="utf-8")
+        result = pack_single(
+            source_path=source,
+            output_dir=self.output_dir,
+            archive_stem="proj",
+            excludes=set(),
+            delete_old=True,
+            include_timestamp=False,
+        )
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as zf:
+            self.assertEqual(zf.namelist(), ["main.py"])
+
+    def test_the_cli_pack_path_refuses_it_as_well(self):
+        from audapack import app
+
+        target = self.root / "token.txt"
+        target.write_text("SECRET", encoding="utf-8")
+        config = AppConfigForPack(self.output_dir)
+        with patch.object(app, "load_config", return_value=config):
+            code = app.run_pack_path(str(target))
+        self.assertEqual(code, 1, "the documented CLI entry point packed a secret")
+        self.assertEqual(list(self.output_dir.glob("*.zip")), [])
+
+
+def AppConfigForPack(output_dir: Path):
+    from audapack.config import AppConfig, PackingConfig
+
+    config = AppConfig(packing=PackingConfig(output_dir=str(output_dir), manifest_enabled=False))
+    config.projects = []
+    return config
+
+
+class TestCanonicalArchiveIdentity(unittest.TestCase):
+    """CORE-005 (audit/3.md): identity is ordered, and blank is not an alias.
+
+    Every alias went into ONE unordered set and blank values were passed through
+    `safe_archive_stem()`, which maps "" to the literal fallback "Archive". So a
+    project with no archive_name matched a stray generic `Archive.zip`, and a
+    NEWER display-name archive beat the explicitly configured archive_name --
+    both reproduced. This resolver feeds packing freshness and Bridge artifact
+    ownership, so it decided those on the wrong ZIP.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.output_dir = Path(self.temp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _archive(self, name: str, age_offset: float) -> Path:
+        import os as _os
+
+        path = self.output_dir / f"{name}.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("x.txt", name)
+        stamp = 1_700_000_000 + age_offset
+        _os.utime(path, (stamp, stamp))
+        return path
+
+    def _project(self, **kwargs):
+        from audapack.models import Project
+
+        defaults = {"id": "proj", "display_name": "My Display", "source_path": "C:/x"}
+        defaults.update(kwargs)
+        return Project(**defaults)
+
+    def test_the_configured_archive_name_wins_over_a_newer_display_archive(self):
+        from audapack.packing import find_archive_for_project
+
+        canonical = self._archive("CustomArchive", 0)
+        self._archive("My Display", 500)  # newer, and must lose
+        project = self._project(archive_name="CustomArchive")
+        self.assertEqual(find_archive_for_project(project, self.output_dir), canonical)
+
+    def test_a_blank_archive_name_never_matches_the_generic_fallback(self):
+        from audapack.packing import find_archive_for_project
+
+        expected = self._archive("MyProj", 0)
+        self._archive("Archive", 900)  # newer generic file from another project
+        project = self._project(archive_name="", display_name="MyProj")
+        self.assertEqual(
+            find_archive_for_project(project, self.output_dir), expected,
+            "a blank archive_name invented the alias 'Archive'",
+        )
+
+    def test_the_display_name_is_still_the_fallback(self):
+        from audapack.packing import find_archive_for_project
+
+        expected = self._archive("My Display", 0)
+        project = self._project(archive_name="")
+        self.assertEqual(find_archive_for_project(project, self.output_dir), expected)
+
+    def test_the_id_is_the_last_resort(self):
+        from audapack.packing import find_archive_for_project
+
+        expected = self._archive("proj", 0)
+        project = self._project(archive_name="", display_name="")
+        self.assertEqual(find_archive_for_project(project, self.output_dir), expected)
+
+    def test_newest_still_wins_inside_one_alias_family(self):
+        from audapack.packing import find_archive_for_project
+
+        self._archive("Proj_01.01.26-T00-00-00", 0)
+        newest = self._archive("Proj_02.01.26-T00-00-00", 400)
+        project = self._project(archive_name="Proj")
+        self.assertEqual(find_archive_for_project(project, self.output_dir), newest)
