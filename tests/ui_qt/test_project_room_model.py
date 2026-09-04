@@ -230,7 +230,7 @@ def test_archive_freshness_cache_ttl(model_fixture, monkeypatch):
     model._archive_fresh_cache[proj.id]["computed_at"] = 0.0  # force expiry
     calls = []
     orig = model._compute_archive_fresh
-    monkeypatch.setattr(model, "_compute_archive_fresh", lambda p: (calls.append(p), orig(p))[1])
+    monkeypatch.setattr(model, "_compute_archive_fresh", lambda p, probe_source=True: (calls.append(p), orig(p))[1])
     # PERF-001: a TTL-expired read serves the stale entry WITHOUT a synchronous
     # filesystem walk on the paint path; recompute is deferred to the tick.
     model._get_archive_fresh(proj)
@@ -396,3 +396,92 @@ def test_archive_age_reads_the_cached_mtime_and_a_live_clock(model_fixture):
 
     model._archive_fresh_cache["p1"]["mtime"] = None
     assert model.data(idx, model.ROLES["archive_age_str"]) == ""
+
+
+def test_data_roles_never_touch_the_filesystem(model_fixture, monkeypatch):
+    """PERF-001 (audit/4.md): data() is a pure in-memory read, all roles.
+
+    inaudit_count / inaudit_label / hover_info called list_inaudit_layers()
+    live, and the delegate asks for inaudit_label on EVERY painted row -- so
+    ordinary painting enumerated every project's audit/ directory. Measured at
+    300 projects x six layers: 41.31 ms per label scan, 103.07 ms with the
+    selected-layer read, on the GUI thread.
+    """
+    import audapack.ui_qt.models.project_room_model as module
+
+    model, _service, _config, _tmp_path = model_fixture
+    model._reload(initial=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("data() touched the filesystem")
+
+    monkeypatch.setattr(module, "list_inaudit_layers", forbidden)
+    monkeypatch.setattr(module, "get_inaudit_selected", forbidden)
+
+    for g_idx in range(model.rowCount(QModelIndex())):
+        group = model.index(g_idx, 0, QModelIndex())
+        for slot in range(model.rowCount(group)):
+            slot_index = model.index(slot, 0, group)
+            if not slot_index.isValid():
+                continue
+            for role_name in ("inaudit_count", "inaudit_selected", "inaudit_label", "hover_info"):
+                model.data(slot_index, model.ROLES[role_name])
+
+
+def test_the_paint_path_never_walks_a_source_tree(model_fixture, monkeypatch):
+    """PERF-001: a cache miss must not run the 0.15 s bounded walk.
+
+    First paint of 24 populated projects used to execute up to 0.15 s of source
+    stats per project, on the GUI thread, inside data().
+    """
+    import audapack.ui_qt.models.project_room_model as module
+
+    model, service, _config, _tmp_path = model_fixture
+    proj = service.get_project("p1")
+    model._archive_fresh_cache.clear()
+
+    def forbidden_walk(*args, **kwargs):
+        raise AssertionError("the paint path walked a source tree")
+
+    monkeypatch.setattr(module.ProjectRoomModel, "_probe_source_mtime", forbidden_walk)
+
+    # No source dir in this fixture, so use the compute guard directly: the
+    # probe_source flag must skip the walk branch entirely.
+    entry = model._compute_archive_fresh(proj, probe_source=False)
+    assert entry["source_older"] is None
+    assert entry["source_mtime"] is None
+
+
+def test_an_observed_newer_file_is_stale_evidence_even_on_a_partial_walk():
+    """PERF-001: refusing positive evidence created a never-verdict loop.
+
+    The probe caps at 1,000 files / 0.15 s. For a bigger tree the walk always
+    came back complete=False, and the old code discarded even a file it had
+    actually SEEN newer than the archive -- so >1,000-file projects paid the
+    scan every TTL cycle and never got a freshness answer. Measured: 24 probes
+    on a 1,200-file tree = 160.58 ms, all complete=False.
+    """
+    import shutil
+    import tempfile
+    import time as _time
+
+    from audapack.ui_qt.models.project_room_model import ProjectRoomModel
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        source = tmp / "proj"
+        source.mkdir()
+        # Enough files to exhaust the 1,000-file cap.
+        for i in range(1200):
+            (source / f"f{i}.txt").write_text("x", encoding="utf-8")
+        import os as _os
+        newer = source / "f1199.txt"
+        stamp = _time.time() + 10_000
+        _os.utime(newer, (stamp, stamp))
+
+        model = ProjectRoomModel.__new__(ProjectRoomModel)
+        mt, complete = model._probe_source_mtime(source)
+        assert complete is False, "the fixture must exercise the budget-cut path"
+        assert mt is not None and mt > _time.time() + 5_000, "the newer file was not observed"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

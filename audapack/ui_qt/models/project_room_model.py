@@ -16,7 +16,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from PySide6.QtCore import (
     QAbstractItemModel,
@@ -126,6 +126,15 @@ class ProjectRoomModel(QAbstractItemModel):
         # invalidated after a pack and refreshed by the temperature tick.
         self._archive_fresh_cache: dict[str, dict] = {}
         self._archive_fresh_ttl = 10.0
+        # PERF-001 (audit/4.md): the INAUDIT presentation snapshot. data() used
+        # to call list_inaudit_layers() live for inaudit_count, inaudit_label AND
+        # hover_info -- and the delegate asks for inaudit_label on EVERY painted
+        # row, so ordinary painting enumerated/stat'ed every project's audit/
+        # directory. Measured at 300 projects x six layers: one label scan =
+        # 41.31 ms, label + selected reads = 103.07 ms, on the GUI thread. Every
+        # INAUDIT role reads this dict now; it is refreshed by the explicit
+        # mutation callback (refresh_inaudit) and by _reload.
+        self._inaudit_snapshot: dict[str, dict] = {}
 
         # Performance counters for diagnostics & tests
         self.model_reset_count: int = 0
@@ -162,6 +171,9 @@ class ProjectRoomModel(QAbstractItemModel):
         # Single-pass structural rebuild; audit enrichment stays asynchronous.
         projects = self._service.list_projects()
         self._refresh_inaudit_suggestions()
+        # PERF-001 (audit/4.md): the INAUDIT snapshot is rebuilt here, once per
+        # structural reload, so no data() role ever needs the filesystem for it.
+        self._refresh_inaudit_snapshot()
         for p in projects:
             g = p.priority_group.upper()
             self._projects[(g, p.slot)] = p
@@ -533,25 +545,16 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["audit_run_ready"]:
             return bool(getattr(run, "ready", False))
         if role == self.ROLES["inaudit_count"]:
-            try:
-                return len(list_inaudit_layers(proj))
-            except Exception:
-                return 0
+            return self._inaudit_view(proj)["count"]
         if role == self.ROLES["inaudit_selected"]:
-            try:
-                return get_inaudit_selected(proj) or 0
-            except Exception:
-                return 0
+            return self._inaudit_view(proj)["selected"]
         if role == self.ROLES["inaudit_label"]:
-            try:
-                layers = list_inaudit_layers(proj)
-                suggestions = self._inaudit_suggestions.get(proj.id, 0)
-                if not layers and not suggestions:
-                    return ""
-                suffix = f" +{suggestions}" if suggestions else ""
-                return f"IA {len(layers)}{suffix}"
-            except Exception:
+            view = self._inaudit_view(proj)
+            suggestions = self._inaudit_suggestions.get(proj.id, 0)
+            if not view["count"] and not suggestions:
                 return ""
+            suffix = f" +{suggestions}" if suggestions else ""
+            return f"IA {view['count']}{suffix}"
 
         # Audit roles
         snap = self._snapshots.get(proj.id)
@@ -633,11 +636,7 @@ class ProjectRoomModel(QAbstractItemModel):
             snap = self._snapshots.get(proj.id)
             arc_data = self.get_archive_info(proj)
             pack_st, pack_msg = self._pack_states.get(proj.id, ("IDLE", ""))
-            try:
-                layers = list_inaudit_layers(proj)
-                sel = get_inaudit_selected(proj)
-            except Exception:
-                layers, sel = [], None
+            view = self._inaudit_view(proj)
             return {
                 "project": proj,
                 "snapshot": snap,
@@ -651,8 +650,8 @@ class ProjectRoomModel(QAbstractItemModel):
                 "archive_sync_status": self.get_archive_sync_status(proj, snap),
                 "archive_freshness_short": self._get_archive_freshness_short(proj),
                 "source_older_than_archive": self._source_older_than_archive(proj),
-                "inaudit_layers": layers,
-                "inaudit_selected": sel,
+                "inaudit_layers": view["layers"],
+                "inaudit_selected": view["selected"],
                 "group": group,
                 "slot": slot,
                 "total_groups": len(self._groups),
@@ -661,8 +660,41 @@ class ProjectRoomModel(QAbstractItemModel):
 
         return None
 
+    def _inaudit_view(self, proj: Project) -> dict:
+        """The INAUDIT presentation state for one project, from the snapshot.
+
+        PERF-001 (audit/4.md): a PURE in-memory read. The filesystem version of
+        this ran inside data(), and the delegate asks for inaudit_label on every
+        painted row, so painting enumerated the audit/ directory per project.
+        """
+        return self._inaudit_snapshot.get(
+            proj.id,
+            {"count": 0, "selected": 0, "layers": []},
+        )
+
+    def _refresh_inaudit_snapshot(self, project_ids: Optional[Iterable[str]] = None) -> None:
+        """Recompute the INAUDIT presentation snapshot off the data() path.
+
+        Called by refresh_inaudit (the explicit mutation callback) and by
+        _reload -- both are event-driven, never paint-driven.
+        """
+        wanted = None if project_ids is None else {str(pid) for pid in project_ids}
+        for key in list(self._projects.values()):
+            if wanted is not None and key.id not in wanted:
+                continue
+            try:
+                layers = list_inaudit_layers(key)
+                self._inaudit_snapshot[key.id] = {
+                    "count": len(layers),
+                    "selected": get_inaudit_selected(key) or 0,
+                    "layers": layers,
+                }
+            except Exception:
+                self._inaudit_snapshot[key.id] = {"count": 0, "selected": 0, "layers": []}
+
     def refresh_inaudit(self, project_id: str) -> None:
         self._refresh_inaudit_suggestions()
+        self._refresh_inaudit_snapshot([str(project_id)])
         idx = self.index_for_project_id(str(project_id))
         if idx.isValid():
             self.dataChanged.emit(idx, idx)
@@ -729,12 +761,14 @@ class ProjectRoomModel(QAbstractItemModel):
     # repaint). All archive roles below read ONE cached snapshot per project,
     # recomputed at most every ``_archive_fresh_ttl`` seconds.
 
-    def _compute_archive_fresh(self, proj: Project) -> dict:
+    def _compute_archive_fresh(self, proj: Project, probe_source: bool = True) -> dict:
         """Single bounded disk pass: archive + source freshness for a project.
 
         Returns a dict consumed by the archive roles. Never raises. The source
         walk is capped both by file count and wall-clock budget so even a huge
-        tree cannot stall the UI thread.
+        tree cannot stall the UI thread. ``probe_source=False`` skips the walk
+        entirely for the paint-path cache miss (PERF-001); the caller then
+        schedules the full compute through update_temperature_all.
         """
         entry = {
             "computed_at": time.time(),
@@ -784,16 +818,22 @@ class ProjectRoomModel(QAbstractItemModel):
                     entry["sync_status"] = self._sync_status_from(proj, snap, arc, arc_mt)
 
             # Bounded source probe (only when an archive exists to compare against;
-            # skip entirely when nothing is packed so the row never pays for the walk).
-            if arc_mt is not None:
+            # skip entirely when nothing is packed so the row never pays for the
+            # walk, and when the caller deferred it off the paint path).
+            if arc_mt is not None and probe_source:
                 src_mt, src_complete = self._probe_source_mtime(sp)
                 if src_mt is not None:
                     entry["source_mtime"] = src_mt
-                    # PERF-001: only a COMPLETE traversal may prove the source is
-                    # newer (or older) than the archive. A budget/interrupt-limited
-                    # scan is UNKNOWN, never evidence of freshness.
-                    if src_complete:
-                        entry["source_older"] = src_mt > arc_mt + 0.5
+                    # PERF-001 (audit/4.md): a file OBSERVED newer than the
+                    # archive is sufficient STALE evidence even when the walk was
+                    # cut short -- refusing it made >1,000-file trees pay the
+                    # bounded scan every TTL cycle and NEVER reach a verdict. Only
+                    # the FRESH verdict (everything older) needs a complete pass.
+                    if src_mt > arc_mt + 0.5:
+                        entry["source_older"] = False
+                    elif src_complete:
+                        entry["source_older"] = True
+                    # else: incomplete AND nothing newer seen -> UNKNOWN.
         except Exception:
             pass
         return entry
@@ -861,11 +901,19 @@ class ProjectRoomModel(QAbstractItemModel):
         now = time.time()
         entry = self._archive_fresh_cache.get(proj.id)
         if entry is None:
-            # Cache miss: initial populate / post-invalidation read. This is the
-            # only synchronous compute path (startup enrichment, invalidation
-            # follow-up); normal paints hit the TTL branch below.
-            entry = self._compute_archive_fresh(proj)
+            # PERF-001 (audit/4.md): a cache miss no longer runs the bounded
+            # source-tree walk on the GUI thread -- on first paint that was up to
+            # 0.15 s PER PROJECT, 24 projects at once. The archive stat (one or
+            # two stats, cheap) runs here so the row shows something real, and
+            # the freshness probe is deferred to update_temperature_all with the
+            # other stale entries.
+            entry = self._compute_archive_fresh(proj, probe_source=False)
+            entry["source_older"] = None
+            entry["source_mtime"] = None
             self._archive_fresh_cache[proj.id] = entry
+            if not hasattr(self, "_stale_projects"):
+                self._stale_projects = set()
+            self._stale_projects.add(proj.id)
             return entry
         if (now - entry.get("computed_at", 0)) >= self._archive_fresh_ttl:
             # Stale but serve it; recompute is scheduled in update_temperature_all.
@@ -875,8 +923,18 @@ class ProjectRoomModel(QAbstractItemModel):
         return entry
 
     def invalidate_archive_fresh(self, project_id: str) -> None:
-        """Force the next archive freshness read to recompute (after a pack)."""
+        """Force the next archive freshness read to recompute (after a pack).
+
+        PERF-001 (audit/4.md): invalidation schedules the recompute for the
+        temperature tick instead of letting the next PAINT pay for the bounded
+        source-tree walk. A pack finishing is a known event; the tick is at most
+        one 60 s cadence away, and the archive stat itself still runs
+        synchronously so the row shows real data immediately.
+        """
         self._archive_fresh_cache.pop(project_id, None)
+        if not hasattr(self, "_stale_projects"):
+            self._stale_projects = set()
+        self._stale_projects.add(str(project_id))
 
     def _get_archive_temperature(self, proj: Project) -> AuditTemperature:
         return self._get_archive_fresh(proj)["temperature"]
