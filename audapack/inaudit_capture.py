@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from audapack.bridge.storage import atomic_write
 from audapack.config import AppConfig, cross_process_lock, get_user_runtime_dir
 from audapack.models import Project
+from audapack.saipen_transport import continuation_command, enqueue_file, is_managed
 
 CAPTURE_SCHEMA_VERSION = 1
 MAX_CAPTURE_BYTES = 5 * 1024 * 1024
@@ -754,12 +755,14 @@ class InauditCaptureStore:
             text = current["text"]
             if record.get("status") == "ARCHIVED":
                 raise InauditCaptureError("capture_archived", "restore archived capture before assignment", status=409)
+            if record.get("delivery_project_root") or is_managed(project.source_path):
+                return self._assign_managed(capture_id, project, record, action, after_assign)
             if record.get("assigned_path"):
                 existing = Path(str(record["assigned_path"]))
                 if existing.is_file() and body_sha256(existing.read_text(encoding="utf-8")) == record.get("content_sha256"):
-                    command = f'saipen {action.lower()} "{existing}"' if action else ""
+                    command = continuation_command(action)
                     if after_assign and action:
-                        after_assign(action, existing)
+                        after_assign("CC", existing)
                     return {"record": record, "assigned_path": str(existing), "command": command, "duplicate": True}
                 raise InauditCaptureError("assignment_conflict", "record claims an invalid assigned path", status=409)
             _root, audit_dir = self._safe_audit_dir(project)
@@ -850,10 +853,56 @@ class InauditCaptureStore:
                 self._save_affinity(affinities)
             self._signal(capture_id, "assign")
             journal_path.unlink(missing_ok=True)
-            command = f'saipen {action.lower()} "{target}"' if action else ""
+            command = continuation_command(action)
             if after_assign and action:
-                after_assign(action, target)
+                after_assign("CC", target)
             return {"record": record, "assigned_path": str(target), "command": command, "duplicate": False}
+
+    def _assign_managed(self, capture_id, project, record, action, after_assign):
+        """The durable capture is the retry journal; SAIPEN owns publication."""
+        root, _audit = self._safe_audit_dir(project)
+        pending = record.get("delivery_project_root")
+        if pending and Path(pending).resolve() != root:
+            raise InauditCaptureError("assignment_conflict", "capture delivery already belongs to another project", status=409)
+        if record.get("assigned_path") and not pending:
+            # Legacy assignments remain valid; do not deliver them a second time.
+            target = Path(record["assigned_path"])
+            if record.get("assigned_project_id") != project.id or not target.is_file():
+                raise InauditCaptureError("assignment_conflict", "legacy assignment needs inspection", status=409)
+            if _bytes_sha256(target) != record.get("content_sha256"):
+                raise InauditCaptureError("assignment_conflict", "legacy assigned bytes changed", status=409)
+            return {"record": record, "assigned_path": str(target), "command": continuation_command(action), "duplicate": True}
+        body = self._body_path(capture_id)
+        if _bytes_sha256(body) != record.get("content_sha256"):
+            raise InauditCaptureError("assignment_verify_failed", "capture bytes no longer match their recorded digest")
+        duplicate = record.get("status") == "ASSIGNED"
+        if not pending:
+            record["delivery_project_root"] = str(root)
+            record["producer_operation_id"] = capture_id
+            self._atomic_json(self._meta_path(capture_id), record)
+        result = enqueue_file(root, body, capture_id, item_id=capture_id)
+        target = root / result["rel"]
+        record.update({"status": "ASSIGNED", "updated_at": utc_now(),
+                       "assigned_project_id": project.id, "assigned_path": str(target),
+                       "assigned_at": record.get("assigned_at") or utc_now(),
+                       "transport": "saipen", "producer_operation_id": capture_id})
+        # Never roll back a SAIPEN-owned layer if metadata persistence fails.
+        # The next attempt recovers this same operation, even after consume.
+        self._atomic_json(self._meta_path(capture_id), record)
+        if not duplicate:
+            fingerprint = str(record.get("conversation_fingerprint") or "")
+            if fingerprint:
+                affinities = self._load_affinity()
+                previous = affinities.get(fingerprint, {})
+                affinities[fingerprint] = {"last_confirmed_project_id": project.id,
+                                          "confirmed_count": int(previous.get("confirmed_count") or 0) + 1,
+                                          "updated_at": utc_now()}
+                self._save_affinity(affinities)
+        self._signal(capture_id, "assign")
+        if after_assign and action:
+            after_assign("CC", target)
+        return {"record": record, "assigned_path": str(target), "command": continuation_command(action),
+                "duplicate": duplicate or result.get("idempotent", False), "present": result.get("present")}
 
     def archive(self, capture_id: str) -> dict[str, Any]:
         return self._move_to_status(capture_id, self.archive_dir, "ARCHIVED", "archive")

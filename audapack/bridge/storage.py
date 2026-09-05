@@ -24,6 +24,7 @@ from audapack.campaign import (
 from audapack.config import AppConfig, open_new_temp_file
 from audapack.models import Project
 from audapack.projects import ProjectRegistry
+from audapack.saipen_transport import SaipenTransportError, enqueue_bytes, is_managed
 
 # Legacy dictionary compatibility for existing imports
 WAVES_CONFIG = {
@@ -728,6 +729,10 @@ def _publish_canonical_layer(
     number. The allocator/binding floors are still consulted, so a number that
     was spent and deleted is never handed out again.
     """
+    if is_managed(root):
+        operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "audapack:mirror:" + hashlib.sha256(payload).hexdigest()))
+        result = enqueue_bytes(root, payload, operation_id, item_id=operation_id)
+        return root / result["rel"] if not result["idempotent"] else None
     for _ in range(_LAYER_PUBLISH_ATTEMPTS):
         number = agent_inbox.next_layer_number(root, dest, binding_rel, allocator_rel)
         target = dest / f"{number}.md"
@@ -783,6 +788,8 @@ def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=Non
     if not str(source_path or "").strip() or not root.is_dir() or not src.is_dir():
         return []
     folder = str(getattr(config.audits, "mirror_dir_name", "audit") or "audit").strip() or "audit"
+    if is_managed(root):
+        folder = "audit"
     # One path segment only: a configured name must never escape the project.
     if any(sep in folder for sep in ("/", "\\", "..")) or Path(folder).is_absolute():
         folder = "audit"
@@ -809,7 +816,7 @@ def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=Non
             digest = hashlib.sha256(payload).hexdigest()
             # Redelivering the same bytes must not create a second unread layer:
             # the operator would be told the agent owes work it already has.
-            already = any(
+            already = not is_managed(root) and any(
                 agent_inbox.layer_number(item.name) is not None
                 and item.is_file()
                 and hashlib.sha256(item.read_bytes()).hexdigest() == digest
@@ -821,6 +828,8 @@ def mirror_project_audits(config, source_path, audit_dir, final_handoff_path=Non
                 target = _publish_canonical_layer(dest, root, probe, spent, payload)
                 if target is not None:
                     copied.append(target)
+        except SaipenTransportError:
+            raise
         except OSError:
             pass
 

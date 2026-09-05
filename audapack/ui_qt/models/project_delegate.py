@@ -617,9 +617,21 @@ class ProjectItemDelegate(QStyledItemDelegate):
             painter.setPen(QColor(PALETTE["textPrimary"]))
         name_x = x + prefix_width
         name_available = col_x - name_x - 8
-        name_width = max(40, name_available)
+        # Reserve room for the IA badge so the name elides before it collides
+        ia_suffix_w = painter.fontMetrics().horizontalAdvance(f" {inaudit_label}") if inaudit_label else 0
+        name_width = max(40, name_available - ia_suffix_w)
         elided_name = painter.fontMetrics().elidedText(str(display_name), Qt.TextElideMode.ElideRight, name_width)
         painter.drawText(QRect(name_x, y, name_width, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_name)
+        # IA badge right after the name — always visible, golden
+        if inaudit_label:
+            ia_x = name_x + painter.fontMetrics().horizontalAdvance(elided_name)
+            painter.setFont(self.font_small)
+            painter.setPen(QColor(PALETTE["borderGolden"]))
+            painter.drawText(
+                QRect(ia_x, y, ia_suffix_w + 4, h),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                f" {inaudit_label}",
+            )
 
         # 7. Draw launcher buttons — letters OC/FB/CL/C1/C2/CF or numbers 1-6
         LETTER_MAP = {"opencode": "OC", "freebuff": "FB", "cline": "CL", "main_codex": "C1", "main_codex2": "C2", "main_codex3_free": "CF"}

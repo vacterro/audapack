@@ -2264,12 +2264,12 @@ QToolTip QLabel {
             return
         mods = QApplication.keyboardModifiers()
         if mods & Qt.KeyboardModifier.ShiftModifier:
-            cmd = f'saipen gg "{p}"'
+            cmd = "saipen cc"
             QApplication.clipboard().setText(cmd)
             self._flash_status(f"IA GG copied: {p.name}", "#D4A840")
             return
         if mods & Qt.KeyboardModifier.ControlModifier:
-            cmd = f'saipen cc "{p}"'
+            cmd = "saipen cc"
             QApplication.clipboard().setText(cmd)
             self._flash_status(f"IA CC copied: {p.name}", "#D4A840")
             return
@@ -2284,7 +2284,7 @@ QToolTip QLabel {
         if p is None or not validate_inaudit_path(target, p):
             self._flash_status("IA GG: no layer", "#D66464")
             return
-        QApplication.clipboard().setText(f'saipen gg "{p}"')
+        QApplication.clipboard().setText("saipen cc")
         self._flash_status(f"IA GG copied: {p.name}", "#D4A840")
 
     def _on_ia_copy_cc(self, proj: Project | None = None):
@@ -2295,7 +2295,7 @@ QToolTip QLabel {
         if p is None or not validate_inaudit_path(target, p):
             self._flash_status("IA CC: no layer", "#D66464")
             return
-        QApplication.clipboard().setText(f'saipen cc "{p}"')
+        QApplication.clipboard().setText("saipen cc")
         self._flash_status(f"IA CC copied: {p.name}", "#D4A840")
 
     def _on_copy_archive(self, proj: Optional[Any] = None):
@@ -2996,8 +2996,29 @@ QToolTip QLabel {
             pass
 
     def _on_temperature_tick(self):
-        """In-memory temperature tick (0 disk reads)."""
+        """In-memory temperature tick, then the freshness recompute off-thread.
+
+        The recompute walks a bounded slice of every stale project's source tree
+        (0.15 s budget each) and stats its archive. That is filesystem work and
+        it never belonged on the GUI thread: with a 10 s TTL against a 60 s tick
+        every project was stale every time, so the tick blocked the UI for
+        roughly a second at a stretch and the window visibly froze mid-drag.
+        """
         self.model.update_temperature_all()
+        stale = self.model.take_stale_archive_projects()
+        if not stale:
+            return
+
+        def _work():
+            return [(pid, self.model.compute_archive_fresh(pid)) for pid in stale]
+
+        def _done(entries):
+            for pid, entry in entries:
+                self.model.apply_archive_fresh(pid, entry)
+
+        self.task_runner.submit_coalesced(
+            "archive-fresh:recompute", _work, on_success=_done, on_error=lambda _e: None
+        )
 
     def _make_pack_progress_callback(self, project_id: str, run_id: int):
         """Builds a thread-safe progress callback for one pack run.

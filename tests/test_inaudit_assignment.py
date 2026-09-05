@@ -86,9 +86,9 @@ def test_assign_action_runs_only_after_verified_write(tmp_path: Path):
         payload["capture_id"], project.id, [project], action="GG", after_assign=lambda action, path: calls.append((action, path))
     )
     assigned = Path(result["assigned_path"])
-    assert calls == [("GG", assigned)]
+    assert calls == [("CC", assigned)]
     assert body_sha256(assigned.read_text(encoding="utf-8")) == store.get(payload["capture_id"])["record"]["content_sha256"]
-    assert result["command"] == f'saipen gg "{assigned}"'
+    assert result["command"] == "saipen cc"
 
 
 def test_assignment_requires_registered_project_and_rejects_external_filename(tmp_path: Path):

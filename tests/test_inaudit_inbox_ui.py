@@ -27,6 +27,102 @@ def test_inaudit_has_layers_and_inbox_tabs(qapp, tmp_path: Path):
     assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
     widget.deleteLater()
 
+
+def test_consumed_layer_disappears_and_foreign_notes_remain(qapp, tmp_path):
+    widget, _store, project = _widget(tmp_path)
+    audit = Path(project.source_path) / "audit"
+    audit.mkdir()
+    layer = audit / "1.md"
+    layer.write_text("audit", encoding="utf-8")
+    (audit / "notes.md").write_text("keep", encoding="utf-8")
+    widget._on_debounced_fs()
+    assert widget.list.count() == 1
+    layer.unlink()
+    widget._on_debounced_fs()
+    assert widget.list.count() == 0
+    assert not widget.editor.toPlainText()
+    assert (audit / "notes.md").read_text() == "keep"
+    assert str(Path(project.source_path).resolve()) in widget._watcher.directories()
+    widget.deleteLater()
+
+
+def test_consumption_preserves_draft_and_save_does_not_recreate_layer(qapp, tmp_path):
+    widget, _store, project = _widget(tmp_path)
+    audit = Path(project.source_path) / "audit"
+    audit.mkdir()
+    layer = audit / "1.md"
+    layer.write_text("audit", encoding="utf-8")
+    widget.refresh()
+    widget.editor.setPlainText("unsaved draft")
+    layer.unlink()
+    widget._on_debounced_fs()
+    widget._on_save()
+    assert widget.editor.toPlainText() == "unsaved draft"
+    assert widget._dirty
+    assert not layer.exists()
+    assert "Save refused" in widget.status.text()
+    widget._on_reload()
+    widget.refresh()
+    assert widget.list.count() == 0
+    widget.deleteLater()
+
+
+def test_layer_commands_use_bare_cc(qapp, tmp_path):
+    widget, _store, project = _widget(tmp_path)
+    audit = Path(project.source_path) / "audit"
+    audit.mkdir()
+    (audit / "1.md").write_text("audit", encoding="utf-8")
+    widget.refresh()
+    for action in (widget._on_gg, widget._on_cc):
+        action()
+        assert QApplication.clipboard().text() == "saipen cc"
+    widget.deleteLater()
+
+
+def test_managed_assignment_runs_off_gui_thread(qapp, tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from PySide6.QtTest import QTest
+
+    from tests.test_saipen_transport import _bind, _fake_cli
+
+    widget, store, project = _widget(tmp_path)
+    home, _calls = _fake_cli(tmp_path, monkeypatch)
+    _bind(Path(project.source_path), home)
+    capture_id = str(uuid.uuid4())
+    store.capture({"capture_id": capture_id, "text": "Audit for AUDAPACK", "source": "desktop"}, [project])
+    widget.refresh_inbox()
+    widget.inbox_project.setCurrentIndex(widget.inbox_project.findData(project.id))
+    original = store.assign
+    release = threading.Event()
+    entered = threading.Event()
+    thread_ids = []
+
+    def assign(*args, **kwargs):
+        thread_ids.append(threading.get_ident())
+        entered.set()
+        assert release.wait(3), "GUI did not release the worker"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "assign", assign)
+    try:
+        widget._on_assign_capture("CC")
+        assert entered.wait(2)
+        assert thread_ids == [thread_ids[0]] and thread_ids[0] != threading.get_ident()
+        assert not widget.inbox_page.isEnabled()
+    finally:
+        release.set()
+    deadline = time.monotonic() + 3
+    while widget._task_runner.is_running("inaudit:assign") and time.monotonic() < deadline:
+        QTest.qWait(10)
+    assert not widget._task_runner.is_running("inaudit:assign")
+    assert widget.inbox_page.isEnabled()
+    assert "CC command copied" in widget.inbox_status.text()
+    assert QApplication.clipboard().text() == "saipen cc"
+    assert widget.list.count() == 1
+    widget.deleteLater()
+
 def test_ia_plus_captures_clipboard_through_canonical_store(qapp, tmp_path: Path):
     widget, store, _project = _widget(tmp_path)
     QApplication.clipboard().setText("# Clipboard audit\nExact clipboard body")
@@ -53,7 +149,7 @@ def test_assign_plus_gg_copies_only_canonical_assigned_path(qapp, tmp_path: Path
     widget._on_assign_capture("GG")
     assigned = Path(project.source_path) / "audit" / "1.md"
     assert assigned.read_text(encoding="utf-8") == payload["text"]
-    assert copied == [f'saipen gg "{assigned}"']
+    assert copied == ["saipen cc"]
     assert store.get(payload["capture_id"])["record"]["assigned_path"] == str(assigned)
     widget.deleteLater()
 

@@ -150,8 +150,16 @@ class ProjectRoomModel(QAbstractItemModel):
             return
         try:
             for record in self._inaudit_store.list_records(include_recovery=False):
-                project_id = str(record.get("suggested_project_id") or "")
-                if project_id and not record.get("assigned_project_id"):
+                if record.get("assigned_project_id"):
+                    continue
+                # A pin is the operator's own answer and outranks the classifier's
+                # guess here exactly like it does in the Inbox row (T-145).
+                # Counting only the guess hid every hand-triaged capture from the
+                # room, so the operator had to reopen the inbox to see it.
+                project_id = str(
+                    record.get("target_project_id") or record.get("suggested_project_id") or ""
+                )
+                if project_id:
                     counts[project_id] = counts.get(project_id, 0) + 1
         except OSError:
             counts = {}
@@ -171,12 +179,17 @@ class ProjectRoomModel(QAbstractItemModel):
         # Single-pass structural rebuild; audit enrichment stays asynchronous.
         projects = self._service.list_projects()
         self._refresh_inaudit_suggestions()
-        # PERF-001 (audit/4.md): the INAUDIT snapshot is rebuilt here, once per
-        # structural reload, so no data() role ever needs the filesystem for it.
-        self._refresh_inaudit_snapshot()
         for p in projects:
             g = p.priority_group.upper()
             self._projects[(g, p.slot)] = p
+
+        # PERF-001 (audit/4.md): the INAUDIT snapshot is rebuilt here, once per
+        # structural reload, so no data() role ever needs the filesystem for it.
+        # It MUST run after self._projects is repopulated above -- it iterates
+        # that dict, so refreshing it earlier snapshotted an empty room and every
+        # IA badge read 0 until the user opened a project's INAUDIT inbox by hand
+        # (refresh_inaudit, the only other writer, fills one project).
+        self._refresh_inaudit_snapshot()
 
         self._snapshots = {}
         for p in projects:
@@ -408,19 +421,49 @@ class ProjectRoomModel(QAbstractItemModel):
         for idx in changed_indexes:
             self.dataChanged.emit(idx, idx)
 
-        # PERF-001: recompute archive/source freshness for entries whose TTL
-        # expired. _get_archive_fresh marks them stale during a paint read and
-        # this periodic tick does the filesystem work off the data() path.
+    def take_stale_archive_projects(self) -> list[str]:
+        """Claim the projects whose archive/source freshness needs recomputing.
+
+        PERF-001 moved the bounded source walk off the paint path, but it landed
+        in the temperature tick, which runs on the GUI thread -- so the walk was
+        still blocking the UI, once per tick per project, and the tick's own
+        docstring claimed zero disk reads. The TTL is 10 s and the tick is 60 s,
+        so every project was stale at every tick: N projects x up to 0.15 s of
+        os.walk plus the archive stats, in one uninterruptible block. Measured as
+        a ~1 s freeze at 60 s intervals; dragging the window during it made the
+        window jump to the cursor once the thread came back.
+
+        The claim is separated from the compute so the caller can run
+        ``compute_archive_fresh`` on a worker thread and hand the result back
+        through ``apply_archive_fresh`` on the GUI thread.
+        """
         stale_ids = getattr(self, "_stale_projects", None)
-        if stale_ids:
-            for pid in list(stale_ids):
-                stale_ids.discard(pid)
-                proj = self.project_by_id(pid)
-                if proj:
-                    self._archive_fresh_cache[pid] = self._compute_archive_fresh(proj)
-                    idx = self.index_for_project_id(pid)
-                    if idx.isValid():
-                        self.dataChanged.emit(idx, idx)
+        if not stale_ids:
+            return []
+        claimed = [pid for pid in stale_ids if self.project_by_id(pid)]
+        stale_ids.clear()
+        return claimed
+
+    def compute_archive_fresh(self, project_id: str) -> Optional[dict]:
+        """Freshness entry for one project. Pure disk+config read, no Qt.
+
+        Safe to call from a worker thread: it touches no model state and emits
+        no signals. ``apply_archive_fresh`` publishes the result.
+        """
+        proj = self.project_by_id(str(project_id))
+        if not proj:
+            return None
+        return self._compute_archive_fresh(proj)
+
+    def apply_archive_fresh(self, project_id: str, entry: Optional[dict]) -> None:
+        """Publish a worker-computed freshness entry with a targeted repaint."""
+        if not entry:
+            return
+        project_id = str(project_id)
+        self._archive_fresh_cache[project_id] = entry
+        idx = self.index_for_project_id(project_id)
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx)
 
     def group_count(self, group: str) -> int:
         """Returns count of active projects in a group."""

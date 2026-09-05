@@ -87,7 +87,7 @@ def test_assignment_accepts_project_id_only_and_returns_canonical_layer(bridge_s
     path = Path(assigned["assigned_path"])
     assert path == project_root / "audit" / "1.md"
     assert path.read_text(encoding="utf-8") == payload["text"]
-    assert assigned["command"] == f'saipen cc "{path}"'
+    assert assigned["command"] == "saipen cc"
 
 
 def test_assignment_rejects_browser_destination_path(bridge_server):

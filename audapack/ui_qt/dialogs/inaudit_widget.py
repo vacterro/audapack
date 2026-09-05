@@ -37,6 +37,8 @@ from audapack.inaudit import (
 )
 from audapack.inaudit_capture import InauditCaptureError, InauditCaptureStore
 from audapack.models import Project
+from audapack.saipen_transport import is_managed
+from audapack.ui_qt.task_runner import TaskRunner
 from audapack.ui_qt.theme.golden_default import GoldenDefault
 
 
@@ -63,6 +65,7 @@ class InauditWidget(QWidget):
         self._project: Project | None = None
         self._inbox_records: list[dict] = []
         self._capture_store = capture_store or InauditCaptureStore()
+        self._task_runner = TaskRunner(max_threads=0, parent=self)
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._on_fs_changed)
         self._watcher.fileChanged.connect(self._on_fs_changed)
@@ -71,6 +74,8 @@ class InauditWidget(QWidget):
         self._debounce.setInterval(250)
         self._debounce.timeout.connect(self._on_debounced_fs)
         self._dirty = False
+        self._editor_path: Path | None = None
+        self._editor_bytes: bytes | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
@@ -106,13 +111,13 @@ class InauditWidget(QWidget):
         self.btn_open = QPushButton("Open", btn_row)
         self.btn_open.clicked.connect(self._on_open)
         self.btn_ia = QPushButton("IA Copy", btn_row)
-        self.btn_ia.setToolTip("Copy selected INAUDIT path\nShift: saipen gg \"path\"\nCtrl: saipen cc \"path\"")
+        self.btn_ia.setToolTip("Copy selected INAUDIT path")
         self.btn_ia.clicked.connect(self._on_ia_copy)
         self.btn_gg = QPushButton("GG", btn_row)
-        self.btn_gg.setToolTip('Copy saipen gg "path"')
+        self.btn_gg.setToolTip("Legacy GG shortcut: copy saipen cc to process the Audit Inbox")
         self.btn_gg.clicked.connect(self._on_gg)
         self.btn_cc = QPushButton("CC", btn_row)
-        self.btn_cc.setToolTip('Copy saipen cc "path"')
+        self.btn_cc.setToolTip("Copy saipen cc to process the project's Audit Inbox")
         self.btn_cc.clicked.connect(self._on_cc)
         self.btn_plus = QPushButton("+", btn_row)
         self.btn_plus.setToolTip("Create next numbered layer")
@@ -391,6 +396,8 @@ class InauditWidget(QWidget):
         if project is None or not project.source_path:
             return ""
         audit_dir = Path(project.source_path) / "audit"
+        if is_managed(project.source_path):
+            return f"{audit_dir} (number assigned on delivery)"
         try:
             numbers = [
                 int(path.stem)
@@ -446,15 +453,46 @@ class InauditWidget(QWidget):
         if record is None or not project_id:
             self.inbox_status.setText("Select one capture and one registered project")
             return
+        projects = self._projects()
+        project = next((p for p in projects if p.id == project_id), None)
+        if project and (is_managed(project.source_path) or record.get("delivery_project_root")):
+            self._submit_assignment(str(record["capture_id"]), project_id, projects, action)
+            return
         try:
             result = self._capture_store.assign(
-                str(record["capture_id"]), project_id, self._projects(), action=action
+                str(record["capture_id"]), project_id, projects, action=action
             )
         except (InauditCaptureError, OSError) as exc:
             self.inbox_status.setText(f"Assign failed: {exc}")
             return
+        self._assignment_finished(result, project_id, action)
+
+    def _submit_assignment(self, capture_id, project_id, projects, action):
+        if self._task_runner.is_running("inaudit:assign"):
+            self.inbox_status.setText("Audit delivery in progress")
+            return
+        self.inbox_page.setEnabled(False)
+        self.btn_plus.setEnabled(False)
+        self.inbox_status.setText("Delivering audit to project...")
+
+        def done(result):
+            self.inbox_page.setEnabled(True)
+            self.btn_plus.setEnabled(True)
+            self._assignment_finished(result, project_id, action)
+
+        def failed(error):
+            self.inbox_page.setEnabled(True)
+            self.btn_plus.setEnabled(True)
+            self.inbox_status.setText(f"Assign failed: {error}")
+            self.status.setText(f"Assign failed: {error}")
+
+        self._task_runner.submit("inaudit:assign",
+                                 lambda: self._capture_store.assign(capture_id, project_id, projects, action=action),
+                                 on_success=done, on_error=failed)
+
+    def _assignment_finished(self, result, project_id, action):
         copied = self._copy_text(str(result["command"])) if result.get("command") else True
-        suffix = f" · {action} command copied" if action and copied else (f" · {action} copy failed" if action else "")
+        suffix = " · CC command copied" if action and copied else (" · CC copy failed" if action else "")
         self.inbox_status.setText(f"Assigned: {result['assigned_path']}{suffix}")
         self.refresh_inbox()
         self.refresh()
@@ -583,6 +621,9 @@ class InauditWidget(QWidget):
         self.btn_delete_capture.setEnabled(has)
 
     def set_project(self, project: Project | None):
+        if self._dirty and project != self._project:
+            self.status.setText("Draft retained. Save or Reload before switching projects.")
+            return
         self._project = project
         self._rewatch()
         self.refresh()
@@ -604,6 +645,7 @@ class InauditWidget(QWidget):
             return
         self.header.setText(f"INAUDIT — {self._project.display_name} · {d}")
         try:
+            self._watcher.addPath(str(Path(self._project.source_path).resolve()))
             if d.exists():
                 self._watcher.addPath(str(d.resolve()))
                 for lay in list_inaudit_layers(self._project):
@@ -615,6 +657,9 @@ class InauditWidget(QWidget):
             pass
 
     def refresh(self):
+        if self._dirty:
+            self.status.setText("Layers changed on disk. Draft retained; Save or Reload before Refresh.")
+            return
         if self._project is None:
             self.list.clear()
             self.editor.clear()
@@ -652,7 +697,11 @@ class InauditWidget(QWidget):
         self._debounce.start()
 
     def _on_debounced_fs(self):
-        self.refresh()
+        if self._dirty:
+            self.status.setText("Layers changed on disk. Draft retained; Save or Reload before Refresh.")
+            self._rewatch()
+        else:
+            self.refresh()
         try:
             if self._on_changed_cb:
                 self._on_changed_cb(self._project)
@@ -685,6 +734,8 @@ class InauditWidget(QWidget):
             pass
 
     def _load_editor(self):
+        self._editor_path = None
+        self._editor_bytes = None
         if self._project is None:
             self.editor.clear()
             self._dirty = False
@@ -699,7 +750,9 @@ class InauditWidget(QWidget):
             self.lbl_dirty.setText("")
             return
         try:
-            text = p.read_text(encoding="utf-8")
+            self._editor_bytes = p.read_bytes()
+            text = self._editor_bytes.decode("utf-8")
+            self._editor_path = p
         except Exception:
             text = ""
         self.editor.blockSignals(True)
@@ -715,12 +768,23 @@ class InauditWidget(QWidget):
     def _on_save(self):
         if self._project is None:
             return
-        p = get_active_inaudit_path(self._project)
+        p = self._editor_path
         if p is None:
             return
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(self.editor.toPlainText(), encoding="utf-8")
+            # Open an existing file: a consume racing Save must never recreate it.
+            try:
+                stream = p.open("r+b")
+            except FileNotFoundError:
+                self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
+                return
+            with stream:
+                if stream.read() != self._editor_bytes:
+                    self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
+                    return
+                stream.seek(0)
+                stream.write(self.editor.toPlainText().encode("utf-8"))
+                stream.truncate()
             self._dirty = False
             self.lbl_dirty.setText(f"Saved {p.name}")
             self.status.setText(f"Saved {p.name}")
@@ -770,7 +834,7 @@ class InauditWidget(QWidget):
         if p is None:
             self.status.setText("No INAUDIT layer selected")
             return
-        cmd = f'saipen gg "{p}"'
+        cmd = "saipen cc"
         QApplication.clipboard().setText(cmd)
         self.status.setText(f"GG copied: {cmd[:80]}")
 
@@ -779,7 +843,7 @@ class InauditWidget(QWidget):
         if p is None:
             self.status.setText("No INAUDIT layer selected")
             return
-        cmd = f'saipen cc "{p}"'
+        cmd = "saipen cc"
         QApplication.clipboard().setText(cmd)
         self.status.setText(f"CC copied: {cmd[:80]}")
 
@@ -788,7 +852,18 @@ class InauditWidget(QWidget):
             self.status.setText("Select a project first")
             return
         try:
-            p = ensure_next_layer(self._project)
+            if is_managed(self._project.source_path):
+                text, accepted = QInputDialog.getMultiLineText(self, "New audit", "Audit text:")
+                if not accepted or not text.strip():
+                    return
+                capture_id = str(uuid.uuid4())
+                self._capture_store.capture({"capture_id": capture_id, "text": text,
+                                             "capture_kind": "audit", "source": "desktop"}, [self._project])
+                self.refresh_inbox()
+                self._submit_assignment(capture_id, self._project.id, [self._project], "")
+                return
+            else:
+                p = ensure_next_layer(self._project)
             self.status.setText(f"Created {p.name}")
             self.refresh()
             # focus new row
@@ -890,7 +965,10 @@ class InauditWidget(QWidget):
         has = self._active_path() is not None
         for b in (self.btn_open, self.btn_ia, self.btn_gg, self.btn_cc, self.btn_save, self.btn_reload):
             b.setEnabled(has if b not in (self.btn_plus, self.btn_refresh) else True)
-        self.btn_plus.setEnabled(self._project is not None)
-        self.btn_rename.setEnabled(has)
+        self.btn_plus.setEnabled(self._project is not None and not self._task_runner.is_running("inaudit:assign"))
+        managed = self._project is not None and is_managed(self._project.source_path)
+        self.btn_rename.setEnabled(has and not managed)
+        self.btn_rename.setToolTip("SAIPEN owns layer numbers; rename the capture title in Inbox" if managed
+                                   else "Move this layer to a different free number (never overwrites)")
         self.btn_delete.setEnabled(has)
         self.editor.setEnabled(has or self._project is not None)

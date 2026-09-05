@@ -238,9 +238,17 @@ def test_archive_freshness_cache_ttl(model_fixture, monkeypatch):
     model._get_archive_fresh(proj)  # still cached, still stale-served
     assert len(calls) == 0
 
-    # The temperature tick performs the deferred recompute.
+    # The tick no longer walks the disk itself. PERF-001 moved the bounded
+    # source walk off the paint path and into this tick -- which is still the
+    # GUI thread, so with a 10 s TTL against a 60 s tick every project was
+    # recomputed every time and the UI froze for about a second. The tick now
+    # only CLAIMS the stale ids; the caller recomputes off-thread and publishes.
     model.update_temperature_all()
-    assert len(calls) == 1, "tick must recompute stale archive entries"
+    assert len(calls) == 0, "the tick must not walk the filesystem"
+    assert model.take_stale_archive_projects() == [proj.id]
+    assert model.take_stale_archive_projects() == [], "a claim is consumed once"
+    model.apply_archive_fresh(proj.id, model.compute_archive_fresh(proj.id))
+    assert len(calls) == 1
     model._get_archive_fresh(proj)
     assert len(calls) == 1
 
@@ -398,7 +406,33 @@ def test_archive_age_reads_the_cached_mtime_and_a_live_clock(model_fixture):
     assert model.data(idx, model.ROLES["archive_age_str"]) == ""
 
 
+def test_reload_snapshots_inaudit_for_every_project(model_fixture, monkeypatch):
+    """The IA badge must be populated for ALL projects after a reload.
+
+    Regression: _reload() called _refresh_inaudit_snapshot() BEFORE repopulating
+    self._projects, and the refresh iterates that dict -- so the snapshot was
+    built over an empty room and every project's count stayed 0. The only other
+    writer is refresh_inaudit(project_id), which fills exactly one project, so
+    the count appeared only for a project whose INAUDIT inbox the user opened by
+    hand.
+    """
+    import audapack.ui_qt.models.project_room_model as module
+
+    model, _service, _config, _tmp_path = model_fixture
+    monkeypatch.setattr(module, "list_inaudit_layers", lambda proj: ["1.md", "2.md"])
+    monkeypatch.setattr(module, "get_inaudit_selected", lambda proj: 1)
+
+    model._reload()
+
+    assert set(model._inaudit_snapshot) == {"p1", "p2", "p3"}
+    for project_id in ("p1", "p2", "p3"):
+        index = model.index_for_project_id(project_id)
+        assert model.data(index, model.ROLES["inaudit_count"]) == 2, project_id
+        assert model.data(index, model.ROLES["inaudit_selected"]) == 1, project_id
+
+
 def test_data_roles_never_touch_the_filesystem(model_fixture, monkeypatch):
+
     """PERF-001 (audit/4.md): data() is a pure in-memory read, all roles.
 
     inaudit_count / inaudit_label / hover_info called list_inaudit_layers()

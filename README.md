@@ -39,7 +39,7 @@
 - **🔌 Loopback Bridge Daemon**: High-throughput HTTP server on `127.0.0.1:17843` (API v3/v2) with token authorization, INAUDIT capture REST API, and atomic wave aggregation.
 - **🪟 Windows Integration**: Explorer right-click context menu integration (*"Упаковать через AUDAPACK"*) and silent VBScript background launchers.
 - **🎨 Golden Vintage Aesthetic**: Authentic Windows 95 Dark Golden theme with 2px raised/sunken bevels and zero antialiasing for maximum readability.
-- **📥 Durable INAUDIT Inbox**: Filesystem-backed capture store for ChatGPT responses, blocks, or clipboard text; deterministic project classification, verified hardlink/copy assignment to `audit/N.md`, and archive/restore/delete lifecycle.
+- **📥 Durable INAUDIT Inbox**: Filesystem-backed capture store for ChatGPT responses, blocks, or clipboard text; deterministic project classification, canonical SAIPEN enqueue for managed projects, and archive/restore/delete lifecycle.
 - **🧠 Dedicated Chromium Worker**: Launches a Chromium-family browser (Chrome, Edge, Vivaldi, Opera) in an isolated profile with all throttling disabled; the top-level-only Widget guard rejects embedded ChatGPT sentinel frames.
 
 ---
@@ -92,7 +92,11 @@ Use **Settings → Components → Launch AUDAPACK Chromium**. AUDAPACK picks an 
 Only a clean root ChatGPT tab in a Chromium-family browser can claim a new audit — existing conversations, drafts, attachments, in-flight generation, and non-root URLs fail closed, and embedded ChatGPT sentinel frames are rejected outright.
 
 ### 6. INAUDIT Capture Workflow
-On a stable ChatGPT answer, press `IA` beside the response or a code block. A verified Bridge write shows `IA ✓`; if the Bridge is unavailable, the bounded IndexedDB spool shows `IA QUEUED` and retries the same capture identity later. In AUDAPACK, open **INAUDIT → Inbox** to inspect provenance and classification evidence, choose a registered project, then use **Assign**, **Assign + GG**, or **Assign + CC**. The toolbar's `IA+` action captures the current Windows clipboard through the same durable store. Assignment rescans the project's `audit` directory, writes `max(N) + 1` without overwriting, verifies the body hash, and only then offers the canonical GG/CC command.
+On a stable ChatGPT answer, press `IA` beside the response or a code block. A verified Bridge write shows `IA ✓`; if the Bridge is unavailable, the bounded IndexedDB spool shows `IA QUEUED` and retries the same capture identity later. In AUDAPACK, open **INAUDIT → Inbox** to inspect provenance and classification evidence, choose a registered project, then use **Assign** or **Assign + CC**. The toolbar's `IA+` action captures the current Windows clipboard through the same durable store.
+
+For projects containing `.saipen/`, AUDAPACK calls the CLI bound by that project's `STATE.md`: `saipen audit enqueue --producer audapack --operation-id <capture UUID> --item-id <capture UUID> --file <capture body>`. SAIPEN allocates the layer number and owns publication. Failed delivery retains the capture; retry uses the same UUID and cannot recreate a consumed layer. A missing or broken SAIPEN binding reports an error without falling back to local allocation. Finished audit mirrors use the same producer API with a stable content-derived operation UUID. Projects without SAIPEN retain local layer delivery.
+
+Run the copied `saipen cc` in the selected project's agent session. It processes the Audit Inbox in protocol order; selecting a row does not override active Work or select that audit for immediate execution. Legacy INAUDIT GG buttons also copy bare `saipen cc`. After Source closure, Work DONE and matching bytes, SAIPEN consumes the layer automatically on the next continuation. Layers refresh from disk; an unsaved editor draft is retained until Save or Reload, and Save refuses an already changed or consumed layer. Manual Delete remains an explicit operator action. Closed audit evidence stays in SAIPEN's source archive; Layers is the live queue.
 
 ---
 

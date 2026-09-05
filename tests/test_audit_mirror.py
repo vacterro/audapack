@@ -102,9 +102,13 @@ def test_redelivering_the_same_bytes_adds_nothing(tmp_path):
     assert sorted(p.name for p in (project / "audit").iterdir()) == [".gitignore", "1.md"]
 
 
-def test_a_layer_number_a_settled_receipt_used_is_never_reissued(tmp_path):
-    """Reusing it would rebind fresh bytes onto a closed receipt's path."""
+def test_managed_project_without_runtime_binding_never_reissues_a_layer(tmp_path):
+    """A legacy journal alone no longer authorizes a local producer writer."""
     import json
+
+    import pytest
+
+    from audapack.saipen_transport import SaipenTransportError
 
     project = tmp_path / "proj"
     binding = project / ".saipen" / "intake"
@@ -115,8 +119,9 @@ def test_a_layer_number_a_settled_receipt_used_is_never_reissued(tmp_path):
     }), encoding="utf-8")
     src = _audit_dir(tmp_path)
 
-    mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, src, _handoff(src))
-    assert (project / "audit" / "2.md").is_file()
+    with pytest.raises(SaipenTransportError, match="SAIPEN binding"):
+        mirror_project_audits(_config(tmp_path, mirror_into_project=True), project, src, _handoff(src))
+    assert not (project / "audit" / "2.md").exists()
     assert not (project / "audit" / "1.md").exists()
 
 

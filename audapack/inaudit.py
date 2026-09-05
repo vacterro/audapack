@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from audapack.models import Project
+from audapack.saipen_transport import is_managed
 
 INAUDIT_RE = re.compile(r"^[1-9][0-9]*\.md$")
 
@@ -121,6 +122,8 @@ def resolve_inaudit_path(project: Project, number: int) -> Optional[Path]:
     return cand
 
 def ensure_next_layer(project: Project) -> Path:
+    if project.source_path and is_managed(project.source_path):
+        raise ValueError("SAIPEN layers need audit text; capture and assign through the Inbox")
     d = inaudit_dir(project)
     if d is None:
         # An assert here vanished under python -O and left d.mkdir raising
@@ -213,6 +216,8 @@ def rename_inaudit_layer(project: Project, number: int, new_number: int) -> str:
 
     Returns "" on success, or a short human-readable reason.
     """
+    if project.source_path and is_managed(project.source_path):
+        return "SAIPEN owns layer numbers; rename the capture title in Inbox instead"
     d = inaudit_dir(project)
     if d is None:
         return "project has no source path"
