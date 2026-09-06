@@ -69,11 +69,25 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
     return result_buttons, gg_rect
 
 
-#: Fixed width reserved on the right edge for the launcher/info button block,
-#: so the state column left edge is identical on every row regardless of how
-#: many launcher buttons a row actually has. Max 6 buttons * 18px + 5 * 2px gap
-#: + 2px margin + 4px gap + 18px info = 142px; round to a safe 150px.
-FIXED_ACTIONS_WIDTH = 150
+#: Fixed width reserved on the right edge for the launcher/info/layer button
+#: block, so the state column left edge is identical on every row regardless of
+#: how many launcher buttons a row actually has. Max 6 buttons * 18px + 5 * 2px
+#: gap + 2px margin + 4px gap + 18px info + 2 * 18px layer buttons + 2 * 2px
+#: gaps = 184px; round to a safe 190px.
+FIXED_ACTIONS_WIDTH = 190
+
+#: Row narrower than this cannot fit checkboxes + name + state grid + the
+#: fixed right-edge button block without elements landing on top of each
+#: other. Below it the row degrades gracefully: no state grid, no buttons —
+#: only checkboxes, slot badge and an elided name. The click handler in
+#: main_window guards on the same constant, so paint and hit-testing agree.
+MIN_ROW_WIDTH = 340
+
+#: The exact width at which the full row layout (name + state grid + buttons)
+#: stops fitting. ONE threshold shared by the delegate's paint and
+#: main_window's hit-testing, so a control can never be clickable where it is
+#: not painted (or painted where it is not clickable).
+FULL_ROW_MIN_WIDTH = MIN_ROW_WIDTH + FIXED_ACTIONS_WIDTH
 
 #: Compact-row state grid: one cell per field, in reading order, at offsets
 #: that do not depend on the value of any other field. Concatenating them into
@@ -88,6 +102,40 @@ COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 58
 #: Width of the whole compact state grid. Derived, so a cell cannot be widened
 #: without the column growing to match and silently clipping the last field.
 COMPACT_STATE_WIDTH = sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS)
+
+#: Full-mode state grid: RUN | WAVES | AGE on line 0, ZIP | PACK on line 1.
+#: Both lines must stay inside FULL_STATE_WIDTH -- a cell beyond it lands on
+#: the fixed right-edge button block. That is exactly how the INAUDIT badge
+#: ended up painted under the [edit] button and how a ZIP line fitted against
+#: the whole column width ran into the PACK badge.
+FULL_STATE_CELL_WIDTHS = (("run", 64), ("waves", 42), ("age", 62), ("zip", 100), ("pack", 60))
+FULL_STATE_WIDTH = 175
+
+#: The slot badge must hold the widest value the Add/Edit dialog can produce:
+#: slots run 1..10, so "[10]" is the worst case. The width is derived from the
+#: font at paint time (see slot_badge_width) -- a hardcoded pixel width lies the
+#: moment the theme's NoAntialias strategy makes Verdana 9 render at 48px.
+SLOT_BADGE_WORST = "[10]"
+SLOT_BADGE_MIN = 24
+
+
+def slot_badge_width(metrics) -> int:
+    """Width the slot badge needs, from the font actually in use.
+
+    Same value on every row, so the name column stays aligned. Derived from
+    metrics instead of a constant: the NoAntialias strategy (crisp pixels) and
+    per-machine DPI both change how wide "[10]" paints, and a fixed 24/30px
+    badge clipped a two-digit slot straight onto the project name.
+    """
+    return max(metrics.horizontalAdvance(SLOT_BADGE_WORST), SLOT_BADGE_MIN)
+
+
+def fit_zip_text(candidates: list[str], advance, limit: int) -> str:
+    """First candidate that fits ``limit`` pixels, else the shortest one."""
+    for candidate in candidates:
+        if advance(candidate) <= limit:
+            return candidate
+    return candidates[-1] if candidates else ""
 
 
 def compact_archive_cell(
@@ -137,6 +185,22 @@ def compute_info_button_rect(row_rect: QRect, launcher_buttons: list[tuple[Any, 
         # no launchers — place near right edge where GG used to be
         x = row_rect.right() - info_w - 2
     return QRect(x, row_rect.top() + 2, info_w, 20)
+
+
+def compute_layer_button_rects(row_rect: QRect, info_rect: QRect) -> tuple[QRect, QRect]:
+    """[+] and [edit] layer buttons placed left of the info button.
+
+    [+] opens the project's audit-layer editor window; [edit] opens it on the
+    operator's LAST user-created layer (never on one the AUDAPACK widget
+    delivered). Same 18x20 bevel geometry as the other row buttons, still
+    hugging the fixed right-edge block.
+    """
+    btn_w = 18
+    gap = 2
+    plus_x = info_rect.left() - gap - btn_w
+    plus_rect = QRect(plus_x, row_rect.top() + 2, btn_w, 20)
+    edit_rect = QRect(plus_x - gap - btn_w, row_rect.top() + 2, btn_w, 20)
+    return plus_rect, edit_rect
 
 
 class ProjectItemDelegate(QStyledItemDelegate):
@@ -262,19 +326,26 @@ class ProjectItemDelegate(QStyledItemDelegate):
             painter.drawText(cb2, Qt.AlignmentFlag.AlignCenter, "A")
         x += 16
 
-        # 1. Slot badge [1..6] — compact 24px
+        # 1. Slot badge [1..10] — width from the font actually painting it, so
+        # two-digit slots and DPI scaling never spill onto the project name.
         slot_badge = f"[{slot_num}]"
         painter.setFont(self.font_mono)
         name_color = QColor(PALETTE["textMuted"]) if is_ignored else QColor(PALETTE["textSecondary"])
         painter.setPen(name_color)
-        slot_w = 24
+        slot_w = slot_badge_width(painter.fontMetrics())
         painter.drawText(QRect(x, y, slot_w, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, slot_badge)
         x += slot_w + 2
 
         if is_empty:
             painter.setFont(self.font_small)
             painter.setPen(QColor(PALETTE["textMuted"]))
-            painter.drawText(QRect(x, y, 200, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "[ EMPTY — DROP ]")
+            empty_text = "[ EMPTY — DROP ]"
+            empty_w = rect.right() - x - 4
+            painter.drawText(
+                QRect(x, y, max(0, empty_w), h),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                painter.fontMetrics().elidedText(empty_text, Qt.TextElideMode.ElideRight, empty_w),
+            )
             painter.restore()
             return
 
@@ -282,6 +353,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         launchers = getattr(self._config, "launchers", None) if self._config else None
         launcher_buttons, gg_rect = compute_row_button_rects(rect, launchers)
         info_rect = compute_info_button_rect(rect, launcher_buttons, gg_rect)
+        plus_rect, edit_rect = compute_layer_button_rects(rect, info_rect)
 
         total_waves = index.data(Qt.ItemDataRole.UserRole + 15) or 3
         prof_label = index.data(Qt.ItemDataRole.UserRole + 19) or ("A10" if total_waves == 10 else "A3")
@@ -299,7 +371,11 @@ class ProjectItemDelegate(QStyledItemDelegate):
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
         # Full mode gives the state column room for the aligned sub-columns
         # (RUN | WAVES | AGE / ZIP | PACK); compact keeps its one wide line.
-        col_w = COMPACT_STATE_WIDTH if compact_rows else 175
+        col_w = COMPACT_STATE_WIDTH if compact_rows else FULL_STATE_WIDTH
+        # A too-narrow row cannot hold name + state grid + button block side by
+        # side: painting them anyway just stacks text on text. Skip the state
+        # grid entirely and let the elided name own the whole middle.
+        cramped = rect.width() < FULL_ROW_MIN_WIDTH
         col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
 
         # Data used by the column
@@ -432,11 +508,14 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # copy counter
         copy_cnt = int(index.data(Qt.ItemDataRole.UserRole + 25) or 0)
         copy_display = f"  ×{copy_cnt}" if copy_cnt > 0 else ""
-        inaudit_display = f"  {inaudit_label}" if inaudit_label else ""
-        inaudit_color = QColor(PALETTE["borderGolden"]) if inaudit_label else QColor(PALETTE["textMuted"])
 
         # ── ZIP text — "ZIP: 156,7 MB 28.08 01:12" — size + creation date
         freshness_tag = ""
+        # The ZIP cell is 100px; the PACK badge owns what is left of the
+        # column. Candidates used to be fitted against the WHOLE column (175px)
+        # and then drawn into the 100px cell, so anything between 100 and 175px
+        # wide ran straight into the PACK badge's pixels.
+        zip_fit_width = dict(FULL_STATE_CELL_WIDTHS)["zip"] if not compact_rows else COMPACT_STATE_CELL_WIDTHS[-2][1]
         if arc_exists:
             size_str = str(arc_size).replace(".", ",")  # 156.7 MB → 156,7 MB like screenshot
             arc_color = QColor(TC.get(arc_temp_val, PALETTE["textSecondary"]))
@@ -470,11 +549,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
                     f"ZIP: {size_str}{age_part}",
                     f"ZIP: {size_str}",
                 ]
-            zip_text = candidates[-1]
-            for candidate in candidates:
-                if painter.fontMetrics().horizontalAdvance(candidate) <= col_w:
-                    zip_text = candidate
-                    break
+            zip_text = fit_zip_text(candidates, painter.fontMetrics().horizontalAdvance, zip_fit_width)
             if compact_rows:
                 # Compact mode keeps the size in the ZIP cell and gives age and
                 # freshness their own cell -- packing borrows the ZIP cell and a
@@ -498,6 +573,17 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # COLUMNS, not one concatenated string. Concatenation made every field
         # start wherever the previous one happened to end, so nothing lined up
         # down the list and the eye had to re-find each value on every row.
+        if cramped:
+            painter.setFont(self.font_bold)
+            painter.setPen(QColor(PALETTE["textPrimary"] if not is_ignored else PALETTE["textMuted"]))
+            available = rect.right() - x - 4
+            painter.drawText(
+                QRect(x, y, available, h),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                painter.fontMetrics().elidedText(str(display_name), Qt.TextElideMode.ElideRight, available),
+            )
+            painter.restore()
+            return
         if compact_rows:
             painter.setFont(self.font_small)
             single_y = y + (h - line_h) // 2
@@ -523,10 +609,11 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 PALETTE["warning"] if completed_waves > 0 else PALETTE["textMuted"]
             )
             _draw_cell(wav_cx, C_WAV, f"{completed_waves}/{total_waves}" if total_waves else "", wav_color)
-            # The copy counter and the INAUDIT badge share the age cell: both
-            # are rare, and neither earns a permanent column of its own.
-            age_cell = (audit_display or "").strip() or (copy_display or "").strip() or (inaudit_display or "").strip()
-            age_color = audit_color if (audit_display or "").strip() else inaudit_color
+            # The INAUDIT badge is already drawn beside the project name; the
+            # compact age cell keeps age, copy counter only. Painting the same
+            # IA token twice on one 22px row made the row read as doubled.
+            age_cell = (audit_display or "").strip() or (copy_display or "").strip()
+            age_color = audit_color if (audit_display or "").strip() else QColor(PALETTE["textMuted"])
             _draw_cell(age_cx, C_AGE, age_cell, age_color)
             # Packing owns the ZIP cell while it runs: the archive size it
             # reports is about to be replaced anyway, and the progress badge
@@ -576,8 +663,9 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 _draw_col(age_x, AGE_W, audit_age_str, audit_color)
             else:
                 _draw_col(age_x, AGE_W, "", QColor(PALETTE["textMuted"]))
-            if inaudit_label:
-                _draw_col(age_x + AGE_W, 50, inaudit_label, inaudit_color)
+            # The INAUDIT count is NOT drawn here: the name line already carries
+            # the golden IA badge, and an extra one at age_x + AGE_W extended
+            # past the state column's 175px onto the fixed [edit] button.
 
             # Line 1: ZIP | PACK
             if pack_state in ("PACKING", "QUEUED") and isinstance(pack_progress, dict):
@@ -617,18 +705,22 @@ class ProjectItemDelegate(QStyledItemDelegate):
             painter.setPen(QColor(PALETTE["textPrimary"]))
         name_x = x + prefix_width
         name_available = col_x - name_x - 8
-        # Reserve room for the IA badge so the name elides before it collides
+        # Reserve room for the IA badge so the name elides before it collides.
+        # No artificial floor: a floor wider than the real gap is exactly what
+        # made the name run over the state column on narrow windows.
         ia_suffix_w = painter.fontMetrics().horizontalAdvance(f" {inaudit_label}") if inaudit_label else 0
-        name_width = max(40, name_available - ia_suffix_w)
+        name_width = max(0, name_available - ia_suffix_w)
         elided_name = painter.fontMetrics().elidedText(str(display_name), Qt.TextElideMode.ElideRight, name_width)
         painter.drawText(QRect(name_x, y, name_width, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_name)
-        # IA badge right after the name — always visible, golden
+        # IA badge right after the name — always visible, golden. Pinned to the
+        # right edge of the name's own box, never past it: the old
+        # name_x + width(elided_name) anchored slid a rounded advance past the
+        # reserved width and onto the state column.
         if inaudit_label:
-            ia_x = name_x + painter.fontMetrics().horizontalAdvance(elided_name)
             painter.setFont(self.font_small)
             painter.setPen(QColor(PALETTE["borderGolden"]))
             painter.drawText(
-                QRect(ia_x, y, ia_suffix_w + 4, h),
+                QRect(name_x + name_width, y, ia_suffix_w + 4, h),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 f" {inaudit_label}",
             )
@@ -677,6 +769,19 @@ class ProjectItemDelegate(QStyledItemDelegate):
         painter.setFont(self.font_bold)
         painter.setPen(QColor(PALETTE["borderGolden"]))
         painter.drawText(info_rect, Qt.AlignmentFlag.AlignCenter, "\u24D8")
+
+        # 7c. Draw [+] / [edit] audit-layer buttons (T-161)
+        for layer_rect, glyph in ((plus_rect, "+"), (edit_rect, "e")):
+            painter.fillRect(layer_rect, QColor(PALETTE["surfaceRaised"]))
+            painter.setPen(QPen(QColor(PALETTE["bevelLight"]), 1))
+            painter.drawLine(layer_rect.left(), layer_rect.top(), layer_rect.right() - 1, layer_rect.top())
+            painter.drawLine(layer_rect.left(), layer_rect.top(), layer_rect.left(), layer_rect.bottom() - 1)
+            painter.setPen(QPen(QColor(PALETTE["borderDark"]), 1))
+            painter.drawLine(layer_rect.left(), layer_rect.bottom() - 1, layer_rect.right() - 1, layer_rect.bottom() - 1)
+            painter.drawLine(layer_rect.right() - 1, layer_rect.top(), layer_rect.right() - 1, layer_rect.bottom() - 1)
+            painter.setFont(self.font_bold)
+            painter.setPen(QColor(PALETTE["borderGolden"]))
+            painter.drawText(layer_rect, Qt.AlignmentFlag.AlignCenter, glyph)
 
         painter.restore()
 

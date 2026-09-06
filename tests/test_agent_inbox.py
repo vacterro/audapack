@@ -343,3 +343,25 @@ def test_a_non_numeric_file_is_simply_not_a_layer(tmp_path):
     (audit_dir / "notes.md").write_text("not a layer", encoding="utf-8")
     layers = list_inaudit_layers(Project(id="p", display_name="P", source_path=str(tmp_path)))
     assert [layer.number for layer in layers] == [1]
+
+
+# ------------------------------------------------------------------ R008
+#
+# The layer number came from a directory scan and the empty file was written
+# afterwards, so a layer created in between was emptied instead of skipped.
+
+
+def test_a_layer_created_after_the_scan_is_skipped_not_emptied(tmp_path, monkeypatch):
+    from audapack import inaudit
+    from audapack.models import Project
+
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "1.md").write_text("someone else's audit text", encoding="utf-8")
+    project = Project(id="p", display_name="P", source_path=str(tmp_path))
+    monkeypatch.setattr(inaudit, "list_inaudit_layers", lambda _project: [])
+
+    target = inaudit.ensure_next_layer(project)
+
+    assert target.name == "2.md"
+    assert (audit_dir / "1.md").read_text(encoding="utf-8") == "someone else's audit text"

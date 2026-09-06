@@ -1,6 +1,7 @@
 """Unit tests for AUDAPACK packing engine."""
 
 import json
+import os
 import queue
 import shutil
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from audapack.fidelity import build_fidelity_plan
 from audapack.models import PackResult
 from audapack.packing import (
     MANIFEST_FILENAME,
@@ -444,9 +446,9 @@ class TestArchiveWeightExclusions(unittest.TestCase):
 
     Measured on the operator's machine: __SAITULS packed to 346MB of which
     326MB was .exe and 14MB .dll; 9router to 210MB of which 150MB was git pack
-    files and 16MB of web fonts; FastPrompter to 160MB with 89MB of .git and
-    35MB of .wav. All of it is uploaded, and the model reads all of it before
-    it can write a single ticket.
+    files. All of it is uploaded, and the model reads all of it before it can
+    write a single ticket. Media and fonts left this layer with CORE-002
+    (audit/6.md): audapack.fidelity owns them.
     """
 
     def setUp(self):
@@ -464,15 +466,28 @@ class TestArchiveWeightExclusions(unittest.TestCase):
             "C:/p/Bin/tool.exe",
             "C:/p/Bin/native.dll",
             "C:/p/lib/core.so",
-            "C:/p/sounds/alert.wav",
-            "C:/p/clips/demo.mp4",
-            "C:/p/assets/inter.woff2",
             "C:/p/vendor/bundle.tgz",
             "C:/p/state/index.zst",
             "C:/p/old/main.py.bak",
             "C:/p/.codebase-memory/graph.db2",
         ):
             self.assertTrue(self._excluded(path), path)
+
+    def test_media_and_fonts_are_owned_by_the_fidelity_profile(self):
+        """CORE-002 (audit/6.md): the pattern layer must not pre-empt fidelity.
+
+        `build_fidelity_plan` matches configured excludes BEFORE
+        `media_class_for`, so while these patterns sat in DEFAULT_EXCLUDES no
+        profile could sample them and FULL could not preserve them -- while the
+        manifest still declared full_snapshot.
+        """
+        for path in (
+            "C:/p/sounds/alert.wav",
+            "C:/p/clips/demo.mp4",
+            "C:/p/assets/inter.woff2",
+            "C:/p/assets/inter.ttf",
+        ):
+            self.assertFalse(self._excluded(path), path)
 
     def test_source_and_docs_and_images_still_ship(self):
         for path in (
@@ -617,30 +632,58 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _service(self):
+    def _config(self):
         from audapack.config import AppConfig, PackingConfig
         from audapack.models import Project
-        from audapack.services.packing_service import PackingService
 
         config = AppConfig(packing=PackingConfig(output_dir=str(self.output_dir), delete_old=True))
         config.projects = [Project(
             id="proj", display_name="proj", source_path=str(self.source), archive_name="proj",
         )]
-        service = PackingService(config, base_dir=self.root)
-        return service
+        return config
 
-    def _seed_archive(self, newer_by: float = 60.0) -> Path:
+    def _service(self):
+        from audapack.services.packing_service import PackingService
+
+        return PackingService(self._config(), base_dir=self.root)
+
+    def _seed_archive(self, newer_by: float = 60.0, *, manifest: bool = True) -> Path:
+        """A reusable predecessor: fresh AND built under the current policy.
+
+        CORE-006: reuse is gated on the archive's own manifest, so a fixture that
+        omits it is testing the legacy-archive path instead of PERF-004's
+        traversal question. ``manifest=False`` seeds that legacy archive on
+        purpose.
+        """
+        import json as _json
         import os as _os
 
+        from audapack.fidelity import policy_fingerprint_from_config
+        from audapack.packing import MANIFEST_FILENAME, MANIFEST_SCHEMA_VERSION
+
+        config = self._config()
         archive = self.output_dir / "proj.zip"
         with zipfile.ZipFile(archive, "w") as zf:
             zf.writestr("main.py", "print('x')")
+            if manifest:
+                zf.writestr(MANIFEST_FILENAME, _json.dumps({
+                    "schema_version": MANIFEST_SCHEMA_VERSION,
+                    "product": "AUDAPACK",
+                    "source_path": str(self.source),
+                    "fidelity_profile": config.packing.fidelity_profile,
+                    "archive_semantics": "full_snapshot",
+                    "policy_fingerprint": policy_fingerprint_from_config(
+                        config.packing, set(config.packing.excludes)
+                    ),
+                }))
         newest = max(path.stat().st_mtime for path in self.source.rglob("*") if path.is_file())
         stamp = newest + newer_by
         _os.utime(archive, (stamp, stamp))
         return archive
 
     def test_excluded_weight_is_never_stat_ed(self):
+        import os as _os
+
         heavy = self.source / "node_modules" / "pkg"
         heavy.mkdir(parents=True)
         for index in range(30):
@@ -648,19 +691,28 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
         archive = self._seed_archive()
 
         stats = []
+        scans = []
         real_stat = Path.stat
+        real_scandir = _os.scandir
 
         def counting_stat(self, *args, **kwargs):
             stats.append(str(self))
             return real_stat(self, *args, **kwargs)
 
-        with patch.object(Path, "stat", autospec=True, side_effect=counting_stat):
+        def counting_scandir(path, *args, **kwargs):
+            scans.append(str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", autospec=True, side_effect=counting_stat), \
+                patch.object(_os, "scandir", side_effect=counting_scandir):
             result = self._service().ensure_fresh_archive("proj")
 
         self.assertTrue(result.success)
         self.assertEqual(result.output_path, archive, "the fresh archive was not reused")
-        touched = [path for path in stats if "node_modules" in path]
-        self.assertEqual(touched, [], f"excluded weight was stat'ed: {touched[:3]}")
+        # PERF-001: metadata now comes from the directory read, so the excluded
+        # weight must be untouched by BOTH -- unstat'ed and unenumerated.
+        touched = [path for path in stats + scans if "node_modules" in path]
+        self.assertEqual(touched, [], f"excluded weight was inspected: {touched[:3]}")
 
     def test_a_changed_included_file_still_forces_a_repack(self):
         import os as _os
@@ -699,17 +751,29 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
         self.assertEqual(result.output_path, archive)
 
     def test_no_existing_archive_packs_without_a_freshness_walk(self):
+        import os as _os
+
         walks = []
-        real_walk = __import__("os").walk
+        real_walk = _os.walk
+        real_scandir = _os.scandir
 
         def counting_walk(*args, **kwargs):
-            walks.append(args[0])
+            walks.append(str(args[0]))
             return real_walk(*args, **kwargs)
+
+        def counting_scandir(path, *args, **kwargs):
+            # The plan walk is scandir-based now (PERF-001); the source tree is
+            # the only traversal this test forbids, and the output directory is
+            # scanned to find the archive.
+            if str(self.source) in str(path):
+                walks.append(str(path))
+            return real_scandir(path, *args, **kwargs)
 
         packed = []
         service = self._service()
         service.pack_project = lambda project_id, **kw: packed.append(project_id)
-        with patch("os.walk", side_effect=counting_walk):
+        with patch.object(_os, "walk", side_effect=counting_walk), \
+                patch.object(_os, "scandir", side_effect=counting_scandir):
             service.ensure_fresh_archive("proj")
 
         self.assertEqual(packed, ["proj"])
@@ -900,3 +964,498 @@ class TestCanonicalArchiveIdentity(unittest.TestCase):
         newest = self._archive("Proj_02.01.26-T00-00-00", 400)
         project = self._project(archive_name="Proj")
         self.assertEqual(find_archive_for_project(project, self.output_dir), newest)
+
+
+class TestPolicyIsPartOfArchiveIdentity(unittest.TestCase):
+    """CORE-006 (audit/6.md): reuse was a timestamp property alone.
+
+    Reproduced against HEAD: pack a project as COMPACT, leave the source
+    untouched so the archive stays newer, switch `fidelity_profile` to FULL, and
+    `ensure_fresh_archive` reported success and returned the COMPACT archive --
+    whose own manifest still declared `fidelity_profile=compact`,
+    `archive_semantics=audit_representation`. The returned PackResult carried
+    blank policy fields, so nothing downstream could notice. An audit asking for
+    a full snapshot silently consumed a sampled representation.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "proj"
+        self.source.mkdir(parents=True)
+        (self.source / "main.py").write_text("print('x')", encoding="utf-8")
+        (self.source / "README.md").write_text("docs", encoding="utf-8")
+        assets = self.source / "assets"
+        assets.mkdir()
+        for index in range(4):
+            (assets / f"clip{index}.png").write_bytes(b"\x89PNG" + b"z" * 4096)
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _service(self, **packing_kwargs):
+        from audapack.config import AppConfig, PackingConfig
+        from audapack.models import Project
+        from audapack.services.packing_service import PackingService
+
+        packing = PackingConfig(
+            output_dir=str(self.output_dir),
+            delete_old=True,
+            include_timestamp=False,
+            **packing_kwargs,
+        )
+        config = AppConfig(packing=packing)
+        config.projects = [Project(
+            id="proj", display_name="proj", source_path=str(self.source), archive_name="proj",
+        )]
+        return PackingService(config, base_dir=self.root)
+
+    def _pack(self, **packing_kwargs) -> Path:
+        """Pack for real, then make the archive unambiguously newer than the source."""
+        import os as _os
+
+        result = self._service(**packing_kwargs).pack_project("proj")
+        self.assertTrue(result.success, result.error_message)
+        archive = Path(result.output_path)
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        _os.utime(archive, (newest + 120, newest + 120))
+        return archive
+
+    def _reuses(self, archive: Path, **packing_kwargs):
+        """(reused, result) for a freshness check that never repacks silently."""
+        service = self._service(**packing_kwargs)
+        repacked = []
+        service.pack_project = lambda project_id, **kw: repacked.append(project_id) or PackResult(
+            project_id=project_id, name=project_id, source_path=str(self.source), success=True,
+        )
+        result = service.ensure_fresh_archive("proj")
+        return (not repacked and result.output_path == archive), result
+
+    def test_an_unchanged_source_under_the_same_policy_is_reused(self):
+        archive = self._pack(fidelity_profile="compact")
+        reused, result = self._reuses(archive, fidelity_profile="compact")
+        self.assertTrue(reused, "identical policy and unchanged source did not reuse")
+        self.assertTrue(result.success)
+
+    def test_a_profile_change_repacks_even_though_the_archive_is_newer(self):
+        archive = self._pack(fidelity_profile="compact")
+        reused, _ = self._reuses(archive, fidelity_profile="full")
+        self.assertFalse(reused, "a COMPACT archive was reused for a FULL request")
+
+    def test_every_content_affecting_policy_change_repacks(self):
+        cases = {
+            "excludes": {"excludes": ["*.md"]},
+            "always_include": {"always_include": ["assets/clip0.png"]},
+            "always_exclude": {"always_exclude": ["README.md"]},
+            "size_override": {"fidelity_max_mb": 1},
+            "media_samples": {"fidelity_media_samples": 1},
+            "media_bytes": {"fidelity_media_bytes": 1024},
+        }
+        for label, override in cases.items():
+            with self.subTest(policy=label):
+                archive = self._pack(fidelity_profile="standard")
+                reused, _ = self._reuses(archive, fidelity_profile="standard", **override)
+                self.assertFalse(reused, f"a {label} change reused the old archive")
+
+    def test_an_inert_override_is_the_same_policy(self):
+        """CORE-004: FULL ignores the generic size override, so it cannot change content."""
+        archive = self._pack(fidelity_profile="full")
+        reused, _ = self._reuses(archive, fidelity_profile="full", fidelity_max_mb=1)
+        self.assertTrue(reused, "an override FULL ignores forced a pointless repack")
+
+    def test_pattern_order_and_case_are_not_policy(self):
+        archive = self._pack(fidelity_profile="standard", excludes=["*.md", "*.log"])
+        reused, _ = self._reuses(
+            archive, fidelity_profile="standard", excludes=["*.LOG", "*.md", "*.md"]
+        )
+        self.assertTrue(reused, "reordered/recased identical patterns forced a repack")
+
+    def test_a_reused_archive_reports_the_policy_from_its_own_manifest(self):
+        archive = self._pack(fidelity_profile="deep")
+        reused, result = self._reuses(archive, fidelity_profile="deep")
+        self.assertTrue(reused)
+        with zipfile.ZipFile(archive) as zf:
+            manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
+        self.assertEqual(result.fidelity_profile, manifest["fidelity_profile"])
+        self.assertEqual(result.archive_semantics, manifest["archive_semantics"])
+        self.assertEqual(result.fidelity_profile, "deep")
+
+    def test_a_legacy_archive_without_a_fingerprint_repacks_once(self):
+        import os as _os
+
+        from audapack.packing import MANIFEST_SCHEMA_VERSION
+
+        archive = self.output_dir / "proj.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("main.py", "print('x')")
+            zf.writestr(MANIFEST_FILENAME, json.dumps({
+                # Current schema on purpose: the absent fingerprint must be the
+                # reason this archive is refused, not a schema mismatch.
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "product": "AUDAPACK", "source_path": str(self.source),
+                "fidelity_profile": "standard", "archive_semantics": "audit_representation",
+            }))
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        _os.utime(archive, (newest + 120, newest + 120))
+
+        reused, _ = self._reuses(archive, fidelity_profile="standard")
+        self.assertFalse(reused, "an archive that cannot prove its policy was trusted")
+
+    def test_an_unreadable_or_foreign_archive_is_never_trusted(self):
+        import os as _os
+
+        from audapack.packing import MANIFEST_SCHEMA_VERSION
+
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        payloads = {
+            "no manifest": None,
+            "corrupt json": b"{not json",
+            "future schema": json.dumps({
+                "schema_version": MANIFEST_SCHEMA_VERSION + 1, "product": "AUDAPACK",
+                "source_path": str(self.source), "policy_fingerprint": "x" * 32,
+            }).encode("utf-8"),
+            # PERF-003 reshaped media_inventory from a per-asset ledger into
+            # per-group aggregates and bumped the schema for it. An archive
+            # written under any superseded schema carries every key this gate
+            # reads and is still not evidence about the current shape.
+            "superseded schema": json.dumps({
+                "schema_version": MANIFEST_SCHEMA_VERSION - 1, "product": "AUDAPACK",
+                "source_path": str(self.source), "policy_fingerprint": "x" * 32,
+            }).encode("utf-8"),
+            "foreign product": json.dumps({
+                "schema_version": MANIFEST_SCHEMA_VERSION, "product": "SOMETHING_ELSE",
+                "source_path": str(self.source), "policy_fingerprint": "x" * 32,
+            }).encode("utf-8"),
+        }
+        for label, payload in payloads.items():
+            with self.subTest(archive=label):
+                archive = self.output_dir / "proj.zip"
+                with zipfile.ZipFile(archive, "w") as zf:
+                    zf.writestr("main.py", "print('x')")
+                    if payload is not None:
+                        zf.writestr(MANIFEST_FILENAME, payload)
+                _os.utime(archive, (newest + 120, newest + 120))
+                reused, _ = self._reuses(archive, fidelity_profile="standard")
+                self.assertFalse(reused, f"{label} was accepted as reuse evidence")
+
+    def test_an_archive_built_from_another_source_is_refused(self):
+        from audapack.fidelity import policy_fingerprint_from_config
+        from audapack.packing import MANIFEST_SCHEMA_VERSION
+
+        service = self._service(fidelity_profile="standard")
+        archive = self.output_dir / "proj.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("main.py", "print('x')")
+            zf.writestr(MANIFEST_FILENAME, json.dumps({
+                "schema_version": MANIFEST_SCHEMA_VERSION, "product": "AUDAPACK",
+                "source_path": str(self.root / "other_project"),
+                "fidelity_profile": "standard", "archive_semantics": "audit_representation",
+                "policy_fingerprint": policy_fingerprint_from_config(
+                    service.config.packing, set(service.config.packing.excludes)
+                ),
+            }))
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        import os as _os
+        _os.utime(archive, (newest + 120, newest + 120))
+
+        reused, _ = self._reuses(archive, fidelity_profile="standard")
+        self.assertFalse(reused, "an archive of a different project was reused")
+
+
+class TestFreshnessCostsOneTraversal(unittest.TestCase):
+    """PERF-001 (audit/6.md): deciding reuse walked the tree three times.
+
+    Measured against HEAD on an unchanged 100-file Python project:
+    FRESHNESS_COUNTS {'walks': 3, 'reads': 100} -- `scan_asset_references`
+    walked and read every source file, `build_fidelity_plan` walked again to
+    classify, and `ensure_fresh_archive` then walked a third time via
+    `eligible_source_files`. All of it to conclude the archive was fresh.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "proj"
+        self.source.mkdir(parents=True)
+        for index in range(40):
+            (self.source / f"mod{index}.py").write_text(f"x = {index}\n", encoding="utf-8")
+        heavy = self.source / "node_modules" / "pkg"
+        heavy.mkdir(parents=True)
+        for index in range(20):
+            (heavy / f"chunk{index}.js").write_text("y", encoding="utf-8")
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _service(self):
+        from audapack.config import AppConfig, PackingConfig
+        from audapack.models import Project
+        from audapack.services.packing_service import PackingService
+
+        config = AppConfig(packing=PackingConfig(
+            output_dir=str(self.output_dir), delete_old=True, include_timestamp=False,
+        ))
+        config.projects = [Project(
+            id="proj", display_name="proj", source_path=str(self.source), archive_name="proj",
+        )]
+        return PackingService(config, base_dir=self.root)
+
+    def _fresh_archive(self) -> Path:
+        import os as _os
+
+        result = self._service().pack_project("proj")
+        self.assertTrue(result.success, result.error_message)
+        archive = Path(result.output_path)
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        _os.utime(archive, (newest + 120, newest + 120))
+        return archive
+
+    def _measure(self):
+        import os as _os
+
+        archive = self._fresh_archive()
+        walks, reads, stats = [], [], []
+        real_walk, real_stat = _os.walk, Path.stat
+        real_scandir = _os.scandir
+        real_text, real_bytes = Path.read_text, Path.read_bytes
+
+        def counting_walk(top, *args, **kwargs):
+            walks.append(str(top))
+            return real_walk(top, *args, **kwargs)
+
+        def counting_scandir(path, *args, **kwargs):
+            # PERF-001: the plan walk is scandir-based, so a traversal of the
+            # source root is one scandir call on it. The output directory is
+            # scanned to find the archive and is not a source traversal.
+            if str(path) == str(self.source):
+                walks.append(str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        def counting_stat(self, *args, **kwargs):
+            stats.append(str(self))
+            return real_stat(self, *args, **kwargs)
+
+        def counting_text(self, *args, **kwargs):
+            reads.append(str(self))
+            return real_text(self, *args, **kwargs)
+
+        def counting_bytes(self, *args, **kwargs):
+            reads.append(str(self))
+            return real_bytes(self, *args, **kwargs)
+
+        with patch.object(_os, "walk", side_effect=counting_walk), \
+                patch.object(_os, "scandir", side_effect=counting_scandir), \
+                patch.object(Path, "stat", autospec=True, side_effect=counting_stat), \
+                patch.object(Path, "read_text", autospec=True, side_effect=counting_text), \
+                patch.object(Path, "read_bytes", autospec=True, side_effect=counting_bytes):
+            result = self._service().ensure_fresh_archive("proj")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.output_path, archive, "the fresh archive was not reused")
+        return walks, reads, stats
+
+    def test_one_traversal_no_source_reads_and_no_excluded_metadata(self):
+        walks, reads, stats = self._measure()
+        self.assertEqual(len(walks), 1, f"the tree was traversed {len(walks)} times: {walks}")
+        source_reads = [path for path in reads if str(self.source) in path]
+        self.assertEqual(source_reads, [], f"source text was parsed to decide reuse: {source_reads[:3]}")
+        touched = [path for path in stats if "node_modules" in path]
+        self.assertEqual(touched, [], f"excluded weight was stat'ed: {touched[:3]}")
+
+    def test_a_files_metadata_comes_from_the_directory_read(self):
+        """PERF-001: scandir already described every entry; re-stat'ing it is waste.
+
+        Measured before this layer: classifying a 40-file tree cost 2 extra
+        syscalls per entry -- ``is_symlink()`` then ``stat()`` on a freshly built
+        ``Path`` -- because ``os.walk`` throws its ``DirEntry`` objects away.
+        """
+        _walks, _reads, stats = self._measure()
+        per_file = [path for path in stats if path.endswith(".py") or path.endswith(".js")]
+        self.assertEqual(
+            per_file, [],
+            f"per-file metadata was re-read after the directory listing: {per_file[:3]}",
+        )
+
+    def test_the_archive_manifest_is_read_once(self):
+        """PERF-001: the policy gate and the reused result share one manifest read.
+
+        CORE-006 made reuse ask the archive what policy built it, and the reused
+        ``PackResult`` reports the same fields -- two independent
+        ``read_archive_manifest`` calls parsing the same zip central directory,
+        which profiling showed dominating a reuse decision on a small tree.
+        """
+        import zipfile as _zipfile
+
+        archive = self._fresh_archive()
+        opens = []
+        real_zipfile = _zipfile.ZipFile
+
+        def counting_zipfile(file, *args, **kwargs):
+            opens.append(str(file))
+            return real_zipfile(file, *args, **kwargs)
+
+        with patch.object(_zipfile, "ZipFile", side_effect=counting_zipfile):
+            result = self._service().ensure_fresh_archive("proj")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.output_path, archive, "the fresh archive was not reused")
+        archive_opens = [path for path in opens if path == str(archive)]
+        self.assertEqual(
+            len(archive_opens), 1,
+            f"the archive was opened {len(archive_opens)} times to read one manifest",
+        )
+
+    def test_a_changed_included_file_still_repacks(self):
+        import os as _os
+
+        archive = self._fresh_archive()
+        target = self.source / "mod7.py"
+        stamp = archive.stat().st_mtime + 300
+        target.write_text("x = 999\n", encoding="utf-8")
+        _os.utime(target, (stamp, stamp))
+
+        service = self._service()
+        repacked = []
+        service.pack_project = lambda project_id, **kw: repacked.append(project_id) or PackResult(
+            project_id=project_id, name=project_id, source_path=str(self.source), success=True,
+        )
+        service.ensure_fresh_archive("proj")
+        self.assertEqual(repacked, ["proj"], "a changed included file did not invalidate the archive")
+
+    def test_media_sampling_still_sees_referenced_assets(self):
+        """PERF-001 deferred the reference scan; it must still run where media exists."""
+        from audapack.fidelity import build_fidelity_plan
+
+        assets = self.source / "assets"
+        assets.mkdir()
+        for index in range(6):
+            (assets / f"img{index}.png").write_bytes(b"\x89PNG" + b"z" * 2048)
+        (self.source / "app.py").write_text("ICON = 'assets/img5.png'\n", encoding="utf-8")
+
+        plan = build_fidelity_plan(self.source, profile="compact", excludes=set())
+        self.assertIn("assets/img5.png", plan.referenced_files)
+        decision = plan.decisions.get("assets/img5.png")
+        self.assertIsNotNone(decision, "the referenced asset has no decision")
+        self.assertTrue(decision.include, "a by-name referenced asset was sampled out")
+
+
+class TestCompressionIsChosenPerFileType(unittest.TestCase):
+    """PERF-002 (audit/6.md): create_zip forced Deflate on precompressed bytes.
+
+    Measured on a 32 MiB payload that models already-compressed media: DEFLATED
+    write 0.698 s producing 33,564,786 bytes, against ZIP_STORED 0.029 s
+    producing 33,554,546 bytes -- 23.9x slower for an archive 0.03% LARGER,
+    with `testzip` clean either way. T-147 made media inclusion a profile
+    decision, so a STANDARD/DEEP/FULL archive now routinely carries exactly the
+    payloads Deflate cannot shrink.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "proj"
+        self.source.mkdir(parents=True)
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _methods(self, out_zip: Path) -> dict:
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            return {info.filename: info.compress_type for info in zf.infolist()}
+
+    def test_precompressed_media_is_stored_and_text_stays_deflated(self):
+        # Incompressible-by-construction bytes: a real Deflate attempt on these
+        # is pure CPU, which is the whole cost this policy removes.
+        payload = os.urandom(64 * 1024)
+        (self.source / "clip.mp4").write_bytes(payload)
+        (self.source / "photo.jpg").write_bytes(payload)
+        (self.source / "icon.png").write_bytes(payload)
+        (self.source / "face.woff2").write_bytes(payload)
+        (self.source / "main.py").write_text("print('x')\n" * 500, encoding="utf-8")
+        (self.source / "data.json").write_text('{"a": 1}\n' * 500, encoding="utf-8")
+
+        out_zip = self.output_dir / "proj.zip"
+        stats = create_zip(self.source, out_zip, set(), manifest_meta={"project_name": "proj"})
+        methods = self._methods(out_zip)
+
+        for name in ("clip.mp4", "photo.jpg", "icon.png", "face.woff2"):
+            self.assertEqual(
+                methods[name], zipfile.ZIP_STORED,
+                f"{name} was deflated: precompressed bytes paid for a pointless compression pass",
+            )
+        for name in ("main.py", "data.json", MANIFEST_FILENAME):
+            self.assertEqual(
+                methods[name], zipfile.ZIP_DEFLATED,
+                f"{name} was stored: compressible text must still be compressed",
+            )
+        # GUARDRAIL: integrity is unchanged by the storage method.
+        self.assertEqual(verify_zip(out_zip, stats.files_added), stats.files_added)
+
+    def test_raw_audio_is_still_deflated(self):
+        """GUARDRAIL: 'media' is not 'incompressible'. WAV/PCM gains from Deflate."""
+        # Silent PCM: the pathological case for storing media blindly.
+        (self.source / "tone.wav").write_bytes(b"RIFF" + b"\x00" * (64 * 1024))
+        (self.source / "raw.aiff").write_bytes(b"FORM" + b"\x00" * (64 * 1024))
+
+        out_zip = self.output_dir / "proj.zip"
+        create_zip(self.source, out_zip, set())
+        methods = self._methods(out_zip)
+
+        for name in ("tone.wav", "raw.aiff"):
+            self.assertEqual(
+                methods[name], zipfile.ZIP_DEFLATED,
+                f"{name} was stored, throwing away the compression raw audio actually gets",
+            )
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            info = zf.getinfo("tone.wav")
+            self.assertLess(
+                info.compress_size, info.file_size // 2,
+                "silent PCM did not shrink, so Deflate was not applied to it",
+            )
+
+    def test_the_policy_is_one_deterministic_function(self):
+        """PERF-002: centralized, so no writing branch can drift from another."""
+        from audapack.packing import compress_type_for
+
+        self.assertEqual(compress_type_for("a/b/CLIP.MP4"), zipfile.ZIP_STORED)
+        self.assertEqual(compress_type_for("a\\b\\clip.mp4"), zipfile.ZIP_STORED)
+        self.assertEqual(compress_type_for("tone.wav"), zipfile.ZIP_DEFLATED)
+        # No extension, and a leading-dot name, are not extensions to match on.
+        self.assertEqual(compress_type_for("Makefile"), zipfile.ZIP_DEFLATED)
+        self.assertEqual(compress_type_for(".mp4"), zipfile.ZIP_DEFLATED)
+        # An unknown type keeps the historical behaviour rather than guessing.
+        self.assertEqual(compress_type_for("payload.bin"), zipfile.ZIP_DEFLATED)
+
+    def test_a_single_file_pack_uses_the_same_policy(self):
+        """The single-file branch is a separate writer; it must not drift."""
+        clip = self.root / "solo.mp4"
+        clip.write_bytes(os.urandom(64 * 1024))
+        out_zip = self.output_dir / "solo.zip"
+        create_zip(clip, out_zip, set())
+        self.assertEqual(self._methods(out_zip)["solo.mp4"], zipfile.ZIP_STORED)
+
+    def test_archive_semantics_do_not_change_with_the_storage_method(self):
+        """GUARDRAIL: storage method is a CPU decision, never a fidelity claim."""
+        (self.source / "main.py").write_text("print('x')\n", encoding="utf-8")
+        (self.source / "clip.mp4").write_bytes(os.urandom(32 * 1024))
+
+        out_zip = self.output_dir / "proj.zip"
+        plan = build_fidelity_plan(self.source, profile="full", excludes=set())
+        stats = create_zip(
+            self.source, out_zip, set(), manifest_meta={"project_name": "proj"}, plan=plan,
+        )
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
+
+        self.assertEqual(manifest["archive_semantics"], "full_snapshot")
+        self.assertEqual(manifest["files_excluded"], 0)
+        self.assertTrue(manifest["accounting_reconciled"], manifest.get("accounting_error"))
+        self.assertEqual(self._methods(out_zip)["clip.mp4"], zipfile.ZIP_STORED)
+        self.assertEqual(stats.files_failed, 0)
+

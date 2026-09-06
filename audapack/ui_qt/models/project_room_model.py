@@ -758,13 +758,25 @@ class ProjectRoomModel(QAbstractItemModel):
                     return
 
     def update_audit_run_snapshot(self, project_id: str, snapshot: Optional[AuditRunSnapshot]) -> None:
-        """Publish one composite run state with a targeted row repaint."""
+        """Publish one composite run state with a targeted row repaint.
+
+        PERF-004: the dashboard refresh publishes EVERY project on EVERY poll,
+        4 s while anything is live. Unconditional publication turned an
+        unchanged backend into one row invalidation per project per tick (300
+        projects = 75 dataChanged per second averaged over the interval), each
+        paying a linear ``index_for_project_id`` scan first. A snapshot equal to
+        the published one is not news and is dropped before the scan. Equality
+        here IS display equality: every value this snapshot feeds is snapshot
+        data, and the two clock-derived cells (audit age, archive age) come from
+        ``_snapshots`` and the archive cache, each refreshed by its own timer.
+        """
         project_id = str(project_id)
         if snapshot is None:
+            if project_id not in self._audit_run_snapshots:
+                return
             self._audit_run_snapshots.pop(project_id, None)
         else:
-            self._audit_run_snapshots[project_id] = snapshot
-            self._dispatch_snapshots[project_id] = {
+            dispatch = {
                 "dispatch_id": snapshot.dispatch_id,
                 "state": snapshot.dispatch_state,
                 "assigned_worker_id": snapshot.worker_id,
@@ -772,6 +784,17 @@ class ProjectRoomModel(QAbstractItemModel):
                 "campaign_run_id": snapshot.campaign_run_id,
                 "error": snapshot.error,
             }
+            # Both halves are compared: a live transport update may have written
+            # a fresher dispatch dict (browser_name, last_error_code) that this
+            # derived one does not carry, and dropping that write silently would
+            # be the mirror of the defect above.
+            if (
+                self._audit_run_snapshots.get(project_id) == snapshot
+                and self._dispatch_snapshots.get(project_id) == dispatch
+            ):
+                return
+            self._audit_run_snapshots[project_id] = snapshot
+            self._dispatch_snapshots[project_id] = dispatch
         idx = self.index_for_project_id(project_id)
         if idx.isValid():
             self.targeted_project_update_count += 1

@@ -190,7 +190,6 @@ class SettingsWidget(QWidget):
         # GG Template: user-configurable clipboard copy template with {path} placeholder
         self.gg_template = QLineEdit(getattr(self._config.ui, "gg_template", "/saipen gg {path}"))
         self.gg_template.setPlaceholderText("Use {path} as placeholder for the audit file path")
-        self.gg_template.setMinimumWidth(400)
         f.addRow("GG Template (Ctrl+C)", self.gg_template)
         lbl_hint = QLabel("Copied to clipboard when pressing GG. Use {path} for the audit file path.", w)
         lbl_hint.setStyleSheet("color: #9C9371; font-size: 10px;")

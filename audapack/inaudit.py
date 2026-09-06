@@ -1,15 +1,130 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from audapack.config import cross_process_lock, get_user_runtime_dir
 from audapack.models import Project
 from audapack.saipen_transport import is_managed
 
 INAUDIT_RE = re.compile(r"^[1-9][0-9]*\.md$")
+
+#: Bookkeeping file per project for layers the OPERATOR created through the
+#: desktop app (the [+] button / ensure_next_layer). Widget-delivered layers
+#: come from inaudit_capture.assign or the Bridge and are deliberately NEVER
+#: recorded here, so the row [edit-last-custom] button can never land on an
+#: AUDAPACK-widget layer. Kept OUTSIDE the audit dir: a sidecar inside it would
+#: be packed into archives and read by the Agent Inbox residue scan.
+_USER_LAYER_LOCK = "inaudit_user_layers.lock"
+
+
+def user_layer_registry_path(project: Project) -> Optional[Path]:
+    if not project or not project.id:
+        return None
+    digest = hashlib.sha256(str(project.id).encode("utf-8")).hexdigest()[:24]
+    return get_user_runtime_dir() / "inaudit_user_layers" / f"{digest}.json"
+
+
+def _load_user_layers(path: Optional[Path]) -> list[int]:
+    if path is None:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        numbers = data.get("user_layers") if isinstance(data, dict) else None
+        return [int(value) for value in (numbers or []) if str(value).isdigit()]
+    except (OSError, ValueError):
+        return []
+
+
+def _save_user_layers(path: Optional[Path], numbers: list[int]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"user_layers": numbers, "schema_version": 1}).encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=".userlayers-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _edit_user_layers(project: Project, mutate) -> None:
+    path = user_layer_registry_path(project)
+    lock_path = get_user_runtime_dir() / _USER_LAYER_LOCK
+    with cross_process_lock(lock_path):
+        numbers = _load_user_layers(path)
+        mutate(numbers)
+        _save_user_layers(path, numbers)
+
+
+def record_user_layer(project: Project, number: int) -> None:
+    """Mark a layer as operator-created. Absent here = opaque to [edit], so a
+    widget-arrived layer is never edited by that button."""
+    def _mutate(numbers: list[int]) -> None:
+        if number in numbers:
+            numbers.remove(number)
+        numbers.append(number)
+
+    _edit_user_layers(project, _mutate)
+
+
+def forget_user_layer(project: Project, number: int) -> None:
+    def _mutate(numbers: list[int]) -> None:
+        try:
+            numbers.remove(number)
+        except ValueError:
+            pass
+
+    _edit_user_layers(project, _mutate)
+
+
+def renumber_user_layer(project: Project, old: int, new: int) -> None:
+    """The layer moved numbers (rename / reorder); the marker follows it.
+
+    Only ``old`` is rewritten: a tracked entry for ``new`` either belongs to
+    this same dance (the park+place reorder always rewrites it away first) or
+    is a stale record for a file that is already gone, which the existence
+    check in last_user_layer skips anyway.
+    """
+    def _mutate(numbers: list[int]) -> None:
+        if old in numbers:
+            numbers[:] = [new if value == old else value for value in numbers]
+
+    _edit_user_layers(project, _mutate)
+
+
+def last_user_layer(project: Project) -> Optional[int]:
+    """The most recently created operator layer that still exists on disk.
+
+    Deleted and consumed layers are skipped; the caller sees the newest live
+    one, or None when the operator has never created one (or deleted them all).
+    """
+    path = user_layer_registry_path(project)
+    d = inaudit_dir(project)
+    if d is None:
+        return None
+    for number in reversed(_load_user_layers(path)):
+        candidate = (d / f"{number}.md").resolve()
+        try:
+            if candidate.is_file() and candidate.relative_to(d.resolve()):
+                return number
+        except ValueError:
+            continue
+    return None
 
 @dataclass
 class InauditLayer:
@@ -81,6 +196,19 @@ def get_inaudit_selected(project: Project) -> Optional[int]:
         return sel
     return layers[0].number
 
+
+def _raw_inaudit_selected(project: Project) -> Optional[int]:
+    """The recorded selection WITHOUT the lowest-layer fallback.
+
+    The follow-the-selection updates in rename/delete run after the source
+    file is already gone, so the fallback answer there is whatever layer
+    happens to sort first -- comparing against it silently skipped the
+    update (the reorder dance left the selection pinned to a stale number).
+    """
+    if not project or not project.id:
+        return None
+    return _selection.get(str(project.id))
+
 def set_inaudit_selected(project: Project, number: Optional[int]) -> None:
     if not project or not project.id:
         return
@@ -121,6 +249,33 @@ def resolve_inaudit_path(project: Project, number: int) -> Optional[Path]:
         return None
     return cand
 
+def open_exclusive_layer(path: Path) -> int:
+    """Create ``path`` and return its write descriptor, or raise FileExistsError.
+
+    The canonical ``audit/<N>.md`` namespace has several producers (this module,
+    the capture store, the Bridge). Any check-then-write pair lets two of them
+    pick the same free number and lets the loser truncate the winner's audit
+    text, so creation of a numbered layer goes through this one primitive.
+    """
+    return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+
+
+def reserve_next_layer(audit_dir: Path, start: int = 1) -> tuple[int, Path, int]:
+    """Reserve the lowest free layer number >= ``start``.
+
+    Returns ``(number, path, fd)``; the caller owns the open descriptor. A taken
+    number is never opened for writing, so a competitor's layer cannot be
+    emptied by a producer that merely scanned the directory a moment earlier.
+    """
+    number = max(1, int(start))
+    while True:
+        candidate = audit_dir / f"{number}.md"
+        try:
+            return number, candidate, open_exclusive_layer(candidate)
+        except FileExistsError:
+            number += 1
+
+
 def ensure_next_layer(project: Project) -> Path:
     if project.source_path and is_managed(project.source_path):
         raise ValueError("SAIPEN layers need audit text; capture and assign through the Inbox")
@@ -132,13 +287,11 @@ def ensure_next_layer(project: Project) -> Path:
         raise ValueError("project has no source path, so it has no audit inbox")
     d.mkdir(parents=True, exist_ok=True)
     layers = list_inaudit_layers(project)
-    nxt = (max((x.number for x in layers), default=0) + 1)
-    if nxt < 1:
-        nxt = 1
-    target = d / f"{nxt}.md"
-    if not target.exists():
-        target.write_text("", encoding="utf-8")
+    start = (max((x.number for x in layers), default=0) + 1)
+    nxt, target, fd = reserve_next_layer(d, start)
+    os.close(fd)
     res = target.resolve()
+    record_user_layer(project, nxt)
     set_inaudit_selected(project, nxt)
     return res
 
@@ -191,7 +344,7 @@ def delete_inaudit_layer(project: Project, number: int) -> str:
     if not cand.is_file():
         # Idempotent: nothing to remove. Also drop a stale selection entry so
         # the UI never points at a ghost layer.
-        if get_inaudit_selected(project) == n:
+        if _raw_inaudit_selected(project) == n:
             set_inaudit_selected(project, None)
         return ""
     try:
@@ -200,8 +353,9 @@ def delete_inaudit_layer(project: Project, number: int) -> str:
         return f"file is locked by another process: {cand.name}"
     except OSError as exc:
         return f"cannot delete {cand.name}: {exc}"
-    if get_inaudit_selected(project) == n:
+    if _raw_inaudit_selected(project) == n:
         set_inaudit_selected(project, None)
+    forget_user_layer(project, n)
     return ""
 
 
@@ -247,7 +401,7 @@ def rename_inaudit_layer(project: Project, number: int, new_number: int) -> str:
     try:
         # O_EXCL, then copy-and-remove: os.replace would silently overwrite a
         # layer created between the check above and the move.
-        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        fd = open_exclusive_layer(target)
     except FileExistsError:
         return f"layer {new} was just taken; pick a free number"
     except OSError as exc:
@@ -269,6 +423,63 @@ def rename_inaudit_layer(project: Project, number: int, new_number: int) -> str:
         # The new layer is durable; the old one is still there. Reported rather
         # than silently leaving two copies the operator cannot see.
         return f"copied to {target.name} but could not remove {source.name}: {exc}"
-    if get_inaudit_selected(project) == old:
+    if _raw_inaudit_selected(project) == old:
         set_inaudit_selected(project, new)
+    renumber_user_layer(project, old, new)
+    return ""
+
+
+def reorder_inaudit_layers(project: Project, order: list[int]) -> str:
+    """Renumber layers so their canonical order equals ``order``.
+
+    Drag-and-drop priority in the Layers list: the operator pulls a layer to
+    the position where the agent should consume it, and the numbers follow.
+    ``order`` is the NEW redisplay order as CURRENT layer numbers, e.g.
+    ``[3, 1, 2]`` means "layer 3 first, layer 1 second, layer 2 third" -- the
+    files are renumbered so ``1.md`` is the top layer, ``2.md`` next, and so
+    on, in the requested sequence.
+
+    Every step goes through `rename_inaudit_layer`, so a taken number is
+    never overwritten: all moved layers are first parked on free scratch
+    numbers, then placed at their final ``1..N`` targets. Selection and the
+    user-layer tracker follow every step automatically.
+
+    Returns "" on success, or a short human-readable reason (identical in
+    spirit to the other primitives here, so the caller can surface it).
+    """
+    if project.source_path and is_managed(project.source_path):
+        return "SAIPEN owns layer numbers; priority reorder is unavailable on managed projects"
+    d = inaudit_dir(project)
+    if d is None:
+        return "project has no source path"
+    existing = sorted(layer.number for layer in list_inaudit_layers(project))
+    order = [int(value) for value in order]
+    if not existing:
+        return "no layers to reorder"
+    if len(order) != len(existing) or sorted(order) != existing:
+        return "layer list is stale; refresh and try again"
+    if order == existing:
+        return ""
+
+    scratch = max(existing) + 1
+    moves: list[tuple[int, int]] = []
+    for at, number in enumerate(order):
+        target = at + 1
+        if number != target:
+            moves.append((number, target))
+
+    parked: list[int] = []
+    try:
+        for source, _target in moves:
+            reason = rename_inaudit_layer(project, source, scratch)
+            if reason:
+                return f"reorder failed parking {source}: {reason}"
+            parked.append(scratch)
+            scratch += 1
+        for index, (source, target) in enumerate(moves):
+            reason = rename_inaudit_layer(project, parked[index], target)
+            if reason:
+                return f"reorder failed placing {source}: {reason}"
+    except Exception:
+        return "reorder failed unexpectedly"
     return ""

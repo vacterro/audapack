@@ -1,11 +1,13 @@
 """Unit tests for audit text and clipboard ingestion."""
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from audapack import ingest
+from audapack import campaign, ingest
+from audapack.campaign import campaign_transaction_lock
 from audapack.config import AppConfig, AuditsConfig
 from audapack.ingest import (
     clean_markdown_headers,
@@ -279,3 +281,94 @@ CORE_DONE_WHEN: done
         names = [p.display_name for p in load_config(self.root).projects]
         self.assertEqual(names.count("NEW_GOOD"), 1)
         self.assertEqual(sorted(result.saved_waves), ["core", "second"])
+
+
+def _lock_is_busy_elsewhere(campaign_root: Path) -> bool:
+    """True when another thread cannot take this campaign root's lock.
+
+    The reentrancy escape in ``campaign_transaction_lock`` is thread-local, so a
+    probe from a second thread contends for real, exactly like a second process.
+    """
+    verdict: dict[str, bool] = {}
+
+    def probe():
+        try:
+            with campaign_transaction_lock(campaign_root, timeout=0.05):
+                verdict["busy"] = False
+        except TimeoutError:
+            verdict["busy"] = True
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(10)
+    return verdict.get("busy", False)
+
+
+class TestCampaignIngestTransactionLock(unittest.TestCase):
+    """W2-001: one campaign root, one writer at a time.
+
+    Before this, ingest captured its rollback snapshot and wrote waves,
+    canonical finals and campaign.json with no cross-process lock, so a
+    concurrent commit for the same project interleaved and the first rollback
+    restored pre-transaction bytes over the other writer's committed campaign.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name)
+        self.config = AppConfig(audits=AuditsConfig(root=str(self.root)))
+        self.core = (
+            "PROJECT_NAME: PROJ_LOCK\nWAVE: AUDIT CORE\nSTATUS: AUDIT_CORE: COMPLETE\nTICKETS: 1\n"
+            "[P1] [CORE-001] a.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\nCORE_DONE_WHEN: done\n"
+        )
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_the_lock_is_held_while_ingest_writes_a_wave(self):
+        observed: list[bool] = []
+        original_atomic_write = ingest.atomic_write
+
+        def probe_then_write(path, text):
+            observed.append(_lock_is_busy_elsewhere(Path(path).parent))
+            return original_atomic_write(path, text)
+
+        with patch.object(ingest, "atomic_write", side_effect=probe_then_write):
+            result = ingest.ingest_audit_text(self.core, self.config, base_dir=self.root)
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(observed and all(observed), "ingest wrote a wave without holding the campaign lock")
+
+    def test_the_lock_is_released_once_the_transaction_ends(self):
+        result = ingest.ingest_audit_text(self.core, self.config, base_dir=self.root)
+        self.assertTrue(result.ok, result.error)
+        campaign_root = next(self.root.rglob("PROJ_LOCK__01_AUDIT_CORE.md")).parent
+        self.assertFalse(
+            _lock_is_busy_elsewhere(campaign_root),
+            "the campaign lock outlived the transaction that took it",
+        )
+
+    def test_publishing_the_index_takes_the_lock_even_outside_ingest(self):
+        result = ingest.ingest_audit_text(self.core, self.config, base_dir=self.root)
+        self.assertTrue(result.ok, result.error)
+        campaign_root = next(self.root.rglob("PROJ_LOCK__01_AUDIT_CORE.md")).parent
+        observed: list[bool] = []
+        original_temp_file = campaign.open_new_temp_file
+
+        def probe_then_open(directory, name):
+            observed.append(_lock_is_busy_elsewhere(directory))
+            return original_temp_file(directory, name)
+
+        with patch.object(campaign, "open_new_temp_file", side_effect=probe_then_open):
+            campaign.save_live_campaign_index(
+                campaign_root=campaign_root,
+                profile=campaign.get_profile("quick3"),
+                run_id="run-lock",
+                project_name="PROJ_LOCK",
+                parsed_waves={},
+                completed_waves=["core"],
+                active_wave_id="second",
+                status=campaign.STATUS_CAMPAIGN_READY_FOR_WAVE,
+            )
+
+        self.assertEqual(observed, [True], "campaign.json was published without the campaign lock")

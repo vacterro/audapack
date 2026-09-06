@@ -162,7 +162,11 @@ QTableWidget::item:selected {{
             self.scope_tabs.setTabToolTip(1, "Select a project in Project Room")
             self.scope_tabs.setTabEnabled(1, False)
         else:
-            self.project_label.setText(f"{project.display_name} · {project.source_path}")
+            # The full source path in a bold label becomes the tab's minimum
+            # width -- a long path forces horizontal scrolling of the whole
+            # tab. Name bold, path as muted detail beneath it.
+            self.project_label.setText(project.display_name)
+            self.project_label.setToolTip(f"{project.display_name} · {project.source_path}")
             self.scope_tabs.setTabText(1, f"{project.display_name} (0)")
             self.scope_tabs.setTabToolTip(1, f"Show only {project.display_name} agent windows")
             self.scope_tabs.setTabEnabled(1, True)

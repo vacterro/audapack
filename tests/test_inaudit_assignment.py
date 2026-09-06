@@ -174,3 +174,25 @@ def test_assignment_falls_back_to_copy_when_hardlink_unsupported(tmp_path: Path,
     assert not (Path(project.source_path) / "audit" / ".inaudit-*").exists() or not any(
         (Path(project.source_path) / "audit").glob(".inaudit-*.tmp")
     )
+
+
+def test_copy_fallback_skips_a_raced_number_instead_of_truncating_it(tmp_path: Path, monkeypatch):
+    """R008: the fallback used to be a path-based copy over the winner's layer."""
+    store, payload, project = _seed(tmp_path)
+    audit = Path(project.source_path) / "audit"
+    audit.mkdir()
+    raced = False
+
+    def forbid_link(_source, path):
+        nonlocal raced
+        if not raced:
+            raced = True
+            Path(path).write_text("external writer", encoding="utf-8")
+        raise OSError(18, "cross-volume link not supported")
+
+    monkeypatch.setattr("audapack.inaudit_capture.os.link", forbid_link)
+    result = store.assign(payload["capture_id"], project.id, [project])
+
+    assert Path(result["assigned_path"]).name == "2.md"
+    assert (audit / "1.md").read_text(encoding="utf-8") == "external writer"
+    assert (audit / "2.md").read_text(encoding="utf-8") == payload["text"]

@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from audapack.config import AppConfig, app_dir, load_config
-from audapack.fidelity import build_plan_from_config
+from audapack.fidelity import build_plan_from_config, policy_fingerprint_from_config
 from audapack.models import PackResult
 from audapack.packing import (
+    archive_policy_mismatch,
     find_archive_for_project,
     pack_single,
+    read_archive_manifest,
     resolve_output_dir,
 )
 from audapack.projects import ProjectRegistry
@@ -88,6 +90,22 @@ class PackingService:
         # archive traversed exactly the node_modules/.venv/.git/objects weight
         # that packing excludes for performance.
         excludes = set(self.config.packing.excludes)
+        # CORE-006 (audit/6.md): packing policy is part of artifact identity, so
+        # the policy question is asked FIRST -- it is one archive read, and a
+        # mismatch makes any amount of source work obsolete (PERF-001). Reuse used
+        # to be a pure timestamp property: packing COMPACT and then switching to
+        # FULL handed back the COMPACT archive as a success.
+        fingerprint = policy_fingerprint_from_config(self.config.packing, excludes)
+        # PERF-001: the manifest is read ONCE. The policy gate and the reused
+        # PackResult's own metadata are the same bytes, and parsing the zip
+        # central directory twice was the single most expensive step left in a
+        # reuse decision on a small tree.
+        manifest = read_archive_manifest(existing)
+        mismatch = archive_policy_mismatch(existing, source, fingerprint, manifest)
+        if mismatch is not None:
+            if log_callback:
+                log_callback(f"repacking {proj.display_name}: {mismatch}")
+            return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
         # T-147: the source-root mtime alone settles the common repack case, so
         # it is checked BEFORE the plan build (a full walk) -- a changed root
         # must not pay for a walk the pack is about to repeat anyway.
@@ -104,10 +122,30 @@ class PackingService:
         # we repack rather than reuse an archive that may miss changed files.
         try:
             plan = build_plan_from_config(
-                source, self.config.packing, excludes, newer_than_mtime=archive_mtime
+                source,
+                self.config.packing,
+                excludes,
+                newer_than_mtime=archive_mtime,
+                # PERF-004: a reuse decision consumes no pruned-tree census, so
+                # deciding freshness must not enumerate the excluded weight
+                # (node_modules/.venv/.git) the census exists to describe.
+                census_pruned=False,
             )
         except OSError:
             return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
         if plan.failed > 0 or plan.newer_found:
             return self.pack_project(project_id, cancel_event=cancel_event, log_callback=log_callback)
-        return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), output_path=existing, success=True)
+        # CORE-006: a reused archive reports the policy metadata from its OWN
+        # validated manifest. Returning blank fields is what masked the mismatch
+        # from every caller, including the audit path that consumes the archive.
+        # Non-None here: archive_policy_mismatch above rejected a None manifest.
+        manifest = manifest or {}
+        return PackResult(
+            project_id=project_id,
+            name=proj.display_name,
+            source_path=str(source),
+            output_path=existing,
+            success=True,
+            fidelity_profile=str(manifest.get("fidelity_profile", "")),
+            archive_semantics=str(manifest.get("archive_semantics", "")),
+        )

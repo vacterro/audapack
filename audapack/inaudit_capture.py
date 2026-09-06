@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from audapack.bridge.storage import atomic_write
 from audapack.config import AppConfig, cross_process_lock, get_user_runtime_dir
+from audapack.inaudit import open_exclusive_layer
 from audapack.models import Project
 from audapack.saipen_transport import continuation_command, enqueue_file, is_managed
 
@@ -39,6 +40,7 @@ _LAYER_RE = re.compile(r"^[1-9][0-9]*\.md$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 _LOCAL_LOCK = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 class InauditCaptureError(RuntimeError):
@@ -181,9 +183,29 @@ class InauditCaptureStore:
         self.transactions_dir = self.root / "transactions"
         self.lock_path = self.root / "inaudit.lock"
         self.generation_path = self.root / "inaudit_generation.json"
+        self.pending_signal_path = self.root / "inaudit_pending_signal.json"
         self.affinity_path = self.root / "conversation_affinity.json"
         self.index_path = self.root / "project_identity_index.json"
+        self.notification_pending = False
+        self._owed_signal: dict[str, str] | None = None
+        self._unannounced_commit: dict[str, str] | None = None
         self._ensure_dirs()
+        owed = self._read_json(self.pending_signal_path)
+        if owed is not None:
+            # A previous process committed a mutation and could not publish its
+            # notification. The marker IS the replay instruction (W2-004), so it
+            # is settled before anything else touches the generation counter, and
+            # its identity is retained: that one operation is exactly the one
+            # whose caller may have been told 500, so its retry must be
+            # recognized as already committed rather than answered with 404.
+            self.notification_pending = True
+            self._owed_signal = {
+                "capture_id": str(owed.get("capture_id") or ""),
+                "event": str(owed.get("event") or "recovered"),
+            }
+            self._unannounced_commit = dict(self._owed_signal)
+            with _LOCAL_LOCK, cross_process_lock(self.lock_path):
+                self._replay_pending_signal()
         self.recover_partial_records()
         self.recover_assignment_transactions()
 
@@ -204,13 +226,83 @@ class InauditCaptureStore:
     def _atomic_json(self, path: Path, value: dict[str, Any]) -> None:
         atomic_write(path, self._json_text(value))
 
+    def _commit_is_unannounced(self, capture_id: str, *, event: str | None = None) -> bool:
+        """True when THIS capture holds a commit whose notification never landed.
+
+        The evidence is the owed notification (this process) or the marker a
+        previous process left behind (`_unannounced_commit`, retained across the
+        replay that clears the marker). Both are cleared once a mutation on this
+        capture completes normally, so a plain already-succeeded request keeps
+        answering `capture_not_found`.
+        """
+        for candidate in (self._owed_signal, self._unannounced_commit):
+            if candidate is None:
+                continue
+            if candidate.get("capture_id") != capture_id:
+                continue
+            if event is not None and candidate.get("event") != event:
+                continue
+            return True
+        return False
+
     def _signal(self, capture_id: str, event: str) -> None:
-        previous = self._read_json(self.generation_path) or {}
-        generation = int(previous.get("generation") or 0) + 1
-        self._atomic_json(
-            self.generation_path,
-            {"generation": generation, "capture_id": capture_id, "event": event, "updated_at": utc_now()},
-        )
+        """Publish the refresh notification for an ALREADY COMMITTED mutation.
+
+        W2-004 (audit/2.md): this ran inside the mutation's success boundary, so
+        an OSError here escaped as `capture_persistence_failed` / 500 retriable
+        after the body, the sidecar, the moved pair or the deletion had already
+        landed durably. The caller was told the mutation failed; the retry then
+        took the duplicate branch (never re-signalling, so the generation stayed
+        permanently unannounced) or, for archive/delete, answered 404 because the
+        source pair no longer existed. Same failure shape the Bridge dispatcher
+        already fixed at `browser_dispatch.py:530` and the ingest path at
+        `ingest.py:588` -- publication is a POST-COMMIT side effect, never proof
+        of durability.
+
+        The owed notification is recorded first, so it survives a crash between
+        the mutation and the publish, and is replayed by the next mutation or the
+        next store construction. `notification_pending` is what the API reports
+        instead of a false persistence failure.
+        """
+        self._owed_signal = {"capture_id": capture_id, "event": event}
+        self._unannounced_commit = None
+        try:
+            self._atomic_json(self.pending_signal_path, dict(self._owed_signal))
+        except OSError:
+            # The marker is an optimization for cross-process replay; this
+            # process still owes the signal in memory.
+            pass
+        self.notification_pending = True
+        self._replay_pending_signal()
+
+    def _replay_pending_signal(self) -> None:
+        """Publish any owed notification exactly once; never raise."""
+        owed = self._owed_signal
+        if owed is None:
+            self.notification_pending = False
+            return
+        try:
+            previous = self._read_json(self.generation_path) or {}
+            generation = int(previous.get("generation") or 0) + 1
+            self._atomic_json(
+                self.generation_path,
+                {
+                    "generation": generation,
+                    "capture_id": owed["capture_id"],
+                    "event": owed["event"],
+                    "updated_at": utc_now(),
+                },
+            )
+        except OSError as exc:
+            self.notification_pending = True
+            logger.warning("INAUDIT generation publish deferred: %s", exc)
+            return
+        self._owed_signal = None
+        self.notification_pending = False
+        try:
+            self.pending_signal_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | None:
@@ -554,6 +646,12 @@ class InauditCaptureStore:
             if body_path.exists() or meta_path.exists():
                 meta = self._read_json(meta_path)
                 if meta and body_path.is_file() and meta.get("content_sha256") == digest:
+                    # W2-004: the duplicate branch is the retry path, so an
+                    # unpublished generation from the first (reported-failed)
+                    # attempt is repaired here instead of staying unannounced
+                    # for good.
+                    self._replay_pending_signal()
+                    self._unannounced_commit = None
                     return {"record": meta, "duplicate": True, "durable": True}
                 raise InauditCaptureError("capture_id_conflict", "capture_id already exists with different content", status=409)
             fingerprint = _bounded_text(payload.get("conversation_fingerprint"), "conversation_fingerprint", maximum=512)
@@ -597,10 +695,10 @@ class InauditCaptureStore:
                 verified = self._read_json(meta_path)
                 if verified != record or body_sha256(body_path.read_text(encoding="utf-8")) != digest:
                     raise OSError("capture pair verification failed")
-                self._signal(capture_id, "capture")
             except Exception:
                 # Preserve any durable half-record for startup recovery.
                 raise
+            self._signal(capture_id, "capture")
             return {"record": record, "duplicate": False, "durable": True}
 
     def list_records(self, *, include_archived: bool = False, include_recovery: bool = True) -> list[dict[str, Any]]:
@@ -760,6 +858,12 @@ class InauditCaptureStore:
             if record.get("assigned_path"):
                 existing = Path(str(record["assigned_path"]))
                 if existing.is_file() and body_sha256(existing.read_text(encoding="utf-8")) == record.get("content_sha256"):
+                    # W2-004: the idempotent path is the retry path, so it repairs
+                    # a notification the first (reported-failed) attempt owed
+                    # instead of returning success over a generation that stays
+                    # unannounced for good.
+                    self._replay_pending_signal()
+                    self._unannounced_commit = None
                     command = continuation_command(action)
                     if after_assign and action:
                         after_assign("CC", existing)
@@ -799,17 +903,32 @@ class InauditCaptureStore:
                     # Cross-volume or unsupported hardlink; fall back to a
                     # verified content copy so the assignment still lands
                     # without leaving the journal to be silently discarded
-                    # on the next recovery pass.
+                    # on the next recovery pass. shutil.copyfile is path-based
+                    # and would truncate a competitor that won this number
+                    # between the failed link and the copy, so the fallback
+                    # reserves the candidate exclusively and streams the
+                    # already-verified temporary bytes into that descriptor.
                     try:
-                        shutil.copyfile(temp, candidate)
-                    except OSError as copy_exc:
-                        if copy_exc.errno != 17:
-                            raise InauditCaptureError(
-                                "assignment_publish_failed",
-                                f"could not hardlink or copy capture to {candidate}: {copy_exc}",
-                            ) from copy_exc
+                        fd = open_exclusive_layer(candidate)
+                    except FileExistsError:
                         number += 1
                         continue
+                    except OSError as copy_exc:
+                        raise InauditCaptureError(
+                            "assignment_publish_failed",
+                            f"could not hardlink or copy capture to {candidate}: {copy_exc}",
+                        ) from copy_exc
+                    try:
+                        with os.fdopen(fd, "wb") as handle:
+                            handle.write(temp.read_bytes())
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    except OSError as copy_exc:
+                        candidate.unlink(missing_ok=True)
+                        raise InauditCaptureError(
+                            "assignment_publish_failed",
+                            f"could not hardlink or copy capture to {candidate}: {copy_exc}",
+                        ) from copy_exc
                 target = candidate.resolve()
                 journal["stage"] = "published"
                 journal["target"] = str(target)
@@ -871,6 +990,8 @@ class InauditCaptureStore:
                 raise InauditCaptureError("assignment_conflict", "legacy assignment needs inspection", status=409)
             if _bytes_sha256(target) != record.get("content_sha256"):
                 raise InauditCaptureError("assignment_conflict", "legacy assigned bytes changed", status=409)
+            self._replay_pending_signal()
+            self._unannounced_commit = None
             return {"record": record, "assigned_path": str(target), "command": continuation_command(action), "duplicate": True}
         body = self._body_path(capture_id)
         if _bytes_sha256(body) != record.get("content_sha256"):
@@ -942,6 +1063,33 @@ class InauditCaptureStore:
             meta = self._meta_path(capture_id, source)
             record = self._read_json(meta)
             if record is None or not body.is_file():
+                # W2-004 (audit/2.md): a move that already committed must not be
+                # answered with 404 just because its source pair is gone. The old
+                # code did exactly that, so a request whose notification failed
+                # (reported 500 retriable) contradicted itself on retry. The
+                # retry is idempotent only where THIS operation left proof: a
+                # complete destination pair in the requested status, plus either
+                # source residue (interrupted between the two source deletes) or
+                # an owed notification naming this capture. A clean prior success
+                # leaves neither and is still not found, so no unrelated call
+                # gains a new meaning.
+                settled = self._read_json(self._meta_path(capture_id, destination))
+                proven = (
+                    meta.is_file()
+                    or body.is_file()
+                    or self._commit_is_unannounced(capture_id)
+                )
+                if (
+                    proven
+                    and settled is not None
+                    and settled.get("status") == status
+                    and self._body_path(capture_id, destination).is_file()
+                ):
+                    meta.unlink(missing_ok=True)
+                    body.unlink(missing_ok=True)
+                    self._replay_pending_signal()
+                    self._unannounced_commit = None
+                    return settled
                 raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
             moved = dict(record)
             moved["status"] = status
@@ -967,6 +1115,15 @@ class InauditCaptureStore:
                         path.unlink()
                         found = True
             if not found:
+                # W2-004: a mutation whose notification never reached the caller
+                # is the one operation whose retry must not contradict the first
+                # response. This capture's delete is provably that operation, so
+                # the retry reports the terminal state it asked for. An id nobody
+                # ever deleted is still unknown.
+                if self._commit_is_unannounced(capture_id, event="delete"):
+                    self._replay_pending_signal()
+                    self._unannounced_commit = None
+                    return
                 raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
             self._signal(capture_id, "delete")
 

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from audapack.config import open_new_temp_file
+from audapack.config import cross_process_lock, get_state_dir, open_new_temp_file
+
+_LOCAL = threading.local()
 
 
 @dataclass
@@ -615,6 +619,49 @@ def _extract_header_line(text: str, key: str) -> Optional[str]:
     return None
 
 
+def campaign_transaction_lock_path(campaign_root: Path) -> Path:
+    """State-dir lock file for one campaign root (never inside the audit dir)."""
+    digest = hashlib.sha256(str(Path(campaign_root).resolve()).encode("utf-8")).hexdigest()[:24]
+    return get_state_dir() / "campaign_locks" / f"campaign_{digest}.lock"
+
+
+@contextmanager
+def campaign_transaction_lock(campaign_root: Path, timeout: float = 30.0):
+    """W2-001: serialize every writer of one campaign root across processes.
+
+    A campaign commit is snapshot -> write waves -> revalidate -> publish
+    canonical finals -> write campaign.json, with a snapshot restore on failure.
+    Unserialized, two commits for the same project interleave and one rollback
+    restores pre-transaction bytes over waves and a campaign.json the other
+    writer already committed. Every such transaction, in this process or
+    another, takes this lock; the key is the resolved campaign root, so
+    different projects never wait on each other.
+
+    Lock ordering, to keep the pair deadlock-free: the registry lock
+    (``config.get_registry_lock_path``) is always taken and released BEFORE this
+    one -- project resolution and registration finish first, and no code holding
+    this lock may acquire the registry lock. Reentrant within one thread so a
+    transaction can call ``save_live_campaign_index`` (which takes the same
+    lock) without blocking on itself; another thread or process still waits.
+    """
+    key = str(campaign_transaction_lock_path(campaign_root))
+    held: dict[str, int] = getattr(_LOCAL, "campaign_locks", None) or {}
+    _LOCAL.campaign_locks = held
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    with cross_process_lock(Path(key), timeout=timeout):
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held.pop(key, None)
+
+
 def save_live_campaign_index(
     campaign_root: Path,
     profile: CampaignProfile,
@@ -701,25 +748,30 @@ def save_live_campaign_index(
     target_file = campaign_root / "campaign.json"
     content_str = json.dumps(payload, indent=2, ensure_ascii=False)
 
-    # Safe atomic write. The name used to carry the pid and a hash of the
-    # content -- both guessable -- and a plain open() follows whatever entry is
-    # already sitting there.
-    fd, tmp_path = open_new_temp_file(campaign_root, "campaign.json")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(content_str.encode("utf-8"))
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_path.replace(target_file)
-    except Exception:
-        # Same contract as every other consumer of open_new_temp_file: a failed
-        # write must not leave the orphan it created behind, next to the real
-        # campaign.json, forever.
+    # W2-001: campaign.json is written from the ingest path, both Bridge
+    # finalization paths and the index auto-repair, so the publication itself
+    # takes the campaign transaction lock. A caller already inside a campaign
+    # transaction holds it and passes straight through (reentrant per thread).
+    with campaign_transaction_lock(campaign_root):
+        # Safe atomic write. The name used to carry the pid and a hash of the
+        # content -- both guessable -- and a plain open() follows whatever entry is
+        # already sitting there.
+        fd, tmp_path = open_new_temp_file(campaign_root, "campaign.json")
         try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "wb") as f:
+                f.write(content_str.encode("utf-8"))
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(target_file)
+        except Exception:
+            # Same contract as every other consumer of open_new_temp_file: a failed
+            # write must not leave the orphan it created behind, next to the real
+            # campaign.json, forever.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
     return target_file
 
 

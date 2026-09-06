@@ -38,7 +38,11 @@ from audapack.models import Project
 
 CONFIG_FILE_NAME = "config.json"
 LEGACY_REPO_CONFIG_NAME = "audapack.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: Schema at which DEFAULT_EXCLUDES stopped owning media/font patterns. A
+#: config persisted below this is upgraded exactly once, on the next load.
+_MEDIA_EXCLUDE_UPGRADE_SCHEMA = 3
 
 DEFAULT_AUDIT_ROOT = r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\__TO_AUDIT\AUDITING_IMPLEMENTATION"
 
@@ -94,10 +98,11 @@ DEFAULT_EXCLUDES = [
     "*.secrets",
     # Weight the auditor cannot read. Measured on this machine: __SAITULS
     # packed to 346MB of which 326MB was .exe and 14MB .dll; 9router to 210MB
-    # of which 150MB was git pack files and 16MB web fonts; FastPrompter to
-    # 160MB with 89MB of .git and 35MB of .wav. Every byte of that is uploaded
-    # and then read by the model before it can write a single ticket.
-    # Text stays -- source, config, docs, and images are all still packed.
+    # of which 150MB was git pack files. Every byte of that is uploaded and
+    # then read by the model before it can write a single ticket.
+    # Text stays -- source, config and docs are all still packed. Media and
+    # fonts are NOT listed here: audapack.fidelity owns them (see
+    # LEGACY_MEDIA_DEFAULT_EXCLUDES below).
     "*.exe",
     "*.dll",
     "*.so",
@@ -110,20 +115,6 @@ DEFAULT_EXCLUDES = [
     "*.lib",
     "*.class",
     "*.jar",
-    "*.wav",
-    "*.mp3",
-    "*.ogg",
-    "*.flac",
-    "*.mp4",
-    "*.avi",
-    "*.mov",
-    "*.mkv",
-    "*.webm",
-    "*.woff",
-    "*.woff2",
-    "*.ttf",
-    "*.otf",
-    "*.eot",
     "*.tar",
     "*.tgz",
     "*.gz",
@@ -143,6 +134,47 @@ DEFAULT_EXCLUDES = [
     # keeps its GIT_CONTEXT line -- branch, sha, tag, dirty worktree.
     ".git/objects",
 ]
+
+#: CORE-002 (audit/6.md): media/font patterns AUDAPACK itself injected into
+#: every config's ``excludes`` before audapack.fidelity existed. A configured
+#: exclude is matched in build_fidelity_plan BEFORE media_class_for, so while
+#: these sit in a persisted config no profile can sample them and FULL cannot
+#: preserve them -- yet the archive still declares full_snapshot. Fidelity owns
+#: this class now, so a schema upgrade drops exactly these and nothing else.
+#: Provenance-safe by construction: only a pattern in this frozen historical
+#: set is removed, so a user who typed ``*.wav`` themselves keeps it (their
+#: config is upgraded once and never re-scanned).
+LEGACY_MEDIA_DEFAULT_EXCLUDES = frozenset({
+    "*.wav", "*.mp3", "*.ogg", "*.flac",
+    "*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm",
+    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+})
+
+
+def strip_legacy_media_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
+    """Split persisted excludes into (kept, dropped legacy media defaults).
+
+    Provenance rule: the historical block was injected as a unit, so it is only
+    recognised as AUDAPACK's when EVERY pattern of it is still present. A
+    curated list -- one the operator pruned, or one where they typed ``*.wav``
+    themselves -- fails that test and is returned untouched. Removing a lone
+    pattern would delete a rule the operator wrote.
+
+    Order and duplicates of the kept patterns are preserved: the list is the
+    operator's, and a migration that reorders it looks like an edit they did
+    not make.
+    """
+    present = {str(pattern).strip().lower() for pattern in excludes}
+    if not LEGACY_MEDIA_DEFAULT_EXCLUDES <= present:
+        return list(excludes), []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for pattern in excludes:
+        if str(pattern).strip().lower() in LEGACY_MEDIA_DEFAULT_EXCLUDES:
+            dropped.append(pattern)
+        else:
+            kept.append(pattern)
+    return kept, dropped
 
 DEFAULT_PROJECT_TEMPLATES = [
     # MAIN0
@@ -1203,10 +1235,21 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                 )
 
     packing_raw = data.get("packing", {})
+    raw_excludes = list(packing_raw.get("excludes", data.get("excludes", DEFAULT_EXCLUDES)))
+    if int(data.get("schema_version") or 0) < _MEDIA_EXCLUDE_UPGRADE_SCHEMA:
+        raw_excludes, dropped_media = strip_legacy_media_excludes(raw_excludes)
+        if dropped_media:
+            logging.getLogger(__name__).info(
+                "config upgrade to schema %d: %d media/font excludes handed to the "
+                "fidelity profile (%s); add them to always_exclude to keep them out",
+                _MEDIA_EXCLUDE_UPGRADE_SCHEMA,
+                len(dropped_media),
+                ", ".join(dropped_media),
+            )
     packing_cfg = PackingConfig(
         output_dir=str(packing_raw.get("output_dir") or data.get("output_dir", "")),
         delete_old=bool(packing_raw.get("delete_old", data.get("delete_old", True))),
-        excludes=list(packing_raw.get("excludes", data.get("excludes", DEFAULT_EXCLUDES))),
+        excludes=raw_excludes,
         manifest_enabled=bool(packing_raw.get("manifest_enabled", data.get("manifest_enabled", True))),
         output_layout=normalize_output_layout(packing_raw.get("output_layout", DEFAULT_OUTPUT_LAYOUT)),
         include_timestamp=bool(packing_raw.get("include_timestamp", True)),
@@ -1348,7 +1391,10 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
         cfg.initialized = bool(data.get("initialized", len(data.get("projects") or []) > 0))
 
         # Heal any paths that point to missing or un-prefixed folder names
-        healed_any = False
+        # A schema upgrade counts as a heal: the media/font excludes handed to
+        # the fidelity profile must be written back once, or a config the
+        # operator later edits by hand is re-stripped on every load.
+        healed_any = int(data.get("schema_version") or 0) < _MEDIA_EXCLUDE_UPGRADE_SCHEMA
         for p in cfg.projects:
             healed = auto_heal_project_path(p.display_name, p.source_path)
             if healed and healed != p.source_path:

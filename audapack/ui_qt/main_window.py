@@ -63,8 +63,10 @@ from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
 from audapack.ui_qt.even_layout import EvenTabBar, fit_toolbar
 from audapack.ui_qt.models.project_delegate import (
+    FULL_ROW_MIN_WIDTH,
     ProjectItemDelegate,
     compute_info_button_rect,
+    compute_layer_button_rects,
     compute_row_button_rects,
 )
 from audapack.ui_qt.models.project_room_model import MIME_TYPE_PROJECT, ProjectRoomModel
@@ -112,12 +114,22 @@ class ProjectTreeView(QTreeView):
             slot = idx.data(self.model().ROLES["slot"])
             proj = self.model().project_at(group, slot)
 
-            # Check [ⓘ] info button first — deterministic, no hover guesswork
-            if proj and not idx.data(self.model().ROLES["is_empty_slot"]):
+            # Check [ⓘ] info button first — deterministic, no hover guesswork.
+            # Same cramped-row rule as the delegate paints with: below the
+            # threshold the buttons are simply not there, so a click must fall
+            # through to the row instead of hitting invisible controls.
+            if proj and not idx.data(self.model().ROLES["is_empty_slot"]) and rect.width() >= FULL_ROW_MIN_WIDTH:
                 launchers = getattr(main_win._service.config, "launchers", None) if hasattr(main_win, "_service") else None
                 launcher_buttons, gg_rect = compute_row_button_rects(rect, launchers)
                 info_rect = compute_info_button_rect(rect, launcher_buttons, gg_rect)
-                if info_rect.contains(pos):
+                plus_rect, edit_rect = compute_layer_button_rects(rect, info_rect)
+                if plus_rect.contains(pos):
+                    main_win._on_open_audit_layers(proj, focus_last=False)
+                    button_hit = True
+                elif edit_rect.contains(pos):
+                    main_win._on_open_audit_layers(proj, focus_last=True)
+                    button_hit = True
+                elif info_rect.contains(pos):
                     hover_info = idx.data(self.model().ROLES["hover_info"])
                     if hasattr(main_win, "_show_project_info"):
                         main_win._show_project_info(hover_info or {"project": proj, "group": group, "slot": slot}, anchor_pos=pos)
@@ -128,8 +140,8 @@ class ProjectTreeView(QTreeView):
                         QApplication.clipboard().setText(tip.replace("<br>", "\n").replace("<b>", "").replace("</b>", ""))
                     button_hit = True
 
-            # Check launcher buttons [1]..[N]
-            if not button_hit and proj and hasattr(main_win, "_on_open_with_launcher"):
+            # Check launcher buttons [1]..[N] — same cramped-row guard.
+            if not button_hit and proj and rect.width() >= FULL_ROW_MIN_WIDTH and hasattr(main_win, "_on_open_with_launcher"):
                 launchers = getattr(main_win._service.config, "launchers", None)
                 if launchers:
                     launcher_buttons, _gg = compute_row_button_rects(rect, launchers)
@@ -315,10 +327,12 @@ class ProjectTreeView(QTreeView):
         painter.drawRect(0, 0, badge_w - 1, 23)
         painter.setFont(QFont("Verdana", 9, QFont.Weight.Bold))
         painter.setPen(QColor(PALETTE["borderGolden"]))
-        if has_archive:
-            painter.drawText(8, 16, f"\U0001F4E4 {proj_name} \u2502 .zip")
-        else:
-            painter.drawText(8, 16, f"\u21C4 {proj_name}")
+        # Elide to the badge's own box: an unbounded name used to be clipped
+        # mid-glyph by the pixmap edge instead of a clean "...".
+        icon = "\U0001F4E4" if has_archive else "\u21C4"
+        painter.drawText(8, 16, painter.fontMetrics().elidedText(
+            f"{icon} {proj_name}", Qt.TextElideMode.ElideRight, badge_w - 16,
+        ))
         painter.end()
         drag.setPixmap(pixmap)
         drag.setHotSpot(QPoint(10, 12))
@@ -709,20 +723,15 @@ class MainWindow(QMainWindow):
 
         # Tab 2: INAUDIT — project-local audit layers (audit/1.md ...)
         def _inaudit_changed(_proj):
-            try:
-                p = _proj or self._selected_project() or self._active_project
-                if p:
-                    self.model.refresh_inaudit(p.id)
-                    if hasattr(self, "tree"):
-                        self.tree.viewport().update()
-            except Exception:
-                pass
+            self._on_inaudit_changed(_proj)
         self.inaudit_widget = InauditWidget(
             parent=self.tabs,
             on_changed=_inaudit_changed,
             config_provider=lambda: self._service.config,
         )
         self.inaudit_widget.set_project(self._active_project)
+        # Standalone audit-layer editor window removed: row [+] / [edit] bind
+        # the INAUDIT tab directly, so the bottom textbox is the only editor.
 
         # Tab 3: Settings
         self.settings_widget = SettingsWidget(service.config, self, on_saved=self._on_settings_saved)
@@ -795,6 +804,12 @@ QToolTip QLabel {
 
         self.pack_all_a_shortcut = QShortcut(QKeySequence("Ctrl+A"), self)
         self.pack_all_a_shortcut.activated.connect(self._on_pack_all)
+
+        self.pack_all_alt_a_shortcut = QShortcut(QKeySequence("Alt+A"), self)
+        self.pack_all_alt_a_shortcut.activated.connect(self._on_pack_all)
+
+        self.new_window_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
+        self.new_window_shortcut.activated.connect(self._on_new_manual_window)
 
         self.quit_shortcut = QShortcut(QKeySequence("Ctrl+Q"), self)
         self.quit_shortcut.activated.connect(self.close)
@@ -1627,6 +1642,32 @@ QToolTip QLabel {
                 self._flash_status(message, "#D4A840", duration_ms=4000)
 
         self.task_runner.submit(key, _work, on_success=_done, on_error=lambda _e: None)
+
+    def _on_inaudit_changed(self, _proj):
+        try:
+            p = _proj or self._selected_project() or self._active_project
+            if p:
+                self.model.refresh_inaudit(p.id)
+                if hasattr(self, "tree"):
+                    self.tree.viewport().update()
+        except Exception:
+            pass
+
+    def _on_open_audit_layers(self, project: Project, focus_last: bool = False):
+        """Row [+] / [edit] buttons: the INAUDIT tab bound to the project.
+
+        No separate window -- the tab's bottom textbox is the editor. [+]
+        creates the next numbered layer and puts the caret in it; [edit]
+        selects the operator's LAST user-created layer, never one the AUDAPACK
+        widget delivered (T-161).
+        """
+        if project is None:
+            return
+        self._show_project_inbox(project)
+        if focus_last:
+            self.inaudit_widget.focus_last_user_layer()
+        else:
+            self.inaudit_widget.create_and_focus_layer()
 
     def _on_new_manual_window(self):
         """Open an unclaimed window in the worker profile, for a manual audit.

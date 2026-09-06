@@ -1131,6 +1131,319 @@ class BrowserWorkerLaunchNeedTests(unittest.TestCase):
         assert len(messages) == 1
 
 
+class TestStopBridgeStaysBoundToItsTarget(unittest.TestCase):
+    """W2-003 (audit/6.md): the shutdown target is immutable.
+
+    `stop_bridge` captured `(pid, nonce)` from a live /health and then threw it
+    away twice. The offline branch called `remove_pid()` with NO expected
+    identity whenever no live Bridge had ever answered -- and `remove_pid` only
+    compares the fields it is given, so that unlinked whatever record was on
+    disk. The fallback re-read `bridge.pid` and /health and checked those two
+    CURRENT values against EACH OTHER, which a successor satisfies perfectly:
+    measured, A(pid=111) was asked to stop, B(pid=222) took the endpoint over
+    with no observable offline interval, and the fallback ran os.kill(222, 9).
+    """
+
+    def _config(self):
+        cfg = AppConfig()
+        cfg.bridge.host = "127.0.0.1"
+        cfg.bridge.port = 18999
+        cfg.bridge.token = "test_secret_token_123456789"
+        return cfg
+
+    def _run(self, *, health, healthy_poll, pid_record, platform="win32", taskkill_rc=0):
+        """Drive stop_bridge over a scripted endpoint. Returns (result, calls)."""
+        import audapack.bridge.lifecycle as lc
+
+        calls: dict[str, list] = {"remove_pid": [], "taskkill": [], "kill": []}
+
+        def _remove_pid(base_dir=None, expected_pid=None, expected_nonce=None):
+            calls["remove_pid"].append((expected_pid, expected_nonce))
+
+        def _run_hidden(cmd, **kwargs):
+            calls["taskkill"].append(list(cmd))
+
+            class _R:
+                returncode = taskkill_rc
+                stdout = ""
+                stderr = "taskkill refused"
+
+            return _R()
+
+        def _kill(pid, sig):
+            calls["kill"].append((pid, sig))
+
+        from unittest.mock import patch as _patch
+        with _patch.object(lc, "check_bridge_health", side_effect=health), \
+             _patch.object(lc, "is_bridge_healthy", side_effect=healthy_poll), \
+             _patch.object(lc, "read_pid", return_value=pid_record), \
+             _patch.object(lc, "remove_pid", side_effect=_remove_pid), \
+             _patch.object(lc, "run_hidden", side_effect=_run_hidden), \
+             _patch.object(lc.os, "kill", side_effect=_kill), \
+             _patch.object(lc.time, "sleep", return_value=None), \
+             _patch.object(lc.sys, "platform", platform), \
+             _patch.object(lc.urllib.request, "urlopen", side_effect=OSError("refused")):
+            result = lc.stop_bridge(self._config())
+        return result, calls
+
+    # ------------------------------------------------------------ the successor
+
+    def test_a_successor_that_took_the_endpoint_over_is_never_killed(self):
+        """A -> B handover with no offline poll: B is not our target."""
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        b = (True, {"pid": 222, "instance_nonce": "n-B"})
+        (ok, msg), calls = self._run(
+            health=[a] + [b] * 4,
+            healthy_poll=[True] * 40,
+            pid_record={"pid": 222, "nonce": "n-B"},
+        )
+        self.assertEqual(calls["taskkill"], [], "the successor was taskkilled")
+        self.assertEqual(calls["kill"], [], "the successor was killed")
+        self.assertEqual(calls["remove_pid"], [], "the successor's record was deleted")
+        self.assertFalse(ok)
+        self.assertIn("111", msg)
+
+    def test_a_successor_that_only_published_its_record_is_never_killed(self):
+        """bridge.pid names B while /health still answers as A."""
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        (ok, msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[True] * 40,
+            pid_record={"pid": 222, "nonce": "n-B"},
+        )
+        self.assertEqual(calls["taskkill"], [])
+        self.assertEqual(calls["kill"], [])
+        self.assertEqual(calls["remove_pid"], [])
+        self.assertFalse(ok)
+        self.assertIn("bridge.pid", msg)
+
+    def test_a_reused_pid_with_a_different_nonce_is_never_killed(self):
+        """The PID matches; the process behind it does not."""
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        recycled = (True, {"pid": 111, "instance_nonce": "n-B"})
+        (ok, _msg), calls = self._run(
+            health=[a] + [recycled] * 4,
+            healthy_poll=[True] * 40,
+            pid_record={"pid": 111, "nonce": "n-B"},
+        )
+        self.assertEqual(calls["taskkill"], [])
+        self.assertEqual(calls["kill"], [])
+        self.assertEqual(calls["remove_pid"], [])
+        self.assertFalse(ok)
+
+    def test_malformed_pid_metadata_authorizes_nothing(self):
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        for record in ({}, {"pid": "junk", "nonce": "n-A"}, {"pid": 111}, {"nonce": "n-A"}):
+            with self.subTest(record=record):
+                (ok, _msg), calls = self._run(
+                    health=[a] * 4,
+                    healthy_poll=[True] * 40,
+                    pid_record=record,
+                )
+                self.assertEqual(calls["taskkill"], [])
+                self.assertEqual(calls["kill"], [])
+                self.assertEqual(calls["remove_pid"], [])
+                self.assertFalse(ok)
+
+    # ------------------------------------------------ no identity, no authority
+
+    def test_an_unverifiable_bridge_never_loses_its_record(self):
+        """Endpoint never answered, then went offline: nothing was verified."""
+        offline = (False, {"status": "offline"})
+        (ok, msg), calls = self._run(
+            health=[offline] * 4,
+            healthy_poll=[False] * 40,
+            pid_record={"pid": 222, "nonce": "n-B"},
+        )
+        self.assertEqual(calls["remove_pid"], [], "remove_pid was called with no expected identity")
+        self.assertTrue(ok)
+        self.assertIn("left untouched", msg)
+
+    def test_an_unverifiable_bridge_is_never_force_killed(self):
+        offline = (False, {"status": "offline"})
+        (ok, msg), calls = self._run(
+            health=[offline] * 4,
+            healthy_poll=[True] * 40,
+            pid_record={"pid": 222, "nonce": "n-B"},
+        )
+        self.assertEqual(calls["taskkill"], [])
+        self.assertEqual(calls["kill"], [])
+        self.assertEqual(calls["remove_pid"], [])
+        self.assertFalse(ok)
+        self.assertIn("Refusing fallback kill", msg)
+
+    def test_a_nonce_without_a_pid_is_still_a_verified_identity(self):
+        """/health answered but its pid was junk: the nonce still binds cleanup."""
+        a = (True, {"pid": "junk", "instance_nonce": "n-A"})
+        (ok, _msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[False] * 40,
+            pid_record={"pid": 111, "nonce": "n-A"},
+        )
+        self.assertEqual(calls["remove_pid"], [(None, "n-A")])
+        self.assertTrue(ok)
+
+    # ------------------------------------------------------ the target itself
+
+    def test_the_captured_identity_still_bounds_a_clean_stop(self):
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        (ok, _msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[False] * 40,
+            pid_record={"pid": 111, "nonce": "n-A"},
+        )
+        self.assertTrue(ok)
+        self.assertEqual(calls["remove_pid"], [(111, "n-A")])
+
+    def test_the_original_target_is_still_force_killed_on_win32(self):
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        (ok, msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[True] * 15 + [False] * 25,
+            pid_record={"pid": 111, "nonce": "n-A"},
+        )
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls["taskkill"], [["taskkill", "/PID", "111", "/T", "/F"]])
+        self.assertEqual(calls["kill"], [])
+        self.assertEqual(calls["remove_pid"], [(111, "n-A")])
+
+    def test_the_original_target_is_still_force_killed_on_posix(self):
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        (ok, msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[True] * 15 + [False] * 25,
+            pid_record={"pid": 111, "nonce": "n-A"},
+            platform="linux",
+        )
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls["kill"], [(111, 9)])
+        self.assertEqual(calls["taskkill"], [])
+        self.assertEqual(calls["remove_pid"], [(111, "n-A")])
+
+    def test_a_target_that_survives_the_kill_is_reported_honestly(self):
+        a = (True, {"pid": 111, "instance_nonce": "n-A"})
+        (ok, msg), calls = self._run(
+            health=[a] * 4,
+            healthy_poll=[True] * 40,
+            pid_record={"pid": 111, "nonce": "n-A"},
+        )
+        self.assertFalse(ok)
+        self.assertIn("remained healthy", msg)
+        self.assertEqual(calls["remove_pid"], [], "a surviving process lost its record")
+
+
+_FAKE_BRIDGE_SOURCE = '''\
+import json
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PORT = int(sys.argv[1])
+NONCE = sys.argv[2]
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps({
+            "service": "AUDAPACK Bridge",
+            "api_version": 3,
+            "pid": os.getpid(),
+            "instance_nonce": NONCE,
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+'''
+
+
+class TestStopBridgeRealSubprocessLifecycle(unittest.TestCase):
+    """W2-003 VERIFY: one real subprocess lifecycle, no mocked identity.
+
+    A real child process owns the endpoint and answers /health with its OWN pid
+    and nonce, and refuses /v1/shutdown, so the graceful path cannot settle it
+    and the fallback force-kill runs for real: real taskkill on Windows, real
+    SIGKILL on POSIX, against a real PID.
+    """
+
+    def _free_port(self) -> int:
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+    def test_a_real_bridge_process_is_stopped_and_its_record_removed(self):
+        import subprocess
+        import sys
+        import time
+
+        import audapack.bridge.lifecycle as lc
+
+        port = self._free_port()
+        nonce = "real-" + secrets.token_hex(8)
+
+        with tempfile.TemporaryDirectory(prefix="audapack_fake_bridge_") as tmp:
+            script = Path(tmp) / "fake_bridge.py"
+            script.write_text(_FAKE_BRIDGE_SOURCE, encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [sys.executable, str(script), str(port), nonce],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.time() + 15.0
+                healthy = False
+                while time.time() < deadline:
+                    healthy, health = lc.check_bridge_health("127.0.0.1", port, timeout=0.5)
+                    if healthy:
+                        break
+                    time.sleep(0.1)
+                if not healthy:
+                    self.skipTest("the fake Bridge subprocess never became healthy")
+                self.assertEqual(int(health["pid"]), proc.pid)
+
+                pid_file = lc.get_pid_file()
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(
+                    json.dumps({"pid": proc.pid, "nonce": nonce}), encoding="utf-8"
+                )
+
+                cfg = AppConfig()
+                cfg.bridge.host = "127.0.0.1"
+                cfg.bridge.port = port
+                cfg.bridge.token = "test_secret_token_123456789"
+
+                ok, msg = lc.stop_bridge(cfg)
+
+                self.assertTrue(ok, msg)
+                self.assertIn(str(proc.pid), msg)
+                self.assertIsNotNone(proc.poll(), "the real process is still running")
+                self.assertFalse(pid_file.exists(), "the stopped target kept its record")
+                self.assertFalse(lc.is_bridge_healthy("127.0.0.1", port, timeout=0.5))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1482,6 +1795,178 @@ class TestPidOwnershipIsAtomicAndBound(unittest.TestCase):
             self.assertEqual(int(current.get("pid") or 0), _os.getpid())
             self.assertEqual(current.get("nonce"), lc.INSTANCE_NONCE)
             self.assertFalse(list(base.glob(".bridge.pid.tmp.*")), "an orphan temp survived")
+
+
+class TestNameOnlyCompletionIdentity(unittest.TestCase):
+    """W2-001 (audit/7.md): a name-only v2 submission must not cross-close.
+
+    The request is canonically resolved once into target_proj; the project-wide
+    cleanup used to revert to the RAW optional payload project_id (None for a
+    legal v2 name-only submission), and complete_runs_for_project fell back to
+    the display NAME -- a different identity domain. A project whose display
+    name equals another project's canonical id closed that other project's
+    live lane.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.audit_root = Path(self.temp_dir) / "AUDITING_IMPLEMENTATION"
+        self.audit_root.mkdir(parents=True)
+
+        self.config = AppConfig()
+        self.config.audits.root = str(self.audit_root)
+        self.config.bridge.host = "127.0.0.1"
+        self.config.bridge.port = 18943
+        self.config.bridge.token = "test_secret_token_123456789"
+        # The collision pair: alpha's DISPLAY NAME is beta, beta's canonical
+        # id is beta. Closing alpha must never reach beta's live job.
+        self.config.projects = [
+            Project(
+                id="alpha", display_name="beta",
+                source_path=str(Path(self.temp_dir) / "alpha"),
+                priority_group="MAIN0", slot=1,
+            ),
+            Project(
+                id="beta", display_name="gamma",
+                source_path=str(Path(self.temp_dir) / "beta"),
+                priority_group="MAIN0", slot=2,
+            ),
+        ]
+
+        from audapack.bridge.browser_dispatch import BrowserDispatcher
+
+        class TestHandler(AudapackBridgeHandler):
+            pass
+
+        TestHandler.config = self.config
+        TestHandler.test_base_dir = self.temp_dir
+        save_config(self.config, base_dir=self.temp_dir)
+        # Pre-seed the dispatcher with two live post-start jobs, one per
+        # project, so the name-only completion has something to wrongly close.
+        self.dispatcher = BrowserDispatcher(state_dir=Path(self.temp_dir) / "browser_dispatch")
+        TestHandler.set_browser_dispatcher(self.dispatcher)
+        self.server = ThreadingHTTPServer((self.config.bridge.host, self.config.bridge.port), TestHandler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self._seed_live_jobs()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _url(self, path: str) -> str:
+        return f"http://{self.config.bridge.host}:{self.config.bridge.port}{path}"
+
+    def _seed_live_jobs(self):
+        import zipfile
+
+        from audapack.bridge.browser_dispatch import (
+            JOB_ARTIFACT_FETCHED,
+            JOB_ATTACHED,
+            JOB_AUDITING,
+            JOB_START_PREPARED,
+            JOB_STARTED,
+        )
+
+        path = Path(self.temp_dir) / "seed.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("payload.txt", "seed")
+        for wid in ("w-alpha", "w-beta"):
+            self.dispatcher.register_worker({
+                "worker_id": wid,
+                "widget_version": "AUDAPACK_WIDGET/3",
+                "bridge_api_version": "3",
+                "is_chromium": True,
+                "is_brave": False,
+                "site": "chatgpt",
+                "conversation_key": f"c:{wid}",
+                "url_path": "/",
+                "has_conversation_turns": False,
+                "generating": False,
+                "action_in_flight": False,
+                "has_manual_draft": False,
+                "has_attachments": False,
+                "page_eligible": True,
+                "clean_for_audit": True,
+                "work_mode_blocked": False,
+                "managed_slot": 1 if wid == "w-alpha" else 2,
+                "managed": True,
+            })
+        self.jobs = {}
+        for wid, pid, pname in (("w-alpha", "alpha", "beta"), ("w-beta", "beta", "gamma")):
+            item = self.dispatcher.enqueue_job({
+                "project_id": pid, "project_name": pname,
+                "archive_path": str(path), "archive_filename": path.name,
+            })
+            self.jobs[pid] = item
+            lease = self.dispatcher.claim_job(wid)
+            for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+                self.dispatcher.transition_job(
+                    item.dispatch_id, wid, lease.lease_id, state,
+                    {"campaign_run_id": f"run-{pid}", "start_receipt": f"receipt-{pid}"},
+                )
+
+    def _submit_all3(self, project_name: str, run_id: str):
+        headers = {
+            "Content-Type": "application/json",
+            "X-ACB-Token": self.config.bridge.token,
+        }
+        waves = (
+            ("core", "AUDIT CORE", "AUDIT_CORE", "CORE-", "CORE_DONE_WHEN: tests pass"),
+            ("second", "AUDIT SECOND WAVE", "SECOND_WAVE", "W2-", "SECOND_WAVE_DONE_WHEN: tests pass"),
+            ("performance", "AUDIT PERFORMANCE / STABILITY / EFFECTIVENESS", "PERFORMANCE", "PERF-", "PERFORMANCE_DONE_WHEN: tests pass"),
+        )
+        for idx, (wave_id, wave_name, status_name, prefix, done_when) in enumerate(waves, start=1):
+            content = (
+                f"PROJECT_NAME: {project_name}\n"
+                "DATE_TIME: 2026-09-06T00:00:00\n"
+                f"WAVE: {wave_name}\n"
+                "TARGET: repo\nBASELINE: v1\n"
+                + ("CORE_BASELINE: v1\n" if idx >= 2 else "")
+                + ("PREVIOUS_BASELINE: v1\n" if idx >= 3 else "")
+                + f"STATUS: {status_name}: COMPLETE\n"
+                "TICKETS: 1\nHANDOFF: IMPLEMENTATION_AGENT\n\n"
+                + (
+                    f"[P2] [{prefix}{idx:03d}] file.py\nEVIDENCE: e\nISSUE: i\nOPTIMIZE: o\nGUARDRAIL: g\nVERIFY: v\n\n"
+                    if prefix == "PERF-"
+                    else f"[P1] [{prefix}{idx:03d}] file.py\nEVIDENCE: e\nDEFECT: d\nREPAIR: r\nVERIFY: v\n\n"
+                )
+                + f"{done_when}\n"
+            )
+            payload = {
+                "run_id": run_id,
+                "project": project_name,
+                "wave": wave_id,
+                "status": "complete",
+                "api_version": 2,
+                "receipt": f"rcpt_{run_id}_{wave_id}",
+                "content": content,
+            }
+            req = urllib.request.Request(
+                self._url("/v1/audits"),
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+
+    def test_name_only_completion_cannot_close_the_id_colliding_project(self):
+        from audapack.bridge.browser_dispatch import JOB_AUDITING, JOB_COMPLETE
+
+        # v2 name-only: project="beta" (alpha's display name), no project_id.
+        # The server resolves it canonically to alpha.
+        self._submit_all3("beta", "run-alpha-x")
+
+        alpha_job = self.dispatcher.get_job(self.jobs["alpha"].dispatch_id)
+        self.assertEqual(alpha_job.state, JOB_COMPLETE, "the resolved project's lane closes")
+        beta_job = self.dispatcher.get_job(self.jobs["beta"].dispatch_id)
+        self.assertEqual(
+            beta_job.state, JOB_AUDITING,
+            "a project whose canonical id equals another's display name was closed by a name-only submission",
+        )
+        self.assertEqual(beta_job.meta_run_id_drift, "", "the foreign project received drift from a run it never saw")
+        self.assertEqual(beta_job.final_handoff_path, "", "the foreign project inherited a handoff as proof")
 
 
 if __name__ == "__main__":

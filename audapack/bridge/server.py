@@ -50,6 +50,7 @@ from audapack.campaign import (
     ARTIFACT_KIND_QUICK3_COMBINED,
     STATUS_CAMPAIGN_COMPLETE,
     STATUS_CAMPAIGN_READY_FOR_WAVE,
+    campaign_transaction_lock,
     get_canonical_manifest_hash,
     get_profile,
     load_profiles,
@@ -920,15 +921,16 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         if not capture_id or action:
             self.send_json(404, {"ok": False, "error": "Endpoint not found"})
             return
+        store = self._inaudit_store()
         try:
-            self._inaudit_store().delete(capture_id)
+            store.delete(capture_id)
         except InauditCaptureError as exc:
             self._send_inaudit_error(exc)
             return
         except (OSError, UnicodeError) as exc:
             self._send_inaudit_persistence_error("capture_delete_failed", exc)
             return
-        self.send_json(200, {"ok": True, "capture_id": capture_id})
+        self._send_inaudit_committed(store, {"capture_id": capture_id})
 
     @staticmethod
     def _inaudit_path_parts(path: str) -> tuple[str, str]:
@@ -975,12 +977,28 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             {"ok": False, "error": {"code": code, "message": str(exc), "retriable": True}},
         )
 
+    def _send_inaudit_committed(self, store, payload: dict) -> None:
+        """200 for a committed mutation, with the notification state stated.
+
+        W2-004 (audit/2.md): notification publication used to share the mutation's
+        success boundary, so a generation-write failure answered 500 retriable
+        after the capture/move/delete had already committed -- and the retry then
+        contradicted that with a 404. `committed=True` plus
+        `notification_pending` says exactly what happened instead.
+        """
+        pending = bool(getattr(store, "notification_pending", False))
+        body = {"ok": True, "committed": True, **payload}
+        if pending:
+            body["notification_pending"] = True
+        self.send_json(200, body)
+
     def _handle_inaudit_capture(self) -> None:
         data = self._read_json_body()
         if data is None:
             return
+        store = self._inaudit_store()
         try:
-            result = self._inaudit_store().capture(data, self.get_live_config().projects)
+            result = store.capture(data, self.get_live_config().projects)
         except InauditCaptureError as exc:
             self._send_inaudit_error(exc)
             return
@@ -990,7 +1008,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": {"code": "capture_persistence_failed", "message": str(exc), "retriable": True}},
             )
             return
-        self.send_json(200, {"ok": True, **result})
+        self._send_inaudit_committed(store, result)
 
     def _handle_inaudit_assign(self, capture_id: str) -> None:
         data = self._read_json_body()
@@ -1001,8 +1019,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 InauditCaptureError("path_not_allowed", "assignment accepts project_id, never a destination path")
             )
             return
+        store = self._inaudit_store()
         try:
-            result = self._inaudit_store().assign(
+            result = store.assign(
                 capture_id,
                 str(data.get("project_id") or ""),
                 self.get_live_config().projects,
@@ -1017,29 +1036,31 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": {"code": "assignment_persistence_failed", "message": str(exc), "retriable": True}},
             )
             return
-        self.send_json(200, {"ok": True, **result})
+        self._send_inaudit_committed(store, result)
 
     def _handle_inaudit_archive(self, capture_id: str) -> None:
+        store = self._inaudit_store()
         try:
-            record = self._inaudit_store().archive(capture_id)
+            record = store.archive(capture_id)
         except InauditCaptureError as exc:
             self._send_inaudit_error(exc)
             return
         except (OSError, UnicodeError) as exc:
             self._send_inaudit_persistence_error("archive_persistence_failed", exc)
             return
-        self.send_json(200, {"ok": True, "record": record})
+        self._send_inaudit_committed(store, {"record": record})
 
     def _handle_inaudit_restore(self, capture_id: str) -> None:
+        store = self._inaudit_store()
         try:
-            record = self._inaudit_store().restore(capture_id)
+            record = store.restore(capture_id)
         except InauditCaptureError as exc:
             self._send_inaudit_error(exc)
             return
         except (OSError, UnicodeError) as exc:
             self._send_inaudit_persistence_error("restore_persistence_failed", exc)
             return
-        self.send_json(200, {"ok": True, "record": record})
+        self._send_inaudit_committed(store, {"record": record})
 
     def _read_json_body(self) -> Optional[dict]:
         raw_length = self.headers.get("Content-Length")
@@ -1515,52 +1536,55 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                             # campaign-index write to succeed before persisting
                             # ready/completion, and on failure restore the exact
                             # prior artifact/index bytes and return retriable 503.
-                            snap_targets = [target_dir / "campaign.json"]
-                            snap_targets.extend(
-                                _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
-                            )
-                            snapshots, snap_err = capture_file_snapshots(snap_targets)
-                            if snap_err:
-                                self.send_json(503, {
-                                    "ok": False,
-                                    "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
-                                })
-                                return
-                            try:
-                                synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
-                                _write_final_artifacts(prof, synth_result, target_dir, history_dir,
-                                                       dt_str, state, resolved_name)
-                                save_live_campaign_index(
-                                    campaign_root=target_dir, profile=prof, run_id=run_id,
-                                    project_name=resolved_name,
-                                    parsed_waves={
-                                        wid: {
-                                            "wave_id": wid,
-                                            "status": "COMPLETE",
-                                            "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
-                                            "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
-                                            "sha256": w_info.get("sha256", ""),
-                                            "completed_at": w_info.get("completed_at", dt_str),
-                                        }
-                                        for wid, w_info in state.get("waves", {}).items()
-                                    },
-                                    completed_waves=[w.id for w in prof.waves],
-                                    active_wave_id=None,
-                                    status=STATUS_CAMPAIGN_COMPLETE,
-                                    final_handoff_path=_get_final_handoff_path(prof, state),
+                            # W2-001: same campaign-root transaction lock as the ingest path and the
+                            # normal delivery path below, so this repair cannot interleave with them.
+                            with campaign_transaction_lock(target_dir):
+                                snap_targets = [target_dir / "campaign.json"]
+                                snap_targets.extend(
+                                    _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
                                 )
-                            except Exception as exc:
-                                self.send_json(503, _rollback_error(
-                                    snapshots, "campaign_index_failed", str(exc)))
-                                return
-                            # Persist ready/completion only after the index commit
-                            # succeeded; a failure above already rolled back.
-                            try:
-                                save_run_state(run_id, state)
-                            except RunStatePersistenceError as exc:
-                                self.send_json(503, _rollback_error(
-                                    snapshots, "campaign_index_failed", str(exc)))
-                                return
+                                snapshots, snap_err = capture_file_snapshots(snap_targets)
+                                if snap_err:
+                                    self.send_json(503, {
+                                        "ok": False,
+                                        "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
+                                    })
+                                    return
+                                try:
+                                    synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                                    _write_final_artifacts(prof, synth_result, target_dir, history_dir,
+                                                           dt_str, state, resolved_name)
+                                    save_live_campaign_index(
+                                        campaign_root=target_dir, profile=prof, run_id=run_id,
+                                        project_name=resolved_name,
+                                        parsed_waves={
+                                            wid: {
+                                                "wave_id": wid,
+                                                "status": "COMPLETE",
+                                                "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                                                "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
+                                                "sha256": w_info.get("sha256", ""),
+                                                "completed_at": w_info.get("completed_at", dt_str),
+                                            }
+                                            for wid, w_info in state.get("waves", {}).items()
+                                        },
+                                        completed_waves=[w.id for w in prof.waves],
+                                        active_wave_id=None,
+                                        status=STATUS_CAMPAIGN_COMPLETE,
+                                        final_handoff_path=_get_final_handoff_path(prof, state),
+                                    )
+                                except Exception as exc:
+                                    self.send_json(503, _rollback_error(
+                                        snapshots, "campaign_index_failed", str(exc)))
+                                    return
+                                # Persist ready/completion only after the index commit
+                                # succeeded; a failure above already rolled back.
+                                try:
+                                    save_run_state(run_id, state)
+                                except RunStatePersistenceError as exc:
+                                    self.send_json(503, _rollback_error(
+                                        snapshots, "campaign_index_failed", str(exc)))
+                                    return
                             is_ready = True
                             from audapack.bridge.state import increment_audit_generation
                             increment_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
@@ -1700,111 +1724,119 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
             # CORE-003: snapshot all canonical artifact paths before any write
             # so ANY failure below can restore the exact previous state.
-            snapshot_paths = [latest_path, history_path, target_dir / "campaign.json"]
-            snapshot_paths.extend(
-                _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
-            )
-            snapshots, snap_err = capture_file_snapshots(snapshot_paths)
-            if snap_err:
-                self.send_json(500, {
-                    "ok": False,
-                    "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
-                })
-                return
-
-            # Write history first, then canonical latest (CORE-003).
-            try:
-                atomic_write(history_path, content)
-                atomic_write(latest_path, content)
-            except Exception as exc:
-                self.send_json(500, _rollback_error(snapshots, "atomic_write_failed", str(exc)))
-                return
-
-            if "waves" not in state:
-                state["waves"] = {}
-            state["waves"][wave_def.id] = {
-                "complete": True,
-                "ordinal": wave_def.ordinal,
-                "sha256": content_hash,
-                "receipt": receipt,
-                "completed_at": dt_str,
-                "latest_path": str(latest_path),
-                "history_path": str(history_path),
-                "meta": wave_meta,
-            }
-
-            all_waves = state["waves"]
-            required_waves = [w for w in prof.waves if w.required]
-            campaign_ready = all(w.id in all_waves and all_waves[w.id].get("complete") for w in required_waves)
-
-            final_handoff_path: Optional[Path] = None
-            canonical_campaign_path: Optional[Path] = None
-            finalization_ok = False
-
-            if campaign_ready:
-                parsed_dict = {
-                    w.id: all_waves[w.id].get("meta", {}) for w in prof.waves if w.id in all_waves
-                }
-                try:
-                    synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
-                    _write_final_artifacts(prof, synth_result, target_dir, history_dir,
-                                           dt_str, state, resolved_name)
-                    final_handoff_path = _get_final_handoff_path(prof, state)
-                    canonical_campaign_path = _get_canonical_path(prof, state)
-                    finalization_ok = True
-                except Exception as exc:
-                    self.send_json(503, _rollback_error(snapshots, "finalization_failed", str(exc)))
+            # W2-001: wave delivery is one transaction against this campaign root --
+            # snapshot, history and canonical wave writes, finalization of the
+            # canonical artifacts, campaign.json, and the snapshot restore that every
+            # failure below performs. Serialized against the ingest path and the
+            # duplicate-finalization repair above, so no rollback here can restore
+            # pre-transaction bytes over another writer's committed campaign. Lock
+            # order: resolve_project_audit_dir (registry lock) already returned above.
+            with campaign_transaction_lock(target_dir):
+                snapshot_paths = [latest_path, history_path, target_dir / "campaign.json"]
+                snapshot_paths.extend(
+                    _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
+                )
+                snapshots, snap_err = capture_file_snapshots(snapshot_paths)
+                if snap_err:
+                    self.send_json(500, {
+                        "ok": False,
+                        "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
+                    })
                     return
 
-            # Live campaign index — only writes COMPLETE when finalization
-            # succeeded (CORE-002). On failure roll back and return retriable.
-            completed_waves_list = [w.id for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")]
-            next_w = prof.get_next_wave(wave_def.id)
-            active_wid = None if campaign_ready else (next_w.id if next_w else None)
-            c_status = STATUS_CAMPAIGN_COMPLETE if (campaign_ready and finalization_ok) else STATUS_CAMPAIGN_READY_FOR_WAVE
+                # Write history first, then canonical latest (CORE-003).
+                try:
+                    atomic_write(history_path, content)
+                    atomic_write(latest_path, content)
+                except Exception as exc:
+                    self.send_json(500, _rollback_error(snapshots, "atomic_write_failed", str(exc)))
+                    return
 
-            parsed_waves_dict = {
-                wid: {
-                    "wave_id": wid,
-                    "status": "COMPLETE" if w_info.get("complete") else "IDLE",
-                    "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
-                    "file": Path(w_info.get("latest_path", "")) if w_info.get("latest_path") else None,
-                    "sha256": w_info.get("sha256", ""),
-                    "completed_at": w_info.get("completed_at", dt_str),
+                if "waves" not in state:
+                    state["waves"] = {}
+                state["waves"][wave_def.id] = {
+                    "complete": True,
+                    "ordinal": wave_def.ordinal,
+                    "sha256": content_hash,
+                    "receipt": receipt,
+                    "completed_at": dt_str,
+                    "latest_path": str(latest_path),
+                    "history_path": str(history_path),
+                    "meta": wave_meta,
                 }
-                for wid, w_info in all_waves.items()
-            }
-            try:
-                save_live_campaign_index(
-                    campaign_root=target_dir,
-                    profile=prof,
-                    run_id=run_id,
-                    project_name=resolved_name,
-                    parsed_waves=parsed_waves_dict,
-                    completed_waves=completed_waves_list,
-                    active_wave_id=active_wid,
-                    status=c_status,
-                    final_handoff_path=final_handoff_path,
-                )
-            except Exception as ex:
-                if finalization_ok:
-                    self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(ex)))
-                else:
-                    self.send_json(503, {
-                        "ok": False,
-                        "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
-                    })
-                return
 
-            # W2-002: persist the pending-publication marker as part of the primary
-            # durable state commit BEFORE publishing generation, so recovery intent
-            # survives a crash and duplicate retries can repair a missed publication.
-            state["generation_pending"] = True
-            try:
-                save_run_state(run_id, state)
-            except RunStatePersistenceError as exc:
-                self.send_json(500, _rollback_error(snapshots, "run_state_persistence_failed", str(exc)))
-                return
+                all_waves = state["waves"]
+                required_waves = [w for w in prof.waves if w.required]
+                campaign_ready = all(w.id in all_waves and all_waves[w.id].get("complete") for w in required_waves)
+
+                final_handoff_path: Optional[Path] = None
+                canonical_campaign_path: Optional[Path] = None
+                finalization_ok = False
+
+                if campaign_ready:
+                    parsed_dict = {
+                        w.id: all_waves[w.id].get("meta", {}) for w in prof.waves if w.id in all_waves
+                    }
+                    try:
+                        synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                        _write_final_artifacts(prof, synth_result, target_dir, history_dir,
+                                               dt_str, state, resolved_name)
+                        final_handoff_path = _get_final_handoff_path(prof, state)
+                        canonical_campaign_path = _get_canonical_path(prof, state)
+                        finalization_ok = True
+                    except Exception as exc:
+                        self.send_json(503, _rollback_error(snapshots, "finalization_failed", str(exc)))
+                        return
+
+                # Live campaign index — only writes COMPLETE when finalization
+                # succeeded (CORE-002). On failure roll back and return retriable.
+                completed_waves_list = [w.id for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")]
+                next_w = prof.get_next_wave(wave_def.id)
+                active_wid = None if campaign_ready else (next_w.id if next_w else None)
+                c_status = STATUS_CAMPAIGN_COMPLETE if (campaign_ready and finalization_ok) else STATUS_CAMPAIGN_READY_FOR_WAVE
+
+                parsed_waves_dict = {
+                    wid: {
+                        "wave_id": wid,
+                        "status": "COMPLETE" if w_info.get("complete") else "IDLE",
+                        "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                        "file": Path(w_info.get("latest_path", "")) if w_info.get("latest_path") else None,
+                        "sha256": w_info.get("sha256", ""),
+                        "completed_at": w_info.get("completed_at", dt_str),
+                    }
+                    for wid, w_info in all_waves.items()
+                }
+                try:
+                    save_live_campaign_index(
+                        campaign_root=target_dir,
+                        profile=prof,
+                        run_id=run_id,
+                        project_name=resolved_name,
+                        parsed_waves=parsed_waves_dict,
+                        completed_waves=completed_waves_list,
+                        active_wave_id=active_wid,
+                        status=c_status,
+                        final_handoff_path=final_handoff_path,
+                    )
+                except Exception as ex:
+                    if finalization_ok:
+                        self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(ex)))
+                    else:
+                        self.send_json(503, {
+                            "ok": False,
+                            "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
+                        })
+                    return
+
+                # W2-002: persist the pending-publication marker as part of the primary
+                # durable state commit BEFORE publishing generation, so recovery intent
+                # survives a crash and duplicate retries can repair a missed publication.
+                state["generation_pending"] = True
+                try:
+                    save_run_state(run_id, state)
+                except RunStatePersistenceError as exc:
+                    self.send_json(500, _rollback_error(snapshots, "run_state_persistence_failed", str(exc)))
+                    return
 
             from audapack.bridge.state import increment_audit_generation
             generation_pending = True
@@ -1862,8 +1894,17 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             # commit, beside the proof-checked completion above.
             if campaign_ready and finalization_ok and final_handoff_path:
                 try:
+                    # W2-001 (audit/7.md): the request is canonically resolved
+                    # once into target_proj; downstream lifecycle operations
+                    # used to revert to the raw optional request project_id,
+                    # which is None for a legal name-only v2 submission. Passing
+                    # "" let complete_runs_for_project fall back to the display
+                    # NAME, so a project whose display name equals another
+                    # project's canonical id closed that unrelated live lane.
+                    # Propagate the resolved id, never the raw payload.
+                    resolved_pid = str(target_proj.id) if target_proj is not None else str(project_id or "")
                     self._dispatcher().complete_runs_for_project(
-                        str(project_id or ""),
+                        resolved_pid,
                         str(resolved_name or ""),
                         str(final_handoff_path),
                         hashlib.sha256(Path(final_handoff_path).read_bytes()).hexdigest(),
@@ -1881,7 +1922,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 try:
                     from audapack.bridge.storage import mirror_project_audits
 
-                    mirror_project = live_registry.get_project_by_id(str(project_id or ""))
+                    mirror_project = live_registry.get_project_by_id(str(target_proj.id) if target_proj is not None else str(project_id or ""))
                     if mirror_project is not None:
                         mirror_project_audits(
                             live_cfg,

@@ -34,10 +34,20 @@ from audapack.fidelity import (
     FidelityPlan,
     archive_semantics_for,
     exclude_reason_summary,
+    failure_summary,
+    pruned_census_totals,
 )
 from audapack.models import PackResult, Project
 
 MANIFEST_FILENAME = "_AUDAPACK_MANIFEST.json"
+
+#: CORE-006 (audit/6.md): a reuse decision reads a manifest written by an earlier
+#: build, so the schema it was written against is part of what it must prove.
+#: Bumped whenever a key a consumer depends on changes meaning.
+#: 3 -- PERF-003: ``media_inventory`` is keyed per media GROUP
+#: (``"<directory>#<class>"``) and carries exact aggregates plus bounded filename
+#: samples instead of one record per media asset.
+MANIFEST_SCHEMA_VERSION = 3
 
 # Mandatory excludes — must never be packaged even if user removes them from config.
 # Mirrors audapack.config.MANDATORY_EXCLUDES; kept local to avoid import cycle in tests.
@@ -57,6 +67,44 @@ MANDATORY_EXCLUDES = {
     "secrets",
     "_AUDAPACK_MANIFEST.json",
 }
+
+
+#: PERF-002 (audit/6.md): extensions whose bytes are already entropy-coded, so
+#: Deflate burns CPU for nothing. Measured on a 32 MiB precompressed payload:
+#: DEFLATED write 0.698 s / 33,564,786 bytes against STORED 0.029 s /
+#: 33,554,546 bytes -- 23.9x slower for an archive 0.03% LARGER.
+#:
+#: Conservative by construction, and NOT "all media": WAV and other raw assets
+#: are deliberately absent because Deflate wins materially on them. An unknown
+#: extension stays DEFLATED, so the fallback is the old behaviour.
+PRECOMPRESSED_EXTENSIONS = frozenset({
+    # image (lossy/entropy-coded containers)
+    "jpg", "jpeg", "png", "webp", "gif",
+    # video
+    "mp4", "m4v", "webm", "mkv", "mov",
+    # audio (raw PCM formats like wav/aiff excluded on purpose)
+    "mp3", "aac", "m4a", "ogg", "opus", "flac",
+    # fonts: woff carries zlib, woff2 carries brotli
+    "woff", "woff2",
+    # containers that already hold compressed members
+    "zip", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "whl", "jar",
+})
+
+
+def compress_type_for(name: str) -> int:
+    """The storage method for ``name``: STORED when its bytes are precompressed.
+
+    PERF-002: one deterministic policy for every archive-writing branch instead
+    of extension checks scattered through them. Extension-only and
+    case-insensitive, so the same file always lands the same way -- storage
+    method is a CPU decision, never an archive-semantics one.
+    """
+    base = str(name).rpartition("/")[2].rpartition("\\")[2]
+    dot = base.rfind(".")
+    # dot > 0 matches Path.suffix: a leading-dot name (".gitignore") has none.
+    if dot > 0 and base[dot + 1:].lower() in PRECOMPRESSED_EXTENSIONS:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
 
 
 class PackingCancelled(Exception):
@@ -201,6 +249,51 @@ class ZipStats:
     source_bytes: int = 0
     included_bytes: int = 0
     excluded_bytes: int = 0
+    #: Bytes of files that were planned or discovered but could not be read into
+    #: the archive. CORE-003 (audit/6.md): without this side the byte identity is
+    #: unsatisfiable the moment one file fails -- its bytes are in neither the
+    #: included nor the excluded column.
+    failed_bytes: int = 0
+    #: Discovered entries whose size could not be read. CORE-003 (audit/6.md):
+    #: an unknowable size is declared unknown instead of being counted as a known
+    #: zero, so ``source_bytes`` stays a statement about measured material.
+    unknown_size_entries: int = 0
+
+
+def stats_accounting_error(
+    stats: ZipStats, fidelity: Optional[dict] = None
+) -> Optional[str]:
+    """Why ``stats`` cannot be serialized as truthful accounting, or None.
+
+    CORE-003 (audit/6.md): the plan's totals were copied straight into the
+    manifest, so a planning-time accounting defect became persistent archive
+    metadata. This is the final gate before emission: the identity, the byte
+    reconciliation, and (with a fidelity payload) the reason totals must all
+    agree with the numbers about to be written.
+    """
+    total = stats.files_included + stats.files_excluded + stats.files_failed
+    if stats.files_discovered != total:
+        return (
+            f"files_discovered {stats.files_discovered} != included "
+            f"{stats.files_included} + excluded {stats.files_excluded} + failed "
+            f"{stats.files_failed}"
+        )
+    if stats.source_bytes != stats.included_bytes + stats.excluded_bytes + stats.failed_bytes:
+        return (
+            f"source_bytes {stats.source_bytes} != included_bytes "
+            f"{stats.included_bytes} + excluded_bytes {stats.excluded_bytes} + "
+            f"failed_bytes {stats.failed_bytes} (unknown-size entries: "
+            f"{stats.unknown_size_entries})"
+        )
+    if fidelity:
+        exclusions = fidelity.get("exclusions") or {}
+        reason_count = sum(int(v.get("count", 0)) for v in exclusions.values())
+        if reason_count != stats.files_excluded:
+            return f"reason totals {reason_count} != files_excluded {stats.files_excluded}"
+        reason_bytes = sum(int(v.get("bytes", 0)) for v in exclusions.values())
+        if reason_bytes != stats.excluded_bytes:
+            return f"reason bytes {reason_bytes} != excluded_bytes {stats.excluded_bytes}"
+    return None
 
 
 def generate_manifest_data(
@@ -219,10 +312,14 @@ def generate_manifest_data(
     from the fidelity plan. Without a plan the packer included everything the
     explicit exclusion policy allowed, so the semantics are honestly FULL --
     the archive never implies audit_representation when nothing was trimmed.
+
+    PERF-003: the media inventory is per-group aggregates plus a bounded name
+    sample. It used to be one record per media asset, so the manifest grew with
+    the tree it described.
     """
     fid_profile = (fidelity or {}).get("fidelity_profile", PROFILE_FULL)
     meta = {
-        "schema_version": 2,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "product": "AUDAPACK",
         "created_at": datetime.now().isoformat(),
         "project": project_name,
@@ -241,17 +338,40 @@ def generate_manifest_data(
         "excluded_bytes": stats.excluded_bytes,
         "archive_bytes": stats.bytes_written,
     }
+    # CORE-003: the archive states whether its own numbers reconcile. Both keys
+    # are always present, so a reader never has to infer the guarantee from an
+    # absent field, and a defect is named rather than silently serialized.
+    error = stats_accounting_error(stats, fidelity)
+    meta["accounting_reconciled"] = error is None
+    if error:
+        meta["accounting_error"] = error
+    if stats.failed_bytes:
+        # The third side of the byte identity: material that was measured but
+        # could not be read into the archive belongs to neither column.
+        meta["failed_bytes"] = stats.failed_bytes
+    if stats.unknown_size_entries:
+        # Sizes that could not be read are declared, so source_bytes is never
+        # mistaken for a complete measurement of the tree.
+        meta["unknown_size_entries"] = stats.unknown_size_entries
     if fidelity:
         meta["budget_bytes"] = fidelity.get("budget_bytes", 0)
         meta["budget_met"] = bool(fidelity.get("budget_met", True))
+        # CORE-006: an archive states the policy identity it was built under, so
+        # a later reuse decision can refuse an archive whose policy has moved.
+        if fidelity.get("policy_fingerprint"):
+            meta["policy_fingerprint"] = fidelity["policy_fingerprint"]
         if fidelity.get("walk_incomplete"):
             meta["walk_incomplete"] = True
         if fidelity.get("exclusions"):
             meta["exclusions"] = fidelity["exclusions"]
+        if fidelity.get("failures"):
+            meta["failures"] = fidelity["failures"]
         if fidelity.get("largest_omitted"):
             meta["largest_omitted"] = fidelity["largest_omitted"]
         if fidelity.get("pruned_directories"):
             meta["pruned_directories"] = fidelity["pruned_directories"]
+            meta["pruned_files"] = fidelity.get("pruned_files", 0)
+            meta["pruned_bytes"] = fidelity.get("pruned_bytes", 0)
         if fidelity.get("media_inventory"):
             meta["media_inventory"] = fidelity["media_inventory"]
     if extra_meta:
@@ -262,9 +382,13 @@ def generate_manifest_data(
 def _fidelity_payload(plan) -> Optional[dict]:
     if plan is None:
         return None
+    pruned_files, pruned_bytes = pruned_census_totals(plan)
     return {
         "fidelity_profile": plan.profile,
         "archive_semantics": plan.archive_semantics,
+        # CORE-006: the policy that produced this archive, so freshness can be a
+        # question about identity rather than only about timestamps.
+        "policy_fingerprint": plan.policy_fingerprint,
         # T-147: the budget is SOFT. Mandatory audit material is never trimmed
         # to reach it, so a source-heavy project can legitimately overshoot --
         # and the manifest says so instead of implying the target was met.
@@ -276,11 +400,23 @@ def _fidelity_payload(plan) -> Optional[dict]:
         # numbers and would otherwise read as complete accounting.
         "walk_incomplete": plan.walk_incomplete,
         "exclusions": exclude_reason_summary(plan),
+        # CORE-003: a file the tree refused to yield is not an exclusion anybody
+        # chose, so failures carry their own category vocabulary.
+        "failures": failure_summary(plan),
         "largest_omitted": [[rel, size] for rel, size in plan.largest_omitted],
+        # Each prune reports the material it removed, so "how much was omitted
+        # here" is answerable without descending into the tree again.
         "pruned_directories": [
-            {"rel": rel, "reason": reason}
-            for rel, reason in sorted(plan.pruned_dirs_rel.items())
+            {
+                "rel": rel,
+                "reason": str(info.get("reason", "")),
+                "files": int(info.get("files", 0)),
+                "bytes": int(info.get("bytes", 0)),
+            }
+            for rel, info in sorted(plan.pruned_dirs_rel.items())
         ],
+        "pruned_files": pruned_files,
+        "pruned_bytes": pruned_bytes,
         "media_inventory": plan.media_inventory,
     }
 
@@ -398,6 +534,7 @@ def create_zip(
         stats.files_failed = plan.failed
         stats.source_bytes = plan.source_bytes
         stats.excluded_bytes = plan.excluded_bytes
+        stats.unknown_size_entries = plan.unknown_size_entries
 
     def on_walk_error(err):
         stats.walk_errors += 1
@@ -429,7 +566,7 @@ def create_zip(
                 stats.source_bytes = size
                 arcname = source.name
                 zinfo = zipfile.ZipInfo.from_file(source, arcname, strict_timestamps=False)
-                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zinfo.compress_type = compress_type_for(arcname)
                 with open(source, "rb") as src, zf.open(zinfo, "w") as dst:
                     while True:
                         if c_event.is_set():
@@ -440,6 +577,9 @@ def create_zip(
                         dst.write(chunk)
                         stats.bytes_written += len(chunk)
                         stats.included_bytes += len(chunk)
+                # The bytes read are the truth: a file that grew between the stat
+                # and the read must not leave source_bytes disagreeing with it.
+                stats.source_bytes = stats.included_bytes
                 stats.files_added = 1
                 prog(1, stats.bytes_written, str(source))
             else:
@@ -481,6 +621,7 @@ def create_zip(
                             continue
 
                         rel_lower = file_path.relative_to(source).as_posix().lower()
+                        planned_size = 0
                         if plan is not None:
                             decision = plan.decisions.get(rel_lower)
                             if decision is None:
@@ -489,30 +630,46 @@ def create_zip(
                                 # NEVER silently disappear: count it failed so
                                 # the pack reports partial and the manifest is
                                 # truthful. (discovered keeps the invariant.)
+                                # CORE-003: its bytes are unaccounted for on both
+                                # sides, so they enter source_bytes and
+                                # failed_bytes together -- or, if unreadable, are
+                                # declared unknown rather than assumed zero.
                                 stats.files_discovered += 1
                                 stats.files_failed += 1
+                                try:
+                                    missed = file_path.stat().st_size
+                                    stats.source_bytes += missed
+                                    stats.failed_bytes += missed
+                                except OSError:
+                                    stats.unknown_size_entries += 1
                                 log(f"! unplanned file (plan walk missed it): {file_path}")
                                 continue
                             if not decision.include:
                                 continue  # already accounted in plan totals
+                            planned_size = decision.size
                         else:
                             stats.files_discovered += 1
                             try:
                                 size = file_path.stat().st_size
                             except OSError:
+                                # An unreadable size is declared unknown, never
+                                # counted as a known zero.
                                 size = 0
+                                stats.unknown_size_entries += 1
                             stats.source_bytes += size
                             if _path_is_excluded_normalized(file_path, normalized_excludes):
                                 stats.files_excluded += 1
                                 stats.excluded_bytes += size
                                 continue
+                            planned_size = size
 
+                        included_before = stats.included_bytes
                         try:
                             arcname = file_path.relative_to(source)
                             zinfo = zipfile.ZipInfo.from_file(
                                 file_path, str(arcname), strict_timestamps=False
                             )
-                            zinfo.compress_type = zipfile.ZIP_DEFLATED
+                            zinfo.compress_type = compress_type_for(arcname.name)
                             with open(file_path, "rb") as src, zf.open(zinfo, "w") as dst:
                                 while True:
                                     if c_event.is_set():
@@ -523,6 +680,13 @@ def create_zip(
                                     dst.write(chunk)
                                     stats.bytes_written += len(chunk)
                                     stats.included_bytes += len(chunk)
+                            # A file can change between planning and packing. The
+                            # bytes actually read are the truth; source_bytes
+                            # absorbs the drift so it keeps describing observed
+                            # material instead of a stale plan (CORE-003).
+                            drift = (stats.included_bytes - included_before) - planned_size
+                            if drift:
+                                stats.source_bytes += drift
                             stats.files_added += 1
                             if plan is None:
                                 stats.files_included += 1
@@ -531,6 +695,13 @@ def create_zip(
                         except PackingCancelled:
                             raise
                         except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                            # A file that could not be read is neither included
+                            # nor excluded: its planned bytes move to the failed
+                            # column and any partial read is taken back out of
+                            # included_bytes, or the byte identity is unsatisfiable
+                            # the moment one file fails.
+                            stats.included_bytes = included_before
+                            stats.failed_bytes += planned_size
                             stats.files_failed += 1
                             if plan is not None:
                                 stats.files_included = max(0, stats.files_included - 1)
@@ -548,7 +719,7 @@ def create_zip(
                 )
                 manifest_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
                 zinfo = zipfile.ZipInfo(MANIFEST_FILENAME)
-                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zinfo.compress_type = compress_type_for(MANIFEST_FILENAME)
                 zf.writestr(zinfo, manifest_bytes)
                 stats.files_added += 1
                 stats.bytes_written += len(manifest_bytes)
@@ -583,6 +754,81 @@ def verify_zip(output_zip: Path, expected_count: int) -> int:
             f"{len(names)} in archive vs {expected_count} expected"
         )
     return len(names)
+
+
+def read_archive_manifest(archive: Path) -> Optional[dict]:
+    """The manifest embedded in ``archive``, or None when unreadable/absent.
+
+    CORE-006 (audit/6.md): reuse used to be decided on mtime alone and never
+    opened the archive it was about to hand back. A legacy archive with no
+    manifest, a corrupt zip and an unparsable manifest are all reported the same
+    way -- None means "this archive cannot state what it is", which the caller
+    must treat as a reason to repack rather than a reason to trust it.
+    """
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            raw = zf.read(MANIFEST_FILENAME)
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def archive_policy_mismatch(
+    archive: Path,
+    source: Path,
+    expected_fingerprint: str,
+    manifest: Optional[dict] = None,
+) -> Optional[str]:
+    """Why ``archive`` may not be reused for ``source`` under this policy, or None.
+
+    CORE-006 (audit/6.md): packing policy is part of artifact identity. Reproduced
+    before this gate: pack COMPACT, make the archive newer than the source, switch
+    ``fidelity_profile`` to FULL, and ``ensure_fresh_archive`` returned the COMPACT
+    archive as a success -- its own manifest still declaring
+    ``fidelity_profile=compact``, ``archive_semantics=audit_representation``.
+
+    Missing or legacy metadata is a mismatch, never a pass: an archive that cannot
+    prove which policy built it has to be rebuilt once.
+
+    PERF-001: ``manifest`` lets a caller that already read it (to report the
+    reused archive's own policy fields) supply it instead of paying a second zip
+    central-directory parse for the same bytes.
+    """
+    if manifest is None:
+        manifest = read_archive_manifest(archive)
+    if manifest is None:
+        return "archive has no readable AUDAPACK manifest"
+    if str(manifest.get("product") or "") != "AUDAPACK":
+        return "archive manifest was not written by AUDAPACK"
+    try:
+        schema = int(manifest.get("schema_version", 0))
+    except (TypeError, ValueError):
+        return "archive manifest has a non-numeric schema_version"
+    # A newer writer may have changed what these keys mean, and an older one may
+    # not have recorded the fields this gate reads. Neither is reusable evidence.
+    if schema != MANIFEST_SCHEMA_VERSION:
+        return f"archive manifest schema {schema} != current {MANIFEST_SCHEMA_VERSION}"
+    recorded = str(manifest.get("policy_fingerprint") or "")
+    if not recorded:
+        return "archive predates policy fingerprinting"
+    if recorded != expected_fingerprint:
+        return (
+            f"packing policy changed (archive {recorded[:12]} != current "
+            f"{expected_fingerprint[:12]})"
+        )
+    # Same policy, different project: the archive is not about this source.
+    recorded_source = str(manifest.get("source_path") or "")
+    if recorded_source:
+        try:
+            if Path(recorded_source).resolve() != source.resolve():
+                return f"archive was built from a different source ({recorded_source})"
+        except OSError:
+            return f"archive source path is unresolvable ({recorded_source})"
+    return None
 
 
 def delete_old_archives(output_dir: Path, stem: str, current_zip: Path, log_cb: Optional[Callable[[str], None]] = None) -> tuple[int, int]:

@@ -198,6 +198,15 @@ def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
     compares against. The old path read `bridge.pid` AFTER the endpoint went
     offline, so a successor Bridge that started in that gap had its valid
     ownership record deleted by the retiring controller.
+
+    W2-003 (audit/6.md): capturing the identity is not enough -- it has to stay
+    the IMMUTABLE subject of the whole operation. Two paths still rebound
+    themselves to whoever currently held the endpoint: the offline branch
+    deleted the PID record with no expected identity when no live Bridge had
+    ever answered, and the fallback discarded the captured identity entirely,
+    re-read bridge.pid plus /health and validated those two CURRENT values
+    against EACH OTHER -- which a successor satisfies perfectly. Both now refuse
+    rather than act on an unverified or changed identity.
     """
     cfg = config or load_config()
 
@@ -230,48 +239,76 @@ def stop_bridge(config: Optional[AppConfig] = None) -> tuple[bool, str]:
         if not is_bridge_healthy(cfg.bridge.host, cfg.bridge.port, timeout=0.3):
             # Bound cleanup to the identity captured BEFORE shutdown. The PID
             # file on disk at this moment may already belong to a successor.
-            if target_pid is not None:
-                remove_pid(expected_pid=target_pid, expected_nonce=target_nonce or None)
-            else:
-                # Never saw a healthy Bridge: nothing to bind to. Only remove
-                # when the on-disk record is provably empty of a DIFFERENT
-                # owner, which remove_pid's fail-closed check enforces.
-                remove_pid()
+            if target_pid is None and not target_nonce:
+                # W2-003 (audit/6.md): this used to call remove_pid() with NO
+                # expected identity, and remove_pid only compares the fields it
+                # was actually given -- so "never saw a healthy Bridge"
+                # authorized an unconditional unlink of whatever record was on
+                # disk, including a successor's. Nothing was verified, so
+                # nothing is deleted. A nonce WITHOUT a pid is still a verified
+                # identity and is still bound below.
+                return True, (
+                    "Bridge is not answering; no live identity was verified, so its "
+                    "ownership record was left untouched."
+                )
+            remove_pid(expected_pid=target_pid, expected_nonce=target_nonce or None)
             return True, "Bridge stopped successfully."
 
-    # Fallback: only kill a process whose recorded identity matches the live Bridge.
+    # Fallback: force only the ORIGINAL target, and only while that target is
+    # provably still the process on the endpoint.
+    #
+    # W2-003: this branch used to DISCARD the captured identity, re-read
+    # bridge.pid and /health, and validate those two CURRENT identities against
+    # each other -- which a successor satisfies perfectly. Measured: A(pid=111)
+    # is asked to stop, B(pid=222) takes the endpoint over with no observable
+    # offline interval, and the fallback called os.kill(222, 9). The captured
+    # target is the immutable subject of this operation from here on.
+    if target_pid is None or not target_nonce:
+        return False, "Refusing fallback kill: no live Bridge identity was verified before shutdown."
+
     identity = read_pid()
     try:
-        pid = int(identity.get("pid", 0))
+        recorded_pid = int(identity.get("pid", 0) or 0)
     except (TypeError, ValueError):
-        pid = 0
-    if pid:
-        healthy, health = check_bridge_health(cfg.bridge.host, cfg.bridge.port, timeout=0.5)
-        recorded_nonce = str(identity.get("nonce", ""))
-        live_nonce = str(health.get("instance_nonce", "")) if healthy else ""
-        if not recorded_nonce or not live_nonce or recorded_nonce != live_nonce:
-            return False, "Refusing fallback kill: PID/Bridge identity cannot be verified."
-        try:
-            if sys.platform == "win32":
-                result = run_hidden(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
+        recorded_pid = 0
+    recorded_nonce = str(identity.get("nonce", "") or "")
+    if recorded_pid != target_pid or recorded_nonce != target_nonce:
+        return False, (
+            f"Refusing fallback kill: bridge.pid no longer names the shutdown target "
+            f"(PID {target_pid}); the current owner was left untouched."
+        )
+
+    healthy, health = check_bridge_health(cfg.bridge.host, cfg.bridge.port, timeout=0.5)
+    try:
+        live_pid = int(health.get("pid") or 0) if healthy else 0
+    except (TypeError, ValueError):
+        live_pid = 0
+    live_nonce = str(health.get("instance_nonce", "")) if healthy else ""
+    if not healthy or live_pid != target_pid or live_nonce != target_nonce:
+        return False, (
+            f"Refusing fallback kill: PID {target_pid} is no longer the process answering "
+            f"on {cfg.bridge.host}:{cfg.bridge.port}; the successor was left untouched."
+        )
+
+    try:
+        if sys.platform == "win32":
+            result = run_hidden(
+                ["taskkill", "/PID", str(target_pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return False, (
+                    f"Failed to stop bridge PID {target_pid}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
                 )
-                if result.returncode != 0:
-                    return False, f"Failed to stop bridge PID {pid}: {result.stderr.strip() or result.stdout.strip()}"
-            else:
-                os.kill(pid, 9)
-            for _ in range(15):
-                time.sleep(0.1)
-                if not is_bridge_healthy(cfg.bridge.host, cfg.bridge.port, timeout=0.3):
-                    remove_pid(expected_pid=pid, expected_nonce=recorded_nonce)
-                    return True, f"Bridge stopped (PID {pid})."
-            return False, "Bridge process remained healthy after fallback stop."
-        except Exception as exc:
-            return False, f"Failed to stop bridge PID: {exc}"
-
-    if not is_bridge_healthy(cfg.bridge.host, cfg.bridge.port, timeout=0.3):
-        return True, "Bridge is not running."
-
-    return False, "Failed to stop bridge gracefully."
+        else:
+            os.kill(target_pid, 9)
+        for _ in range(15):
+            time.sleep(0.1)
+            if not is_bridge_healthy(cfg.bridge.host, cfg.bridge.port, timeout=0.3):
+                remove_pid(expected_pid=target_pid, expected_nonce=target_nonce)
+                return True, f"Bridge stopped (PID {target_pid})."
+        return False, "Bridge process remained healthy after fallback stop."
+    except Exception as exc:
+        return False, f"Failed to stop bridge PID: {exc}"

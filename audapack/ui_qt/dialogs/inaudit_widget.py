@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QFileSystemWatcher, Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QHBoxLayout,
@@ -30,8 +31,10 @@ from audapack.inaudit import (
     get_active_inaudit_path,
     get_inaudit_selected,
     inaudit_dir,
+    last_user_layer,
     list_inaudit_layers,
     rename_inaudit_layer,
+    reorder_inaudit_layers,
     set_inaudit_selected,
     validate_inaudit_path,
 )
@@ -43,11 +46,43 @@ from audapack.ui_qt.theme.golden_default import GoldenDefault
 
 
 class _InauditLayerList(QListWidget):
-    """QListWidget that forwards the Delete key to the owning widget."""
+    """QListWidget that forwards the Delete key to the owning widget and
+    lets layers be drag-reordered into audit priority order."""
 
     def __init__(self, owner, parent=None):
         super().__init__(parent)
         self._owner = owner
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def dropEvent(self, event):
+        # The canonical renumbering lives on disk (reorder_inaudit_layers), so
+        # Qt's automatic InternalMove row shuffling is deliberately suppressed
+        # here: the widget re-renders from disk after the reorder succeeds.
+        owner = self._owner
+        if owner is None or owner._project is None:
+            event.ignore()
+            return
+        source_row = self.currentRow()
+        if source_row < 0:
+            event.ignore()
+            return
+        target_index = self.indexAt(event.position().toPoint())
+        target_row = target_index.row() if target_index.isValid() else self.count() - 1
+        position = self.dropIndicatorPosition()
+        if position == QAbstractItemView.DropIndicatorPosition.BelowItem:
+            target_row += 1
+        elif position in (QAbstractItemView.DropIndicatorPosition.AboveItem,):
+            target_row = target_row
+        if target_row == source_row:
+            event.ignore()
+            return
+        event.accept()
+        owner._on_reorder(source_row, target_row)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete and self._owner is not None:
@@ -848,31 +883,32 @@ class InauditWidget(QWidget):
         self.status.setText(f"CC copied: {cmd[:80]}")
 
     def _on_plus(self):
+        self.create_and_focus_layer()
+
+    def create_and_focus_layer(self):
+        """Create the next numbered layer and put the caret in the editor.
+
+        The bottom textbox IS where a manual audit is written: one [+], one
+        new layer, the caret already in the box. No popup asks for the text
+        first -- the operator types straight into the editor and presses Save.
+        """
         if self._project is None:
             self.status.setText("Select a project first")
             return
+        self.mode_tabs.setCurrentWidget(self.layers_page)
         try:
-            if is_managed(self._project.source_path):
-                text, accepted = QInputDialog.getMultiLineText(self, "New audit", "Audit text:")
-                if not accepted or not text.strip():
-                    return
-                capture_id = str(uuid.uuid4())
-                self._capture_store.capture({"capture_id": capture_id, "text": text,
-                                             "capture_kind": "audit", "source": "desktop"}, [self._project])
-                self.refresh_inbox()
-                self._submit_assignment(capture_id, self._project.id, [self._project], "")
-                return
-            else:
-                p = ensure_next_layer(self._project)
-            self.status.setText(f"Created {p.name}")
-            self.refresh()
-            # focus new row
-            for i in range(self.list.count()):
-                if self.list.item(i).data(Qt.ItemDataRole.UserRole) == int(p.stem):
-                    self.list.setCurrentRow(i)
-                    break
+            p = ensure_next_layer(self._project)
         except Exception as exc:
             self.status.setText(f"Create failed: {exc}")
+            return
+        self.status.setText(f"Created {p.name} — type the audit below, then Save")
+        self.refresh()
+        # focus new row
+        for i in range(self.list.count()):
+            if self.list.item(i).data(Qt.ItemDataRole.UserRole) == int(p.stem):
+                self.list.setCurrentRow(i)
+                break
+        self.editor.setFocus()
 
     def _on_rename_layer(self):
         """Move the selected layer to a different free number (T-144).
@@ -916,6 +952,64 @@ class InauditWidget(QWidget):
                 self._on_changed_cb(self._project)
         except Exception:
             pass
+
+    def _on_reorder(self, source_row: int, target_row: int):
+        """Drag-and-drop layer priority (T-162/T-163).
+
+        The list shows layers in canonical number order, so "move row A to
+        row B's position" translates directly into a new order of the CURRENT
+        numbers; reorder_inaudit_layers renumbers the files to match and
+        refresh() re-renders from disk, so the widget can never disagree with
+        what actually happened.
+        """
+        if self._project is None:
+            self.status.setText("Select a project first")
+            return
+        if self._dirty:
+            self.status.setText("Unsaved edits — Save or Reload before reordering")
+            return
+        rows = [
+            int(self.list.item(row).data(Qt.ItemDataRole.UserRole))
+            for row in range(self.list.count())
+        ]
+        if not 0 <= source_row < len(rows):
+            return
+        number = rows.pop(source_row)
+        target_row = max(0, min(target_row, len(rows)))
+        rows.insert(target_row, number)
+        reason = reorder_inaudit_layers(self._project, rows)
+        if reason:
+            self.status.setText(f"Reorder failed: {reason}")
+            self.refresh()
+            return
+        self.status.setText("Layer order updated (priority = top to bottom)")
+        self.refresh()
+        if 0 <= target_row < self.list.count():
+            self.list.setCurrentRow(target_row)
+        try:
+            if self._on_changed_cb:
+                self._on_changed_cb(self._project)
+        except Exception:
+            pass
+
+    def focus_last_user_layer(self) -> bool:
+        """Select the most recent operator-created layer. False when the
+        operator has never made one, so the caller can say so instead of
+        silently landing on a widget-delivered layer."""
+        if self._project is None:
+            return False
+        self.refresh()
+        number = last_user_layer(self._project)
+        if number is None:
+            self.status.setText("No custom (user-created) layer yet — use [+] first")
+            return False
+        for row in range(self.list.count()):
+            if self.list.item(row).data(Qt.ItemDataRole.UserRole) == number:
+                self.list.setCurrentRow(row)
+                self.status.setText(f"Editing your last custom layer: {number}.md")
+                return True
+        self.status.setText(f"Custom layer {number}.md is gone — create a new one with [+]")
+        return False
 
     def _on_delete(self):
         """Deletes the currently selected layer.

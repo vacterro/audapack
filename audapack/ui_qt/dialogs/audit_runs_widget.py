@@ -62,6 +62,34 @@ def _queue_position(run) -> int:
         return -1
 
 
+#: Every snapshot field this panel actually renders or acts on, in one place.
+#: PERF-004 skips the table rebuild when the signature is unchanged, so a field
+#: that reaches a cell, a button or the summary and is NOT listed here would
+#: stop repainting. Comparing whole snapshots instead would defeat the guard:
+#: `worker_counts` and `bridge_healthy` are refreshed from the Bridge on every
+#: poll and this panel draws neither.
+DISPLAY_FIELDS = (
+    "project_id", "project_name", "operator_state", "summary", "intent_id",
+    "dispatch_id", "profile_id", "campaign_run_id", "completed_waves",
+    "total_waves", "ready", "worker_label", "handoff_path", "actions",
+    "queue_position", "created_at", "updated_at", "completed_at",
+    "agent_state", "agent_summary", "agent_guidance", "agent_residue",
+)
+
+
+def display_signature(runs) -> tuple:
+    """What the panel would draw for ``runs`` -- order included.
+
+    No clock-derived value participates: every cell is snapshot data, and the
+    two timestamps are formatted from the snapshot itself, so an unchanged
+    signature means an unchanged panel rather than a frozen one.
+    """
+    return tuple(
+        tuple(getattr(run, field, None) for field in DISPLAY_FIELDS)
+        for run in runs
+    )
+
+
 class AuditRunsWidget(QWidget):
     """Shows six current lanes plus bounded recent history and safe actions."""
 
@@ -79,6 +107,10 @@ class AuditRunsWidget(QWidget):
         self._runs: list[AuditRunSnapshot] = []
         self._lane_runs: list[AuditRunSnapshot] = []
         self._queue_runs: list[AuditRunSnapshot] = []
+        #: None, not (): the constructor leaves the lane table with rows and no
+        #: items, so the first set_runs([]) must still draw the empty lanes.
+        self._display_signature: tuple | None = None
+        self.table_rebuild_count: int = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -188,6 +220,19 @@ class AuditRunsWidget(QWidget):
             return "—"
 
     def set_runs(self, runs: list[AuditRunSnapshot]) -> None:
+        # PERF-004: this is called on every dashboard poll -- 4 s while a run is
+        # live -- and it used to clear and rebuild the lane, queue and history
+        # tables unconditionally, allocating ~100 QTableWidgetItems for a board
+        # nothing had touched. An unchanged board draws nothing. The guard is
+        # display equality (DISPLAY_FIELDS, order included), so a genuine
+        # transition, a queue reorder or a new agent verdict still rebuilds; the
+        # selection needs no restoring because nothing was destroyed.
+        signature = display_signature(runs)
+        if signature == self._display_signature:
+            self._runs = list(runs)
+            return
+        self._display_signature = signature
+        self.table_rebuild_count += 1
         # A 4 s refresh that silently drops the operator's selection makes the
         # action buttons unusable: you aim at a lane and the panel repaints under
         # your cursor. Remember the selected project and restore it.

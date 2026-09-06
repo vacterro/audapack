@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from audapack.config import (
+    SCHEMA_VERSION,
     AppConfig,
     create_default_projects,
     legacy_token_acceptance_revoked,
@@ -44,7 +45,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(ok)
 
         loaded = load_config(self.base_dir)
-        self.assertEqual(loaded.schema_version, 2)
+        self.assertEqual(loaded.schema_version, 3)
         self.assertEqual(len(loaded.projects), len(cfg.projects))
         self.assertEqual(loaded.packing.output_dir, str(self.base_dir / "out"))
         self.assertEqual(loaded.audits.root, str(self.base_dir / "audits"))
@@ -188,6 +189,141 @@ class TestConfig(unittest.TestCase):
 
         # And it left nothing behind for the next test to inherit.
         self.assertFalse(legacy_token_acceptance_revoked())
+
+
+class TestLegacyMediaExcludeUpgrade(unittest.TestCase):
+    """CORE-002 (audit/6.md): the pattern layer pre-empted the fidelity layer.
+
+    `build_fidelity_plan` matches configured excludes before `media_class_for`,
+    so every `*.wav`/`*.mp4`/`*.woff` AUDAPACK had injected into `excludes`
+    made FULL silently lossy while the manifest still said `full_snapshot`, and
+    denied COMPACT/STANDARD/DEEP any media to sample. The patterns now belong to
+    audapack.fidelity, and a config persisted below schema 3 is upgraded once.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.base_dir = Path(self.temp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _legacy_excludes(self) -> list[str]:
+        from audapack.config import LEGACY_MEDIA_DEFAULT_EXCLUDES
+
+        return ["node_modules", "*.log", *sorted(LEGACY_MEDIA_DEFAULT_EXCLUDES)]
+
+    def _write_config(self, packing: dict, schema_version: int = 2) -> Path:
+        cfg_file = self.base_dir / "config.json"
+        cfg_file.write_text(
+            json.dumps({
+                "schema_version": schema_version,
+                "initialized": True,
+                "projects": [],
+                "packing": packing,
+            }),
+            encoding="utf-8",
+        )
+        return cfg_file
+
+    def test_the_shipped_defaults_no_longer_own_media_or_fonts(self):
+        from audapack.config import DEFAULT_EXCLUDES, LEGACY_MEDIA_DEFAULT_EXCLUDES
+
+        overlap = LEGACY_MEDIA_DEFAULT_EXCLUDES & {p.lower() for p in DEFAULT_EXCLUDES}
+        self.assertEqual(overlap, set(), f"fidelity-owned patterns still shipped: {sorted(overlap)}")
+
+        # The example an operator copies must describe the same behaviour as the
+        # executable default; the two disagreed for the whole of T-147.
+        example = json.loads(
+            (Path(__file__).resolve().parent.parent / "config.example.json").read_text(encoding="utf-8")
+        )
+        example_media = LEGACY_MEDIA_DEFAULT_EXCLUDES & {
+            str(p).lower() for p in example.get("packing", {}).get("excludes", [])
+        }
+        self.assertEqual(example_media, set(), f"config.example.json still owns: {sorted(example_media)}")
+        self.assertEqual(example.get("schema_version"), SCHEMA_VERSION)
+
+    def test_a_legacy_config_is_upgraded_once_and_user_patterns_survive(self):
+        cfg_file = self._write_config({"output_dir": "", "excludes": self._legacy_excludes()})
+
+        loaded = load_config(self.base_dir)
+        self.assertNotIn("*.wav", loaded.packing.excludes)
+        self.assertNotIn("*.woff2", loaded.packing.excludes)
+        self.assertEqual(
+            loaded.packing.excludes, ["node_modules", "*.log"],
+            "only the historical media block may go, and order must not change",
+        )
+
+        # Persisting stamps the new schema, so the upgrade is not re-derived
+        # from a legacy list forever.
+        self.assertTrue(save_config(loaded, self.base_dir))
+        on_disk = json.loads(cfg_file.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["schema_version"], 3)
+        self.assertEqual(on_disk["packing"]["excludes"], ["node_modules", "*.log"])
+        self.assertEqual(load_config(self.base_dir).packing.excludes, ["node_modules", "*.log"])
+
+    def test_a_media_pattern_the_operator_typed_is_never_removed(self):
+        """Provenance: without the whole historical block, the rule is theirs."""
+        self._write_config({"output_dir": "", "excludes": ["node_modules", "*.wav"]})
+
+        loaded = load_config(self.base_dir)
+        self.assertEqual(loaded.packing.excludes, ["node_modules", "*.wav"])
+
+    def test_an_upgraded_config_is_idempotent_across_two_round_trips(self):
+        self._write_config({"output_dir": "", "excludes": self._legacy_excludes()})
+
+        first = load_config(self.base_dir).packing.excludes
+        self.assertTrue(save_config(load_config(self.base_dir), self.base_dir))
+        second = load_config(self.base_dir).packing.excludes
+        self.assertEqual(first, second)
+
+    def test_full_preserves_media_a_legacy_config_used_to_drop(self):
+        from audapack.fidelity import PROFILE_FULL, build_plan_from_config
+
+        source = self.base_dir / "proj"
+        source.mkdir(parents=True)
+        (source / "main.py").write_text("print('x')", encoding="utf-8")
+        (source / "sound.wav").write_bytes(b"\x00" * 1024)
+        (source / "clip.mp4").write_bytes(b"\x00" * 1024)
+        (source / "inter.woff2").write_bytes(b"\x00" * 1024)
+
+        self._write_config({
+            "output_dir": "",
+            "excludes": self._legacy_excludes(),
+            "fidelity_profile": PROFILE_FULL,
+        })
+        packing = load_config(self.base_dir).packing
+        plan = build_plan_from_config(source, packing, set(packing.excludes))
+
+        self.assertEqual(plan.archive_semantics, "full_snapshot")
+        self.assertEqual(plan.excluded, 0, "FULL declaring a full snapshot may omit nothing")
+        for rel in ("sound.wav", "clip.mp4", "inter.woff2"):
+            self.assertTrue(plan.decisions[rel].include, rel)
+
+    def test_always_exclude_still_wins_over_the_profile(self):
+        from audapack.fidelity import (
+            PROFILE_FULL,
+            REASON_CONFIGURED_IGNORE,
+            build_plan_from_config,
+        )
+
+        source = self.base_dir / "proj"
+        source.mkdir(parents=True)
+        (source / "main.py").write_text("print('x')", encoding="utf-8")
+        (source / "sound.wav").write_bytes(b"\x00" * 1024)
+
+        self._write_config({
+            "output_dir": "",
+            "excludes": self._legacy_excludes(),
+            "fidelity_profile": PROFILE_FULL,
+            "always_exclude": ["*.wav"],
+        })
+        packing = load_config(self.base_dir).packing
+        plan = build_plan_from_config(source, packing, set(packing.excludes))
+
+        decision = plan.decisions["sound.wav"]
+        self.assertFalse(decision.include, "an explicit always_exclude must still win")
+        self.assertEqual(decision.reason, REASON_CONFIGURED_IGNORE)
 
 
 if __name__ == "__main__":

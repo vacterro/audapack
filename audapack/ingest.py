@@ -23,6 +23,7 @@ from audapack.bridge.storage import (
 from audapack.campaign import (
     STATUS_CAMPAIGN_COMPLETE,
     STATUS_CAMPAIGN_READY_FOR_WAVE,
+    campaign_transaction_lock,
     get_profile,
     load_profiles,
     save_live_campaign_index,
@@ -401,178 +402,188 @@ def ingest_audit_text(
         target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json",
         target_dir / "campaign.json",
     ]
-    snapshots, snapshot_error = capture_file_snapshots(wave_paths + canonical_paths)
-    if snapshot_error:
-        return IngestResult(
-            ok=False,
-            project_name=resolved_name,
-            profile_id=profile.profile_id,
-            error=snapshot_error,
-        )
-
-    try:
-        for wid, latest_path, chunk_clean in prepared:
-            atomic_write(latest_path, chunk_clean)
-            saved_waves.append(wid)
-            files_written.append(latest_path)
-    except Exception as exc:
-        return _ingest_failure(
-            resolved_name,
-            profile.profile_id,
-            f"Failed to write {latest_path.name}: {exc}",
-            snapshots,
-        )
-
-    # Check if all required waves of active profile now exist on disk
-    all_wave_paths = [
-        target_dir / f"{resolved_name}__{w.number}_{w.slug}.md"
-        for w in profile.waves
-    ]
-    all_exist = all(p.exists() for p in all_wave_paths)
-
-    campaign_generated = False
-    all3_generated = False
-    final_path = None
-    all3_path = None
-
-    try:
-        # W4-003: the canonical campaign run id comes from the wave content
-        # itself, so the same id flows through the wave files, the synthesized
-        # __00_AUDIT_ALL_3.md, the campaign.json index, and the Bridge payload
-        # that will carry them. Cross-wave equality was already proven in
-        # prepare, before any registration or directory creation (CORE-004);
-        # what remains here is choosing the id and, below, comparing it against
-        # a campaign already on disk -- which needs target_dir and therefore
-        # cannot move earlier.
-        if len(canonical_run_ids) == 1:
-            ingest_run_id = next(iter(canonical_run_ids))
-        else:
-            # Legacy path: wave content carries no CAMPAIGN_RUN_ID. Preserve
-            # the original W2-006 mint so existing callers that fabricate the
-            # id server-side keep working.
-            ingest_run_id = (
-                f"ingest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
-                f"{_uuid.uuid4().hex[:6]}"
+    # W2-001: everything from here to the end of the commit block -- snapshot,
+    # wave writes, the on-disk revalidation that decides completeness, canonical
+    # publication, campaign.json and the rollback -- is ONE transaction against
+    # this campaign root. Unserialized, a concurrent commit for the same project
+    # interleaved and the first rollback restored pre-transaction bytes over
+    # waves and a campaign.json the other writer had already committed.
+    # Lock order: the registry lock (project resolution and registration in
+    # resolve_project_audit_dir above) is released before this one is taken, and
+    # nothing inside re-enters the registry.
+    with campaign_transaction_lock(target_dir):
+        snapshots, snapshot_error = capture_file_snapshots(wave_paths + canonical_paths)
+        if snapshot_error:
+            return IngestResult(
+                ok=False,
+                project_name=resolved_name,
+                profile_id=profile.profile_id,
+                error=snapshot_error,
             )
 
-        # W4-003: also reject a drift against the on-disk campaign.json if the
-        # same project already has a finalized run. A new ingest that brings
-        # a different run id for an existing campaign means a transport /
-        # content split-brain, and the only honest answer is to refuse before
-        # any file write instead of silently rewriting the index.
-        existing_index = target_dir / "campaign.json"
-        if existing_index.exists() and canonical_run_ids:
-            try:
-                idx_doc = json.loads(existing_index.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                idx_doc = None
-            if isinstance(idx_doc, dict):
-                existing_run = (idx_doc.get("campaign_run_id") or "").strip()
-                if existing_run and existing_run != ingest_run_id:
-                    return _ingest_failure(
-                        resolved_name,
-                        profile.profile_id,
-                        f"Multiple campaign run IDs: existing campaign run id {existing_run!r} "
-                        f"disagrees with the new content CAMPAIGN_RUN_ID {ingest_run_id!r}. "
-                        f"A campaign run id is immutable; start a fresh run instead of "
-                        f"re-pasting under a different id.",
-                        snapshots,
-                    )
-
-        if all_exist:
-            parsed_d = {}
-            valid_all = True
-            for w, p in zip(profile.waves, all_wave_paths, strict=False):
-                text = p.read_text(encoding="utf-8")
-                v, m, _ = parse_wave(text, w.id, profile)
-                if not (v and m):
-                    valid_all = False
-                    break
-                parsed_d[w.id] = m
-
-            if valid_all:
-                synth_map = generate_canonical_campaign(
-                    profile,
-                    ingest_run_id,
-                    parsed_d,
-                    resolved_name,
-                )
-
-                if profile.profile_id == "quick3":
-                    all3_file = target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
-                    atomic_write(all3_file, synth_map.get("all3", ""))
-                    all3_generated = True
-                    campaign_generated = True
-                    all3_path = all3_file
-                    final_path = all3_file
-                    files_written.append(all3_file)
-                else:
-                    all_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md"
-                    final_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md"
-                    idx_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json"
-
-                    atomic_write(all_file, synth_map.get("super_all", ""))
-                    atomic_write(final_file, synth_map.get("super_final", ""))
-                    atomic_write(idx_file, synth_map.get("super_index", ""))
-
-                    campaign_generated = True
-                    final_path = final_file
-                    files_written.extend([all_file, final_file, idx_file])
-
-        if all_exist and not campaign_generated:
+        try:
+            for wid, latest_path, chunk_clean in prepared:
+                atomic_write(latest_path, chunk_clean)
+                saved_waves.append(wid)
+                files_written.append(latest_path)
+        except Exception as exc:
             return _ingest_failure(
                 resolved_name,
                 profile.profile_id,
-                "Failed to finalize complete campaign: canonical final artifact was not generated",
+                f"Failed to write {latest_path.name}: {exc}",
                 snapshots,
             )
 
-        # Save / update live campaign.json after ingestion. This is part of the
-        # same transaction: a stale index can make the next-wave gate lie.
-        completed_waves = []
-        parsed_waves_dict = {}
-        for w in profile.waves:
-            w_path = target_dir / f"{resolved_name}__{w.number}_{w.slug}.md"
-            if w_path.exists():
-                txt = w_path.read_text(encoding="utf-8", errors="replace")
-                v, m, _ = parse_wave(txt, w.id, profile)
-                if v and m:
-                    completed_waves.append(w.id)
-                    parsed_waves_dict[w.id] = {
-                        "wave_id": w.id,
-                        "status": "COMPLETE",
-                        "tickets": int(m.get("tickets", 0)),
-                        "file": w_path,
-                        "sha256": hashlib.sha256(txt.encode("utf-8")).hexdigest(),
-                    }
-        next_w = None
-        for w in profile.waves:
-            if w.id not in completed_waves:
-                next_w = w
-                break
-        c_status = (
-            STATUS_CAMPAIGN_COMPLETE
-            if len(completed_waves) == profile.wave_count and campaign_generated and final_path
-            else STATUS_CAMPAIGN_READY_FOR_WAVE
-        )
-        save_live_campaign_index(
-            campaign_root=target_dir,
-            profile=profile,
-            run_id=ingest_run_id,
-            project_name=resolved_name,
-            parsed_waves=parsed_waves_dict,
-            completed_waves=completed_waves,
-            active_wave_id=next_w.id if next_w else None,
-            status=c_status,
-            final_handoff_path=final_path,
-        )
-    except Exception as exc:
-        return _ingest_failure(
-            resolved_name,
-            profile.profile_id,
-            f"Failed to commit canonical campaign artifacts: {exc}",
-            snapshots,
-        )
+        # Check if all required waves of active profile now exist on disk
+        all_wave_paths = [
+            target_dir / f"{resolved_name}__{w.number}_{w.slug}.md"
+            for w in profile.waves
+        ]
+        all_exist = all(p.exists() for p in all_wave_paths)
+
+        campaign_generated = False
+        all3_generated = False
+        final_path = None
+        all3_path = None
+
+        try:
+            # W4-003: the canonical campaign run id comes from the wave content
+            # itself, so the same id flows through the wave files, the synthesized
+            # __00_AUDIT_ALL_3.md, the campaign.json index, and the Bridge payload
+            # that will carry them. Cross-wave equality was already proven in
+            # prepare, before any registration or directory creation (CORE-004);
+            # what remains here is choosing the id and, below, comparing it against
+            # a campaign already on disk -- which needs target_dir and therefore
+            # cannot move earlier.
+            if len(canonical_run_ids) == 1:
+                ingest_run_id = next(iter(canonical_run_ids))
+            else:
+                # Legacy path: wave content carries no CAMPAIGN_RUN_ID. Preserve
+                # the original W2-006 mint so existing callers that fabricate the
+                # id server-side keep working.
+                ingest_run_id = (
+                    f"ingest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                    f"{_uuid.uuid4().hex[:6]}"
+                )
+
+            # W4-003: also reject a drift against the on-disk campaign.json if the
+            # same project already has a finalized run. A new ingest that brings
+            # a different run id for an existing campaign means a transport /
+            # content split-brain, and the only honest answer is to refuse before
+            # any file write instead of silently rewriting the index.
+            existing_index = target_dir / "campaign.json"
+            if existing_index.exists() and canonical_run_ids:
+                try:
+                    idx_doc = json.loads(existing_index.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    idx_doc = None
+                if isinstance(idx_doc, dict):
+                    existing_run = (idx_doc.get("campaign_run_id") or "").strip()
+                    if existing_run and existing_run != ingest_run_id:
+                        return _ingest_failure(
+                            resolved_name,
+                            profile.profile_id,
+                            f"Multiple campaign run IDs: existing campaign run id {existing_run!r} "
+                            f"disagrees with the new content CAMPAIGN_RUN_ID {ingest_run_id!r}. "
+                            f"A campaign run id is immutable; start a fresh run instead of "
+                            f"re-pasting under a different id.",
+                            snapshots,
+                        )
+
+            if all_exist:
+                parsed_d = {}
+                valid_all = True
+                for w, p in zip(profile.waves, all_wave_paths, strict=False):
+                    text = p.read_text(encoding="utf-8")
+                    v, m, _ = parse_wave(text, w.id, profile)
+                    if not (v and m):
+                        valid_all = False
+                        break
+                    parsed_d[w.id] = m
+
+                if valid_all:
+                    synth_map = generate_canonical_campaign(
+                        profile,
+                        ingest_run_id,
+                        parsed_d,
+                        resolved_name,
+                    )
+
+                    if profile.profile_id == "quick3":
+                        all3_file = target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
+                        atomic_write(all3_file, synth_map.get("all3", ""))
+                        all3_generated = True
+                        campaign_generated = True
+                        all3_path = all3_file
+                        final_path = all3_file
+                        files_written.append(all3_file)
+                    else:
+                        all_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_ALL.md"
+                        final_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_FINAL.md"
+                        idx_file = target_dir / f"{resolved_name}__00_SUPER_AUDIT_INDEX.json"
+
+                        atomic_write(all_file, synth_map.get("super_all", ""))
+                        atomic_write(final_file, synth_map.get("super_final", ""))
+                        atomic_write(idx_file, synth_map.get("super_index", ""))
+
+                        campaign_generated = True
+                        final_path = final_file
+                        files_written.extend([all_file, final_file, idx_file])
+
+            if all_exist and not campaign_generated:
+                return _ingest_failure(
+                    resolved_name,
+                    profile.profile_id,
+                    "Failed to finalize complete campaign: canonical final artifact was not generated",
+                    snapshots,
+                )
+
+            # Save / update live campaign.json after ingestion. This is part of the
+            # same transaction: a stale index can make the next-wave gate lie.
+            completed_waves = []
+            parsed_waves_dict = {}
+            for w in profile.waves:
+                w_path = target_dir / f"{resolved_name}__{w.number}_{w.slug}.md"
+                if w_path.exists():
+                    txt = w_path.read_text(encoding="utf-8", errors="replace")
+                    v, m, _ = parse_wave(txt, w.id, profile)
+                    if v and m:
+                        completed_waves.append(w.id)
+                        parsed_waves_dict[w.id] = {
+                            "wave_id": w.id,
+                            "status": "COMPLETE",
+                            "tickets": int(m.get("tickets", 0)),
+                            "file": w_path,
+                            "sha256": hashlib.sha256(txt.encode("utf-8")).hexdigest(),
+                        }
+            next_w = None
+            for w in profile.waves:
+                if w.id not in completed_waves:
+                    next_w = w
+                    break
+            c_status = (
+                STATUS_CAMPAIGN_COMPLETE
+                if len(completed_waves) == profile.wave_count and campaign_generated and final_path
+                else STATUS_CAMPAIGN_READY_FOR_WAVE
+            )
+            save_live_campaign_index(
+                campaign_root=target_dir,
+                profile=profile,
+                run_id=ingest_run_id,
+                project_name=resolved_name,
+                parsed_waves=parsed_waves_dict,
+                completed_waves=completed_waves,
+                active_wave_id=next_w.id if next_w else None,
+                status=c_status,
+                final_handoff_path=final_path,
+            )
+        except Exception as exc:
+            return _ingest_failure(
+                resolved_name,
+                profile.profile_id,
+                f"Failed to commit canonical campaign artifacts: {exc}",
+                snapshots,
+            )
 
     # W2-005: generation publication is a separate POST-COMMIT phase. The
     # transaction block above already durably committed wave files, canonical

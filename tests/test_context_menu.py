@@ -221,6 +221,12 @@ class TestSeamlessProjectOperations(unittest.TestCase):
             cfg = AppConfig()
             svc = ProjectService(cfg, base_dir=Path(tmp))
             win = MainWindow(svc)
+            # Row buttons are only present on rows wide enough to hold them
+            # (FULL_ROW_MIN_WIDTH); an unshown window keeps the 100px default
+            # tree width and every row is legitimately cramped. Render it.
+            win.resize(900, 600)
+            win.show()
+            QApplication.processEvents()
 
             # 1. Create a dummy project directory
             proj_dir = Path(tmp) / "MyNewApp"
@@ -252,11 +258,12 @@ class TestSeamlessProjectOperations(unittest.TestCase):
                 ),
             )
             toolbar_actions = [
-                action.text()
+                str(action.property("toolbar_key"))
                 for bar in win.findChildren(QToolBar)
                 for action in bar.actions()
             ]
-            # Label shortened to fit a 640px window in one row; the action is the same.
+            # The short key is the button's identity; the visible label is
+            # spelled out ("CLEAR MARKS") whenever the row is wide enough.
             self.assertIn("MRK", toolbar_actions)
             win._on_reset_project_marks()
             cleared = svc.get_project(p1.id)
@@ -379,6 +386,7 @@ class TestSeamlessProjectOperations(unittest.TestCase):
             p2_after = svc.get_project(p2.id)
             self.assertFalse(p2_after.enabled)
         finally:
+            win.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
 

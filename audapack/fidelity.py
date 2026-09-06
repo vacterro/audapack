@@ -16,9 +16,13 @@ dependency-referenced assets.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import heapq
+import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,24 +48,42 @@ PROFILE_BUDGET_BYTES = {
 }
 
 #: Representative media files physically kept per media-heavy directory.
+#: CORE-005 (audit/6.md): every audit profile has a real count, DEEP included.
+#: 0 means "keep everything" and belongs to FULL alone -- while DEEP carried it,
+#: three arbitrary 40 MB videos entered a 100 MB "bounded" archive untouched.
 PROFILE_MEDIA_SAMPLES = {
     PROFILE_COMPACT: 1,
     PROFILE_STANDARD: 3,
-    PROFILE_DEEP: 0,     # 0 = keep everything
-    PROFILE_FULL: 0,
+    PROFILE_DEEP: 10,
+    PROFILE_FULL: 0,     # 0 = keep everything
 }
 
-#: Per media directory byte cap for the physically included samples.
+#: Per media directory byte cap for the physically included samples. Applied
+#: JOINTLY with the count above: an unreferenced media file needs room under
+#: both, never one or the other.
 PROFILE_MEDIA_BYTES = {
     PROFILE_COMPACT: 1 * 1024 * 1024,
     PROFILE_STANDARD: 2 * 1024 * 1024,
-    PROFILE_DEEP: 0,
+    PROFILE_DEEP: 50 * 1024 * 1024,
     PROFILE_FULL: 0,
 }
 
-#: Files below this size are "small assets" kept at STANDARD/DEEP even when
-#: their media directory is otherwise sampled.
+#: Sampling order threshold: files at or below this size are cheap coverage per
+#: byte, so they are offered to the cap FIRST. They still consume both caps --
+#: CORE-005: an unconditional keep for small files was a second way past the
+#: count cap, which is the defect this layer removes.
 MEDIA_SMALL_BYTES = 256 * 1024
+
+#: PERF-003 (audit/6.md): how many media filenames a group reports as diagnostic
+#: evidence. The group's counts and bytes stay EXACT -- only the per-file name
+#: list is bounded, because the manifest previously carried one record per media
+#: asset and grew linearly with the tree (20k media files: 1.13 MiB of payload).
+MEDIA_SAMPLE_LIMIT = 5
+
+#: How many of the largest omitted files the plan reports. Selected with a
+#: bounded heap, never by sorting the whole omitted collection.
+LARGEST_OMITTED_LIMIT = 10
+
 
 
 def normalize_fidelity_profile(value: object) -> str:
@@ -78,24 +100,113 @@ def normalize_fidelity_profile(value: object) -> str:
 
 
 def archive_semantics_for(profile: str) -> str:
-    """FULL is a complete snapshot; everything else is an audit representation."""
+    """FULL is a complete snapshot; everything else is an audit representation.
+
+    This is the *declared* semantics of a profile. The semantics an archive
+    actually earns is decided by ``semantics_for_plan`` after planning: a
+    profile name alone cannot promise a snapshot.
+    """
     return "full_snapshot" if normalize_fidelity_profile(profile) == PROFILE_FULL else "audit_representation"
 
 
+#: Reasons that make an archive an audit representation rather than a snapshot:
+#: fidelity POLICY decided to omit material. Explicit configuration and safety
+#: exclusions are not in this set -- the operator asked for those, and a full
+#: snapshot of a source minus its secrets is still a snapshot by contract.
+#: Defined next to the reason names themselves, below.
+
+
+#: Bumped when the fingerprint's canonical form changes, so archives fingerprinted
+#: by an older rule are not compared against a newer one -- they simply repack.
+POLICY_FINGERPRINT_VERSION = 1
+
+
+def packing_policy_fingerprint(
+    *,
+    profile: str,
+    max_mb: int = 0,
+    media_samples: int = 0,
+    media_bytes: int = 0,
+    excludes=(),
+    always_include=(),
+    always_exclude=(),
+    mandatory_excludes=None,
+) -> str:
+    """Canonical identity of every content-affecting packing policy input.
+
+    CORE-006 (audit/6.md): archive freshness was a timestamp property alone, so
+    packing an archive as COMPACT, then switching the profile to FULL, reused the
+    COMPACT archive -- an audit asking for a full snapshot silently consumed a
+    sampled representation whose own manifest still said ``compact``.
+
+    Fingerprinted over the EFFECTIVE policy, not the raw fields: the profile's
+    resolved budgets are what decide content, so FULL's inert overrides (CORE-004)
+    cannot produce a spurious mismatch, and an override equal to the profile
+    default is correctly the same policy. Pattern lists are lowercased and sorted
+    because the matcher is case-insensitive and order-independent.
+    """
+    from audapack.packing import MANDATORY_EXCLUDES
+
+    profile = normalize_fidelity_profile(profile)
+
+    def norm(patterns) -> list[str]:
+        return sorted({str(p).strip().lower().replace("\\", "/") for p in patterns if str(p).strip()})
+
+    canonical = {
+        "v": POLICY_FINGERPRINT_VERSION,
+        "profile": profile,
+        "budget_bytes": profile_budget_bytes(profile, max_mb),
+        "media_samples": profile_media_samples(profile, media_samples),
+        "media_bytes": profile_media_bytes(profile, media_bytes),
+        "excludes": norm(excludes),
+        "always_include": norm(always_include),
+        "always_exclude": norm(always_exclude),
+        "mandatory": norm(MANDATORY_EXCLUDES if mandatory_excludes is None else mandatory_excludes),
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:32]
+
+
+def policy_fingerprint_from_config(packing, excludes) -> str:
+    """``packing_policy_fingerprint`` for a ``PackingConfig`` + its excludes."""
+    return packing_policy_fingerprint(
+        profile=str(getattr(packing, "fidelity_profile", DEFAULT_PROFILE)),
+        max_mb=int(getattr(packing, "fidelity_max_mb", 0) or 0),
+        media_samples=int(getattr(packing, "fidelity_media_samples", 0) or 0),
+        media_bytes=int(getattr(packing, "fidelity_media_bytes", 0) or 0),
+        excludes=excludes,
+        always_include=list(getattr(packing, "always_include", None) or []),
+        always_exclude=list(getattr(packing, "always_exclude", None) or []),
+    )
+
+
 def profile_budget_bytes(profile: str, override_mb: int = 0) -> int:
-    """Soft budget for the profile, or ``override_mb`` megabytes when set."""
+    """Soft budget for the profile, or ``override_mb`` megabytes when set.
+
+    CORE-004 (audit/6.md): FULL is structurally unbounded. A generic override
+    used to apply to it too, so ``fidelity_max_mb=1`` trimmed a FULL archive by
+    ``size_limit`` while the manifest still declared ``full_snapshot``. FULL now
+    ignores the override rather than silently downgrading -- one canonical rule,
+    enforced in the planner's only source of budgets.
+    """
+    if normalize_fidelity_profile(profile) == PROFILE_FULL:
+        return 0
     if override_mb and override_mb > 0:
         return override_mb * 1024 * 1024
     return int(PROFILE_BUDGET_BYTES.get(normalize_fidelity_profile(profile), 0))
 
 
 def profile_media_samples(profile: str, override: int = 0) -> int:
+    if normalize_fidelity_profile(profile) == PROFILE_FULL:
+        return 0  # 0 = keep everything; see profile_budget_bytes
     if override and override > 0:
         return override
     return int(PROFILE_MEDIA_SAMPLES.get(normalize_fidelity_profile(profile), 0))
 
 
 def profile_media_bytes(profile: str, override: int = 0) -> int:
+    if normalize_fidelity_profile(profile) == PROFILE_FULL:
+        return 0
     if override and override > 0:
         return override
     return int(PROFILE_MEDIA_BYTES.get(normalize_fidelity_profile(profile), 0))
@@ -124,6 +235,22 @@ REASON_CATEGORIES = (
     REASON_UNSUPPORTED,
 )
 
+#: Failure categories. CORE-003 (audit/6.md): a file that could not be read is
+#: not an exclusion -- nobody decided to omit it -- so failures carry their own
+#: vocabulary instead of borrowing an exclusion reason. Part of the accounting
+#: identity: ``sum(failure_stats.values()) == failed``.
+FAILURE_STAT = "stat_failure"
+FAILURE_WALK = "walk_failure"
+
+FAILURE_CATEGORIES = (FAILURE_STAT, FAILURE_WALK)
+
+#: Omissions decided by fidelity POLICY rather than by the operator. CORE-004
+#: (audit/6.md): if any of these fire, the archive is an audit representation no
+#: matter which profile asked for it. Configuration, dependency/output and
+#: secret exclusions are deliberately absent -- the operator asked for those, and
+#: a snapshot of a source minus its secrets is still a snapshot by contract.
+LOSSY_POLICY_REASONS = frozenset({REASON_MEDIA_BUDGET, REASON_SIZE_LIMIT})
+
 #: ext -> media class. Only extensions that map to a class are "media".
 MEDIA_EXTENSIONS = {
     # audio
@@ -146,9 +273,19 @@ MEDIA_EXTENSIONS = {
 
 
 def media_class_for(path: Path | str) -> Optional[str]:
-    """Media class for a path's extension, or None for non-media files."""
-    suffix = Path(path).suffix.lower().lstrip(".")
-    return MEDIA_EXTENSIONS.get(suffix)
+    """Media class for a path's extension, or None for non-media files.
+
+    PERF-001: called once per discovered file, so it takes the plain name the
+    walk already has. Constructing a ``Path`` just to read one suffix cost more
+    than the dict lookup it fed.
+    """
+    name = path if isinstance(path, str) else path.name
+    name = name.rpartition("/")[2].rpartition("\\")[2]
+    dot = name.rfind(".")
+    # dot > 0 matches Path.suffix: a leading-dot name (".gitignore") has none.
+    if dot <= 0:
+        return None
+    return MEDIA_EXTENSIONS.get(name[dot + 1:].lower())
 
 
 #: Priority-1 (mandatory audit material) extensions: code, tests, configs,
@@ -398,17 +535,29 @@ class FileDecision:
 @dataclass
 class FidelityPlan:
     profile: str
-    archive_semantics: str
-    budget_bytes: int
-    media_samples: int
-    media_bytes_per_dir: int
+    #: The four fields below carry profile-derived defaults so a plan can be
+    #: constructed by name alone (the CORE-004 defensiveness tests build a bare
+    #: plan and flip individual flags). ``build_fidelity_plan`` always passes
+    #: them explicitly, so the post-init fill only ever backstops a manual plan.
+    archive_semantics: Optional[str] = None
+    budget_bytes: Optional[int] = None
+    media_samples: Optional[int] = None
+    media_bytes_per_dir: Optional[int] = None
     decisions: dict[str, FileDecision] = field(default_factory=dict)
     #: Relative paths excluded purely by profile decisions (media budget,
     #: size limit, always_exclude) so freshness walks can skip them too.
     extra_excluded_rel: set[str] = field(default_factory=set)
-    #: Relative directories pruned whole (rel lower -> reason category) so
-    #: the zipper never descends into them and the manifest names them.
-    pruned_dirs_rel: dict[str, str] = field(default_factory=dict)
+    #: Relative directories pruned whole -> ``{"reason", "files", "bytes"}`` so
+    #: the zipper never descends into them and the manifest can say how much
+    #: material the prune removed. CORE-003 (audit/6.md): the tree below a prune
+    #: used to vanish from every counter, so a manifest could not answer how much
+    #: source was omitted -- three physical files reported discovered=1.
+    pruned_dirs_rel: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: False when the pruned-tree census was deliberately not taken. A freshness
+    #: probe never touches excluded weight (PERF-004), and the census is manifest
+    #: metadata a reuse decision does not consume -- so the counts below describe
+    #: only the traversed tree and must not read as a full census.
+    pruned_census_taken: bool = True
     discovered: int = 0
     included: int = 0
     excluded: int = 0
@@ -416,8 +565,22 @@ class FidelityPlan:
     source_bytes: int = 0
     included_bytes: int = 0
     excluded_bytes: int = 0
+    #: Discovered entries whose byte size could not be determined. Their bytes
+    #: are absent from ``source_bytes`` rather than fabricated as a known zero,
+    #: so "unknown" stays distinguishable from "empty".
+    unknown_size_entries: int = 0
     reason_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: Failure categories (``FAILURE_CATEGORIES``). A file nobody decided to omit
+    #: is not an exclusion, so failures are counted in their own vocabulary and
+    #: ``sum(failure_stats.values()) == failed`` is part of the identity.
+    failure_stats: dict[str, int] = field(default_factory=dict)
     largest_omitted: list[tuple[str, int]] = field(default_factory=list)
+    #: PERF-003: one entry per media GROUP, keyed ``"<directory>#<class>"``.
+    #: Counts and bytes are exact; the filename lists are bounded samples. The
+    #: previous shape kept one record per media asset and was serialized into
+    #: every manifest, so both planner memory and manifest size grew with the
+    #: media count. Keying by directory alone also let a second media class in
+    #: the same directory overwrite the first group's aggregates outright.
     media_inventory: dict[str, dict[str, object]] = field(default_factory=dict)
     referenced_files: set[str] = field(default_factory=set)
     #: Freshness fusion (T-147): True when any INCLUDED file is newer
@@ -431,18 +594,104 @@ class FidelityPlan:
     #: without this flag the identity discovered == included + excluded + failed
     #: still holds over the truncated numbers and reads as full accounting.
     walk_incomplete: bool = False
+    #: Why this plan's accounting does not reconcile, or None. Set at the end of
+    #: ``build_fidelity_plan`` from ``plan_accounting_error``; a non-None value
+    #: forbids a full_snapshot claim.
+    accounting_error: Optional[str] = None
+    #: Canonical identity of the policy that produced this plan. CORE-006
+    #: (audit/6.md): archive reuse was decided on mtime alone, so a profile or
+    #: exclude change silently reused an archive with materially different
+    #: contents. Persisted in the manifest, compared before any mtime reuse.
+    policy_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        profile = normalize_fidelity_profile(self.profile)
+        if self.archive_semantics is None:
+            self.archive_semantics = archive_semantics_for(profile)
+        if self.budget_bytes is None:
+            self.budget_bytes = profile_budget_bytes(profile)
+        if self.media_samples is None:
+            self.media_samples = profile_media_samples(profile)
+        if self.media_bytes_per_dir is None:
+            self.media_bytes_per_dir = profile_media_bytes(profile)
 
     def decision_for(self, rel_posix_lower: str) -> Optional[FileDecision]:
         return self.decisions.get(rel_posix_lower)
 
 
+def plan_accounting_error(plan: "FidelityPlan") -> Optional[str]:
+    """Why ``plan``'s accounting is untruthful, or None when it reconciles.
+
+    CORE-003 (audit/6.md): ``discovered == included + excluded + failed`` was
+    advertised but never enforced, and it is not sufficient on its own -- an
+    excluded file with no reason, a reason total that disagrees with the
+    terminals, or bytes that do not add up all leave the identity intact. This
+    is the single oracle both the planner and the manifest are checked against.
+    """
+    if plan.discovered != plan.included + plan.excluded + plan.failed:
+        return (
+            f"discovered {plan.discovered} != included {plan.included} + "
+            f"excluded {plan.excluded} + failed {plan.failed}"
+        )
+    reason_count = sum(int(s.get("count", 0)) for s in plan.reason_stats.values())
+    if reason_count != plan.excluded:
+        return f"reason totals {reason_count} != excluded {plan.excluded}"
+    reason_bytes = sum(int(s.get("bytes", 0)) for s in plan.reason_stats.values())
+    if reason_bytes != plan.excluded_bytes:
+        return f"reason bytes {reason_bytes} != excluded_bytes {plan.excluded_bytes}"
+    failure_count = sum(plan.failure_stats.values())
+    if failure_count != plan.failed:
+        return f"failure totals {failure_count} != failed {plan.failed}"
+    unknown = set(plan.reason_stats) - set(REASON_CATEGORIES)
+    if unknown:
+        return f"unknown exclusion reason(s): {sorted(unknown)}"
+    unknown_failures = set(plan.failure_stats) - set(FAILURE_CATEGORIES)
+    if unknown_failures:
+        return f"unknown failure categor(y/ies): {sorted(unknown_failures)}"
+    if plan.source_bytes != plan.included_bytes + plan.excluded_bytes:
+        return (
+            f"source_bytes {plan.source_bytes} != included {plan.included_bytes} + "
+            f"excluded {plan.excluded_bytes} (unknown-size entries: "
+            f"{plan.unknown_size_entries})"
+        )
+    undecided = [rel for rel, d in plan.decisions.items() if not d.include and not d.reason]
+    if undecided:
+        return f"excluded without a reason: {sorted(undecided)[:3]}"
+    return None
+
+
+def pruned_census_totals(plan: "FidelityPlan") -> tuple[int, int]:
+    """``(files, bytes)`` a whole-directory prune removed from the archive."""
+    files = sum(int(info.get("files", 0)) for info in plan.pruned_dirs_rel.values())
+    size = sum(int(info.get("bytes", 0)) for info in plan.pruned_dirs_rel.values())
+    return files, size
+
+
+@lru_cache(maxsize=16384)
+def _lower_path_parts(key: str) -> tuple[str, tuple[str, ...]]:
+    """``(name_lower, parts_lower)`` for a path, parsed once.
+
+    PERF-001 (audit/6.md): the four exclusion matchers are asked about the same
+    path in sequence, and each one re-parsed it into a ``Path`` and re-lowered
+    every component. Bounded cache: a walk of an arbitrarily large tree cannot
+    grow it without limit.
+    """
+    p = Path(key)
+    return p.name.lower(), tuple(part.lower() for part in p.parts)
+
+
 def _build_matcher(patterns: set[str]):
     lowered = frozenset(pat.lower() for pat in patterns)
     exact = {p for p in lowered if not any(ch in p for ch in "*?[") and "/" not in p}
-    globs = tuple(
-        re.compile(fnmatch.translate(p))
-        for p in lowered
-        if p not in exact and "/" not in p
+    # PERF-001: ONE alternation instead of one fullmatch per pattern per path
+    # component. The freshness profile showed 465,000 generator+fullmatch calls
+    # for a 1,000-file tree (52% of the whole reuse decision) purely because
+    # every glob was tried separately against every component.
+    glob_pats = sorted(p for p in lowered if p not in exact and "/" not in p)
+    glob_re = (
+        re.compile("|".join(f"(?:{fnmatch.translate(p)})" for p in glob_pats))
+        if glob_pats
+        else None
     )
     multi = tuple(
         tuple(seg for seg in p.split("/") if seg)
@@ -452,10 +701,9 @@ def _build_matcher(patterns: set[str]):
     multi_res = tuple(tuple(re.compile(fnmatch.translate(s)) for s in segs) for segs in multi)
 
     def matches(path: Path | str) -> bool:
-        p = path if isinstance(path, Path) else Path(path)
-        parts = tuple(part.lower() for part in p.parts)
-        for part in (p.name.lower(), *parts):
-            if part in exact or any(g.fullmatch(part) for g in globs):
+        name, parts = _lower_path_parts(path if isinstance(path, str) else str(path))
+        for part in (name, *parts):
+            if part in exact or (glob_re is not None and glob_re.fullmatch(part)):
                 return True
         for segs in multi_res:
             span = len(segs)
@@ -467,6 +715,47 @@ def _build_matcher(patterns: set[str]):
         return False
 
     return matches
+
+
+def _census_pruned_tree(top: Path) -> tuple[int, int, int]:
+    """``(files, known_bytes, unknown_size_entries)`` under a whole-pruned dir.
+
+    CORE-003 (audit/6.md): a pruned subtree used to vanish from every counter,
+    so the manifest could not answer how much source material was omitted. The
+    census never opens a file: ``os.scandir`` already carries the size on the
+    platforms this ships on, so representing the omission costs directory
+    enumeration and nothing more. A size that cannot be read is reported as
+    unknown rather than fabricated as a known zero.
+    """
+    files = 0
+    known = 0
+    unknown = 0
+    stack = [top]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                    except OSError:
+                        files += 1
+                        unknown += 1
+                        continue
+                    files += 1
+                    try:
+                        known += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        unknown += 1
+        except OSError:
+            # An unreadable pruned directory is still omitted material; its
+            # contents are simply uncountable. Counted as one unknown entry so
+            # the census never silently reports a complete zero.
+            files += 1
+            unknown += 1
+    return files, known, unknown
 
 
 def build_fidelity_plan(
@@ -481,11 +770,17 @@ def build_fidelity_plan(
     always_exclude: Optional[list[str]] = None,
     mandatory_excludes: Optional[set[str]] = None,
     newer_than_mtime: Optional[float] = None,
+    census_pruned: bool = True,
 ) -> FidelityPlan:
     """Classify every file under ``source`` and decide what the archive holds.
 
     One traversal, one truth: the returned plan feeds both the zipper and the
     freshness walk, so the archive and the freshness check can never drift.
+
+    ``census_pruned`` enumerates whole-pruned directories (names and sizes only,
+    never contents) so their omission is represented in the counters instead of
+    erased. A freshness probe passes False: it consumes none of that metadata and
+    must not touch excluded weight (PERF-004).
     """
     from audapack.packing import MANDATORY_EXCLUDES
 
@@ -497,15 +792,32 @@ def build_fidelity_plan(
         media_samples=profile_media_samples(profile, media_samples),
         media_bytes_per_dir=profile_media_bytes(profile, media_bytes),
     )
+    plan.pruned_census_taken = census_pruned
     always_incl = _build_matcher({p for p in (always_include or [])})
     always_excl = _build_matcher({p for p in (always_exclude or [])})
     configured = _build_matcher({p for p in excludes})
     mandatory = _build_matcher(set(mandatory_excludes or MANDATORY_EXCLUDES))
-
-    referenced_files, referenced_dirs = scan_asset_references(
-        source, prune=lambda p: always_excl(p) or configured(p) or mandatory(p)
+    plan.policy_fingerprint = packing_policy_fingerprint(
+        profile=profile,
+        max_mb=max_mb,
+        media_samples=media_samples,
+        media_bytes=media_bytes,
+        excludes=excludes,
+        always_include=always_include or (),
+        always_exclude=always_exclude or (),
+        mandatory_excludes=mandatory_excludes,
     )
-    plan.referenced_files = referenced_files
+
+    # PERF-001 (audit/6.md): the reference scan is a SECOND full walk that reads
+    # source text, and its only consumers are media sampling and
+    # ``plan.referenced_files``. It used to run unconditionally before the
+    # classification walk, so an unchanged 100-file Python project paid one extra
+    # traversal and 100 file reads merely to decide an archive was fresh
+    # (measured FRESHNESS_COUNTS {'walks': 3, 'reads': 100}). Deferred until the
+    # tree is known to hold media: a tree with nothing to sample cannot be
+    # affected by the answer.
+    referenced_files: set[str] = set()
+    referenced_dirs: set[str] = set()
 
     # Media groups: (media_class, parent_rel) -> list of (rel, size, path)
     media_groups: dict[tuple[str, str], list[tuple[str, int, Path]]] = {}
@@ -513,77 +825,138 @@ def build_fidelity_plan(
     raw: list[tuple[str, int, FileDecision]] = []
     mtimes: dict[str, float] = {}  # rel -> st_mtime, fused freshness data
 
-    def reason_stat(reason: str, size: int) -> None:
+    def reason_stat(reason: str, size: int, count: int = 1) -> None:
         stats = plan.reason_stats.setdefault(reason, {"count": 0, "bytes": 0})
-        stats["count"] += 1
+        stats["count"] += count
         stats["bytes"] += size
 
-    def _plan_walk_error(err):
-        # A directory that cannot be traversed means files below it were never
-        # discovered: freshness cannot be proven, so the plan counts the walk
-        # failure and the caller must repack rather than reuse an archive.
-        # It counts as discovered as well: every increment of failed/excluded
-        # has a matching discovered, or the manifest identity
-        # discovered == included + excluded + failed silently goes false and an
-        # incomplete archive reads as fully accounted for.
-        plan.discovered += 1
-        plan.failed += 1
-        plan.walk_incomplete = True
+    def failure_stat(category: str, count: int = 1) -> None:
+        """Count a file nobody chose to omit: the tree, not the policy, refused.
 
+        CORE-003 (audit/6.md): ``failed`` had no category vocabulary at all, so
+        an I/O failure was indistinguishable from a decision in the manifest.
+        Every increment is paired with ``discovered`` and with an unknown byte
+        size -- a size that could not be read is never reported as a known zero.
+        """
+        plan.discovered += count
+        plan.failed += count
+        plan.unknown_size_entries += count
+        plan.failure_stats[category] = plan.failure_stats.get(category, 0) + count
+
+    def prune_dir(rel_dir: str, reason: str, path: Path) -> None:
+        """Record a whole-directory prune, with the material it removed.
+
+        The census counts files and bytes without opening one, so the manifest
+        can answer "how much was omitted here" -- the tree below a prune used to
+        disappear from every counter, which is what let three physical files
+        report ``discovered=1``.
+        """
+        info: dict[str, object] = {"reason": reason, "files": 0, "bytes": 0}
+        plan.pruned_dirs_rel[rel_dir] = info
+        if not census_pruned:
+            return
+        files, known, unknown = _census_pruned_tree(path)
+        info["files"] = files
+        info["bytes"] = known
+        if unknown:
+            info["unknown_size_entries"] = unknown
+        if files:
+            plan.discovered += files
+            plan.excluded += files
+            plan.source_bytes += known
+            plan.excluded_bytes += known
+            plan.unknown_size_entries += unknown
+            reason_stat(reason, known, count=files)
+
+    # PERF-001 (audit/6.md): one scandir traversal, and every entry's metadata
+    # comes from the directory read that found it. ``os.walk`` discards the
+    # ``os.DirEntry`` objects it already built, so classifying a file cost a
+    # second and third syscall (``is_symlink`` then ``stat``) plus a ``Path``
+    # construction and a ``relative_to`` per entry -- 2,030 stat calls for a
+    # 1,000-file tree that scandir had already described.
+    stack: list[tuple[Path, str]] = [(source, "")]
     try:
-        for root, dirs, files in os.walk(source, onerror=_plan_walk_error):
-            base = Path(root)
-            kept_dirs = []
-            for d in dirs:
-                dp = base / d
-                rel_dir = dp.relative_to(source).as_posix().lower()
-                # PERF-004 (audit/2.md): matcher BEFORE is_symlink(). The symlink
-                # probe is a stat, and an excluded directory must never be stat'ed
-                # (packing.py's eligible_source_files short-circuits the same way:
-                # matcher first, symlink second).
-                if mandatory(rel_dir):
-                    plan.pruned_dirs_rel[rel_dir] = REASON_SECRET_POLICY
-                    continue
-                if always_excl(rel_dir):
-                    plan.extra_excluded_rel.add(rel_dir)
-                    plan.pruned_dirs_rel[rel_dir] = REASON_CONFIGURED_IGNORE
-                    continue
-                if configured(rel_dir):
-                    plan.pruned_dirs_rel[rel_dir] = exclusion_reason_for(rel_dir, d.lower())
-                    continue
+        while stack:
+            base, rel_prefix = stack.pop()
+            try:
+                with os.scandir(base) as it:
+                    entries = list(it)
+            except OSError:
+                # A directory that cannot be enumerated means the files below it
+                # were never discovered: freshness cannot be proven, so the plan
+                # counts the failure and the caller must repack rather than reuse
+                # an archive. It counts as discovered as well -- every increment
+                # of failed/excluded has a matching discovered, or the manifest
+                # identity discovered == included + excluded + failed silently
+                # goes false and an incomplete archive reads as fully accounted
+                # for.
+                failure_stat(FAILURE_WALK)
+                plan.walk_incomplete = True
+                continue
+            child_dirs: list[tuple[Path, str]] = []
+            for entry in entries:
+                name = entry.name
+                rel = f"{rel_prefix}/{name}" if rel_prefix else name
                 try:
-                    if dp.is_symlink():
-                        continue
+                    is_dir = entry.is_dir()
                 except OSError:
-                    # An unreadable directory entry is one failed entry, not a
-                    # reason to abandon the rest of the tree.
-                    plan.discovered += 1
-                    plan.failed += 1
-                    plan.walk_incomplete = True
+                    failure_stat(FAILURE_STAT)
                     continue
-                kept_dirs.append(d)
-            dirs[:] = kept_dirs
-            for name in files:
-                fp = base / name
-                # The symlink probe is itself a stat and raises on an unreadable
-                # entry, so it shares the guard: outside it, one EACCES file
-                # aborted the whole walk and the plan reported an empty tree as a
-                # complete audit representation.
+                if is_dir:
+                    rel_dir = rel.lower()
+                    # PERF-004 (audit/2.md): matcher BEFORE any symlink probe.
+                    # The probe is filesystem metadata work, and an excluded
+                    # directory must never incur it (packing.py's
+                    # eligible_source_files short-circuits the same way).
+                    if mandatory(rel_dir):
+                        prune_dir(rel_dir, REASON_SECRET_POLICY, Path(entry.path))
+                        continue
+                    if always_excl(rel_dir):
+                        plan.extra_excluded_rel.add(rel_dir)
+                        prune_dir(rel_dir, REASON_CONFIGURED_IGNORE, Path(entry.path))
+                        continue
+                    if configured(rel_dir):
+                        prune_dir(
+                            rel_dir, exclusion_reason_for(rel_dir, name.lower()), Path(entry.path)
+                        )
+                        continue
+                    try:
+                        if entry.is_symlink():
+                            continue
+                    except OSError:
+                        # An unreadable directory entry is one failed entry, not
+                        # a reason to abandon the rest of the tree.
+                        failure_stat(FAILURE_WALK)
+                        plan.walk_incomplete = True
+                        continue
+                    child_dirs.append((Path(entry.path), rel))
+                    continue
+                # The symlink probe raises on an unreadable entry, so it shares
+                # the guard: outside it, one EACCES file aborted the whole walk
+                # and the plan reported an empty tree as a complete audit
+                # representation.
                 try:
-                    if fp.is_symlink():
+                    if entry.is_symlink():
+                        # A link's own bytes are not source material and its
+                        # target may sit outside the tree, so the size stays
+                        # unknown rather than being called a known zero.
                         plan.discovered += 1
                         plan.excluded += 1
+                        plan.unknown_size_entries += 1
                         reason_stat(REASON_UNSUPPORTED, 0)
+                        raw.append((rel, 0, FileDecision(rel, 0, False, REASON_UNSUPPORTED)))
                         continue
-                    st = fp.stat()
+                    # follow_symlinks=False reuses the metadata scandir already
+                    # returned, so this costs no syscall at all on Windows and
+                    # is equivalent for a non-symlink, which is all that reaches
+                    # here.
+                    st = entry.stat(follow_symlinks=False)
                     size = st.st_size
                 except OSError:
-                    plan.discovered += 1
-                    plan.failed += 1
+                    failure_stat(FAILURE_STAT)
                     continue
                 plan.discovered += 1
                 plan.source_bytes += size
-                rel = fp.relative_to(source).as_posix()
                 if newer_than_mtime is not None:
                     mtimes[rel] = st.st_mtime
                 rel_lower = rel.lower()
@@ -613,10 +986,12 @@ def build_fidelity_plan(
                     raw.append((rel, size, FileDecision(rel, size, False, reason)))
                     continue
 
-                mclass = media_class_for(fp)
+                mclass = media_class_for(name)
                 if mclass is not None:
-                    media_groups.setdefault((mclass, str(base.relative_to(source).as_posix())), []).append(
-                        (rel, size, fp)
+                    # PERF-003: rel + size is everything the sampler decides on.
+                    # A per-file Path object was retained here and never read.
+                    media_groups.setdefault((mclass, rel_prefix or "."), []).append(
+                        (rel, size)
                     )
                     continue
 
@@ -628,6 +1003,9 @@ def build_fidelity_plan(
                 plan.included += 1
                 plan.included_bytes += size
                 raw.append((rel, size, FileDecision(rel, size, True, None, priority)))
+            # Depth-first in directory order, so an identical tree plans in an
+            # identical sequence.
+            stack.extend(reversed(child_dirs))
     except OSError:
         # Last-resort guard: the per-entry handlers above own the expected
         # failures, so reaching here means the walk itself died and the tree is
@@ -635,79 +1013,84 @@ def build_fidelity_plan(
         plan.walk_incomplete = True
 
     # ---- media sampling ---------------------------------------------------
-    for (mclass, parent_rel), members in media_groups.items():
-        inventory: dict[str, object] = {
-            "class": mclass,
-            "directory": parent_rel,
-            "included": 0,
-            "total": len(members),
-            "bytes": 0,
-            "files": [],
-        }
-        plan.media_inventory[parent_rel or "."] = inventory
-        if plan.media_samples <= 0 or profile == PROFILE_FULL:
-            # DEEP/FULL: keep every media file.
-            for rel, size, _fp in members:
-                plan.included += 1
-                plan.included_bytes += size
-                raw.append((rel, size, FileDecision(rel, size, True, None, 2)))
-                inventory["included"] = int(inventory["included"]) + 1
-                inventory["bytes"] = int(inventory["bytes"]) + size
-                inventory["files"].append({"rel": rel, "size": size, "included": True})
-            continue
+    # CORE-005 (audit/6.md): sampling is a JOINT cap. An unreferenced media file
+    # is kept only while BOTH the per-directory sample count and the per-
+    # directory byte budget still have room. Either one alone used to be enough,
+    # so a nominal 3-sample STANDARD directory kept five 400 KB files, and DEEP
+    # (samples=0, i.e. "keep everything") let three arbitrary 40 MB videos
+    # produce a ~120 MB archive inside a declared 100 MB tier.
+    #
+    # Protected rather than capped: explicit always_include, and media a build or
+    # runtime text references BY NAME. Those are mandatory material (priority 1).
+    # Every sampled-in unreferenced file is an ordinary asset (priority 3), so
+    # the global soft budget below can still reach it -- media used to sit at
+    # priority 2 above ordinary assets, which shielded exactly the arbitrary
+    # bulk this cap exists to bound.
+    #
+    # PERF-001: the reference scan happens HERE, once, and only when the walk
+    # actually found media to rank. Nothing above this point consumes it.
+    if media_groups:
+        referenced_files, referenced_dirs = scan_asset_references(
+            source, prune=lambda p: always_excl(p) or configured(p) or mandatory(p)
+        )
+        plan.referenced_files = referenced_files
+    referenced_files_lower = {rel.lower() for rel in referenced_files}
+    referenced_dirs_lower = {rel.lower() for rel in referenced_dirs}
 
+    def _ref_rank(rel: str) -> int:
+        """0 = referenced by name, 1 = under a referenced dir, 2 = arbitrary.
+
+        Case-insensitive: a reference written ``Sounds/theme.wav`` names the same
+        asset as ``Sounds/Theme.wav`` on the filesystems this ships on.
+        """
+        low = rel.lower()
+        if low in referenced_files_lower:
+            return 0
+        segs = low.split("/")
+        for seg_i in range(1, len(segs)):
+            if "/".join(segs[:seg_i]) in referenced_dirs_lower:
+                return 1
+        return 2
+
+    for (_mclass, _parent_rel), members in sorted(media_groups.items()):
+        keep_all = profile == PROFILE_FULL or plan.media_samples <= 0
+        # Deterministic order: referenced first, then small files (most coverage
+        # per byte), then largest-first, then path. Identical trees plan
+        # identically, which is what makes a sampled archive reproducible -- and
+        # it makes the bounded samples below deterministic for free. Sorted IN
+        # PLACE so the inventory pass below can reuse it and PERF-003 does not
+        # trade a per-file manifest ledger for a second per-file list.
+        members.sort(
+            key=lambda m: (
+                _ref_rank(m[0]),
+                0 if m[1] <= MEDIA_SMALL_BYTES else 1,
+                -m[1],
+                m[0].lower(),
+            ),
+        )
+        samples_left = plan.media_samples
         cap_bytes = plan.media_bytes_per_dir
         budget_left = cap_bytes if cap_bytes > 0 else None
-
-        def _ref_rank(member) -> int:
-            rel, _size, _fp = member
-            if rel in referenced_files:
-                return 0
-            for seg_i in range(1, len(rel.split("/"))):
-                if "/".join(rel.split("/")[:seg_i]) in referenced_dirs:
-                    return 1
-            return 2
-
-        def _small_ok(member) -> bool:
-            return member[1] <= MEDIA_SMALL_BYTES and profile != PROFILE_COMPACT
-
-        # Small assets always count at STANDARD/DEEP; then referenced, then
-        # largest-first until the count/byte cap. User always_include wins
-        # over every profile decision (but never over safety policy above).
-        ordered = sorted(members, key=lambda m: (_ref_rank(m), 0 if m[1] > MEDIA_SMALL_BYTES else 1, -m[1]))
-        kept_count = 0
-        for rel, size, fp in ordered:
-            referenced = _ref_rank((rel, size, fp)) == 0
-            if always_incl(rel.lower()):
-                keep = True
-            elif _small_ok((rel, size, fp)):
-                keep = True
-            elif referenced:
-                keep = True  # build/runtime-referenced media outranks the cap
-            elif kept_count < plan.media_samples:
-                keep = True
-            elif budget_left is not None and budget_left >= size:
+        for rel, size in members:
+            protected = keep_all or always_incl(rel.lower()) or _ref_rank(rel) == 0
+            if protected:
                 keep = True
             else:
-                keep = False
+                keep = samples_left > 0 and (budget_left is None or budget_left >= size)
             if keep:
                 plan.included += 1
                 plan.included_bytes += size
-                inventory["included"] = int(inventory["included"]) + 1
-                inventory["bytes"] = int(inventory["bytes"]) + size
-                if budget_left is not None:
-                    budget_left = max(0, budget_left - size)
-                if not referenced and not _small_ok((rel, size, fp)) and not always_incl(rel.lower()):
-                    kept_count += 1
-                raw.append((rel, size, FileDecision(rel, size, True, None, 2)))
-                inventory["files"].append({"rel": rel, "size": size, "included": True})
+                if not protected:
+                    samples_left -= 1
+                    if budget_left is not None:
+                        budget_left -= size
+                raw.append((rel, size, FileDecision(rel, size, True, None, 1 if protected else 3)))
             else:
                 plan.excluded += 1
                 plan.excluded_bytes += size
                 plan.extra_excluded_rel.add(rel)
                 reason_stat(REASON_MEDIA_BUDGET, size)
                 raw.append((rel, size, FileDecision(rel, size, False, REASON_MEDIA_BUDGET)))
-                inventory["files"].append({"rel": rel, "size": size, "included": False})
     # ---- soft budget trim: ordinary assets first, prose second, never P1 ---
     # Two ordered passes, largest-first inside each. Priority 1 (code, tests,
     # configs, manifests, schemas, explicit always_include) is never offered to
@@ -732,6 +1115,50 @@ def build_fidelity_plan(
 
     # ---- finish -----------------------------------------------------------
     plan.decisions = {d[0].lower(): d[2] for d in raw}
+    # PERF-003: exact aggregates, bounded evidence -- computed HERE, after the
+    # soft-budget trim, because the trim reverses media decisions the sampler
+    # already made. Aggregating during sampling reported files as included that
+    # the finished plan excludes (measured: 10 of 20 groups claimed
+    # included=1/excluded=1 for a group the decisions recorded as 0/2).
+    # Keyed by GROUP, because a directory holding two media classes used to
+    # write both groups to the same key and keep only the last one's numbers.
+    for (mclass, parent_rel), members in sorted(media_groups.items()):
+        included = included_bytes = excluded = excluded_bytes = 0
+        included_sample: list[dict[str, object]] = []
+        omitted_sample: list[dict[str, object]] = []
+        # ``members`` is still in the sampler's deterministic order, so the
+        # bounded samples are the first N of a reproducible sequence.
+        for rel, size in members:
+            if plan.decisions[rel.lower()].include:
+                included += 1
+                included_bytes += size
+                if len(included_sample) < MEDIA_SAMPLE_LIMIT:
+                    included_sample.append({"rel": rel, "size": size})
+            else:
+                excluded += 1
+                excluded_bytes += size
+                if len(omitted_sample) < MEDIA_SAMPLE_LIMIT:
+                    omitted_sample.append({"rel": rel, "size": size})
+        plan.media_inventory[f"{parent_rel or '.'}#{mclass}"] = {
+            "class": mclass,
+            "directory": parent_rel,
+            "total": len(members),
+            "total_bytes": included_bytes + excluded_bytes,
+            "included": included,
+            "included_bytes": included_bytes,
+            "excluded": excluded,
+            "excluded_bytes": excluded_bytes,
+            "sample_limit": MEDIA_SAMPLE_LIMIT,
+            "included_sample": included_sample,
+            "omitted_sample": omitted_sample,
+        }
+    # CORE-003 (audit/6.md): the accounting is checked HERE, at the traversal
+    # boundary, before anything can serialize it. A mismatch is recorded rather
+    # than raised -- losing a finished archive over a metadata defect would be a
+    # worse answer -- and ``semantics_for_plan`` refuses the snapshot claim for a
+    # plan that cannot account for itself.
+    plan.accounting_error = plan_accounting_error(plan)
+    plan.archive_semantics = semantics_for_plan(plan)
     if newer_than_mtime is not None:
         # Freshness fusion: only INCLUDED files count. Excluded, sampled-out
         # and budget-trimmed files must never invalidate an archive they were
@@ -740,13 +1167,41 @@ def build_fidelity_plan(
             if decision.include and mtimes.get(_rel, 0) > newer_than_mtime:
                 plan.newer_found = True
                 break
-    omitted = sorted(
+    # PERF-003: a bounded selection, not a full sort. The key is the same
+    # ``(-size, lowercased path)`` the sort used, and ``nsmallest`` is documented
+    # to equal ``sorted(iterable, key=key)[:n]`` -- so the reported top-N is
+    # byte-identical while the O(n log n) sort of every omitted file and the
+    # O(n) temporary list it materialized are gone.
+    plan.largest_omitted = heapq.nsmallest(
+        LARGEST_OMITTED_LIMIT,
         ((d[0], d[1]) for d in raw if not d[2].include and d[1] > 0),
-        key=lambda item: item[1],
-        reverse=True,
+        key=lambda item: (-item[1], item[0].lower()),
     )
-    plan.largest_omitted = omitted[:10]
     return plan
+
+
+def semantics_for_plan(plan: "FidelityPlan") -> str:
+    """The semantics an archive built from ``plan`` actually earns.
+
+    CORE-004 (audit/6.md): ``archive_semantics_for`` reads the profile NAME, so
+    a FULL run that lost material still declared ``full_snapshot``. A snapshot
+    claim now has to survive the plan: any fidelity-policy omission
+    (``LOSSY_POLICY_REASONS``), an incompletely enumerated tree, or a file the
+    walk could not read downgrades it to an audit representation. Configured and
+    secret exclusions do not -- the operator asked for those.
+    """
+    declared = archive_semantics_for(plan.profile)
+    if declared != "full_snapshot":
+        return declared
+    if plan.walk_incomplete or plan.failed:
+        return "audit_representation"
+    # CORE-003: a plan that cannot account for its own files has not proven it
+    # holds everything, whatever the counters happen to say.
+    if plan.accounting_error:
+        return "audit_representation"
+    if any(plan.reason_stats.get(reason, {}).get("count", 0) for reason in LOSSY_POLICY_REASONS):
+        return "audit_representation"
+    return "full_snapshot"
 
 
 def build_plan_from_config(
@@ -755,6 +1210,7 @@ def build_plan_from_config(
     excludes: set[str],
     *,
     newer_than_mtime: Optional[float] = None,
+    census_pruned: bool = True,
 ) -> FidelityPlan:
     """Build a plan from a ``PackingConfig`` (or object with same attrs)."""
     return build_fidelity_plan(
@@ -767,9 +1223,15 @@ def build_plan_from_config(
         always_include=list(getattr(packing, "always_include", None) or []),
         always_exclude=list(getattr(packing, "always_exclude", None) or []),
         newer_than_mtime=newer_than_mtime,
+        census_pruned=census_pruned,
     )
 
 
 def exclude_reason_summary(plan: FidelityPlan) -> dict[str, dict[str, int]]:
     """Stable, JSON-friendly reason stats (only categories with hits)."""
     return {k: dict(v) for k, v in sorted(plan.reason_stats.items())}
+
+
+def failure_summary(plan: FidelityPlan) -> dict[str, int]:
+    """Stable, JSON-friendly failure categories (only those with hits)."""
+    return dict(sorted(plan.failure_stats.items()))
