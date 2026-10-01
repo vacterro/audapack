@@ -8,6 +8,8 @@
   <b>High-velocity Windows project packaging, audit cockpit & browser automation bridge</b>
 </p>
 
+**AUDAPACK is a Windows audit-packaging and workflow automation tool for AI-assisted software projects.** It creates clean project archives, tracks multi-wave audit freshness, manages handoff state, and bridges browser-based audit workflows with a local project cockpit.
+
 <p align="center">
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.2-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
