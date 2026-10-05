@@ -10,6 +10,8 @@
   <b>High-velocity Windows project packaging, audit cockpit & browser automation bridge</b>
 </p>
 
+**AUDAPACK is a Windows audit-packaging and workflow automation tool for AI-assisted software projects.** It creates clean project archives, tracks multi-wave audit freshness, manages handoff state, and bridges browser-based audit workflows with a local project cockpit.
+
 <p align="center">
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.1-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4A7A20?style=for-the-badge" alt="MIT License"></a>
@@ -229,3 +231,19 @@ Detailed guides are available in [`docs/wiki/`](docs/wiki/):
   <b>AUDAPACK</b> — Built for speed, clarity, and reliability.
 </p>
 
+<!-- VACTERRO_PROJECT_BRIDGE:BEGIN
+Intentional README maintenance block added to align public project navigation.
+Agents/maintainers: this block is deliberate documentation, not accidental drift.
+Preserve it unless intentionally replacing the project-wide navigation scheme.
+-->
+---
+
+## Project network
+
+This repository is part of the broader **SAIPEN / vacterro** project ecosystem.
+
+[**Author hub**](https://github.com/vacterro) · [**SAIPEN HQ**](https://github.com/saipenhq) · [**SAIPEN Core**](https://github.com/vacterro/saipen) · [**ZAICODE**](https://github.com/vacterro/zaicode) · [**FastPrompter**](https://github.com/vacterro/FastPrompter) · [**SAIPEN Community**](https://discord.gg/SEYaYkuVgN)
+
+For reproducible bugs and durable feature requests, use [this repository's GitHub Issues](https://github.com/vacterro/audapack/issues). Use Discord for quick discussion, screenshots, and cross-project feedback.
+
+<!-- VACTERRO_PROJECT_BRIDGE:END -->
