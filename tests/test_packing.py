@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from audapack import packing
+from audapack.config import PackingConfig
 from audapack.fidelity import build_fidelity_plan
 from audapack.models import PackResult
 from audapack.packing import (
@@ -26,6 +28,7 @@ from audapack.packing import (
     safe_archive_stem,
     verify_zip,
 )
+from audapack.source_inventory import CODE_RESERVED_ARCHIVE_NAME_CONFLICT
 
 
 class TestPackingEngine(unittest.TestCase):
@@ -302,7 +305,13 @@ class TestPackingEngine(unittest.TestCase):
 
     def test_concurrent_same_target_pack_preserves_successful_payload(self):
         """CORE-001: a failing same-target pack must never restore its stale
-        predecessor over (or unlink) an archive written by another pack."""
+        predecessor over (or unlink) an archive written by another pack.
+
+        T-190: the write path is now DISCOVER -> FREEZE -> stage -> verify ->
+        commit, so the fault is injected at the frozen-inventory staging
+        boundary (``stage_inventory_zip``) instead of the obsolete
+        ``create_zip`` helper.
+        """
         import time as _time
 
         # Seed a pre-existing OLD archive for the same stem.
@@ -312,22 +321,22 @@ class TestPackingEngine(unittest.TestCase):
 
         from audapack import packing as packing_mod
 
-        real_create_zip = packing_mod.create_zip
+        real_stage = packing_mod.stage_inventory_zip
         a_entered = threading.Event()
         state = {"calls": 0}
         state_lock = threading.Lock()
         results = {}
 
-        def flaky_create_zip(*args, **kwargs):
+        def flaky_stage_inventory_zip(source_dir, output_zip, inventory, **kwargs):
             with state_lock:
                 state["calls"] += 1
                 is_first = state["calls"] == 1
             if is_first:
-                # Pack A: begin (backup done), then fail mid-creation.
+                # Pack A: begin (backup done), then fail mid-staging.
                 a_entered.set()
                 _time.sleep(0.2)
                 raise RuntimeError("simulated pack failure (A)")
-            return real_create_zip(*args, **kwargs)
+            return real_stage(source_dir, output_zip, inventory, **kwargs)
 
         def pack_a():
             results["a"] = pack_single(
@@ -339,10 +348,10 @@ class TestPackingEngine(unittest.TestCase):
                 include_timestamp=False,
             )
 
-        with patch.object(packing_mod, "create_zip", side_effect=flaky_create_zip):
+        with patch.object(packing_mod, "stage_inventory_zip", side_effect=flaky_stage_inventory_zip):
             ta = threading.Thread(target=pack_a)
             ta.start()
-            self.assertTrue(a_entered.wait(timeout=5), "pack A never entered creation")
+            self.assertTrue(a_entered.wait(timeout=5), "pack A never entered staging")
             # Pack B runs concurrently against the same target.
             results["b"] = pack_single(
                 source_path=self.source_dir,
@@ -396,6 +405,98 @@ class TestPackingEngine(unittest.TestCase):
             with zipfile.ZipFile(p) as zf:
                 n = zf.namelist()
             self.assertEqual(verify_zip(Path(p), len(n)), len(n), f"{p} must be byte-valid")
+
+
+class TestProjectOwnedBinaryPacking(unittest.TestCase):
+    """Generic .bin inputs are opaque source assets, not generated output."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "project"
+        self.source.mkdir()
+        fixtures = self.source / "fixtures"
+        fixtures.mkdir()
+        (self.source / "host-patch.json").write_text(
+            '{"anchor": "fixtures/anchor-853.bin", "replacement": "fixtures/replacement-853.bin"}',
+            encoding="utf-8",
+        )
+        (fixtures / "anchor-853.bin").write_bytes(b"ANCHOR\\x00\\x853")
+        (fixtures / "replacement-853.bin").write_bytes(b"REPLACEMENT\\x00\\x853")
+        self.output = self.root / "output"
+        self.output.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _pack(self, *, profile="standard", excludes=None, always_exclude=None):
+        packing = PackingConfig(
+            fidelity_profile=profile,
+            include_timestamp=False,
+            manifest_enabled=True,
+            always_exclude=list(always_exclude or []),
+        )
+        return pack_single(
+            self.source,
+            self.output,
+            f"Binary-{profile}",
+            set(excludes or []),
+            delete_old=True,
+            include_timestamp=False,
+            packing=packing,
+            manifest_meta={"project_name": "Binary"},
+        )
+
+    def test_standard_keeps_small_project_owned_bin_fixtures(self):
+        result = self._pack()
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as archive:
+            names = set(archive.namelist())
+        self.assertIn("fixtures/anchor-853.bin", names)
+        self.assertIn("fixtures/replacement-853.bin", names)
+
+    def test_full_keeps_ordinary_project_owned_bin_input(self):
+        result = self._pack(profile="full")
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as archive:
+            self.assertIn("fixtures/anchor-853.bin", archive.namelist())
+            self.assertIn("fixtures/replacement-853.bin", archive.namelist())
+
+    def test_explicit_configured_bin_exclusion_still_wins(self):
+        result = self._pack(excludes=["*.bin"])
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as archive:
+            names = set(archive.namelist())
+        self.assertNotIn("fixtures/anchor-853.bin", names)
+        self.assertNotIn("fixtures/replacement-853.bin", names)
+
+    def test_explicit_always_exclude_bin_still_wins(self):
+        result = self._pack(always_exclude=["*.bin"])
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as archive:
+            names = set(archive.namelist())
+        self.assertNotIn("fixtures/anchor-853.bin", names)
+        self.assertNotIn("fixtures/replacement-853.bin", names)
+
+    def test_large_opaque_bin_remains_subject_to_standard_size_budget(self):
+        large = self.source / "large.bin"
+        large.write_bytes(b"x" * (2 * 1024 * 1024))
+        plan = build_fidelity_plan(self.source, set(), profile="standard", max_mb=1)
+        self.assertFalse(plan.decisions["large.bin"].include)
+        self.assertEqual(plan.decisions["large.bin"].reason, "size_limit")
+        self.assertEqual(plan.discovered, plan.included + plan.excluded + plan.failed)
+        self.assertEqual(plan.decisions["large.bin"].priority, 3)
+
+    def test_manifest_accounting_reconciles_for_bin_inputs(self):
+        result = self._pack()
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as archive:
+            manifest = json.loads(archive.read(MANIFEST_FILENAME).decode("utf-8"))
+        self.assertTrue(manifest["accounting_reconciled"])
+        self.assertEqual(
+            manifest["files_discovered"],
+            manifest["files_included"] + manifest["files_excluded"] + manifest["files_failed"],
+        )
 
 
 class TestTkFallbackPackingOptions(unittest.TestCase):
@@ -562,7 +663,7 @@ class TestBackupIsRollbackAuthority(unittest.TestCase):
             return real_replace(self, destination)
 
         with patch.object(Path, "replace", autospec=True, side_effect=refuse_backup), \
-             patch("audapack.packing.create_zip", side_effect=AssertionError("packed without rollback authority")), \
+             patch("audapack.packing.stage_inventory_zip", side_effect=AssertionError("packed without rollback authority")), \
              patch("time.sleep"):
             result = self._pack()
 
@@ -575,6 +676,7 @@ class TestBackupIsRollbackAuthority(unittest.TestCase):
         archive, before = self._seed_previous_archive()
         real_replace = Path.replace
         attempts = {"n": 0}
+        # (intentional continuation below)
 
         def flaky_backup(self, destination):
             if ".bak." in Path(destination).name:
@@ -594,9 +696,19 @@ class TestBackupIsRollbackAuthority(unittest.TestCase):
         self.assertNotEqual(archive.read_bytes(), before)
 
     def test_a_post_commit_verify_failure_restores_the_predecessor_exactly(self):
+        """T-190: verification now runs at the inventory-parity boundary.
+
+        A verification failure BEFORE the final commit must restore/preserve
+        the previous known-good archive exactly -- proven here by injecting
+        the fault through ``verify_inventory_archive`` (the new authority),
+        not the obsolete ``verify_zip`` helper.
+        """
         archive, before = self._seed_previous_archive()
 
-        with patch("audapack.packing.verify_zip", side_effect=RuntimeError("simulated verify failure")):
+        with patch(
+            "audapack.packing.verify_inventory_archive",
+            side_effect=packing.ArchiveVerifyError("simulated verify failure"),
+        ):
             result = self._pack()
 
         self.assertFalse(result.success)
@@ -849,7 +961,11 @@ class TestSingleFileSecretBoundary(unittest.TestCase):
         target, result = self._pack_file("notes.md")
         self.assertTrue(result.success, result.error_message)
         with zipfile.ZipFile(result.output_path) as zf:
-            self.assertEqual(zf.namelist(), ["notes.md"])
+            names = zf.namelist()
+        self.assertIn("notes.md", names)
+        # T-190: reserved archive-control metadata is NOT source payload.
+        payload = [n for n in names if n not in packing.RESERVED_ARCHIVE_NAMES]
+        self.assertEqual(payload, ["notes.md"])
         self.assertTrue(target.exists())
 
     def test_the_same_secret_inside_a_directory_is_still_skipped(self):
@@ -867,7 +983,13 @@ class TestSingleFileSecretBoundary(unittest.TestCase):
         )
         self.assertTrue(result.success, result.error_message)
         with zipfile.ZipFile(result.output_path) as zf:
-            self.assertEqual(zf.namelist(), ["main.py"])
+            names = zf.namelist()
+        # T-190: distinguish source payload from reserved archive metadata;
+        # the canonical inventory manifest may be present, the secret must not.
+        payload = [n for n in names if n not in packing.RESERVED_ARCHIVE_NAMES]
+        self.assertEqual(payload, ["main.py"])
+        self.assertNotIn("token.txt", names)
+        self.assertIn(".audapack/manifest.json", names)
 
     def test_the_cli_pack_path_refuses_it_as_well(self):
         from audapack import app
@@ -1342,6 +1464,257 @@ class TestFreshnessCostsOneTraversal(unittest.TestCase):
         self.assertIsNotNone(decision, "the referenced asset has no decision")
         self.assertTrue(decision.include, "a by-name referenced asset was sampled out")
 
+    def test_create_zip_resolves_decisions_by_exact_case_identity(self):
+        """T-150: the packer must tell Asset.PNG from asset.png.
+
+        The old lookup lowercased the walked path before asking the plan, so
+        on a case-sensitive filesystem the two physical twins shared one
+        decision. Requires a filesystem that can hold case-distinct siblings.
+        """
+        import subprocess
+        import sys
+
+        source = Path(self.temp_dir) / "casetree"
+        source.mkdir()
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["fsutil", "file", "setCaseSensitiveInfo", str(source), "enable"],
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                self.skipTest("per-directory case sensitivity unavailable (fsutil refused)")
+        try:
+            (source / "Asset.PNG").write_bytes(b"A" * 300_000)
+            (source / "asset.png").write_bytes(b"B" * 300_000)
+        except OSError:
+            self.skipTest("filesystem cannot hold case-distinct siblings")
+        if not ((source / "Asset.PNG").is_file() and (source / "asset.png").is_file()):
+            self.skipTest("filesystem collapsed case-distinct siblings into one file")
+        (source / "main.py").write_text("print('x')", encoding="utf-8")
+
+        plan = build_fidelity_plan(source, set(), profile="compact")
+        self.assertEqual(len(plan.decisions), 3, "the twins collapsed into one decision")
+        output_zip = Path(self.temp_dir) / "case.zip"
+        stats = create_zip(source, output_zip, set(), plan=plan)
+        with zipfile.ZipFile(output_zip) as zf:
+            names = set(zf.namelist())
+        included = "Asset.PNG" if plan.decision_for("Asset.PNG").include else "asset.png"
+        excluded = "asset.png" if included == "Asset.PNG" else "Asset.PNG"
+        self.assertIn(included, names)
+        self.assertNotIn(excluded, names)
+        self.assertIn("main.py", names)
+        self.assertEqual(stats.files_included, plan.included)
+        self.assertEqual(stats.files_excluded, plan.excluded)
+
+
+class TestFreshnessProbeStopsEarly(unittest.TestCase):
+    """T-155 (PERF-004 residue): the freshness preflight is a probe, not a walk.
+
+    Three costs the probe used to pay for an answer it already had. First, it
+    decided staleness only after traversing the whole tree, although the first
+    priority-1 included file newer than the archive settles the verdict. Second,
+    it never looked at the caller's cancel_event, so a cancelled operation kept
+    paying for a full traversal. Third, a stale verdict made pack_project walk
+    the tree a second time (a fresh plan build), although the probe's own plan
+    already holds every decision the pack needs.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+        self.source = self.root / "proj"
+        self.source.mkdir(parents=True)
+        for index in range(40):
+            (self.source / f"mod{index}.py").write_text(f"x = {index}\n", encoding="utf-8")
+        heavy = self.source / "node_modules" / "pkg"
+        heavy.mkdir(parents=True)
+        for index in range(20):
+            (heavy / f"chunk{index}.js").write_text("y", encoding="utf-8")
+        self.deep = self.source / "deep" / "deeper"
+        self.deep.mkdir(parents=True)
+        for index in range(5):
+            (self.deep / f"f{index}.py").write_text("d", encoding="utf-8")
+        self.output_dir = self.root / "out"
+        self.output_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _service(self):
+        from audapack.config import AppConfig, PackingConfig
+        from audapack.models import Project
+        from audapack.services.packing_service import PackingService
+
+        config = AppConfig(packing=PackingConfig(
+            output_dir=str(self.output_dir), delete_old=True, include_timestamp=False,
+        ))
+        config.projects = [Project(
+            id="proj", display_name="proj", source_path=str(self.source), archive_name="proj",
+        )]
+        return PackingService(config, base_dir=self.root)
+
+    def _fresh_archive(self) -> Path:
+        import os as _os
+
+        result = self._service().pack_project("proj")
+        self.assertTrue(result.success, result.error_message)
+        archive = Path(result.output_path)
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        _os.utime(archive, (newest + 120, newest + 120))
+        return archive
+
+    def _scandir_probe(self):
+        """A counting scandir plus the paths it saw under the source root."""
+        import os as _os
+
+        scans = []
+        real_scandir = _os.scandir
+
+        def counting_scandir(path, *args, **kwargs):
+            scans.append(str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        return scans, counting_scandir
+
+    def test_the_probe_stops_at_the_first_newer_priority_one_file(self):
+        import os as _os
+
+        self._fresh_archive()
+        target = self.source / "mod3.py"
+        stamp = self.output_dir.joinpath("proj.zip").stat().st_mtime + 300
+        _os.utime(target, (stamp, stamp))
+
+        scans, counting_scandir = self._scandir_probe()
+        pre_pack_scans = []
+
+        service = self._service()
+        real_pack = service.pack_project
+
+        def spy_pack(project_id, **kwargs):
+            # Runs the moment the probe has its verdict -- whatever it walked
+            # up to here is everything the probe paid for.
+            pre_pack_scans.extend(scans)
+            return real_pack(project_id, **kwargs)
+
+        service.pack_project = spy_pack
+        with patch.object(_os, "scandir", side_effect=counting_scandir):
+            service.ensure_fresh_archive("proj")
+
+        descended = [p for p in pre_pack_scans if str(self.deep) in p or "deep" in p]
+        self.assertEqual(
+            descended, [],
+            "the probe kept walking after a priority-1 include newer than the archive "
+            f"had already settled the verdict: {descended[:3]}",
+        )
+
+    def test_a_cancel_during_the_probe_returns_promptly(self):
+        import os as _os
+
+        self._fresh_archive()
+        scans, counting_scandir = self._scandir_probe()
+
+        cancel = threading.Event()
+
+        def cancelling_scandir(path, *args, **kwargs):
+            result = counting_scandir(path, *args, **kwargs)
+            # The cancel lands while the probe is standing on the root: every
+            # further traversal is work a cancelled operation never asked for.
+            if str(path) == str(self.source):
+                cancel.set()
+            return result
+
+        packed = []
+        service = self._service()
+        service.pack_project = lambda project_id, **kw: packed.append(project_id) or PackResult(
+            project_id=project_id, name=project_id, source_path=str(self.source), success=True,
+        )
+        with patch.object(_os, "scandir", side_effect=cancelling_scandir):
+            result = service.ensure_fresh_archive("proj", cancel_event=cancel)
+
+        self.assertFalse(result.success, "a cancelled probe reported a usable archive")
+        self.assertIn("cancel", result.error_message.lower())
+        self.assertEqual(packed, [], "a cancelled probe started a pack")
+        descended = [p for p in scans if p != str(self.source) and str(self.source) in p]
+        self.assertEqual(
+            descended, [],
+            f"the probe kept traversing after the cancel landed: {descended[:3]}",
+        )
+
+    def test_a_stale_verdict_does_not_rewalk_the_tree(self):
+        """The probe's complete stale plan IS the pack plan: one decision walk."""
+        import os as _os
+
+        assets = self.source / "assets"
+        assets.mkdir()
+        for index in range(6):
+            (assets / f"img{index}.png").write_bytes(b"\x89PNG" + b"z" * 2048)
+        (self.source / "app.py").write_text("ICON = 'assets/img5.png'\n", encoding="utf-8")
+
+        service = self._service()
+        packed = service.pack_project("proj")
+        self.assertTrue(packed.success, packed.error_message)
+        archive = Path(packed.output_path)
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        _os.utime(archive, (newest + 120, newest + 120))
+        # A referenced (protected, priority-1) asset is now newer than the
+        # archive: stale, but only decidable after the walk completes, so the
+        # probe's plan is complete and reusable.
+        stamp = archive.stat().st_mtime + 300
+        _os.utime(assets / "img5.png", (stamp, stamp))
+
+        plan_builds = []
+        import audapack.fidelity as fidelity_mod
+        import audapack.freshness as freshness_mod
+        real_build = fidelity_mod.build_plan_from_config
+
+        def counting_build(*args, **kwargs):
+            plan_builds.append(args)
+            return real_build(*args, **kwargs)
+
+        # The canonical name is kept, so the repack is proven by the manifest's
+        # own creation stamp, not the file mtime (include_timestamp=False).
+        with zipfile.ZipFile(archive) as zf:
+            seed_created = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))["created_at"]
+
+        # Both bindings: PERF-002 (audit/9.md) moved the probe's binding into
+        # the canonical freshness module, pack_single imports it straight from
+        # fidelity -- counting only one would let the second decision walk hide.
+        with patch.object(freshness_mod, "build_plan_from_config", side_effect=counting_build), \
+                patch.object(fidelity_mod, "build_plan_from_config", side_effect=counting_build):
+            result = service.ensure_fresh_archive("proj")
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(
+            len(plan_builds), 1,
+            f"the tree was walked {len(plan_builds)} times to decide and pack: "
+            "a stale verdict must reuse the probe's plan",
+        )
+        with zipfile.ZipFile(result.output_path) as zf:
+            names = zf.namelist()
+            manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
+        self.assertGreater(
+            manifest["created_at"], seed_created,
+            "a stale verdict did not repack",
+        )
+        pruned = {entry["rel"]: entry for entry in manifest["pruned_directories"]}
+        node_modules = pruned.get("node_modules")
+        self.assertIsNotNone(node_modules, "the manifest lost the node_modules prune")
+        self.assertEqual(
+            node_modules["files"], 20,
+            "the census was not completed on the reused plan",
+        )
+        self.assertIn("assets/img5.png", names, "the newer referenced asset was not packed")
+
+
+def _noop():
+    class _C:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+    return _C()
+
 
 class TestCompressionIsChosenPerFileType(unittest.TestCase):
     """PERF-002 (audit/6.md): create_zip forced Deflate on precompressed bytes.
@@ -1459,3 +1832,85 @@ class TestCompressionIsChosenPerFileType(unittest.TestCase):
         self.assertEqual(self._methods(out_zip)["clip.mp4"], zipfile.ZIP_STORED)
         self.assertEqual(stats.files_failed, 0)
 
+
+
+class ReservedControlInNonGitSources(unittest.TestCase):
+    """SRC-100: a reserved control name must behave the same in every mode.
+
+    Git mode refused (or superseded) a tracked ``.audapack/manifest.json``.
+    The walk and plan modes used to include it as ordinary payload, and the
+    writer then emitted its own manifest under the same name: zipfile allowed
+    the duplicate with a UserWarning, and the pack died as FAILED_VERIFY with
+    nothing naming the cause. A non-Git source must fail closed with the SAME
+    named classification instead.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.output_dir = self.tmp / "out"
+        self.output_dir.mkdir()
+        self.source = self.tmp / "proj"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pack(self, payload):
+        (self.source / ".audapack").mkdir(parents=True, exist_ok=True)
+        (self.source / "app.py").write_text("print('x')", encoding="utf-8")
+        (self.source / ".audapack" / "manifest.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        return packing.pack_single(
+            source_path=self.source,
+            output_dir=self.output_dir,
+            archive_stem="proj",
+            excludes=set(),
+            delete_old=False,
+            include_timestamp=False,
+        )
+
+    def test_a_project_owned_reserved_name_refuses_with_a_named_code(self):
+        result = self._pack({"mine": True})
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, packing.PACK_STATUS_FAILED_INVENTORY)
+        # SRC-100: the code no longer claims TRACKED for a source that has no
+        # source control at all. The sentence below already said "Source path"
+        # -- only the classification was still pointing an operator at a
+        # repository that is not involved.
+        self.assertEqual(
+            result.error_code, CODE_RESERVED_ARCHIVE_NAME_CONFLICT, result.error_message
+        )
+        # Not the opaque FAILED_VERIFY this replaced, and the sentence must not
+        # tell a filesystem-mode operator to touch source control.
+        self.assertNotEqual(result.status, packing.PACK_STATUS_FAILED_VERIFY)
+        self.assertNotIn("Tracked source path", result.error_message)
+        self.assertIn("Source path", result.error_message)
+        self.assertEqual(list(self.output_dir.glob("*.zip")), [])
+
+    def test_an_unmarked_reserved_name_also_refuses(self):
+        result = self._pack({"hello": "world"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, CODE_RESERVED_ARCHIVE_NAME_CONFLICT)
+
+    def test_a_generated_control_is_superseded_and_never_duplicated(self):
+        result = self._pack({"schema_version": 1, "kind": "audapack_source_inventory", "files": []})
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as zf:
+            names = zf.namelist()
+        self.assertEqual(
+            [n for n in names if n == ".audapack/manifest.json"].__len__(), 1,
+            f"the archive carried the reserved member more than once: {names}",
+        )
+        self.assertIn("app.py", names)
+
+    def test_no_duplicate_member_ever_reaches_the_archive(self):
+        for payload in ({"mine": True}, {"hello": "world"},
+                        {"schema_version": 1, "kind": "audapack_source_inventory", "files": []}):
+            with self.subTest(payload=payload):
+                result = self._pack(payload)
+                if not result.success:
+                    self.assertEqual(list(self.output_dir.glob("*.zip")), [])
+                    continue
+                with zipfile.ZipFile(result.output_path) as zf:
+                    names = zf.namelist()
+                self.assertEqual(len(names), len(set(names)), f"duplicate members in {names}")

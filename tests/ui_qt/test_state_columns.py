@@ -1,23 +1,31 @@
-"""The compact state row is a grid, not a concatenated string.
+"""The compact state row is a right-anchored token rail, not a fixed grid.
 
-Every field used to be appended to the previous one, so a short RUN token or a
-missing age shifted everything after it. Down a list of projects nothing lined
-up and the same value sat in a different place on every row.
+Compact mode used to reserve five maximum-width cells (234px) on every row:
+absent values kept their cells, short values took their maximum width, and
+the project name was elided while pixels sat unused. Now every visible token
+takes its measured text width plus one small gap, absent values cost zero,
+the rail sits at the REAL action block (never a guessed 190px), and whatever
+the rail does not need flows back to the project name.
 """
 
 from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QModelIndex, QRect
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtGui import QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import QStyleOptionViewItem
 
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import Project
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.models.project_delegate import (
+    COMPACT_RAIL_GAP,
     COMPACT_STATE_CELL_WIDTHS,
+    actions_block_width,
+    compact_fit_tokens,
     compact_state_columns,
+    compact_state_tokens,
+    compute_actions_left,
 )
 
 
@@ -32,51 +40,154 @@ def test_cells_are_contiguous_and_never_overlap():
         cursor += width
 
 
-def test_the_grid_fits_the_compact_state_column_exactly():
-    """The delegate reserves exactly COMPACT_STATE_WIDTH, no separate literal.
+def test_the_token_order_is_the_reading_order():
+    """RUN WAVES AGE ZIP ARC -- preserved from the old grid contract."""
+    tokens = compact_state_tokens("A3", "0/3", "2d7h", "ZIP 16,7MB", "", "16m ✓")
+    assert [key for key, _text in tokens] == ["run", "waves", "age", "zip", "arc"]
 
-    They used to be two numbers that had to agree; widening one cell clipped
-    the last field on every row and nothing said so.
+
+def test_empty_tokens_cost_zero():
+    """Absent values must not reserve invisible cells (Phase G #3)."""
+    tokens = compact_state_tokens("A3", "", "", "ZIP 16,7MB", "", "1h40m ✓")
+    assert [key for key, _text in tokens] == ["run", "zip", "arc"]
+    assert "waves" not in dict(tokens)
+    assert "age" not in dict(tokens)
+
+
+def test_packing_owns_the_zip_token():
+    assert dict(compact_state_tokens("A3", "", "", "ZIP x", " [42%]", ""))["zip"] == " [42%]"
+    assert dict(compact_state_tokens("A3", "", "", "ZIP x", "", ""))["zip"] == "ZIP x"
+
+
+def test_the_rail_is_right_anchored_at_the_real_action_block(qapp):
+    """Phase G #1: the content boundary is the real geometry, not a guess."""
+    from PySide6.QtGui import QFont
+
+    rect = QRect(0, 0, 620, 22)
+    fm = QFontMetrics(QFont("Verdana", 9))
+    launchers = [type("L", (), {"enabled": True, "id": f"l{i}"})() for i in range(3)]
+    actions_left = compute_actions_left(rect, launchers)
+    # SRC-081 TARGET H: measured from the real launchers it is given (three
+    # 18px buttons + gaps + the fixed info/plus/edit block), never a phantom.
+    assert actions_block_width(launchers) == 123
+    tokens = compact_state_tokens("FAIL", "", "", "ZIP 16,7MB", "", "2d7h !")
+    rects, name_right = compact_fit_tokens(fm, tokens, actions_left, 100)
+    assert rects
+    rightmost = max(r.right() for _key, r in rects)
+    # Phase G #2: dead gap is only the declared rail gap. QRect.right() is
+    # left+width-1, so the closed-interval gap measures rail_gap+1.
+    assert COMPACT_RAIL_GAP <= actions_left - rightmost <= COMPACT_RAIL_GAP + 1
+    assert name_right <= actions_left - COMPACT_RAIL_GAP
+
+
+def test_short_values_use_content_width(qapp):
+    """Phase G #4: "FAIL" must not consume a 50px cell."""
+    from PySide6.QtGui import QFont
+
+    fm = QFontMetrics(QFont("Verdana", 9))
+    tokens = compact_state_tokens("FAIL", "", "", "", "", "")
+    rects, _name_right = compact_fit_tokens(fm, tokens, 500, 0)
+    run_rect = dict(rects)["run"]
+    assert run_rect.width() == fm.horizontalAdvance("FAIL")
+
+
+def test_sparse_row_has_no_holes(qapp):
+    """Phase G #10: RUN + ARC only -- no invisible WAVES/AGE/ZIP cells."""
+    from PySide6.QtGui import QFont
+
+    fm = QFontMetrics(QFont("Verdana", 9))
+    tokens = compact_state_tokens("A3", "", "", "", "", "—")
+    rects, _name_right = compact_fit_tokens(fm, tokens, 500, 0)
+    assert [key for key, _r in rects] == ["run", "arc"]
+
+
+def test_the_name_reclaims_the_reclaimed_space(qapp):
+    """Phase G #5: the rail degrades tail-first until the full name fits, so
+    the name box ends right of the old fixed grid start. Relative invariant.
     """
-    from audapack.ui_qt.models.project_delegate import COMPACT_STATE_WIDTH
+    from PySide6.QtGui import QFont
 
-    assert sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS) == COMPACT_STATE_WIDTH
+    rect = QRect(0, 0, 620, 22)
+    fm = QFontMetrics(QFont("Verdana", 9))
+    launchers = [type("L", (), {"enabled": True, "id": f"l{i}"})() for i in range(3)]
+    actions_left = compute_actions_left(rect, launchers)
+    tokens = compact_state_tokens("A3", "1/3", "2d7h", "ZIP 19,5MB", "", "18h53m ·")
+    _rects, name_right = compact_fit_tokens(
+        fm, tokens, actions_left, 100, name_text="_AUDAPACK"
+    )
+    old_fixed_col_x = rect.right() - 190 - 4 - 234  # the old phantom+grid
+    assert name_right > old_fixed_col_x
+    assert name_right - 100 >= fm.horizontalAdvance("_AUDAPACK")
+
+
+def test_long_name_elides_but_name_box_never_crosses_the_rail(qapp):
+    """Phase G #6: the NAME box is bounded; elision happens inside it."""
+    from PySide6.QtGui import QFont
+
+    rect = QRect(0, 0, 620, 22)
+    fm = QFontMetrics(QFont("Verdana", 9))
+    launchers = [type("L", (), {"enabled": True, "id": f"l{i}"})() for i in range(6)]
+    actions_left = compute_actions_left(rect, launchers)
+    tokens = compact_state_tokens("AUDIT", "2/3", "2d7h", "ZIP 16,7MB", "", "16m ✓")
+    _rects, name_right = compact_fit_tokens(fm, tokens, actions_left, 100)
+    assert name_right <= actions_left - 8
+
+
+def test_all_tokens_present_still_paint_without_overlap(qapp):
+    """Phase G #9: a fully populated rail keeps its declared inter-token gaps
+    and never exceeds the action boundary."""
+    from PySide6.QtGui import QFont
+
+    fm = QFontMetrics(QFont("Verdana", 9))
+    tokens = compact_state_tokens("AUDIT", "2/3", "2d7h", "ZIP 16,7MB", "", "16m ✓")
+    rects, _name_right = compact_fit_tokens(fm, tokens, 500, 0)
+    ordered = sorted(rects, key=lambda kr: kr[1].left())
+    for (_ka, a), (_kb, b) in zip(ordered, ordered[1:], strict=False):
+        assert a.right() < b.left()
+    assert ordered[-1][1].right() <= 500 - 8
+
+
+def test_launcher_count_moves_the_boundary_with_the_real_block(qapp):
+    """Phase G #11: few vs max launchers both derive from actual geometry."""
+    from PySide6.QtGui import QFont
+
+    rect = QRect(0, 0, 620, 22)
+    fm = QFontMetrics(QFont("Verdana", 9))
+    few = [type("L", (), {"enabled": True, "id": f"l{i}"})() for i in range(2)]
+    many = [type("L", (), {"enabled": True, "id": f"l{i}"})() for i in range(6)]
+    few_left = compute_actions_left(rect, few)
+    many_left = compute_actions_left(rect, many)
+    assert many_left < few_left  # more buttons push the boundary left
+    tokens = compact_state_tokens("A3", "", "", "", "", "")
+    _rects_few, name_right_few = compact_fit_tokens(fm, tokens, few_left, 0)
+    _rects_many, name_right_many = compact_fit_tokens(fm, tokens, many_left, 0)
+    assert name_right_many < name_right_few
 
 
 def test_the_archive_cell_shows_age_and_verdict_together():
-    """A bare mark cannot tell one stale archive from another."""
+    """A bare mark cannot tell one stale archive from another.
+
+    PERF-002 (audit/9.md): the fourth argument is now the canonical tri-state,
+    not a boolean whose producer and consumer read it in opposite directions.
+    """
     from audapack.ui_qt.models.project_delegate import compact_archive_cell
 
     assert compact_archive_cell(False, "", "none", None) == "—"
-    assert compact_archive_cell(True, "16m", "fresh", False) == "16m ✓"
-    assert compact_archive_cell(True, "2d 7h", "old", False) == "2d7h !"
-    assert compact_archive_cell(True, "1d", "stale", False) == "1d ·"
-    # A source that moved on outranks any freshness verdict: repack first.
-    assert compact_archive_cell(True, "1d", "fresh", True) == "1d ▲"
+    assert compact_archive_cell(True, "16m", "fresh", "FRESH") == "16m ✓"
+    assert compact_archive_cell(True, "2d 7h", "old", "FRESH") == "2d7h !"
+    assert compact_archive_cell(True, "1d", "stale", "FRESH") == "1d ·"
+    # A source that moved on outranks any age verdict: repack first.
+    assert compact_archive_cell(True, "1d", "fresh", "STALE") == "1d ▲"
+    # Freshness that could not be proven is never painted as current.
+    assert compact_archive_cell(True, "1d", "fresh", "UNKNOWN") == "1d ?"
+    assert compact_archive_cell(True, "1d", "fresh", None) == "1d ?"
 
 
-def test_the_archive_cell_survives_packing_owning_the_zip_cell():
-    """Packing borrows ZIP and a COMPLETE badge never gives it back.
-
-    That is why archive age got its own cell instead of sharing ZIP: on a
-    packed project -- which is most of them -- ZIP reads "[OK]" forever.
-    """
-    assert "arc" in dict(COMPACT_STATE_CELL_WIDTHS)
-
-
-def test_no_column_is_reserved_for_the_pack_badge():
-    """It was 32px wide, empty on almost every row, and too narrow to read.
-
-    "PACK 42% 3f 1.2MB" was elided to nothing in it. Packing borrows the ZIP
-    cell instead -- the archive size it shows is about to be replaced anyway --
-    and the width goes to the project name, which was being truncated.
-    """
-    assert "pack" not in dict(COMPACT_STATE_CELL_WIDTHS)
-
-
-def test_cell_offsets_do_not_depend_on_any_field_value():
-    """The whole point: the same field is at the same x on every row."""
-    assert compact_state_columns(0)["zip"][0] - 0 == compact_state_columns(500)["zip"][0] - 500
+def test_the_legacy_cell_offsets_survive_for_full_mode_importers():
+    """Full mode and legacy importers still get contiguous fixed cells."""
+    order = [name for name, _width in COMPACT_STATE_CELL_WIDTHS]
+    cells = compact_state_columns(0)
+    assert list(cells) == order
 
 
 def test_the_full_mode_grid_fits_its_declared_width():
@@ -109,8 +220,6 @@ def test_the_slot_badge_holds_a_two_digit_slot(compact_window):
     The width is derived from the font metrics (NoAntialias/DPI change how wide
     the same point size paints), never a hardcoded pixel count.
     """
-    from PySide6.QtGui import QFontMetrics
-
     from audapack.ui_qt.models.project_delegate import slot_badge_width
 
     fm = QFontMetrics(compact_window.delegate.font_mono)
@@ -167,7 +276,8 @@ def test_cramped_threshold_matches_main_window_hit_testing():
     from audapack.ui_qt import main_window
 
     src = inspect.getsource(main_window.ProjectTreeView.mousePressEvent)
-    assert "FULL_ROW_MIN_WIDTH" in src
+    # SRC-081 TARGET H: hit-testing asks the SAME helper the painter asks.
+    assert "full_row_min_width" in src
 
 
 @pytest.fixture
@@ -188,7 +298,7 @@ def compact_window(tmp_path, qapp):
 
 
 def test_a_compact_row_paints_without_error(compact_window):
-    """Guards the grid rewrite against a crash in the real paint path."""
+    """Guards the token-rail rewrite against a crash in the real paint path."""
     index = compact_window.model.index_for_project_id("p1")
     assert index.isValid()
 
@@ -203,6 +313,21 @@ def test_a_compact_row_paints_without_error(compact_window):
 
     assert compact_window.delegate.sizeHint(QStyleOptionViewItem(), index).height() == 22
     assert isinstance(index, QModelIndex)
+
+
+def test_a_screenshot_class_row_paints_without_error(compact_window):
+    """The supplied 640px-class viewport must paint cleanly (Phase H)."""
+    index = compact_window.model.index_for_project_id("p1")
+    assert index.isValid()
+
+    pixmap = QPixmap(620, 40)
+    painter = QPainter(pixmap)
+    try:
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 620, 22)
+        compact_window.delegate.paint(painter, option, index)
+    finally:
+        painter.end()
 
 
 def test_an_unanswered_bridge_poll_says_so():

@@ -28,6 +28,23 @@ class ProjectService:
     def list_projects(self) -> list[Project]:
         return list(self.registry.projects)
 
+    def refresh_projects(self) -> bool:
+        """CORE-002: synchronize the shared AppConfig with canonical disk in place.
+
+        The structural boundary for external (Bridge) registry changes and
+        explicit Refresh All. Ordinary queries stay memory-only.
+        Returns whether a transactional refresh occurred.
+        Backward-compatible with callers expecting ``bool``: newer
+        ``(refreshed, structure_changed)`` reporting is available via
+        ``registry.refresh()`` / ``refresh_projects_with_delta()``.
+        """
+        refreshed, _changed = self.registry.refresh()
+        return refreshed
+
+    def refresh_projects_with_delta(self) -> tuple[bool, bool]:
+        """Variant that reports ``(refreshed, structure_changed)``."""
+        return self.registry.refresh()
+
     def get_project(self, project_id: str) -> Optional[Project]:
         return self.registry.get_project_by_id(project_id)
 

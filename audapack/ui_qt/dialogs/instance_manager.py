@@ -29,7 +29,7 @@ from audapack.ui_qt.theme.golden_default import GoldenDefault
 class InstanceManagerWidget(QWidget):
     """Embedded tab for project/global agent windows and explicit Win32 actions."""
 
-    COLUMNS = ("State", "Launcher", "Project", "Window title", "PID", "Process")
+    COLUMNS = ("State", "Launcher", "Project", "Window title", "PID", "Process", "Account / Limit")
 
     def __init__(
         self,
@@ -37,11 +37,18 @@ class InstanceManagerWidget(QWidget):
         service: ProjectService,
         project: Optional[Project],
         parent=None,
+        request_refresh=None,
+        limit_snapshots=None,
     ):
         super().__init__(parent)
         self.monitor = monitor
         self.service = service
         self.project = project
+        # T-216 TARGET E: when supplied, a refresh is REQUESTED on the owner's
+        # coalesced background lane instead of scanning native windows on the
+        # Qt GUI thread. The widget then re-renders from the installed snapshot.
+        self._request_refresh = request_refresh
+        self._limit_snapshots = limit_snapshots or (lambda: {})
         self._displayed: list[WindowInstance] = []
         self._select_project_on_refresh = False
 
@@ -192,10 +199,33 @@ QTableWidget::item:selected {{
             chunks.append(f"{launcher.short_label} {count}/{suffix}{state}")
         return "  |  ".join(chunks)
 
+    def render_latest(self) -> None:
+        """Re-render the table from the monitor's installed snapshot only.
+
+        T-216 TARGET E: the owner calls this from the scan callback, so a
+        completed background scan can never re-request itself.
+        """
+        self._render_instances()
+
     def refresh_instances(self, *_args) -> None:
+        """Refresh the table from the monitor's current snapshot.
+
+        T-216 TARGET E/F: when the owner supplied ``request_refresh``, the
+        native scan is enqueued on the coalesced background lane and this call
+        only re-renders the last installed snapshot; the owner re-invokes it
+        from the scan callback. Without an owner (standalone/test use) the
+        synchronous monitor refresh is kept.
+        """
+        if self._request_refresh is not None:
+            self._request_refresh("instances-tab")
+            self._render_instances()
+            return
+        self.monitor.refresh(self.service.list_projects(), self.service.config.launchers)
+        self._render_instances()
+
+    def _render_instances(self) -> None:
         selected = self._selected_instance()
         selected_key = (selected.hwnd, selected.pid) if selected else None
-        self.monitor.refresh(self.service.list_projects(), self.service.config.launchers)
         project_instances = self.monitor.for_project(self.project.id) if self.project is not None else []
         self.scope_tabs.setTabText(0, f"All ({len(self.monitor.instances)})")
         if self.project is not None:
@@ -211,6 +241,14 @@ QTableWidget::item:selected {{
         self.table.setRowCount(len(self._displayed))
         selected_row = -1
         for row, instance in enumerate(self._displayed):
+            resource = self._limit_snapshots().get(instance.launcher_id)
+            if resource:
+                account, snapshot, tooltip = resource
+                availability = snapshot.availability().value if snapshot else "UNKNOWN"
+                resource_text = f"{account.display_name} · {availability}"
+            else:
+                tooltip = "No bound account limit observation"
+                resource_text = "—"
             values = (
                 "RUNNING" if instance.state == "running" else "STARTING",
                 instance.launcher_name,
@@ -218,6 +256,7 @@ QTableWidget::item:selected {{
                 instance.title,
                 str(instance.pid),
                 instance.process_name or "—",
+                resource_text,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -225,6 +264,8 @@ QTableWidget::item:selected {{
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, instance)
+                if column == 6:
+                    item.setToolTip(tooltip)
                 self.table.setItem(row, column, item)
             if self._select_project_on_refresh and instance.project_id == getattr(self.project, "id", ""):
                 if selected_row < 0:

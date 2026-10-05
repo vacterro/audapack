@@ -94,13 +94,21 @@ class TestAgentLaunchers(unittest.TestCase):
             cfg = AppConfig()
             svc = ProjectService(cfg, base_dir=Path(tmp))
 
+            # A real on-disk project root: launch admission validates the cwd
+            # exists, so a nonexistent fixture path would (correctly) block every
+            # launcher and the mock would never fire.
+            proj_dir = Path(tmp) / "testproj"
+            proj_dir.mkdir(parents=True, exist_ok=True)
             proj = Project(
                 id="testproj",
                 display_name="Test Project",
-                source_path=str(Path("V:/code/testproj")),
+                source_path=str(proj_dir),
                 priority_group="MAIN0",
                 slot=1,
             )
+            # Codex launch resolves through the shared launch authority, which
+            # admits only projects present in the live config.
+            cfg.projects.append(proj)
 
             win = MainWindow(svc)
             with patch("subprocess.Popen") as mock_popen:
@@ -119,19 +127,20 @@ class TestAgentLaunchers(unittest.TestCase):
                 win._on_open_with_codex(proj, "main_codex")
                 self.assertTrue(mock_popen.called)
 
-            with patch("audapack.ui_qt.main_window.Path.exists", return_value=True), \
-                 patch("subprocess.Popen") as mock_popen:
+            # Codex accounts are self-contained YOLO consoles: CODEX_HOME per
+            # account, no external launcher script required.
+            with patch("subprocess.Popen") as mock_popen:
                 win._on_open_with_codex(proj, "main_codex2")
                 command = " ".join(mock_popen.call_args.args[0])
-                self.assertIn("Start-Codex-Account2.ps1", command)
-                self.assertIn("-WorkDir", command)
+                self.assertIn("'.codex-account2'", command)
+                self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+                self.assertIn("Remove-Item Env:OPENAI_API_KEY", command)
+                self.assertNotIn("Start-Codex", command)
 
-            with patch("audapack.ui_qt.main_window.Path.exists", return_value=False), \
-                 patch("subprocess.Popen") as mock_popen, \
-                 patch.object(win.statusBar(), "showMessage") as mock_status:
-                win._on_open_with_codex(proj, "main_codex2")
-                mock_popen.assert_not_called()
-                mock_status.assert_called_once()
+            with patch("subprocess.Popen") as mock_popen:
+                win._on_open_with_codex(proj, "main_codex3_free")
+                command = " ".join(mock_popen.call_args.args[0])
+                self.assertIn("'.codex-account3free'", command)
 
             # Generic launcher dispatch must route launcher_id to the right handler
             with patch.object(win, "_launcher_block_reason", return_value=""), \
@@ -172,16 +181,21 @@ class TestAgentLaunchers(unittest.TestCase):
                 win._on_open_with_launcher(proj, "nonexistent")
                 mock_sb.assert_called_once()
 
-            # Test Copy Audit File Path (non-SAIPEN)
+            # Test Copy Audit File Path (non-SAIPEN) and SAIPEN variant.
+            # The OS clipboard is contended by unrelated processes in this
+            # environment (E-1911 diagnosis); assert the exact text handed to
+            # the clipboard instead of reading the global clipboard back.
             audit_dir = Path(tmp) / "audits" / "testproj"
             audit_dir.mkdir(parents=True, exist_ok=True)
             audit_file = audit_dir / "AUDIT_CORE_testproj.md"
             audit_file.write_text("Test audit content", encoding="utf-8")
             cfg.audits.root = str(Path(tmp) / "audits")
 
-            with patch.object(win._audit_service, "get_preferred_audit_file_path", return_value=audit_file):
+            with patch.object(win._audit_service, "get_preferred_audit_file_path", return_value=audit_file), \
+                 patch.object(QApplication.clipboard(), "setText") as mock_set_text:
                 win._on_copy_audit_file_path(proj)
-                self.assertEqual(QApplication.clipboard().text(), str(audit_file.resolve()))
+                self.assertEqual(mock_set_text.call_count, 1)
+                self.assertEqual(mock_set_text.call_args.args[0], str(audit_file.resolve()))
 
                 # Test Copy Audit File Path with SAIPEN detected
                 saipen_proj_dir = Path(tmp) / "saipen_proj"
@@ -195,7 +209,8 @@ class TestAgentLaunchers(unittest.TestCase):
                 )
                 win._on_copy_audit_file_path(saipen_proj)
                 expected_text = f"/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {audit_file.resolve()}"
-                self.assertEqual(QApplication.clipboard().text(), expected_text)
+                self.assertEqual(mock_set_text.call_count, 2)
+                self.assertEqual(mock_set_text.call_args.args[0], expected_text)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

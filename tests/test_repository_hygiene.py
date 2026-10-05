@@ -1,5 +1,6 @@
 """Repository hygiene + secret sentinel tests (Wave K)."""
 
+import json
 import pathlib
 import zipfile
 
@@ -93,9 +94,19 @@ def test_package_has_no_caches_or_bytecode():
 
 def test_package_has_exactly_one_manifest():
     """Generated archive must contain exactly one _AUDAPACK_MANIFEST.json even if
-    the source tree accidentally carries a physical copy."""
+    the source tree accidentally carries a physical copy.
+
+    SRC-100: the planted copy used to be a hand-written ``{}``, and the pack
+    only produced one manifest because a GENERIC ``manifest.json`` exclude
+    happened to swallow it -- an accidental save, not a policy, and one that
+    silently dropped the file. The copy planted here is now real AUDAPACK
+    output (pack once, read it back), so the single member is the SUPERSESSION
+    contract doing the work. The unrecognized-bytes case is pinned separately
+    below, where the correct answer is a refusal rather than a lucky exclude.
+    """
     from audapack.config import DEFAULT_EXCLUDES
     from audapack.packing import MANIFEST_FILENAME, pack_single
+    from audapack.source_inventory import CODE_RESERVED_ARCHIVE_NAME_CONFLICT
 
     out_dir = REPO / ".pytest_tmp"
     out_dir.mkdir(exist_ok=True)
@@ -103,22 +114,42 @@ def test_package_has_exactly_one_manifest():
     try:
         plant = REPO / "cfg_plant"
         plant.mkdir(exist_ok=True)
-        (plant / MANIFEST_FILENAME).write_text("{}", encoding="utf-8")  # physical stale copy
         (plant / "keep.txt").write_text("y", encoding="utf-8")
 
-        res = pack_single(
-            source_path=plant,
-            output_dir=out_dir,
-            archive_stem="ManifestCheck",
-            excludes=set(DEFAULT_EXCLUDES),
-            delete_old=True,
-            manifest_meta={"project_name": "ManifestCheck"},
-        )
+        def _pack(stem):
+            return pack_single(
+                source_path=plant,
+                output_dir=out_dir,
+                archive_stem=stem,
+                excludes=set(DEFAULT_EXCLUDES),
+                delete_old=True,
+                manifest_meta={"project_name": stem},
+            )
+
+        # First pack: no reserved file present, so this yields genuine bytes.
+        seed = _pack("ManifestSeed")
+        assert seed.success, seed.error_message
+        with zipfile.ZipFile(seed.output_path, "r") as zf:
+            generated = zf.read(MANIFEST_FILENAME)
+        (plant / MANIFEST_FILENAME).write_bytes(generated)  # physical stale copy
+
+        res = _pack("ManifestCheck")
         assert res.success, res.error_message
         zip_path = res.output_path
         with zipfile.ZipFile(zip_path, "r") as zf:
-            man = [n for n in zf.namelist() if n.endswith(MANIFEST_FILENAME)]
+            names = zf.namelist()
+            man = [n for n in names if n.endswith(MANIFEST_FILENAME)]
             assert len(man) == 1, f"expected exactly 1 manifest, got {man}"
+            assert len(names) == len(set(names)), f"duplicate members: {names}"
+            assert json.loads(zf.read(MANIFEST_FILENAME))["product"] == "AUDAPACK"
+
+        # Arbitrary bytes on a name AUDAPACK owns are NOT a stale generated
+        # artifact: refuse, and never publish an archive at all.
+        (plant / MANIFEST_FILENAME).write_text("{}", encoding="utf-8")
+        refused = _pack("ManifestRefused")
+        assert not refused.success
+        assert refused.error_code == CODE_RESERVED_ARCHIVE_NAME_CONFLICT
+        assert refused.output_path is None
     finally:
         if zip_path and zip_path.exists():
             zip_path.unlink()

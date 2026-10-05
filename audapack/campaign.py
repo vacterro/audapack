@@ -535,17 +535,43 @@ def get_canonical_manifest_hash() -> str:
     return _MANIFEST_HASH_CACHE
 
 
-def manifest_hash_is_compatible(declared: str, profile: CampaignProfile, wave: Optional[WaveDefinition]) -> bool:
+_COMPATIBILITY_LEDGER: dict[str, set[str]] = {}
+
+
+def register_manifest_compatibility(upstream_hash: str, downstream_hash: str) -> None:
+    """CORE-003: record a proven compatibility edge between two manifest hashes.
+
+    Historical manifest edits that did not touch a wave's contract are encoded
+    here explicitly; "the wave id still exists" is insufficient evidence, so the
+    ledger is empty by default and only an operator/migration can populate it.
+    """
+    _COMPATIBILITY_LEDGER.setdefault(upstream_hash.lower(), set()).add(downstream_hash.lower())
+
+
+def manifest_hash_is_compatible(
+    declared: str,
+    profile: CampaignProfile,
+    wave: Optional[WaveDefinition],
+    allow_missing: bool = False,
+) -> bool:
     """True when an artifact's declared manifest hash may still be trusted.
 
-    An exact match is the fast path. Otherwise the artifact predates a manifest
-    edit that did not touch its own wave: adding a profile must never invalidate
-    campaigns written under the profiles that already existed.
+    CORE-003: an exact match is the fast path. A missing or arbitrary hash is
+    rejected by default. Historical compatibility is permitted only through an
+    explicit, proven compatibility ledger entry; "the wave id still exists" is
+    not accepted as manifest-identity proof. ``allow_missing`` is the deliberate
+    legacy/API-v2 boundary for an artifact that declares no v3 identity at all.
     """
-    expected = get_canonical_manifest_hash()
-    if not declared or declared.lower() == expected.lower():
+    expected = (profile.manifest_hash or get_canonical_manifest_hash()).lower()
+    declared_norm = (declared or "").strip().lower()
+    if not declared_norm:
+        return allow_missing
+    if declared_norm == expected:
         return True
-    return wave is not None and profile.get_wave_by_id(wave.id) is not None
+    return (
+        declared_norm in _COMPATIBILITY_LEDGER.get(expected, set())
+        or expected in _COMPATIBILITY_LEDGER.get(declared_norm, set())
+    )
 
 
 STATUS_CAMPAIGN_NOT_FOUND = "CAMPAIGN_NOT_FOUND"
@@ -935,14 +961,50 @@ def resolve_audit_campaign_entrypoint(
                     wave_def = w
                     break
 
-        if not manifest_hash_is_compatible(h_manifest or "", profile, wave_def):
-            return {
-                "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
-                "ok": False,
-                "message": f"Artifact {f.name} declares manifest hash '{(h_manifest or '')[:12]}', expected '{expected_manifest_hash[:12]}', and its wave is no longer in profile '{profile.profile_id}'",
-                "campaign_root": campaign_root,
-                "entry_artifact": resolved_entry,
-            }
+        # CORE-003: per-artifact v3 identity must match parse_wave/server.
+        # An artifact that declares CAMPAIGN_PROFILE is a v3 artifact and must
+        # validate profile id / version exact and manifest hash (ledger only).
+        h_ver = _extract_header_line(content, "CAMPAIGN_PROFILE_VERSION")
+        h_prof = _extract_header_line(content, "CAMPAIGN_PROFILE")
+        is_v3_artifact = bool(h_prof or h_ver or h_manifest or h_run)
+        if is_v3_artifact:
+            if not h_prof or (h_prof or "").strip().lower() != profile.profile_id.lower():
+                return {
+                    "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
+                    "ok": False,
+                    "message": f"Artifact {f.name} declares wrong CAMPAIGN_PROFILE {h_prof!r}, expected {profile.profile_id!r}",
+                    "campaign_root": campaign_root,
+                    "entry_artifact": resolved_entry,
+                }
+            if not h_ver or (h_ver or "").strip() != profile.profile_version:
+                return {
+                    "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
+                    "ok": False,
+                    "message": f"Artifact {f.name} declares wrong CAMPAIGN_PROFILE_VERSION {h_ver!r}, expected {profile.profile_version!r}",
+                    "campaign_root": campaign_root,
+                    "entry_artifact": resolved_entry,
+                }
+            if not (h_manifest or "").strip():
+                return {
+                    "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
+                    "ok": False,
+                    "message": f"Artifact {f.name} missing CAMPAIGN_MANIFEST_SHA256",
+                    "campaign_root": campaign_root,
+                    "entry_artifact": resolved_entry,
+                }
+            if not manifest_hash_is_compatible(
+                h_manifest or "",
+                profile,
+                wave_def,
+                allow_missing=False,
+            ):
+                return {
+                    "status": STATUS_CAMPAIGN_MANIFEST_MISMATCH,
+                    "ok": False,
+                    "message": f"Artifact {f.name} declares manifest hash '{(h_manifest or '')[:12]}', expected '{expected_manifest_hash[:12]}', and its wave is no longer in profile '{profile.profile_id}'",
+                    "campaign_root": campaign_root,
+                    "entry_artifact": resolved_entry,
+                }
 
         if wave_def:
             done_label = wave_def.done_marker.split(":")[0].strip().replace("_", " ")

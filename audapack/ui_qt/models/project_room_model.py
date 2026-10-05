@@ -12,7 +12,6 @@ Presentation-only in-memory model:
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,9 +27,12 @@ from PySide6.QtCore import (
     Signal,
 )
 
+from audapack import hot_freshness
 from audapack.audits import calculate_temperature, format_age_str, format_created_str
 from audapack.campaign import profile_short_label
 from audapack.config import app_dir
+from audapack.fidelity import policy_fingerprint_from_config
+from audapack.freshness import ArchiveFreshness, probe_archive_freshness
 from audapack.inaudit import get_inaudit_selected, list_inaudit_layers
 from audapack.inaudit_capture import InauditCaptureStore
 from audapack.models import AuditSnapshot, AuditTemperature, Project
@@ -76,7 +78,10 @@ class ProjectRoomModel(QAbstractItemModel):
         "pack_percent": Qt.ItemDataRole.UserRole + 27,  # 0..100 float or None
         "archive_mtime": Qt.ItemDataRole.UserRole + 28,  # float epoch seconds or None
         "source_dir_mtime": Qt.ItemDataRole.UserRole + 29,  # float epoch seconds or None
-        "source_older_than_archive": Qt.ItemDataRole.UserRole + 30,  # True/False/None
+        # PERF-002 (audit/9.md): explicit tri-state, "FRESH" | "STALE" |
+        # "UNKNOWN". The old boolean was named source_older, set False when the
+        # source was NEWER, and read by the delegate as "source changed".
+        "archive_freshness": Qt.ItemDataRole.UserRole + 30,
         "archive_freshness_short": Qt.ItemDataRole.UserRole + 31,  # "fresh" | "stale" | "old" | "none"
         "dispatch_id": Qt.ItemDataRole.UserRole + 32,
         "dispatch_state": Qt.ItemDataRole.UserRole + 33,
@@ -126,6 +131,11 @@ class ProjectRoomModel(QAbstractItemModel):
         # invalidated after a pack and refreshed by the temperature tick.
         self._archive_fresh_cache: dict[str, dict] = {}
         self._archive_fresh_ttl = 10.0
+        # PERF-002: the freshness probe stays bounded off the paint path. When
+        # the budget runs out the verdict is UNKNOWN -- never a fabricated FRESH.
+        # Real Wintage needs ~2.2 s for its 1,081-file tree; 0.15 s reported
+        # UNKNOWN after a successful PACK although the canonical probe was fresh.
+        self._archive_fresh_budget_s = 5.0
         # PERF-001 (audit/4.md): the INAUDIT presentation snapshot. data() used
         # to call list_inaudit_layers() live for inaudit_count, inaudit_label AND
         # hover_info -- and the delegate asks for inaudit_label on EVERY painted
@@ -236,6 +246,24 @@ class ProjectRoomModel(QAbstractItemModel):
                 return self.index_for_slot(g, s)
         return QModelIndex()
 
+    def reconcile_arrangement(self):
+        """Re-read arrangement from the authoritative registry (CORE-004).
+
+        Used by the move lane at stable points: instead of rolling the model
+        back to a pre-gesture snapshot (which can visually erase a newer
+        optimistic intent), every project row is refreshed from the service's
+        current committed registry state.
+
+        The mapping is rebuilt from the registry rather than patched in place.
+        An optimistic move re-keys the dict but leaves the Project object
+        carrying its old group/slot, so a positional diff against that object
+        sees no change and the failed gesture stays on screen forever.
+        """
+        self.targeted_project_update_count += 1
+        self._projects = {(p.priority_group.upper(), p.slot): p
+                          for p in self._service.list_projects()}
+        self.layoutChanged.emit()
+
     def apply_project_move(
         self,
         src_group: str,
@@ -316,21 +344,35 @@ class ProjectRoomModel(QAbstractItemModel):
             self.dataChanged.emit(idx, idx)
 
     def update_pack_state(self, project_id: str, state: str, message: str = ""):
-        """Updates packing progress/completion status for a project row."""
+        """Updates packing progress/completion status for a project row.
+
+        Run-id invariant (T-191): one logical pack run owns ONE generation.
+        Entering QUEUED/PACKING from a non-active state (IDLE/COMPLETE/FAILED)
+        allocates the next run id; the QUEUED -> PACKING transition of the SAME
+        run preserves it, so progress callbacks carrying the id allocated at
+        dispatch time stay live until the run terminates. A terminal state
+        invalidates the run id again, so a lingering worker from the old run
+        becomes a no-op.
+        """
         self.targeted_project_update_count += 1
+        previous_state, _ = self._pack_states.get(project_id, ("", ""))
         self._pack_states[project_id] = (state, message)
         if state not in ("PACKING", "QUEUED"):
             # Pack finished (COMPLETE / FAILED / IDLE): drop any in-flight progress,
             # bump the run id so a stale worker callback becomes a no-op, and force
-            # the archive freshness cache to recompute (a failed pack may have moved
-            # the archive to a .PARTIAL.* name / restored the previous good one).
+            # the archive freshness cache to recompute (a failed pack stages into a
+            # .part.{uuid} file, unlinks the replacement and restores the previous good
+            # archive from .bak.{uuid}, so the cached verdict no longer describes disk).
             self._pack_progress.pop(project_id, None)
             self._pack_run_id[project_id] = self._pack_run_id.get(project_id, 0) + 1
             self._archive_fresh_cache.pop(project_id, None)
         else:
-            # A fresh run is starting: invalidate any previous run id so a
-            # lingering worker for the prior pack cannot update progress here.
-            self._pack_run_id[project_id] = self._pack_run_id.get(project_id, 0) + 1
+            if previous_state not in ("PACKING", "QUEUED"):
+                # A fresh logical run starts: invalidate any previous run id so a
+                # lingering worker for the prior pack cannot update progress here.
+                self._pack_run_id[project_id] = self._pack_run_id.get(project_id, 0) + 1
+            # else: QUEUED -> PACKING (or QUEUED -> QUEUED) of the same logical
+            # run: the generation allocated at dispatch time stays current.
             self._pack_progress.pop(project_id, None)
         idx = self.index_for_project_id(project_id)
         if idx.isValid():
@@ -580,7 +622,16 @@ class ProjectRoomModel(QAbstractItemModel):
         if role == self.ROLES["dispatch_run_id"]:
             return str(getattr(run, "campaign_run_id", "") or dispatch.get("campaign_run_id") or "")
         if role == self.ROLES["dispatch_error"]:
-            return str(getattr(run, "error", "") or dispatch.get("error") or dispatch.get("last_error_code") or "")
+            # A real error outranks a held-lane reason: the lane failing is more
+            # news than the lane waiting. Neither is invented -- both come from
+            # the Bridge, which is the only thing that knows the run's state.
+            return str(
+                getattr(run, "error", "")
+                or dispatch.get("error")
+                or dispatch.get("last_error_code")
+                or dispatch.get("attention")
+                or ""
+            )
         if role == self.ROLES["audit_run_state"]:
             return str(getattr(run, "operator_state", "") or "")
         if role == self.ROLES["audit_run_summary"]:
@@ -660,8 +711,8 @@ class ProjectRoomModel(QAbstractItemModel):
             return self._get_archive_mtime(proj)
         if role == self.ROLES["source_dir_mtime"]:
             return self._get_source_dir_mtime(proj)
-        if role == self.ROLES["source_older_than_archive"]:
-            return self._source_older_than_archive(proj)
+        if role == self.ROLES["archive_freshness"]:
+            return self._archive_freshness(proj)
         if role == self.ROLES["archive_freshness_short"]:
             return self._get_archive_freshness_short(proj)
         if role == self.ROLES["archive_age_str"]:
@@ -692,7 +743,7 @@ class ProjectRoomModel(QAbstractItemModel):
                 "pack_percent": self._pack_progress.get(proj.id) and self.data(index, self.ROLES["pack_percent"]) or None,
                 "archive_sync_status": self.get_archive_sync_status(proj, snap),
                 "archive_freshness_short": self._get_archive_freshness_short(proj),
-                "source_older_than_archive": self._source_older_than_archive(proj),
+                "archive_freshness": self._archive_freshness(proj),
                 "inaudit_layers": view["layers"],
                 "inaudit_selected": view["selected"],
                 "group": group,
@@ -845,8 +896,7 @@ class ProjectRoomModel(QAbstractItemModel):
             "created_str": "",
             "temperature": AuditTemperature.NONE,
             "sync_status": "NO_ARCHIVE",
-            "source_mtime": None,
-            "source_older": None,
+            "archive_freshness": ArchiveFreshness.UNKNOWN.value,
             "freshness_short": "none",
         }
         try:
@@ -883,23 +933,32 @@ class ProjectRoomModel(QAbstractItemModel):
                     snap = self._snapshots.get(proj.id)
                     entry["sync_status"] = self._sync_status_from(proj, snap, arc, arc_mt)
 
-            # Bounded source probe (only when an archive exists to compare against;
-            # skip entirely when nothing is packed so the row never pays for the
-            # walk, and when the caller deferred it off the paint path).
+            # PERF-002 (audit/9.md): the canonical read-only probe, the SAME
+            # decision code PackingService.ensure_fresh_archive runs. Project
+            # Room no longer owns a second raw os.walk: excluded, sampled-out and
+            # otherwise non-archivable material can neither mark the archive
+            # stale nor consume the bounded budget, because the packer's plan
+            # builder prunes it before it is ever stat-ed. A budget-exhausted or
+            # failed traversal is UNKNOWN, never FRESH.
             if arc_mt is not None and probe_source:
-                src_mt, src_complete = self._probe_source_mtime(sp)
-                if src_mt is not None:
-                    entry["source_mtime"] = src_mt
-                    # PERF-001 (audit/4.md): a file OBSERVED newer than the
-                    # archive is sufficient STALE evidence even when the walk was
-                    # cut short -- refusing it made >1,000-file trees pay the
-                    # bounded scan every TTL cycle and NEVER reach a verdict. Only
-                    # the FRESH verdict (everything older) needs a complete pass.
-                    if src_mt > arc_mt + 0.5:
-                        entry["source_older"] = False
-                    elif src_complete:
-                        entry["source_older"] = True
-                    # else: incomplete AND nothing newer seen -> UNKNOWN.
+                proof = hot_freshness.lookup(
+                    proj.source_path,
+                    policy_fingerprint_from_config(
+                        self._service.config.packing,
+                        set(self._service.config.packing.excludes or []),
+                    ),
+                    arc,
+                )
+                if proof is not None:
+                    entry["archive_freshness"] = ArchiveFreshness.FRESH.value
+                else:
+                    verdict = probe_archive_freshness(
+                        proj,
+                        self._service.config.packing,
+                        output_dir=out_dir,
+                        budget_s=self._archive_fresh_budget_s,
+                    )
+                    entry["archive_freshness"] = verdict.state.value
         except Exception:
             pass
         return entry
@@ -916,39 +975,6 @@ class ProjectRoomModel(QAbstractItemModel):
             pass
         return "SYNCED"
 
-    def _probe_source_mtime(self, sp: Path) -> tuple[Optional[float], bool]:
-        """Newest file mtime under ``sp``. File cap + time budget bound the walk.
-
-        Returns ``(mtime, complete)``. When the budget or file cap is exhausted
-        ``complete`` is ``False`` and the mtime is the best-effort newest seen so
-        far -- callers MUST NOT treat it as proof that source is older than the
-        archive (PERF-001).
-        """
-        try:
-            if sp.is_file():
-                return float(sp.stat().st_mtime), True
-            max_entries = 1000
-            budget_s = 0.15
-            deadline = time.monotonic() + budget_s
-            newest = sp.stat().st_mtime
-            count = 0
-            for root, _dirs, files in os.walk(sp):
-                if count >= max_entries or time.monotonic() >= deadline:
-                    return float(newest), False
-                for f in files:
-                    if count >= max_entries or time.monotonic() >= deadline:
-                        return float(newest), False
-                    try:
-                        mt = (Path(root) / f).stat().st_mtime
-                        if mt > newest:
-                            newest = mt
-                    except OSError:
-                        continue
-                    count += 1
-            return float(newest), True
-        except Exception:
-            return None, False
-
     def _get_archive_fresh(self, proj: Project) -> dict:
         """Cached archive freshness entry.
 
@@ -961,7 +987,8 @@ class ProjectRoomModel(QAbstractItemModel):
             return {
                 "computed_at": time.time(), "exists": False, "path": None, "mtime": None,
                 "size_str": "", "created_str": "", "temperature": AuditTemperature.NONE,
-                "sync_status": "NO_ARCHIVE", "source_mtime": None, "source_older": None,
+                "sync_status": "NO_ARCHIVE",
+                "archive_freshness": ArchiveFreshness.UNKNOWN.value,
                 "freshness_short": "none",
             }
         now = time.time()
@@ -974,8 +1001,7 @@ class ProjectRoomModel(QAbstractItemModel):
             # the freshness probe is deferred to update_temperature_all with the
             # other stale entries.
             entry = self._compute_archive_fresh(proj, probe_source=False)
-            entry["source_older"] = None
-            entry["source_mtime"] = None
+            entry["archive_freshness"] = ArchiveFreshness.UNKNOWN.value
             self._archive_fresh_cache[proj.id] = entry
             if not hasattr(self, "_stale_projects"):
                 self._stale_projects = set()
@@ -1008,9 +1034,6 @@ class ProjectRoomModel(QAbstractItemModel):
     def _get_archive_mtime(self, proj: Project) -> Optional[float]:
         return self._get_archive_fresh(proj)["mtime"]
 
-    def _get_source_dir_mtime(self, proj: Project) -> Optional[float]:
-        return self._get_archive_fresh(proj)["source_mtime"]
-
     def _get_archive_age_str(self, proj: Project) -> str:
         """Archive age in the same shape as the audit age -- "16m", "2d 7h".
 
@@ -1023,8 +1046,9 @@ class ProjectRoomModel(QAbstractItemModel):
             return ""
         return format_age_str(max(0.0, time.time() - float(mtime)))
 
-    def _source_older_than_archive(self, proj: Project) -> Optional[bool]:
-        return self._get_archive_fresh(proj)["source_older"]
+    def _archive_freshness(self, proj: Project) -> str:
+        """"FRESH" | "STALE" | "UNKNOWN" for the compact/full archive cells."""
+        return self._get_archive_fresh(proj)["archive_freshness"]
 
     def _get_archive_freshness_short(self, proj: Project) -> str:
         return self._get_archive_fresh(proj)["freshness_short"]
@@ -1081,7 +1105,6 @@ class ProjectRoomModel(QAbstractItemModel):
         }
         data = QByteArray(json.dumps(payload).encode("utf-8"))
         mime.setData(MIME_TYPE_PROJECT, data)
-        mime.setText(proj.display_name)
         return mime
 
     def canDropMimeData(

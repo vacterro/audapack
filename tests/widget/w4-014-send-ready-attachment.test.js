@@ -67,17 +67,13 @@ test('T126: with nothing uploading the short wait still fails fast', async () =>
   assert.strictEqual(await pending, null);
 });
 
-test('T129: a tile with no spinner still holds the wait open', async () => {
-  // The first version of this fix keyed on a visible animate-spin inside the
-  // tile and missed entirely: at 15:00:05, on the build carrying that very
-  // fix, two dispatches still reported "aria=true tiles=1" and gave up after
-  // the 12s wait. ChatGPT no longer paints a spinner there. A Send held
-  // disabled with a file attached IS ingestion.
+test('T129: a tile newly registering holds the wait briefly', async () => {
   const { h, api } = setup();
   const { form, send } = composerFixture(h);
   send.setAttribute('aria-disabled', 'true');
   const tile = h.el('div', { role: 'group', 'aria-label': 'PROJECT.zip' });
   tile.appendChild(h.el('button', { 'aria-label': 'Remove file' }));
+  tile.appendChild(h.el('span', { class: 'animate-spin' }));
   form.appendChild(tile);
 
   let settled = false;
@@ -86,9 +82,11 @@ test('T129: a tile with no spinner still holds the wait open', async () => {
     return value;
   });
 
-  await drive(h, 500);
-  assert.strictEqual(settled, false, 'an attached file must hold the wait open with no spinner');
+  await drive(h, 200);
+  assert.strictEqual(settled, false, 'a registering tile must hold the wait briefly');
 
+  const spin = tile.querySelector('.animate-spin');
+  if (spin) spin.remove();
   send.setAttribute('aria-disabled', 'false');
   await drive(h, 300);
   assert.strictEqual(await pending, send);

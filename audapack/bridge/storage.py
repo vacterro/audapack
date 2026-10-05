@@ -20,6 +20,7 @@ from audapack.campaign import (
     get_default_profile,
     get_profile,
     load_profiles,
+    manifest_hash_is_compatible,
 )
 from audapack.config import AppConfig, open_new_temp_file
 from audapack.models import Project
@@ -94,6 +95,76 @@ def ensure_contained(path: Path, root: Path) -> Path:
     return resolved_path
 
 
+def canonical_audit_bytes(content: str) -> bytes:
+    """The exact physical bytes an audit file must hold for ``content`` (T-185).
+
+    atomic_write() normalizes CRLF to LF before encoding, so a raw incoming
+    sha256 can legitimately differ from the on-disk bytes. Every durability
+    question ("does this file still contain the canonical wave?") and every
+    write must derive its expected representation through THIS one helper;
+    three separate byte derivations would drift apart again.
+    """
+    return content.replace("\r\n", "\n").encode("utf-8")
+
+
+def read_canonical_file(path: Path) -> tuple[Optional[bytes], str]:
+    """Returns (bytes, verdict). verdict is "" when the bytes were read."""
+    try:
+        if not path.exists():
+            return None, "MISSING"
+        if not path.is_file():
+            return None, "WRONG_TYPE"
+        try:
+            return path.read_bytes(), ""
+        except OSError:
+            return None, "UNREADABLE"
+    except OSError:
+        return None, "UNREADABLE"
+
+
+def classify_canonical_file(path: Path, content: str) -> str:
+    """One canonical audit file's physical state vs the expected bytes.
+
+    Returns one of: INTACT, MISSING, WRONG_TYPE, UNREADABLE, CONTENT_MISMATCH.
+    Path.exists() alone is never durability proof: a corrupted file exists just
+    as hard as a correct one.
+    """
+    data, verdict = read_canonical_file(path)
+    if verdict:
+        return verdict
+    return "INTACT" if data == canonical_audit_bytes(content) else "CONTENT_MISMATCH"
+
+
+def classify_canonical_file_by_sha(
+    path: Path,
+    physical_sha256: str = "",
+    logical_sha256: str = "",
+) -> str:
+    """Content-less integrity check (T-185 E).
+
+    A verify_only probe carries no wave body, so integrity is proven against the
+    digest recorded when those bytes were committed: ``physical_sha256`` is the
+    digest of the normalized file bytes and is exact even when the submitted
+    content used CRLF. ``logical_sha256`` is the wave's canonical content digest
+    and covers legacy records written before the physical digest existed (for
+    them the two agree unless the content carried CRLF, in which case this fails
+    closed and the next materialization records the physical digest).
+    """
+    data, verdict = read_canonical_file(path)
+    if verdict:
+        return verdict
+    digest = hashlib.sha256(data or b"").hexdigest()
+    expected = {
+        value.strip().lower()
+        for value in (str(physical_sha256 or ""), str(logical_sha256 or ""))
+        if str(value or "").strip()
+    }
+    if not expected:
+        # Nothing to compare against: an unprovable file is never durable.
+        return "UNREADABLE"
+    return "INTACT" if digest in expected else "CONTENT_MISMATCH"
+
+
 def atomic_write(filepath: Path, content: str):
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -102,8 +173,7 @@ def atomic_write(filepath: Path, content: str):
     fd, tmp_path = open_new_temp_file(filepath.parent, filepath.name)
     try:
         with os.fdopen(fd, "wb") as f:
-            norm_content = content.replace("\r\n", "\n")
-            f.write(norm_content.encode("utf-8"))
+            f.write(canonical_audit_bytes(content))
             f.flush()
             os.fsync(f.fileno())
         tmp_path.replace(filepath)
@@ -244,15 +314,81 @@ def resolve_project_audit_dir(
     return target_dir, fs_name, proj, was_created
 
 
+def resolve_project_audit_dir_readonly(
+    config: AppConfig,
+    raw_project_name: str,
+    project_id: Optional[str] = None,
+    base_dir: Optional[Path] = None,
+) -> Optional[tuple[Path, str, Project]]:
+    """Read-only twin of resolve_project_audit_dir (T-185 D2).
+
+    A verification must never register a project: a legacy run without a bound
+    project_id would otherwise mint a registry entry just because somebody asked
+    "are the canonical files still there?". Lookup only; None when the identity
+    cannot be resolved without registration.
+    """
+    out_root = Path(config.audits.root).resolve()
+    registry = ProjectRegistry(config, base_dir=base_dir)
+    proj = registry.get_project_by_id(project_id) if project_id else None
+    if proj is None and raw_project_name:
+        proj = registry.get_project_by_name(raw_project_name)
+    if proj is None:
+        return None
+    grp = sanitize_project_name(proj.priority_group.upper(), max_length=40)
+    fs_name = sanitize_project_name(proj.display_name)
+    target_dir = out_root / grp / fs_name
+    ensure_contained(target_dir, out_root)
+    return target_dir, fs_name, proj
+
+
+def expected_wave_representation_paths(
+    *,
+    wave_number: str,
+    wave_slug: str,
+    resolved_name: str,
+    target_dir: Path,
+    history_dir: Path,
+    completed_at: str,
+    latest_path: Optional[str] = None,
+    history_path: Optional[str] = None,
+) -> tuple[Path, Path]:
+    """The canonical latest+history paths one committed wave must occupy (T-185 C).
+
+    Single derivation owner for materialize, duplicate acknowledgement and
+    verify_only. Recorded paths win; a legacy record without them gets exactly
+    the deterministic form the original commit minted -- its own completion
+    stamp, never a fresh "now", so no second history artifact can appear.
+    """
+    latest = Path(latest_path) if latest_path else Path(target_dir) / f"{resolved_name}__{wave_number}_{wave_slug}.md"
+    history = (
+        Path(history_path)
+        if history_path
+        else Path(history_dir) / f"{resolved_name}__{wave_number}_{wave_slug}__{completed_at}.md"
+    )
+    return latest, history
+
+
+def expected_history_dir(target_dir: Path, completed_at: str, run_id: str) -> Path:
+    """The deterministic per-run history directory used when state carries none."""
+    run_hash = hashlib.sha256(str(run_id).encode("utf-8")).hexdigest()[:8]
+    return Path(target_dir) / "_history" / f"{completed_at}_{run_hash}"
+
+
 def parse_wave(
     text: str,
     wave_or_id: str,
     profile_or_id: Optional[Union[str, CampaignProfile]] = None,
+    require_identity: bool = False,
 ) -> tuple[bool, Optional[dict[str, Any]], str]:
     """
     Strict canonical validation of an incoming audit wave markdown.
 
     Supports both legacy quick3 waves and any generic CampaignProfile wave.
+
+    CORE-003: ``require_identity`` enforces the v3/canonical artifact identity
+    gate -- non-empty CAMPAIGN_PROFILE, exact CAMPAIGN_PROFILE_VERSION and an
+    exactly-matching (or ledger-proven) CAMPAIGN_MANIFEST_SHA256. It is False
+    for legacy/API-v2 callers so the historical relaxed form keeps parsing.
     """
     raw_lines = [line.strip() for line in text.splitlines()]
     lines = []
@@ -321,6 +457,34 @@ def parse_wave(
         "wave_count": prof.wave_count,
         "ticket_prefix": wave_def.ticket_prefix,
     }
+
+    # CORE-003: v3/canonical artifacts must declare their binding identity.
+    if require_identity:
+        declared_profile = _header_value("CAMPAIGN_PROFILE")
+        declared_version = _header_value("CAMPAIGN_PROFILE_VERSION")
+        declared_manifest = (_header_value("CAMPAIGN_MANIFEST_SHA256") or "").strip()
+        if not declared_profile:
+            return False, None, f"Missing CAMPAIGN_PROFILE in {wave_def.id}"
+        if declared_profile.strip() != prof.profile_id:
+            return False, None, (
+                f"Wrong CAMPAIGN_PROFILE in {wave_def.id}: got {declared_profile!r}, "
+                f"expected {prof.profile_id!r}"
+            )
+        if not declared_version:
+            return False, None, f"Missing CAMPAIGN_PROFILE_VERSION in {wave_def.id}"
+        if declared_version != prof.profile_version:
+            return False, None, (
+                f"Wrong CAMPAIGN_PROFILE_VERSION in {wave_def.id}: got {declared_version!r}, "
+                f"expected {prof.profile_version!r}"
+            )
+        if not declared_manifest:
+            return False, None, f"Missing CAMPAIGN_MANIFEST_SHA256 in {wave_def.id}"
+        if not manifest_hash_is_compatible(declared_manifest, prof, wave_def):
+            expected = prof.manifest_hash or get_canonical_manifest_hash()
+            return False, None, (
+                f"Manifest hash mismatch in {wave_def.id}: got {declared_manifest[:12]}, "
+                f"expected {expected[:12]}"
+            )
 
     # Optional metadata headers
     metadata_keys = (

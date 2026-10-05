@@ -7,10 +7,27 @@ is accounted for exactly once, so ``discovered == included + excluded +
 failed`` always holds and nothing silently disappears.
 
 The engine never implements ``if size > budget: drop arbitrary files``.
-Files carry a semantic priority; budget enforcement only ever trims the
-lowest-priority *ordinary assets*, never mandatory audit material (source,
-tests, configs, manifests, .saipen, docs, schemas, git evidence) and never
-dependency-referenced assets.
+Material is governed by a strict semantic priority hierarchy:
+1. Safety / explicit exclusions (mandatory excludes, secrets, operator always_exclude)
+2. Active control plane (.saipen root state, active intake .saipen/intake/active/**,
+   canonical numeric audit layers audit/<numeric>.md and .saipen/audit/<numeric>.md,
+   direct project-root active checkpoints *_CHECKPOINT.md) and manifest-declared
+   requirements (project MANIFEST.json closure)
+3. Source / tests / configs / schemas / build files
+4. Useful prose (documentation, markdown guides)
+5. Ordinary bulk / media / history (disposable assets, unreferenced media samples)
+
+Profile byte budgets are SOFT TARGETS subordinate to audit correctness:
+proven load-bearing control-plane material and manifest-declared requirements
+are never removed merely to chase an arbitrary byte target. When mandatory
+material alone exceeds the profile budget, budget feasibility is explicitly
+surfaced:
+  budget_bytes:        31457280
+  budget_floor_bytes:  73400320
+  budget_feasible:     false
+  budget_met:          false
+This is preferable to deleting load-bearing control-plane files or current task
+instructions while still missing the target.
 """
 
 from __future__ import annotations
@@ -21,6 +38,7 @@ import heapq
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -84,6 +102,23 @@ MEDIA_SAMPLE_LIMIT = 5
 #: bounded heap, never by sorting the whole omitted collection.
 LARGEST_OMITTED_LIMIT = 10
 
+#: How many of the largest included files the plan reports.
+LARGEST_INCLUDED_LIMIT = 10
+
+#: How many top directory byte contributors the plan reports.
+LARGEST_INCLUDED_DIRECTORIES_LIMIT = 10
+
+#: Bounded prose allowance settings for impossible budgets (Case 2).
+PROSE_DISCRETIONARY_CEILING_RATIO = 0.10
+PROSE_DISCRETIONARY_FLOOR_BYTES = 2 * 1024 * 1024
+
+
+def prose_discretionary_allowance(budget_bytes: int) -> int:
+    """Bounded prose allowance above mandatory floor when budget is impossible."""
+    if budget_bytes <= 0:
+        return 0
+    return max(PROSE_DISCRETIONARY_FLOOR_BYTES, int(budget_bytes * PROSE_DISCRETIONARY_CEILING_RATIO))
+
 
 
 def normalize_fidelity_profile(value: object) -> str:
@@ -118,7 +153,11 @@ def archive_semantics_for(profile: str) -> str:
 
 #: Bumped when the fingerprint's canonical form changes, so archives fingerprinted
 #: by an older rule are not compared against a newer one -- they simply repack.
-POLICY_FINGERPRINT_VERSION = 1
+#: 4 -- T-190 (SRC-046): archive membership moved from walk-derived to the
+#: frozen source inventory (Git: tracked UNION untracked_nonignored, tracked
+#: overrides noise excludes), so archives built by the pre-inventory writer can
+#: silently differ in contents under an identical policy. One clean repack wave.
+POLICY_FINGERPRINT_VERSION = 4
 
 
 def packing_policy_fingerprint(
@@ -244,6 +283,11 @@ FAILURE_WALK = "walk_failure"
 
 FAILURE_CATEGORIES = (FAILURE_STAT, FAILURE_WALK)
 
+#: Pause before re-probing a directory Windows refused with "access denied". A
+#: directory that is being deleted reports that error until its last handle
+#: closes, so one short re-probe tells "still going away" from "unreadable".
+_DELETE_PENDING_REPROBE_S = 0.05
+
 #: Omissions decided by fidelity POLICY rather than by the operator. CORE-004
 #: (audit/6.md): if any of these fire, the archive is an audit representation no
 #: matter which profile asked for it. Configuration, dependency/output and
@@ -301,7 +345,7 @@ P1_EXTENSIONS = {
     # tests
     # (test files share source extensions; test dirs are classified by name)
     # configs / manifests / build
-    "json", "json5", "yaml", "yml", "toml", "ini", "cfg", "conf", "env",
+    "yaml", "yml", "toml", "ini", "cfg", "conf", "env",
     "properties", "xml", "xsd", "lock", "gradle", "bazel", "bzl",
     "cmake", "mk", "make", "ninja", "dockerfile", "service", "desktop",
     "nuspec", "csproj", "sln", "vbproj", "fsproj", "pro", "pri",
@@ -325,9 +369,86 @@ P1_NAME_PREFIXES = (
 P1_NAMES = frozenset({
     "version", "gitignore", "editorconfig", "dockerfile", "makefile",
     "gemfile", "rakefile", "procfile", "requirements.txt", "cargo.toml",
-    "package.json", "pyproject.toml", "cmakelists.txt", "gradlew",
-    "gradlew.bat",
+    "package.json", "manifest.json", "pyproject.toml", "cmakelists.txt",
+    "gradlew", "gradlew.bat",
 })
+
+#: Known config and manifest filenames recognized as priority 1 regardless of directory.
+P1_JSON_EXACT_NAMES = frozenset({
+    "manifest.json",
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "tsconfig.json",
+    "jsconfig.json",
+    "composer.json",
+    "composer.lock",
+    "deno.json",
+    "deno.jsonc",
+    "turbo.json",
+    "nx.json",
+    "lerna.json",
+    "workspace.json",
+    "bower.json",
+    "launch.json",
+    "tasks.json",
+    "settings.json",
+    "extensions.json",
+    "keybindings.json",
+    "components.json",
+    "theme.json",
+    "angular.json",
+    "nest-cli.json",
+    "biome.json",
+    "policy.json",
+    "audit.json",
+    "project.json",
+    "bundleconfig.json",
+    "api-extractor.json",
+    "typedoc.json",
+})
+
+P1_JSON_SUFFIXES = (
+    ".config.json",
+    ".settings.json",
+    ".schema.json",
+    ".spec.json",
+    ".manifest.json",
+    ".policy.json",
+)
+
+P1_JSON_PREFIXES = (
+    "tsconfig.",
+    "jsconfig.",
+    "appsettings.",
+    "launchsettings.",
+    "config.",
+    "settings.",
+)
+
+DISCRETIONARY_JSON_DIRS = frozenset({
+    "corpus", "sessions", "session", "history", "historical",
+    "transcripts", "transcript", "conversations", "conversation",
+    "conversation_history", "telemetry", "dumps", "dump",
+    "exports", "export", "snapshots", "snapshot", "data_dump",
+    "data_dumps", "dataset", "datasets", "bulk", "archives",
+    "archive", "records", "events",
+})
+
+DISCRETIONARY_JSON_DIR_PREFIXES = (
+    "session_", "corpus_", "history_", "dump_", "export_", "telemetry_",
+)
+
+DISCRETIONARY_JSON_DIR_SUFFIXES = (
+    "_sessions", "_corpus", "_history", "_dumps", "_exports", "_telemetry",
+)
+
+DISCRETIONARY_JSON_NAME_PREFIXES = (
+    "session", "history", "transcript", "conversation", "dump",
+    "export", "telemetry", "snapshot", "corpus", "event_log",
+)
+
+JSON_CONFIG_MAX_BYTES = 256 * 1024
 
 #: `.saipen/` is agent protocol memory: its decision documents ARE audit
 #: material, but the content-addressed blob stores, journals and settled
@@ -341,32 +462,79 @@ SAIPEN_P1_DOCS = frozenset({
 SAIPEN_DOC_DIRS = frozenset({"tickets", "work"})
 
 
-def _priority_for(rel_lower: str, name_lower: str) -> int:
+def _is_numeric_md(name_lower: str) -> bool:
+    """True for <numeric>.md (e.g. 1.md, 3.md, 17.md)."""
+    if not name_lower.endswith(".md"):
+        return False
+    stem = name_lower[:-3]
+    return stem.isdigit()
+
+
+def _priority_for(rel_lower: str, name_lower: str, size: int = 0) -> int:
     """Semantic priority: 1 = mandatory audit material, 2 = prose, 3 = asset.
 
     Budget enforcement only ever trims 3 then 2. Nothing trims 1.
     """
     segs = rel_lower.split("/")
     if segs[0] == ".saipen":
-        # Decision documents at the memory root plus the ticket/work trees.
+        # Decision documents at the memory root
         if len(segs) == 2 and name_lower in SAIPEN_P1_DOCS:
             return 1
+        # Canonical active audit layer: .saipen/audit/<numeric>.md
+        if len(segs) == 3 and segs[1] == "audit" and _is_numeric_md(name_lower):
+            return 1
+        # Active intake: .saipen/intake/active/**
+        if len(segs) >= 4 and segs[1] == "intake" and segs[2] == "active":
+            return 1
+        # Ticket / work trees
         if len(segs) > 2 and segs[1] in SAIPEN_DOC_DIRS:
             return 2
         return 3
+
+    # Direct project-root checkpoint documents: *_CHECKPOINT.md
+    if len(segs) == 1 and (name_lower.endswith("_checkpoint.md") or name_lower == "checkpoint.md"):
+        return 1
+
+    # Canonical active audit layer: audit/<numeric>.md
+    if len(segs) == 2 and segs[0] == "audit" and _is_numeric_md(name_lower):
+        return 1
+
     if name_lower.startswith(P1_NAME_PREFIXES) or name_lower in P1_NAMES:
         return 1
-    ext = name_lower.rsplit(".", 1)[1] if "." in name_lower else ""
-    if ext in P1_EXTENSIONS:
-        return 1
-    # Priority directories: git evidence (non-objects), schemas, tests, tools.
+
+    # Priority directories: git evidence (non-objects), schemas, specs, tests, tools, scripts, configs.
     for seg in segs:
-        if seg in (".github", "schemas", "schema", "specs", "spec"):
+        if seg in (
+            ".github", "schemas", "schema", "specs", "spec",
+            "config", "configs", ".config", ".vscode", ".idea", ".devcontainer"
+        ):
             return 1
-        if seg == "tests" or seg.startswith("test_") or seg.startswith("tests_"):
+        if seg == "tests" or seg.startswith("test_") or seg.startswith("tests_") or seg in ("fixtures", "fixture"):
             return 1
         if seg == "scripts" or seg == "tools":
             return 1
+
+    ext = name_lower.rsplit(".", 1)[1] if "." in name_lower else ""
+    if ext in P1_EXTENSIONS:
+        return 1
+
+    # Role-aware JSON classification:
+    if ext in ("json", "json5", "jsonc"):
+        if name_lower in P1_JSON_EXACT_NAMES:
+            return 1
+        if name_lower.endswith(P1_JSON_SUFFIXES) or name_lower.startswith(P1_JSON_PREFIXES):
+            return 1
+        for seg in segs:
+            if seg in DISCRETIONARY_JSON_DIRS:
+                return 3
+            if seg.startswith(DISCRETIONARY_JSON_DIR_PREFIXES) or seg.endswith(DISCRETIONARY_JSON_DIR_SUFFIXES):
+                return 3
+        if name_lower.startswith(DISCRETIONARY_JSON_NAME_PREFIXES):
+            return 3
+        if size > JSON_CONFIG_MAX_BYTES:
+            return 3
+        return 1
+
     if ext in P2_EXTENSIONS:
         return 2
     for seg in segs:
@@ -400,8 +568,8 @@ GENERATED_EXTS = {
 
 def exclusion_reason_for(rel_lower: str, name_lower: str) -> str:
     """Classify a matched configured/mandatory exclusion into a reason category."""
-    if name_lower.endswith((".secret", ".secrets", ".token")) or name_lower in (
-        "token.txt", "secrets"
+    if name_lower.endswith((".secret", ".secrets", ".token", ".ppk")) or name_lower in (
+        "token.txt", "secrets", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"
     ) or name_lower.endswith(".pid"):
         return REASON_SECRET_POLICY
     for pat in DEPENDENCY_PATTERNS:
@@ -430,7 +598,7 @@ _REF_SCAN_MAX_TOTAL = 4 * 1024 * 1024
 #: A reference to a concrete file with a media extension, or to a media-ish
 #: directory, as it appears inside build/runtime config text.
 _REF_FILE_RE = re.compile(
-    r"""["'\\(\s]([A-Za-z0-9_\-.\\/ ]+\.(?:wav|mp3|ogg|flac|aac|m4a|mp4|avi|mov|mkv|webm|png|jpe?g|gif|webp|bmp|ico|tiff?|woff2?|ttf|otf|eot|npy|npz|h5|hdf5|mat))["'\)\s,]""",
+    r"""["'\\(\s]([A-Za-z0-9_\-.\\/ ]+\.(?:bin|wav|mp3|ogg|flac|aac|m4a|mp4|avi|mov|mkv|webm|png|jpe?g|gif|webp|bmp|ico|tiff?|woff2?|ttf|otf|eot|npy|npz|h5|hdf5|mat))["'\)\s,]""",
     re.IGNORECASE,
 )
 _REF_DIR_RE = re.compile(
@@ -440,7 +608,9 @@ _REF_DIR_RE = re.compile(
 
 
 def scan_asset_references(
-    source: Path, prune: Optional[Callable[[Path], bool]] = None
+    source: Path,
+    prune: Optional[Callable[[Path], bool]] = None,
+    known_media_rel_lower: Optional[set[str]] = None,
 ) -> tuple[set[str], set[str]]:
     """Find assets referenced by build/runtime text files.
 
@@ -452,6 +622,14 @@ def scan_asset_references(
     T-147: when ``prune`` is supplied (the plan's configured/mandatory
     matcher) excluded directories and files are never descended into or
     stat'ed, so the reference scan costs the same as the pack itself.
+
+    T-168: when ``known_media_rel_lower`` is supplied (the plan's already
+    completed classification walk IS the existence evidence), a reference
+    whose normalized path names one of those discovered media entries is
+    verified without an exact-case ``is_file()`` probe -- reference matching
+    is case-insensitive by contract, while file identity stays exact-case.
+    Without it the exact candidate containment + existence check remains the
+    only verification path.
     """
     referenced_files: set[str] = set()
     referenced_dirs: set[str] = set()
@@ -490,6 +668,17 @@ def scan_asset_references(
                     raw = m.group(1).replace("\\", "/").strip().lstrip("./").strip("'\" ")
                     if not raw:
                         continue
+                    # T-168: membership in the already-discovered media
+                    # inventory verifies the reference case-insensitively --
+                    # the set only ever contains paths the classification
+                    # walk found inside the source tree, so containment and
+                    # existence both hold without an exact-case stat probe.
+                    if (
+                        known_media_rel_lower is not None
+                        and raw.lower() in known_media_rel_lower
+                    ):
+                        referenced_files.add(raw)
+                        continue
                     candidate = (source / raw).resolve()
                     try:
                         if candidate.is_relative_to(source.resolve()) and candidate.is_file():
@@ -520,6 +709,27 @@ def scan_asset_references(
 # ---------------------------------------------------------------------------
 # Plan
 # ---------------------------------------------------------------------------
+
+
+class PriorityBytes(dict):
+    """Dictionary mapping priority to byte totals supporting int and str keys."""
+
+    def __getitem__(self, key):
+        if key in self:
+            return super().__getitem__(key)
+        try:
+            ikey = int(key)
+            if ikey in self:
+                return super().__getitem__(ikey)
+        except (ValueError, TypeError):
+            pass
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 
 @dataclass
@@ -565,6 +775,13 @@ class FidelityPlan:
     source_bytes: int = 0
     included_bytes: int = 0
     excluded_bytes: int = 0
+    mandatory_bytes: int = 0
+    discretionary_bytes: int = 0
+    budget_floor_bytes: int = 0
+    budget_feasible: bool = True
+    included_bytes_by_priority: dict[int, int] = field(default_factory=PriorityBytes)
+    largest_included: list[dict[str, object]] = field(default_factory=list)
+    largest_included_directories: list[dict[str, object]] = field(default_factory=list)
     #: Discovered entries whose byte size could not be determined. Their bytes
     #: are absent from ``source_bytes`` rather than fabricated as a known zero,
     #: so "unknown" stays distinguishable from "empty".
@@ -587,6 +804,15 @@ class FidelityPlan:
     #: than ``newer_than_mtime``. Excluded/sampled/trimmed files never
     #: count, so a sampled-out media file can never force endless repacks.
     newer_found: bool = False
+    #: T-155 (PERF-004 residue): True when the probe stopped the traversal the
+    #: moment a priority-1 INCLUDED file proved the archive stale. The plan
+    #: then describes only the prefix the probe walked -- a truthful stale
+    #: verdict that must never be packed, because the tree was never finished.
+    stopped_on_stale: bool = False
+    #: T-155: True when the caller's ``cancel_event`` fired mid-traversal. The
+    #: plan is a prefix of the tree and carries no freshness verdict at all;
+    #: the caller must abandon the decision instead of reusing or packing it.
+    cancelled: bool = False
     #: True when the walk could not enumerate the whole tree (an untraversable
     #: directory, or an OSError that ended the walk early). The counters below
     #: then describe only what was reached, so an archive built from this plan
@@ -594,6 +820,14 @@ class FidelityPlan:
     #: without this flag the identity discovered == included + excluded + failed
     #: still holds over the truncated numbers and reads as full accounting.
     walk_incomplete: bool = False
+    #: Entries that disappeared between their parent's listing and their own
+    #: read (a live tool removing its session or lock directories mid-walk).
+    #: They no longer exist, so they are neither discovered nor failed; the
+    #: count only records that the tree changed under the walk.
+    vanished_entries: int = 0
+    #: Source-relative path of the first entry the walk could not read, so an
+    #: incomplete traversal names something the operator can go look at.
+    first_failure_rel: Optional[str] = None
     #: Why this plan's accounting does not reconcile, or None. Set at the end of
     #: ``build_fidelity_plan`` from ``plan_accounting_error``; a non-None value
     #: forbids a full_snapshot claim.
@@ -603,6 +837,10 @@ class FidelityPlan:
     #: exclude change silently reused an archive with materially different
     #: contents. Persisted in the manifest, compared before any mtime reuse.
     policy_fingerprint: str = ""
+    #: T-155: whole-pruned directories whose census is pending, rel -> path.
+    #: The manifest writer finalizes these counts; a probe that stopped early
+    #: never carries them. Internal, not serialized.
+    _pruned_paths: dict[str, Path] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         profile = normalize_fidelity_profile(self.profile)
@@ -615,8 +853,22 @@ class FidelityPlan:
         if self.media_bytes_per_dir is None:
             self.media_bytes_per_dir = profile_media_bytes(profile)
 
-    def decision_for(self, rel_posix_lower: str) -> Optional[FileDecision]:
-        return self.decisions.get(rel_posix_lower)
+    def decision_for(self, rel_posix: str) -> Optional[FileDecision]:
+        """Exact source-relative POSIX path lookup.
+
+        T-150: file identity is case-EXACT -- ``Asset.PNG`` and ``asset.png``
+        are two distinct files with two distinct decisions. Policy and
+        reference matching stay case-insensitive; only this identity map is
+        exact, so no lowercase fallback exists here by design.
+        """
+        return self.decisions.get(rel_posix)
+
+    @property
+    def budget_met(self) -> bool:
+        """True when the included bytes do not exceed the plan's byte budget."""
+        if self.budget_bytes is None or self.budget_bytes == 0:
+            return True
+        return self.included_bytes <= self.budget_bytes
 
 
 def plan_accounting_error(plan: "FidelityPlan") -> Optional[str]:
@@ -758,6 +1010,154 @@ def _census_pruned_tree(top: Path) -> tuple[int, int, int]:
     return files, known, unknown
 
 
+def _scan_live_directory(path: Path, *, may_vanish: bool) -> Optional[list]:
+    """List ``path``, or return None when it vanished after its parent listed it.
+
+    A project whose own tooling runs during the pack (agent session, exec and
+    lock directories) removes directories between the parent's listing and this
+    read. A directory that no longer exists holds no source the walk could miss,
+    so that is not a traversal failure. Windows reports a directory pending
+    deletion as access denied, so one short re-probe separates "still going
+    away" from "unreadable". Every other error, and any error on the source
+    root itself (``may_vanish=False``), still raises.
+    """
+    for attempt in range(2):
+        try:
+            with os.scandir(path) as it:
+                return list(it)
+        except FileNotFoundError:
+            if may_vanish:
+                return None
+            raise
+        except PermissionError:
+            if not may_vanish or attempt:
+                raise
+            time.sleep(_DELETE_PENDING_REPROBE_S)
+    return None  # pragma: no cover - the loop always returns or raises
+
+
+def _take_pruned_census(
+    plan: "FidelityPlan", rel_dir: str, info: dict[str, object], path: Path
+) -> None:
+    """Finalize one prune's census into ``plan`` (T-155: once, on demand).
+
+    The counters must not read as complete while the tree is unfinished, so a
+    probe that stops early leaves its prunes uncensused and the manifest writer
+    calls this for every prune it is about to describe.
+    """
+    if plan._pruned_paths.get(rel_dir) is None:
+        return
+    files, known, unknown = _census_pruned_tree(path)
+    info["files"] = files
+    info["bytes"] = known
+    if unknown:
+        info["unknown_size_entries"] = unknown
+    if files:
+        plan.discovered += files
+        plan.excluded += files
+        plan.source_bytes += known
+        plan.excluded_bytes += known
+        plan.unknown_size_entries += unknown
+        reason = str(info.get("reason", ""))
+        stats = plan.reason_stats.setdefault(reason, {"count": 0, "bytes": 0})
+        stats["count"] += files
+        stats["bytes"] += known
+    plan._pruned_paths.pop(rel_dir, None)
+
+
+def finalize_pruned_census(plan: "FidelityPlan") -> None:
+    """Take every pending prune census so ``plan`` fully describes its tree."""
+    for rel_dir, path in list(plan._pruned_paths.items()):
+        _take_pruned_census(plan, rel_dir, plan.pruned_dirs_rel[rel_dir], path)
+
+
+def _extract_manifest_required(
+    manifest_path: Path,
+    manifest_rel: str,
+    all_known_rels: set[str],
+    lower_to_exact: dict[str, list[str]],
+) -> set[str]:
+    """Conservative required-file closure for project-owned MANIFEST.json files.
+
+    Enforces the conservative manifest contract:
+    - filename must be MANIFEST.json, case-insensitive;
+    - JSON must parse as an object;
+    - recognized 'required' member with relative file paths (string or structured);
+    - reject absolute paths and '..' escapes;
+    - resolve only inside source root;
+    - require path to exist in discovered inventory;
+    - malformed manifests fail closed;
+    - ambiguous case twins protect both.
+    """
+    promoted: set[str] = set()
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return promoted
+    if not isinstance(data, dict):
+        return promoted
+    raw_required = data.get("required")
+    if not isinstance(raw_required, (list, tuple, set, dict, str)):
+        return promoted
+
+    items: list[object] = []
+    if isinstance(raw_required, (list, tuple, set)):
+        items = list(raw_required)
+    elif isinstance(raw_required, dict):
+        items = list(raw_required.keys())
+    elif isinstance(raw_required, str):
+        items = [raw_required]
+
+    manifest_dir = manifest_rel.rpartition("/")[0]
+
+    for item in items:
+        if isinstance(item, str):
+            p_str = item
+        elif isinstance(item, dict):
+            p_str = item.get("path") or item.get("file") or item.get("rel") or item.get("name")
+            if not isinstance(p_str, str):
+                continue
+        else:
+            continue
+
+        p_str = p_str.strip()
+        if not p_str:
+            continue
+        p_norm = p_str.replace("\\", "/")
+        # Reject absolute paths (POSIX leading slash or Windows drive letter)
+        if p_norm.startswith("/") or re.match(r"^[a-zA-Z]:", p_norm):
+            continue
+        # Reject .. escape
+        parts = [seg for seg in p_norm.split("/") if seg]
+        if ".." in parts:
+            continue
+        clean = "/".join(parts)
+        if clean.startswith("./"):
+            clean = clean[2:]
+        if not clean:
+            continue
+
+        cand_dir = f"{manifest_dir}/{clean}" if manifest_dir else clean
+        cand_root = clean if manifest_dir else None
+
+        # Check exact inventory first
+        if cand_dir in all_known_rels:
+            promoted.add(cand_dir)
+            continue
+        if cand_root and cand_root in all_known_rels:
+            promoted.add(cand_root)
+            continue
+
+        # Case-insensitive resolution (for Windows-style or case tolerance)
+        matches = lower_to_exact.get(cand_dir.lower())
+        if not matches and cand_root:
+            matches = lower_to_exact.get(cand_root.lower())
+        if matches:
+            for m in matches:
+                promoted.add(m)
+    return promoted
+
+
 def build_fidelity_plan(
     source: Path,
     excludes: set[str],
@@ -771,6 +1171,7 @@ def build_fidelity_plan(
     mandatory_excludes: Optional[set[str]] = None,
     newer_than_mtime: Optional[float] = None,
     census_pruned: bool = True,
+    cancel_event: object = None,
 ) -> FidelityPlan:
     """Classify every file under ``source`` and decide what the archive holds.
 
@@ -781,6 +1182,10 @@ def build_fidelity_plan(
     never contents) so their omission is represented in the counters instead of
     erased. A freshness probe passes False: it consumes none of that metadata and
     must not touch excluded weight (PERF-004).
+
+    ``cancel_event`` (T-155) is a ``threading.Event``-like object checked
+    throughout the traversal: when it fires, ``plan.cancelled`` is set and the
+    walk returns with only the prefix it managed to see.
     """
     from audapack.packing import MANDATORY_EXCLUDES
 
@@ -821,6 +1226,11 @@ def build_fidelity_plan(
 
     # Media groups: (media_class, parent_rel) -> list of (rel, size, path)
     media_groups: dict[tuple[str, str], list[tuple[str, int, Path]]] = {}
+    # Generic .bin assets are opaque project material, not media. Keep a small
+    # existence index so the existing bounded reference scan can promote a
+    # verified project-local reference without making every .bin mandatory.
+    binary_assets: set[str] = set()
+    manifest_candidates: list[tuple[str, Path]] = []
     # Non-media decisions first (media sampling needs the full group first).
     raw: list[tuple[str, int, FileDecision]] = []
     mtimes: dict[str, float] = {}  # rel -> st_mtime, fused freshness data
@@ -830,7 +1240,7 @@ def build_fidelity_plan(
         stats["count"] += count
         stats["bytes"] += size
 
-    def failure_stat(category: str, count: int = 1) -> None:
+    def failure_stat(category: str, rel: str, count: int = 1) -> None:
         """Count a file nobody chose to omit: the tree, not the policy, refused.
 
         CORE-003 (audit/6.md): ``failed`` had no category vocabulary at all, so
@@ -838,6 +1248,8 @@ def build_fidelity_plan(
         Every increment is paired with ``discovered`` and with an unknown byte
         size -- a size that could not be read is never reported as a known zero.
         """
+        if plan.first_failure_rel is None:
+            plan.first_failure_rel = rel or "."
         plan.discovered += count
         plan.failed += count
         plan.unknown_size_entries += count
@@ -851,22 +1263,12 @@ def build_fidelity_plan(
         disappear from every counter, which is what let three physical files
         report ``discovered=1``.
         """
-        info: dict[str, object] = {"reason": reason, "files": 0, "bytes": 0}
+        info: dict[str, object] = {"reason": reason}
         plan.pruned_dirs_rel[rel_dir] = info
+        plan._pruned_paths[rel_dir] = path
         if not census_pruned:
             return
-        files, known, unknown = _census_pruned_tree(path)
-        info["files"] = files
-        info["bytes"] = known
-        if unknown:
-            info["unknown_size_entries"] = unknown
-        if files:
-            plan.discovered += files
-            plan.excluded += files
-            plan.source_bytes += known
-            plan.excluded_bytes += known
-            plan.unknown_size_entries += unknown
-            reason_stat(reason, known, count=files)
+        _take_pruned_census(plan, rel_dir, info, path)
 
     # PERF-001 (audit/6.md): one scandir traversal, and every entry's metadata
     # comes from the directory read that found it. ``os.walk`` discards the
@@ -875,12 +1277,38 @@ def build_fidelity_plan(
     # construction and a ``relative_to`` per entry -- 2,030 stat calls for a
     # 1,000-file tree that scandir had already described.
     stack: list[tuple[Path, str]] = [(source, "")]
+    # T-155 (PERF-004 residue): the first INCLUDED file newer than the archive
+    # already settles a staleness verdict. Only PRIORITY-1 includes qualify for
+    # the early exit: the soft-budget trim runs after the walk and may reverse
+    # a tier-2/3 include, and a file the finished plan would exclude must never
+    # invalidate the archive. Media decisions are deferred to the sampler, so
+    # they stay on the post-walk verdict. A probe that stops early reports a
+    # truthful prefix: the counters describe only what was walked, the prune
+    # census stays pending, and the caller must treat the plan as a verdict,
+    # never as a pack input.
+    early_verdict = newer_than_mtime is not None
+
+    def _stale_hit(decision: FileDecision) -> bool:
+        if not early_verdict:
+            return False
+        if not decision.include or decision.priority != 1:
+            return False
+        return mtimes.get(decision.rel, 0.0) > newer_than_mtime
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     try:
         while stack:
+            if _cancelled():
+                plan.cancelled = True
+                break
+            if early_verdict and plan.newer_found:
+                plan.stopped_on_stale = True
+                break
             base, rel_prefix = stack.pop()
             try:
-                with os.scandir(base) as it:
-                    entries = list(it)
+                entries = _scan_live_directory(base, may_vanish=bool(rel_prefix))
             except OSError:
                 # A directory that cannot be enumerated means the files below it
                 # were never discovered: freshness cannot be proven, so the plan
@@ -890,17 +1318,28 @@ def build_fidelity_plan(
                 # identity discovered == included + excluded + failed silently
                 # goes false and an incomplete archive reads as fully accounted
                 # for.
-                failure_stat(FAILURE_WALK)
+                failure_stat(FAILURE_WALK, rel_prefix)
                 plan.walk_incomplete = True
                 continue
+            if entries is None:
+                plan.vanished_entries += 1
+                continue
             child_dirs: list[tuple[Path, str]] = []
+            stop_now = False
             for entry in entries:
+                if _cancelled():
+                    plan.cancelled = True
+                    stop_now = True
+                    break
                 name = entry.name
                 rel = f"{rel_prefix}/{name}" if rel_prefix else name
                 try:
                     is_dir = entry.is_dir()
+                except FileNotFoundError:
+                    plan.vanished_entries += 1
+                    continue
                 except OSError:
-                    failure_stat(FAILURE_STAT)
+                    failure_stat(FAILURE_STAT, rel)
                     continue
                 if is_dir:
                     rel_dir = rel.lower()
@@ -926,7 +1365,7 @@ def build_fidelity_plan(
                     except OSError:
                         # An unreadable directory entry is one failed entry, not
                         # a reason to abandon the rest of the tree.
-                        failure_stat(FAILURE_WALK)
+                        failure_stat(FAILURE_WALK, rel)
                         plan.walk_incomplete = True
                         continue
                     child_dirs.append((Path(entry.path), rel))
@@ -952,8 +1391,12 @@ def build_fidelity_plan(
                     # here.
                     st = entry.stat(follow_symlinks=False)
                     size = st.st_size
+                except FileNotFoundError:
+                    # Deleted after the listing: no longer source material.
+                    plan.vanished_entries += 1
+                    continue
                 except OSError:
-                    failure_stat(FAILURE_STAT)
+                    failure_stat(FAILURE_STAT, rel)
                     continue
                 plan.discovered += 1
                 plan.source_bytes += size
@@ -973,9 +1416,19 @@ def build_fidelity_plan(
                 if always_excl(rel_lower):
                     plan.excluded += 1
                     plan.excluded_bytes += size
-                    plan.extra_excluded_rel.add(rel)
+                    plan.extra_excluded_rel.add(rel_lower)
                     reason_stat(REASON_CONFIGURED_IGNORE, size)
                     raw.append((rel, size, FileDecision(rel, size, False, REASON_CONFIGURED_IGNORE)))
+                    continue
+                # 2b. user always_include wins over configured excludes (but
+                # never over safety policy above): an explicitly named file is
+                # mandatory audit material even when its extension sits in the
+                # default exclude list (e.g. small mandatory *.bin patch assets).
+                if always_incl(rel_lower):
+                    priority = 1
+                    plan.included += 1
+                    plan.included_bytes += size
+                    raw.append((rel, size, FileDecision(rel, size, True, None, priority)))
                     continue
                 # 3. configured excludes (deps / generated / plain).
                 if configured(rel_lower):
@@ -986,6 +1439,9 @@ def build_fidelity_plan(
                     raw.append((rel, size, FileDecision(rel, size, False, reason)))
                     continue
 
+                if name_lower == "manifest.json":
+                    manifest_candidates.append((rel, Path(entry.path)))
+
                 mclass = media_class_for(name)
                 if mclass is not None:
                     # PERF-003: rel + size is everything the sampler decides on.
@@ -994,18 +1450,29 @@ def build_fidelity_plan(
                         (rel, size)
                     )
                     continue
+                if name_lower.endswith(".bin"):
+                    binary_assets.add(rel)
 
-                priority = _priority_for(rel_lower, name_lower)
+                priority = _priority_for(rel_lower, name_lower, size)
                 # 4. user always_include wins over the profile: an explicitly
                 # named file is mandatory material, so no budget trims it.
                 if always_incl(rel_lower):
                     priority = 1
                 plan.included += 1
                 plan.included_bytes += size
-                raw.append((rel, size, FileDecision(rel, size, True, None, priority)))
+                decision = FileDecision(rel, size, True, None, priority)
+                raw.append((rel, size, decision))
+                if _stale_hit(decision):
+                    plan.newer_found = True
             # Depth-first in directory order, so an identical tree plans in an
             # identical sequence.
             stack.extend(reversed(child_dirs))
+            if stop_now or (early_verdict and plan.newer_found):
+                # T-155: a cancel or a settled staleness verdict ends the probe;
+                # the child directories were queued but never walked.
+                if plan.newer_found and early_verdict:
+                    plan.stopped_on_stale = True
+                break
     except OSError:
         # Last-resort guard: the per-entry handlers above own the expected
         # failures, so reaching here means the walk itself died and the tree is
@@ -1029,9 +1496,57 @@ def build_fidelity_plan(
     #
     # PERF-001: the reference scan happens HERE, once, and only when the walk
     # actually found media to rank. Nothing above this point consumes it.
-    if media_groups:
+    # T-155: a probe that settled its verdict (or was cancelled) mid-tree
+    # consumes none of this: sampling, the reference scan and the budget trim
+    # would rank media the finished walk never saw. The verdict rests on the
+    # walked prefix alone; the plan is a verdict, never a pack input.
+    if plan.cancelled or plan.stopped_on_stale:
+        # A prefix of the tree: the counters describe only what was reached,
+        # so the plan must never read as a fully enumerated one.
+        plan.walk_incomplete = True
+    prefix_verdict = plan.stopped_on_stale or plan.cancelled
+    # Manifest required file resolution: conservative closure over discovered inventory
+    manifest_required_files: set[str] = set()
+    if manifest_candidates and not prefix_verdict:
+        exact_inventory = {d[0]: d[2] for d in raw}
+        all_known_rels = set(exact_inventory.keys())
+        for members in media_groups.values():
+            for rel_m, _size_m in members:
+                all_known_rels.add(rel_m)
+        lower_to_exact: dict[str, list[str]] = {}
+        for r in all_known_rels:
+            lower_to_exact.setdefault(r.lower(), []).append(r)
+
+        for m_rel, m_path in manifest_candidates:
+            reqs = _extract_manifest_required(
+                m_path,
+                m_rel,
+                all_known_rels,
+                lower_to_exact,
+            )
+            manifest_required_files.update(reqs)
+
+        for req_rel in manifest_required_files:
+            dec = exact_inventory.get(req_rel)
+            if dec is not None and dec.include:
+                dec.priority = 1
+
+    if (media_groups or binary_assets) and not prefix_verdict:
+        # T-168/M1: the classification walk already discovered every physical
+        # media or generic binary asset; their relative paths are existence
+        # evidence for the one bounded reference scan. No second source walk is
+        # introduced for .bin, and only a verified project-local reference is
+        # promoted below.
+        known_media_rel_lower = {
+            rel.lower()
+            for members in media_groups.values()
+            for rel, _size in members
+        }
+        known_media_rel_lower.update(rel.lower() for rel in binary_assets)
         referenced_files, referenced_dirs = scan_asset_references(
-            source, prune=lambda p: always_excl(p) or configured(p) or mandatory(p)
+            source,
+            prune=lambda p: always_excl(p) or configured(p) or mandatory(p),
+            known_media_rel_lower=known_media_rel_lower,
         )
         plan.referenced_files = referenced_files
     referenced_files_lower = {rel.lower() for rel in referenced_files}
@@ -1066,13 +1581,22 @@ def build_fidelity_plan(
                 0 if m[1] <= MEDIA_SMALL_BYTES else 1,
                 -m[1],
                 m[0].lower(),
+                # T-150: case-distinct paths share a lowercase sort key, so the
+                # exact path is the final tie-break -- order must not lean on
+                # traversal order.
+                m[0],
             ),
         )
         samples_left = plan.media_samples
         cap_bytes = plan.media_bytes_per_dir
         budget_left = cap_bytes if cap_bytes > 0 else None
         for rel, size in members:
-            protected = keep_all or always_incl(rel.lower()) or _ref_rank(rel) == 0
+            protected = (
+                keep_all
+                or always_incl(rel.lower())
+                or _ref_rank(rel) == 0
+                or rel in manifest_required_files
+            )
             if protected:
                 keep = True
             else:
@@ -1091,19 +1615,59 @@ def build_fidelity_plan(
                 plan.extra_excluded_rel.add(rel)
                 reason_stat(REASON_MEDIA_BUDGET, size)
                 raw.append((rel, size, FileDecision(rel, size, False, REASON_MEDIA_BUDGET)))
+    # A verified reference to a generic opaque asset is priority-1 audit
+    # material. This reuses the existing soft-budget ladder: referenced .bin
+    # survives, while an unrelated bulky .bin remains priority 3 and can still
+    # be trimmed normally. The reference scanner has already enforced source
+    # containment and physical existence (or membership in the discovered
+    # inventory), so this is not a filename-based mandatory rule.
+    for _rel, _size, _decision in raw:
+        if _decision.include and _rel.lower() in referenced_files_lower:
+            _decision.priority = 1
+        elif _decision.include and _rel in manifest_required_files:
+            _decision.priority = 1
+
+    # Calculate budget feasibility and budget floor before discretionary trimming
+    mandatory_bytes = sum(d[1] for d in raw if d[2].include and d[2].priority == 1)
+    discretionary_bytes = sum(d[1] for d in raw if d[2].include and d[2].priority > 1)
+    plan.mandatory_bytes = mandatory_bytes
+    plan.discretionary_bytes = discretionary_bytes
+    plan.budget_floor_bytes = mandatory_bytes
+    plan.budget_feasible = plan.budget_bytes == 0 or mandatory_bytes <= plan.budget_bytes
+
     # ---- soft budget trim: ordinary assets first, prose second, never P1 ---
     # Two ordered passes, largest-first inside each. Priority 1 (code, tests,
-    # configs, manifests, schemas, explicit always_include) is never offered to
-    # the trim at all, so a budget can be missed but source is never sacrificed.
-    if plan.budget_bytes > 0 and plan.included_bytes > plan.budget_bytes:
-        for tier in (3, 2):
-            if plan.included_bytes <= plan.budget_bytes:
-                break
-            trimmable = [d for d in raw if d[2].include and d[2].priority == tier]
-            trimmable.sort(key=lambda d: d[1], reverse=True)
-            for rel, size, decision in trimmable:
+    # configs, manifests, schemas, active control plane, explicit always_include)
+    # is never offered to the trim at all, so a budget can be missed but source
+    # and control plane are never sacrificed.
+    # T-155: skipped for a prefix verdict -- the trim could reverse an include
+    # that already justified the verdict, and a stale probe packs nothing.
+    if not prefix_verdict and plan.budget_bytes > 0 and plan.included_bytes > plan.budget_bytes:
+        if plan.budget_feasible:
+            # CASE 1: mandatory_bytes < budget_bytes
+            # Trim normal discretionary material using tier order (3 then 2) until target met
+            for tier in (3, 2):
                 if plan.included_bytes <= plan.budget_bytes:
                     break
+                trimmable = [d for d in raw if d[2].include and d[2].priority == tier]
+                trimmable.sort(key=lambda d: (-d[1], d[0].lower(), d[0]))
+                for rel, size, decision in trimmable:
+                    if plan.included_bytes <= plan.budget_bytes:
+                        break
+                    decision.include = False
+                    decision.reason = REASON_SIZE_LIMIT
+                    plan.included -= 1
+                    plan.included_bytes -= size
+                    plan.excluded += 1
+                    plan.excluded_bytes += size
+                    plan.extra_excluded_rel.add(rel)
+                    reason_stat(REASON_SIZE_LIMIT, size)
+        else:
+            # CASE 2: mandatory_bytes >= budget_bytes (target impossible before optional material)
+            # 1. Trim all disposable priority 3 bulk largest-first
+            trimmable_p3 = [d for d in raw if d[2].include and d[2].priority == 3]
+            trimmable_p3.sort(key=lambda d: (-d[1], d[0].lower(), d[0]))
+            for rel, size, decision in trimmable_p3:
                 decision.include = False
                 decision.reason = REASON_SIZE_LIMIT
                 plan.included -= 1
@@ -1113,8 +1677,33 @@ def build_fidelity_plan(
                 plan.extra_excluded_rel.add(rel)
                 reason_stat(REASON_SIZE_LIMIT, size)
 
+            # 2. Bounded policy for ordinary priority 2 prose:
+            # Stop pretending the budget can be met once only protected/non-disposable material remains.
+            # Allow a bounded discretionary prose allowance; trim excess P2 largest-first.
+            p2_included = [d for d in raw if d[2].include and d[2].priority == 2]
+            p2_total_bytes = sum(d[1] for d in p2_included)
+            p2_allowance = prose_discretionary_allowance(plan.budget_bytes)
+            if p2_total_bytes > p2_allowance:
+                p2_included.sort(key=lambda d: (-d[1], d[0].lower(), d[0]))
+                for rel, size, decision in p2_included:
+                    if p2_total_bytes <= p2_allowance:
+                        break
+                    decision.include = False
+                    decision.reason = REASON_SIZE_LIMIT
+                    plan.included -= 1
+                    plan.included_bytes -= size
+                    plan.excluded += 1
+                    plan.excluded_bytes += size
+                    plan.extra_excluded_rel.add(rel)
+                    reason_stat(REASON_SIZE_LIMIT, size)
+                    p2_total_bytes -= size
+
     # ---- finish -----------------------------------------------------------
-    plan.decisions = {d[0].lower(): d[2] for d in raw}
+    # T-150: decision keys are the EXACT source-relative POSIX path. A
+    # case-sensitive filesystem can hold ``Asset.PNG`` and ``asset.png`` in one
+    # directory; a lowercased key collapsed them into one decision and the
+    # later traversal entry silently won while the counters stayed consistent.
+    plan.decisions = {d[0]: d[2] for d in raw}
     # PERF-003: exact aggregates, bounded evidence -- computed HERE, after the
     # soft-budget trim, because the trim reverses media decisions the sampler
     # already made. Aggregating during sampling reported files as included that
@@ -1122,36 +1711,39 @@ def build_fidelity_plan(
     # included=1/excluded=1 for a group the decisions recorded as 0/2).
     # Keyed by GROUP, because a directory holding two media classes used to
     # write both groups to the same key and keep only the last one's numbers.
-    for (mclass, parent_rel), members in sorted(media_groups.items()):
-        included = included_bytes = excluded = excluded_bytes = 0
-        included_sample: list[dict[str, object]] = []
-        omitted_sample: list[dict[str, object]] = []
-        # ``members`` is still in the sampler's deterministic order, so the
-        # bounded samples are the first N of a reproducible sequence.
-        for rel, size in members:
-            if plan.decisions[rel.lower()].include:
-                included += 1
-                included_bytes += size
-                if len(included_sample) < MEDIA_SAMPLE_LIMIT:
-                    included_sample.append({"rel": rel, "size": size})
-            else:
-                excluded += 1
-                excluded_bytes += size
-                if len(omitted_sample) < MEDIA_SAMPLE_LIMIT:
-                    omitted_sample.append({"rel": rel, "size": size})
-        plan.media_inventory[f"{parent_rel or '.'}#{mclass}"] = {
-            "class": mclass,
-            "directory": parent_rel,
-            "total": len(members),
-            "total_bytes": included_bytes + excluded_bytes,
-            "included": included,
-            "included_bytes": included_bytes,
-            "excluded": excluded,
-            "excluded_bytes": excluded_bytes,
-            "sample_limit": MEDIA_SAMPLE_LIMIT,
-            "included_sample": included_sample,
-            "omitted_sample": omitted_sample,
-        }
+    # T-155: skipped for a prefix verdict -- its media groups were never
+    # sampled, so they have no decisions to aggregate.
+    if not prefix_verdict:
+        for (mclass, parent_rel), members in sorted(media_groups.items()):
+            included = included_bytes = excluded = excluded_bytes = 0
+            included_sample: list[dict[str, object]] = []
+            omitted_sample: list[dict[str, object]] = []
+            # ``members`` is still in the sampler's deterministic order, so the
+            # bounded samples are the first N of a reproducible sequence.
+            for rel, size in members:
+                if plan.decisions[rel].include:
+                    included += 1
+                    included_bytes += size
+                    if len(included_sample) < MEDIA_SAMPLE_LIMIT:
+                        included_sample.append({"rel": rel, "size": size})
+                else:
+                    excluded += 1
+                    excluded_bytes += size
+                    if len(omitted_sample) < MEDIA_SAMPLE_LIMIT:
+                        omitted_sample.append({"rel": rel, "size": size})
+            plan.media_inventory[f"{parent_rel or '.'}#{mclass}"] = {
+                "class": mclass,
+                "directory": parent_rel,
+                "total": len(members),
+                "total_bytes": included_bytes + excluded_bytes,
+                "included": included,
+                "included_bytes": included_bytes,
+                "excluded": excluded,
+                "excluded_bytes": excluded_bytes,
+                "sample_limit": MEDIA_SAMPLE_LIMIT,
+                "included_sample": included_sample,
+                "omitted_sample": omitted_sample,
+            }
     # CORE-003 (audit/6.md): the accounting is checked HERE, at the traversal
     # boundary, before anything can serialize it. A mismatch is recorded rather
     # than raised -- losing a finished archive over a metadata defect would be a
@@ -1159,10 +1751,12 @@ def build_fidelity_plan(
     # plan that cannot account for itself.
     plan.accounting_error = plan_accounting_error(plan)
     plan.archive_semantics = semantics_for_plan(plan)
-    if newer_than_mtime is not None:
+    if newer_than_mtime is not None and not plan.newer_found:
         # Freshness fusion: only INCLUDED files count. Excluded, sampled-out
         # and budget-trimmed files must never invalidate an archive they were
         # not part of. One stat per file already happened in the walk above.
+        # T-155: a verdict the early exit already settled stands -- the prefix
+        # that remains is unsorted raw and must not be able to flip it.
         for _rel, _size, decision in raw:
             if decision.include and mtimes.get(_rel, 0) > newer_than_mtime:
                 plan.newer_found = True
@@ -1171,12 +1765,40 @@ def build_fidelity_plan(
     # ``(-size, lowercased path)`` the sort used, and ``nsmallest`` is documented
     # to equal ``sorted(iterable, key=key)[:n]`` -- so the reported top-N is
     # byte-identical while the O(n log n) sort of every omitted file and the
-    # O(n) temporary list it materialized are gone.
+    # O(n) temporary list it materialized are gone. T-150: the exact path is
+    # the final tie-break so case-distinct omissions order deterministically.
     plan.largest_omitted = heapq.nsmallest(
         LARGEST_OMITTED_LIMIT,
         ((d[0], d[1]) for d in raw if not d[2].include and d[1] > 0),
-        key=lambda item: (-item[1], item[0].lower()),
+        key=lambda item: (-item[1], item[0].lower(), item[0]),
     )
+    by_priority = PriorityBytes()
+    dir_bytes: dict[str, int] = {}
+    for rel, size, decision in raw:
+        if decision.include:
+            by_priority[decision.priority] = by_priority.get(decision.priority, 0) + size
+            parent_dir = rel.rpartition("/")[0] or "."
+            dir_bytes[parent_dir] = dir_bytes.get(parent_dir, 0) + size
+
+    plan.included_bytes_by_priority = by_priority
+
+    plan.largest_included = [
+        {"rel": d[0], "size": d[1], "priority": d[2].priority}
+        for d in heapq.nsmallest(
+            LARGEST_INCLUDED_LIMIT,
+            (d for d in raw if d[2].include and d[1] >= 0),
+            key=lambda item: (-item[1], item[0].lower(), item[0]),
+        )
+    ]
+
+    plan.largest_included_directories = [
+        {"rel": dir_rel, "bytes": total_b}
+        for dir_rel, total_b in heapq.nsmallest(
+            LARGEST_INCLUDED_DIRECTORIES_LIMIT,
+            dir_bytes.items(),
+            key=lambda item: (-item[1], item[0].lower(), item[0]),
+        )
+    ]
     return plan
 
 
@@ -1211,6 +1833,7 @@ def build_plan_from_config(
     *,
     newer_than_mtime: Optional[float] = None,
     census_pruned: bool = True,
+    cancel_event=None,
 ) -> FidelityPlan:
     """Build a plan from a ``PackingConfig`` (or object with same attrs)."""
     return build_fidelity_plan(
@@ -1224,6 +1847,7 @@ def build_plan_from_config(
         always_exclude=list(getattr(packing, "always_exclude", None) or []),
         newer_than_mtime=newer_than_mtime,
         census_pruned=census_pruned,
+        cancel_event=cancel_event,
     )
 
 

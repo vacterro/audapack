@@ -29,6 +29,11 @@ INSTANCE_NONCE = uuid.uuid4().hex
 #: write_pid(B) landing between remove_pid(A)'s read and unlink erases B.
 _PID_LOCK_NAME = "bridge_pid.lock"
 
+#: API versions this Bridge build can talk. One canonical set shared by the
+#: server advertisement and the client health probe (W2-004 / SRC-041:R008).
+SUPPORTED_API_VERSIONS = (2, 3)
+CLIENT_SUPPORTED_API_VERSIONS = frozenset(SUPPORTED_API_VERSIONS)
+
 
 def _pid_lock_path(base_dir: Optional[Path] = None) -> Path:
     return get_pid_file(base_dir).with_name(_PID_LOCK_NAME)
@@ -122,11 +127,31 @@ def remove_pid(base_dir: Optional[Path] = None, expected_pid: Optional[int] = No
             pass
 
 
+def _normalized_supported_api_versions(value: Any) -> set[int]:
+    """Valid integer members of an advertised supported-version collection.
+
+    W2-004 (SRC-041:R008): `bool(supported_api_versions)` accepted ANY truthy
+    form as compatible -- the string "3", the dict {"3": True}, the bare int 99.
+    Normalize to a set of real ints (bool excluded) and drop invalid members;
+    the caller still requires a non-empty intersection.
+    """
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return set()
+    versions: set[int] = set()
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            versions.add(item)
+    return versions
+
+
 def check_bridge_health(host: str = "127.0.0.1", port: int = 17843, timeout: float = 1.2) -> tuple[bool, dict[str, Any]]:
     """
     Queries /health on loopback.
     Returns (is_healthy, payload_or_error).
-    Ensures service == 'AUDAPACK Bridge' and api_version in (2, 3).
+    Healthy only when service == 'AUDAPACK Bridge' AND the primary api_version
+    or an advertised supported_api_versions member is in the client set.
     """
     url = f"http://{host}:{port}/health"
     try:
@@ -136,13 +161,24 @@ def check_bridge_health(host: str = "127.0.0.1", port: int = 17843, timeout: flo
                 raw = resp.read().decode("utf-8")
                 data = json.loads(raw)
                 svc = data.get("service")
-                api_ver = data.get("api_version")
-                if svc == "AUDAPACK Bridge" and (api_ver in (2, 3) or bool(data.get("supported_api_versions"))):
-                    return True, data
-                elif svc == "ACBBridge":
+                if svc == "ACBBridge":
                     return False, {"status": "legacy_acbbridge", "raw": data}
-                else:
+                if svc != "AUDAPACK Bridge":
                     return False, {"status": "wrong_service", "raw": data}
+                api_ver = data.get("api_version")
+                primary_ok = (
+                    not isinstance(api_ver, bool)
+                    and isinstance(api_ver, int)
+                    and api_ver in CLIENT_SUPPORTED_API_VERSIONS
+                )
+                advertised = _normalized_supported_api_versions(
+                    data.get("supported_api_versions")
+                )
+                if primary_ok or (advertised & CLIENT_SUPPORTED_API_VERSIONS):
+                    return True, data
+                # A real Bridge with no shared protocol version is a version
+                # skew, not the wrong service.
+                return False, {"status": "incompatible_api_version", "raw": data}
             return False, {"status": f"http_{resp.status}"}
     except Exception as exc:
         return False, {"status": "offline", "error": str(exc)}

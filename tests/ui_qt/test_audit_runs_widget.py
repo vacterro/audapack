@@ -284,3 +284,75 @@ def test_a_refresh_keeps_the_queue_selection(qapp):
     # It follows the project, not the row: that is the point of moving it.
     widget.set_runs([waiting(9, 0), waiting(7, 1), waiting(8, 2)])
     assert widget.queue.currentRow() == 0
+
+
+# ------------------------------------------------------------------- STOP
+#
+# The one stop control reads what the selected run actually is: CANCEL before
+# START, STOP on live post-START work, FORCE UNBLOCK on a post-START BLOCK.
+# A control whose label lies about the irreversible thing it does is worse than
+# no control at all.
+
+
+def stopped(index=1):
+    import dataclasses
+
+    return dataclasses.replace(
+        run(index, "AUDITING"), actions=("STOP", "DETAILS")
+    )
+
+
+def test_a_live_run_shows_an_enabled_stop(qapp):
+    widget = AuditRunsWidget()
+    widget.set_runs([stopped(1)])
+    widget.lanes.selectRow(0)
+    assert widget.abandon_button.isEnabled()
+    assert widget.abandon_button.text() == "STOP"
+    assert not widget.cancel_button.isEnabled(), (
+        "CANCEL would falsely assert that no Core was sent"
+    )
+
+
+def test_pre_start_work_still_reads_cancel(qapp):
+    import dataclasses
+
+    widget = AuditRunsWidget()
+    widget.set_runs([dataclasses.replace(waiting(7, 0), actions=("CANCEL", "DETAILS"))])
+    widget.lanes.selectRow(0)
+    assert widget.cancel_button.isEnabled()
+    assert not widget.abandon_button.isEnabled()
+    assert widget.abandon_button.text() == "STOP", (
+        "a disabled control must not claim to be an unblock"
+    )
+
+
+def test_a_blocked_post_start_run_still_reads_force_unblock(qapp):
+    import dataclasses
+
+    widget = AuditRunsWidget()
+    widget.set_runs([
+        dataclasses.replace(run(1, "BLOCKED_POST_START"), actions=("RECOVER", "ABANDON", "DETAILS"))
+    ])
+    widget.lanes.selectRow(0)
+    assert widget.abandon_button.isEnabled()
+    assert widget.abandon_button.text() == "FORCE UNBLOCK"
+
+
+def test_stopping_a_live_run_emits_its_dispatch_id(qapp):
+    widget = AuditRunsWidget()
+    widget.set_runs([stopped(1)])
+    widget.lanes.selectRow(0)
+    emitted = []
+    widget.abandon_requested.connect(emitted.append)
+    widget.abandon_button.click()
+    assert emitted == ["dsp-0000000000000001"]
+
+
+def test_a_terminal_run_offers_no_stop_at_all(qapp):
+    import dataclasses
+
+    widget = AuditRunsWidget()
+    widget.set_runs([dataclasses.replace(run(1, "FAILED"), actions=("RETRY", "DETAILS"))])
+    widget.lanes.selectRow(0)
+    assert not widget.abandon_button.isEnabled()
+    assert not widget.cancel_button.isEnabled()

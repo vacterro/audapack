@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.48
+// @version      0.0.98
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -72,14 +72,14 @@
   const BUILTIN_REVISION = 8;
   const MAX_CATEGORIES = 10;
   const MAX_PRESETS = 20;
-  const PANEL_WIDTH = 400;
-  const PANEL_HEIGHT = 510;
-  const SUPER_COMPACT_WIDTH = 300;
+  const PANEL_WIDTH = 440;
+  const PANEL_HEIGHT = 520;
+  const SUPER_COMPACT_WIDTH = 450;
   const SUPER_COMPACT_HEIGHT = 28;
   const PANEL_SIZES = Object.freeze({
-    compact: Object.freeze({ width: 340, height: 420, label: 'Small' }),
+    compact: Object.freeze({ width: 360, height: 440, label: 'Small' }),
     normal: Object.freeze({ width: PANEL_WIDTH, height: PANEL_HEIGHT, label: 'Normal' }),
-    large: Object.freeze({ width: 480, height: 620, label: 'Large' })
+    large: Object.freeze({ width: 520, height: 640, label: 'Large' })
   });
   const OPACITY_LEVELS = Object.freeze([100, 75, 50, 25]);
   const PANEL_EDGE_MARGIN = 8;
@@ -96,6 +96,7 @@
   const AUTO_START_HARD_NAV_BOOTSTRAP_MS = 120000;
   const AUTO_AUTH_HOLD_RETRY_MS = 5000;
   const AUTO_LAST_STABLE_CHAT_SESSION_KEY = 'ai_chatbuttons_last_stable_chat_v1';
+  const AUTO_NEW_CHAT_REQUIRES_CHAT_KEY = 'ai_chatbuttons_new_chat_requires_chat_v1';
   const AUTO_A3_INTENT_SESSION_KEY = 'ai_chatbuttons_a3_intent_v1';
   const AUTO_ROUTE_TRANSIENT_GRACE_MS = 30000;
   const LOCAL_TITLE_REAPPLY_MIN_MS = 800;
@@ -118,7 +119,20 @@
   const AUTO_STAGE_TIMEOUTS = Object.freeze([60, 120, 180, 360]);
   const AUTO_DELAYS_MS = Object.freeze([500, 1200, 2500, 5000, 10000]);
   const AUTO_RESPONSE_STABLE_MS = 1200;
+  // T-249 (residual seam): enabled + idle + ChatGPT generating opens a BOUNDED
+  // characterData recovery window, even before the audit lineage is
+  // recognizable, so a stream that finishes hydrating an audit user turn purely
+  // through characterData mutations still re-arms canonical reconciliation.
+  // Anchored per continuous generation (reset when generation ends) and hard
+  // capped so no idle chat observes characterData forever. Generation alone is
+  // only permission to keep looking briefly -- never an adoption.
+  const AUTO_HYDRATION_RECOVERY_WINDOW_MS = 120000;
   const AUTO_OBSERVER_DEBOUNCE_MS = 650;
+  // PERF-002: a burst of topology mutations that cannot have changed route or
+  // auth state is coalesced into ONE trailing runtime rebind. A short settled
+  // delay keeps the rebind prompt (well inside the existing 650 ms audit
+  // debounce) while collapsing an O(mutations) global scan into O(1) per burst.
+  const AUTO_TOPOLOGY_PROBE_DELAY_MS = 90;
   const AUTO_SEND_REGISTER_TIMEOUT_MS = 12000;
   const AUTO_SEND_REGISTER_RETRY_MS = 15000;
   const AUTO_SEND_REGISTER_HARD_TIMEOUT_MS = 120000;
@@ -150,6 +164,11 @@
   const BRIDGE_FLUSH_LEASE_KEY = 'ai_chatbuttons_bridge_flush_lease_v1';
   const BRIDGE_FLUSH_LEASE_MS = 30000;
   const BRIDGE_REQUEST_TIMEOUT_MS = 12000;
+  // T-184: the manual materialize operation is a single localhost batch write.
+  // It is deliberately shorter than the manual wall-clock deadline so one
+  // stalled request can never be the reason SAVE... outlives its own budget.
+  const BRIDGE_MATERIALIZE_TIMEOUT_MS = 12000;
+  const BRIDGE_MATERIALIZE_RECEIPT_PREFIX = 'ai_chatbuttons_bridge_materialize_receipt_v1:';
   const BROWSER_WORKER_PROTOCOL_VERSION = 'AUDAPACK_WIDGET/3';
   const BRIDGE_RETRY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000, 60000, 120000, 300000]);
   const BRIDGE_API_VERSION = 3;
@@ -172,7 +191,22 @@
   //: one burst touched -- never the whole conversation.
   const inauditDirtyTurns = new Set();
   let inauditAttachFullScanPending = false;
+  //: SRC-083: what this runtime saw of each assistant turn -- 'live' (first
+  //: seen while still streaming), 'historical' (first seen already final) or
+  //: 'captured'. Only a 'live' turn that finishes is auto-captured, so opening
+  //: or scrolling an old conversation never re-files its old handoffs. Keyed by
+  //: message id (element when absent), bounded, oldest evicted first.
+  const handoffTurnSightings = new Map();
+  const HANDOFF_TURN_MEMORY = 400;
   let inauditCaptureFlushTimer = 0;
+  //: PERF-001 (audit/9.md): the retry schedule is one ABSOLUTE deadline, not a
+  //: pile of relative delays. `DueAt` is the deadline the armed timer will fire
+  //: at (0 = no timer). `PendingDueAt` is the earliest deadline requested WHILE
+  //: a flush held the in-flight guard; the flush's finally block arms it. Before
+  //: this the in-flight guard silently swallowed every internal retry request,
+  //: so a spool could record next_retry_at with no timer alive to honour it.
+  let inauditCaptureFlushDueAt = 0;
+  let inauditCapturePendingDueAt = 0;
   let inauditCaptureFlushInFlight = false;
   let inauditSpoolBackendOverride = null;
   let inauditBridgeRequestOverride = null;
@@ -1032,6 +1066,10 @@ ordinal/name of the entrypoint file.`;
   const CHAT_RENAME_429_COOLDOWN_MS = 900000;
   const CHATGPT_LONG_PROMPT_THRESHOLD = 6000;
   const CHATGPT_ATTACHMENT_TIMEOUT_MS = 30000;
+  //: Bounded wait for a composer-owned file input to appear after the single
+  //: canonical attachment surface is opened. Current ChatGPT builds render the
+  //: input on demand, so discovery alone cannot be trusted.
+  const CHATGPT_UPLOAD_PREPARE_TIMEOUT_MS = 2500;
   //: Ceiling on waiting for Send while an attachment is still being ingested.
   //: Only reached when a tile keeps reporting progress, so it bounds a stuck
   //: upload without cutting off a large one that is genuinely working.
@@ -1477,9 +1515,19 @@ ordinal/name of the entrypoint file.`;
 }
 
 #acb-popup[data-supercompact="true"] #acb-super-state {
-  flex: 1 1 36px !important;
-  min-width: 36px !important;
-  max-width: 78px !important;
+  flex: 0 1 auto !important;
+  min-width: 44px !important;
+  max-width: 80px !important;
+}
+
+#acb-popup[data-supercompact="true"] #acb-manual-zip {
+  flex: 0 1 auto !important;
+  min-width: 0 !important;
+}
+
+#acb-popup[data-supercompact="true"] #acb-manual-zip-btn {
+  max-width: 170px !important;
+  flex: 0 1 auto !important;
 }
 
 #acb-popup[data-supercompact="true"] #acb-settings-btn {
@@ -1492,10 +1540,10 @@ ordinal/name of the entrypoint file.`;
 
 #acb-collapse {
   flex: 0 0 auto !important;
-  min-width: 60px !important;
+  min-width: 50px !important;
   min-height: 18px !important;
   height: 18px !important;
-  padding: 1px 5px !important;
+  padding: 1px 4px !important;
   font-size: 10px !important;
 }
 
@@ -1685,18 +1733,152 @@ ordinal/name of the entrypoint file.`;
 }
 #acb-auto-state-row {
   display: grid !important;
-  grid-template-columns: minmax(0, 1fr) 52px !important;
+  grid-template-columns: minmax(0, 1fr) auto 52px 52px !important;
   gap: 3px !important;
   margin-top: 4px !important;
 }
+#acb-saihandoff-state[data-state="idle"]{color:var(--textSecondary)!important}
+#acb-saihandoff-state[data-state="ready"]{color:var(--textPrimary)!important;border-color:var(--success)!important}
+#acb-saihandoff-state[data-state="sending"]{color:var(--textAccent)!important}
+#acb-saihandoff-state[data-state="sent"]{color:var(--success)!important}
 #acb-auto-state-row #acb-auto-state { margin-top: 0 !important; }
-#acb-save-now {
+#acb-save-now,
+#acb-auto-zip {
   min-width: 0 !important;
   min-height: 24px !important;
   height: 24px !important;
   padding: 2px 3px !important;
   font-size: 10px !important;
   font-weight: 700 !important;
+}
+#acb-auto-zip[data-state="checking"],
+#acb-auto-zip[data-state="packing"],
+#acb-auto-zip[data-state="downloading"],
+#acb-auto-zip[data-state="verifying"],
+#acb-auto-zip[data-state="attaching"] {
+  background: var(--accentTealDeep) !important;
+  color: var(--borderHighlight) !important;
+  border-color: var(--accentTeal) !important;
+}
+#acb-auto-zip[data-state="ready"] {
+  background: var(--success) !important;
+  color: var(--textPrimary) !important;
+}
+#acb-auto-zip[data-state="error"] {
+  background: var(--danger) !important;
+  color: var(--dangerText) !important;
+  border-color: var(--dangerText) !important;
+}
+#acb-popup[data-menu-open="true"],
+#acb-popup[data-supercompact="true"][data-menu-open="true"] {
+  overflow: visible !important;
+}
+#acb-manual-zip {
+  position: relative !important;
+  display: inline-flex !important;
+  align-items: center !important;
+}
+#acb-manual-zip-btn {
+  min-height: 20px !important;
+  height: 20px !important;
+  padding: 1px 5px !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  max-width: 170px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+#acb-popup:not([data-supercompact="true"]) #acb-manual-zip-btn {
+  max-width: 140px !important;
+}
+#acb-manual-zip-btn[data-state="checking"],
+#acb-manual-zip-btn[data-state="packing"],
+#acb-manual-zip-btn[data-state="downloading"],
+#acb-manual-zip-btn[data-state="verifying"],
+#acb-manual-zip-btn[data-state="attaching"],
+#acb-manual-zip-btn[data-state="sending"] {
+  background: var(--accentTealDeep) !important;
+  color: var(--borderHighlight) !important;
+  border-color: var(--accentTeal) !important;
+}
+#acb-manual-zip-btn[data-state="sent"],
+#acb-manual-zip-btn[data-state="already_sent"] {
+  border-color: #3fa96b;
+  color: #b6f2ca;
+}
+
+#acb-manual-zip-btn[data-state="ready"] {
+  background: var(--success) !important;
+  color: var(--textPrimary) !important;
+}
+#acb-manual-zip-btn[data-state="error"] {
+  background: var(--danger) !important;
+  color: var(--dangerText) !important;
+  border-color: var(--dangerText) !important;
+}
+#acb-manual-zip-menu {
+  position: absolute !important;
+  top: 22px !important;
+  left: 0 !important;
+  z-index: 2147483000 !important;
+  min-width: 280px !important;
+  max-width: min(440px, calc(100vw - 32px)) !important;
+  max-height: min(360px, calc(100vh - 80px)) !important;
+  overflow-y: auto !important;
+  background: var(--surfaceRaised) !important;
+  border: 2px solid !important;
+  border-color: var(--bevelLight) var(--borderDark) var(--borderDark) var(--bevelLight) !important;
+  padding: 4px !important;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6) !important;
+}
+#acb-manual-zip-menu-title {
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  color: var(--textSecondary) !important;
+  margin-bottom: 4px !important;
+}
+#acb-manual-zip-menu-list {
+  display: grid !important;
+  gap: 2px !important;
+}
+#acb-manual-zip-menu-list button {
+  width: 100% !important;
+  min-height: 22px !important;
+  font-size: 10px !important;
+  text-align: left !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  padding: 2px 6px !important;
+  box-sizing: border-box !important;
+}
+#acb-manual-zip-menu-list button[data-selected="true"] {
+  border-color: var(--borderDark) var(--bevelLight) var(--bevelLight) var(--borderDark) !important;
+  background: var(--surface) !important;
+}
+#acb-manual-zip-menu-list .acb-manual-zip-item-meta {
+  color: var(--textMuted) !important;
+  font-size: 9px !important;
+  margin-left: 4px !important;
+}
+.acb-manual-zip-note {
+  color: var(--textSecondary) !important;
+  font-size: 10px !important;
+  padding: 2px !important;
+}
+.acb-manual-zip-note[data-state="error"] {
+  color: var(--dangerText) !important;
+}
+#acb-manual-zip-menu-actions {
+  display: flex !important;
+  gap: 3px !important;
+  margin-top: 4px !important;
+}
+#acb-manual-zip-menu-actions button {
+  flex: 1 1 auto !important;
+  min-height: 20px !important;
+  font-size: 10px !important;
 }
 #acb-save-now[data-state="pending"] {
   background: var(--accentTealDeep) !important;
@@ -2279,6 +2461,7 @@ ordinal/name of the entrypoint file.`;
 #acb-bridge-diagnostics-head {
   min-height: 24px !important;
   display: flex !important;
+  flex-wrap: wrap !important;
   align-items: center !important;
   justify-content: space-between !important;
   gap: 4px !important;
@@ -2481,6 +2664,8 @@ ordinal/name of the entrypoint file.`;
   function auditActionIsLive() {
     return inFlightIsLive(actionInFlight, actionInFlightSince);
   }
+  let currentStartPhase = '';
+  const startPhaseHistory = [];
   let viewportSyncFrame = 0;
   let dragFrame = 0;
   let autoAuditObserver = null;
@@ -2488,8 +2673,19 @@ ordinal/name of the entrypoint file.`;
   let autoAuditObservedConfig = null;
   let autoAuditCheckTimer = 0;
   let autoAuditNextTimer = 0;
+  // T-249 (residual seam): the timestamp at which the current enabled+idle
+  // hydration recovery window opened. 0 = closed. It opens when generation is
+  // first observed on an enabled+idle runtime with no recognizable lineage yet,
+  // and closes the moment generation ends, the runtime is adopted, or the hard
+  // cap (AUTO_HYDRATION_RECOVERY_WINDOW_MS) expires.
+  let autoHydrationRecoveryStartedAt = 0;
   let autoAuditEvaluating = false;
   let autoLastEvaluationAt = 0;
+  // PERF-002: the pathname the runtime was last bound against. A topology
+  // mutation on the same pathname that introduced no auth surface cannot have
+  // changed the bound conversation key, so it must not trigger a global
+  // auth/root rebind. Maintained by bindAutoRuntimeToCurrentConversation.
+  let autoObserverLastPathname = null;
 
   let autoComposerHoldReason = '';
   let autoComposerHoldSince = 0;
@@ -2505,6 +2701,12 @@ ordinal/name of the entrypoint file.`;
   let bridgeOutputRoot = '';
   let bridgeServerVersion = '';
   let bridgeLastCheckedAt = 0;
+  // T-185 C3: Bridge-generation counter. Every successful /v1/status reply
+  // bumps it; a verification is only fresh while its recorded epoch matches
+  // the current one (reconnect after outage invalidates old proof).
+  // First connect from unknown does NOT bump (no prior proof to invalidate).
+  let bridgeConnectEpoch = 0;
+  let bridgeEverConnected = false;
   let bridgeFlushTimer = 0;
   let bridgeFlushInFlight = false;
   let bridgeQueueListenerId = null;
@@ -2520,6 +2722,24 @@ ordinal/name of the entrypoint file.`;
   let manualAuditSyncFeedback = '';
   let manualAuditSyncFeedbackUntil = 0;
   let manualAuditSyncFeedbackTimer = 0;
+
+  // T-184: SAVE... is a FOREGROUND claim on the compact button, and a
+  // foreground claim needs an end. The old manual loop retried five times per
+  // wave behind a 7s project resolve and a 12s audit write, serially across
+  // three waves, so a stalled Bridge could hold the button for minutes with no
+  // way out. One wall-clock deadline owns the foreground; anything unfinished
+  // at the deadline stays a durable background job and the button says so.
+  const MANUAL_SAVE_DEADLINE_MS = 30000;
+  // Each manual attempt takes a generation. A timed-out attempt that finishes
+  // later may still commit backend/job state, but it must never repaint a
+  // button a newer attempt now owns.
+  let manualAuditSyncGeneration = 0;
+  let manualAuditSyncOwnerGeneration = 0;
+  let manualAuditSyncDeadlineTimer = 0;
+  // The compact feedback chip expires after a few seconds; the OUTCOME does
+  // not. Diagnostics and the generation fence both need to know what the last
+  // manual save actually concluded, and which attempt concluded it.
+  let manualAuditSyncLastOutcome = { label: '', generation: 0, at: 0 };
   let startRecoveryScheduleToken = '';
   let armedStartRecoveryTimer = 0;
 
@@ -2861,11 +3081,58 @@ ordinal/name of the entrypoint file.`;
     'button.composer-submit-btn'
   ].join(', ');
 
+  // T-257: generation detection is part of the audit state machine, not a
+  // cosmetic activity light, so a marker is admitted only when it names a
+  // generation control EXACTLY. The former `button[data-testid*="stop" i]`
+  // wildcard and bare `button[aria-label="Stop"]` matched voice, media and
+  // response-action controls; a visible one near the composer held a finished
+  // response at BUSY forever and short-circuited evaluateAutoAudit() before
+  // completedAssistantCandidate(), stalling wave progression.
+  // T-259: `aria-label="Stop"` was removed from this list in T-257 and is the
+  // CURRENT chatgpt.com build's own generation control. Captured live on
+  // 2026-09-29 mid-generation: <button type="button" aria-label="Stop"> with NO
+  // data-testid, no id and no role, inside the composer <form
+  // class="relative flex flex-col gap-2"> (that form has no data-type), holding
+  // the trailing action slot next to a DISABLED Dictate and the model picker,
+  // with an svg.icon-primary-action child carrying the square glyph.
+  //
+  // Dropping it did not merely lose a signal, it inverted the verdict: with the
+  // real control invisible to identity, two live audit tabs both generating read
+  // READY, and the audit evaluator believed the page was idle. Ownership was
+  // never the blocker -- chatGPTStopNearComposer() accepts root.contains() and
+  // this control is inside the current composer form. Only identity rejected it.
+  //
+  // It is admitted EXACTLY, never as a substring: "Stop listening", "Stop
+  // recording" and "Stop the running turn" must keep failing, and the exclusion
+  // of voice/audio/response-action surfaces keeps an exact "Stop" elsewhere on
+  // the page out of the verdict.
+  const CHATGPT_STOP_SELECTOR = [
+    'button[aria-label="Stop"]',
+    '[data-testid="stop-button"]',
+    'button[aria-label="Stop generating"]',
+    'button[aria-label="Stop streaming"]'
+  ].join(', ');
+
+  // The over-broad shapes, kept ONLY so chatGPTGenerationSnapshot() can name a
+  // rejected candidate in its structural evidence. Never a generation verdict.
+  const CHATGPT_STOP_LIKE_SELECTOR = [
+    CHATGPT_STOP_SELECTOR,
+    'button[data-testid*="stop" i]',
+    'button[aria-label*="stop" i]'
+  ].join(', ');
+
   function rawChatGPTComposerInput() {
+    // T-248: the 2026-09 ChatGPT build dropped the `#prompt-textarea` id and
+    // renamed the editor `aria-label` from "Chat with ChatGPT" to "Ask
+    // ChatGPT", keeping only the ProseMirror contenteditable. Match the stable
+    // shape (contenteditable role=textbox ProseMirror) as well as the historic
+    // id/label, so a label rename never blinds the whole composer again.
     const candidates = document.querySelectorAll(
       '#prompt-textarea[contenteditable="true"][role="textbox"], ' +
       '#prompt-textarea.ProseMirror[contenteditable="true"], ' +
-      '[contenteditable="true"][role="textbox"][aria-label="Chat with ChatGPT"]'
+      '[contenteditable="true"][role="textbox"].ProseMirror, ' +
+      '[contenteditable="true"][role="textbox"][aria-label="Chat with ChatGPT"], ' +
+      '[contenteditable="true"][role="textbox"][aria-label^="Ask ChatGPT" i]'
     );
     for (const input of candidates) {
       if (!input || !isVisible(input)) continue;
@@ -2889,7 +3156,9 @@ ordinal/name of the entrypoint file.`;
     const form = input.closest('form');
     if (form && isVisible(form)) return form;
 
-    const shell = input.closest('[data-type="unified-composer"], [data-testid*="composer" i]');
+    // T-248: the 2026-09 build's composer <form> lost its data-type; the only
+    // durable shell markers left are the hashed `Composer*` layout classes.
+    const shell = input.closest('[data-type="unified-composer"], [data-testid*="composer" i], [class*="Composer" i]');
     return shell && isVisible(shell) ? shell : null;
   }
 
@@ -2899,11 +3168,13 @@ ordinal/name of the entrypoint file.`;
     if (!root || !root.contains(element)) return false;
     if (element.closest('[data-testid^="conversation-turn-"], article[data-testid], article')) return false;
 
+    const label = String(element.getAttribute('aria-label') || '');
     const isCanonicalId = element.id === 'prompt-textarea';
-    const isCanonicalLabel = element.getAttribute('aria-label') === 'Chat with ChatGPT';
+    const isCanonicalLabel = label === 'Chat with ChatGPT' || /^Ask ChatGPT/i.test(label);
+    const isProseMirror = Boolean(element.classList?.contains('ProseMirror')) && element.getAttribute('role') === 'textbox';
     const isEditable = element.isContentEditable || element.tagName === 'TEXTAREA';
 
-    return isEditable && (isCanonicalId || isCanonicalLabel);
+    return isEditable && (isCanonicalId || isCanonicalLabel || isProseMirror);
   }
 
   function getChatGPTInput() {
@@ -2913,7 +3184,9 @@ ordinal/name of the entrypoint file.`;
     const candidates = [
       root.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]'),
       root.querySelector('#prompt-textarea.ProseMirror[contenteditable="true"]'),
-      root.querySelector('[contenteditable="true"][role="textbox"][aria-label="Chat with ChatGPT"]')
+      root.querySelector('[contenteditable="true"][role="textbox"].ProseMirror'),
+      root.querySelector('[contenteditable="true"][role="textbox"][aria-label="Chat with ChatGPT"]'),
+      root.querySelector('[contenteditable="true"][role="textbox"][aria-label^="Ask ChatGPT" i]')
     ];
 
     for (const candidate of candidates) {
@@ -2948,6 +3221,75 @@ ordinal/name of the entrypoint file.`;
       if (ancestor.contains(element)) return true;
     }
     return false;
+  }
+
+  // T-257: Stop ownership is NOT Send proximity. chatGPTSendNearComposer()
+  // accepts a shared ancestor up to seven levels above the editor, because a
+  // Send arrow is useful anywhere in the bottom shell; the same leniency for
+  // Stop lets an unrelated visible control claim generation. A generation Stop
+  // must sit on the CURRENT composer's action surface and nowhere else.
+  const CHATGPT_NON_GENERATION_STOP_SELECTOR = [
+    '[data-testid*="voice" i]',
+    '[data-testid*="audio" i]',
+    '[data-testid*="dictation" i]',
+    '[data-testid*="listening" i]',
+    '[data-testid*="recording" i]',
+    '[aria-label*="voice" i]',
+    '[aria-label*="microphone" i]',
+    '[aria-label*="audio" i]',
+    '[aria-label*="dictation" i]',
+    // T-260: the voice surface names its own teardown -- "Stop listening",
+    // "Stop recording" -- and none of those words is "voice" or "microphone",
+    // so the exclusion missed every one of them. A control the widget already
+    // classifies as non-generation must also be exempt from the READY veto
+    // below, or a dictating operator gets an ATTN the exclusion just denied.
+    '[aria-label*="listening" i]',
+    '[aria-label*="recording" i]'
+  ].join(', ');
+
+  function stopCandidateIsExcluded(element) {
+    if (!element) return true;
+    if (element.closest('[data-testid^="conversation-turn-"], article[data-testid], article')) return true;
+    if (element.closest(ASSISTANT_RESPONSE_ACTIONS_SELECTOR)) return true;
+    if (element.closest(CHATGPT_NON_GENERATION_STOP_SELECTOR)) return true;
+    return false;
+  }
+
+  // Structural distance from the live editor up to the nearest ancestor that
+  // owns the candidate. Reported as evidence; never a verdict on its own.
+  function composerDistanceTo(element) {
+    const input = rawChatGPTComposerInput();
+    if (!input || !element) return -1;
+    if (input === element || input.contains(element)) return 0;
+    let distance = 0;
+    for (let node = input.parentElement; node; node = node.parentElement) {
+      distance += 1;
+      if (node === element || node.contains(element)) return distance;
+      if (node === document.body || node === document.documentElement) break;
+    }
+    return -1;
+  }
+
+  function chatGPTStopNearComposer(element, root = chatGPTComposerRoot()) {
+    if (!element || !isVisible(element)) return false;
+    if (stopCandidateIsExcluded(element)) return false;
+    if (!root) return false;
+    if (root.contains(element)) return true;
+
+    // The current build can render the generation control in a sibling action
+    // shell just outside the composer <form>. That shell is proven to be the
+    // composer's own action surface only when it is the form's immediate parent
+    // AND it carries the composer's own Send control. Anything sharing a higher
+    // ancestor is page layout, and a stale control from a previous composer
+    // shell has no live Send sibling to prove it.
+    const input = rawChatGPTComposerInput();
+    const form = input?.closest('form') || (root.tagName === 'FORM' ? root : null);
+    const shell = form?.parentElement;
+    if (!shell || !shell.contains(element)) return false;
+    const send = shell.querySelector(
+      '#composer-submit-button, [data-testid="send-button"], [data-testid="composer-submit-button"]'
+    );
+    return Boolean(send && isVisible(send));
   }
 
   function isChatGPTSend(element) {
@@ -2997,19 +3339,388 @@ ordinal/name of the entrypoint file.`;
   }
 
 
-  function chatGPTUploadInput() {
+  // ---------------------------------------------------------------------
+  // Composer upload surface -- the ONE upload engine.
+  //
+  // T-248: on 2026-09-27 all six A3 lanes died in BLOCKED PRE-START with the
+  // single opaque code `file-injection-rejected`, while the Bridge held a valid
+  // archive and all 39 synthetic DOM tests stayed green. Two defects sat here.
+  // (1) Discovery only accepted a file input rendered INSIDE the composer
+  // root, and every caller additionally demanded `root.contains(input)`, so a
+  // portal-mounted or composer-adjacent input on the current build was
+  // unreachable and indistinguishable from "no input at all". (2) Missing
+  // input, missing root, a detached input and a rejected FileList assignment
+  // all reported the same code, so no retry could ever learn anything.
+  //
+  // Everything below is shared by the manual ZIP door and the A3 worker door.
+  // ponytail: ceiling is one attachment-surface open per attempt and a single
+  // file input. Upgrade path: a bounded sub-menu walk if ChatGPT ever nests the
+  // input under a second-level "Upload from" control.
+  // ---------------------------------------------------------------------
+  const CHATGPT_UPLOAD_STABLE_SELECTOR = [
+    '#upload-files[type="file"]',
+    'input[type="file"][data-testid*="upload" i]',
+    'input[type="file"][data-testid*="file" i]',
+    'input[type="file"][aria-label*="upload" i]'
+  ].join(', ');
+
+  // Never inject here, whatever else matches: conversation history, and the
+  // account/settings/personalization surfaces that own their own file pickers.
+  const CHATGPT_UPLOAD_FOREIGN_ANCESTORS = [
+    '[data-testid^="conversation-turn-"]',
+    'article[data-testid]',
+    'article',
+    '[data-testid*="account" i]',
+    '[data-testid*="profile" i]',
+    '[data-testid*="settings" i]',
+    '[data-testid*="user-menu" i]',
+    '[role="dialog"][aria-label*="settings" i]',
+    '[role="dialog"][aria-label*="profile" i]',
+    '[role="dialog"][aria-label*="account" i]',
+    '[role="dialog"][aria-label*="personaliz" i]'
+  ].join(', ');
+
+  const CHATGPT_COMPOSER_MARKER_SELECTOR = [
+    '[data-type="unified-composer"]',
+    '[data-testid*="composer" i]',
+    '[id*="composer" i]'
+  ].join(', ');
+
+  const CHATGPT_COMPOSER_ATTACH_SELECTOR = [
+    '[data-testid*="attach" i]',
+    'button[aria-label*="attach" i]',
+    'button[aria-label*="add file" i]',
+    'button[aria-label*="upload" i]',
+    'button[title*="attach" i]'
+  ].join(', ');
+
+  // Bounded candidate scan: a page that mounts dozens of hidden file inputs is
+  // not a shape we are willing to guess about.
+  const CHATGPT_UPLOAD_MAX_CANDIDATES = 12;
+
+  // A DOM contract this build does not offer. Retrying cannot create an upload
+  // surface, so these block once with an actionable reason instead of burning
+  // the whole pre-start retry budget six times over.
+  const CHATGPT_UPLOAD_STRUCTURAL_CODES = [
+    'composer-root-unavailable',
+    'upload-input-unavailable',
+    'upload-input-ambiguous'
+  ];
+
+  function chatGPTUploadCodeIsStructural(code) {
+    return CHATGPT_UPLOAD_STRUCTURAL_CODES.includes(String(code || '').trim());
+  }
+
+  function chatGPTUploadInputIsStable(input) {
+    return Boolean(input && typeof input.matches === 'function' && input.matches(CHATGPT_UPLOAD_STABLE_SELECTOR));
+  }
+
+  // T-248 (2026-09 build): the composer renders three hidden file inputs at
+  // once -- one `image/*`, one `image/*,video/*`, and one general input with no
+  // `accept`. A project ZIP (or a generated .md prompt) must never go into an
+  // image/video picker, so a media-only input is not a candidate for our
+  // non-media payloads. This is also what disambiguates the three-input build
+  // down to the single general upload input.
+  function chatGPTUploadInputIsMediaOnly(input) {
+    const accept = String((input && input.getAttribute && input.getAttribute('accept')) || '').trim().toLowerCase();
+    if (!accept) return false;
+    const tokens = accept.split(',').map(token => token.trim()).filter(Boolean);
+    if (!tokens.length) return false;
+    return tokens.every(token =>
+      token.startsWith('image/') || token.startsWith('video/') || token.startsWith('audio/') ||
+      /\.(png|jpe?g|jfif|pjpeg|pjp|gif|webp|bmp|svg|ico|heic|heif|avif|tiff?|mpo|raw|cr2|nef|arw|dng|mp4|mov|webm|avi|mkv|m4v|mpe?g|3gp|wmv|flv|mp3|wav|m4a|ogg|oga|opus|flac|aac|amr|weba)$/.test(token)
+    );
+  }
+
+  function chatGPTUploadRejection(input) {
+    if (!input) return 'missing';
+    if (input.disabled) return 'disabled';
+    if (input.closest(CHATGPT_UPLOAD_FOREIGN_ANCESTORS)) return 'foreign-surface';
+    if (chatGPTUploadInputIsMediaOnly(input)) return 'media-only';
+    return '';
+  }
+
+  function chatGPTComposerMarkedAncestor(element) {
+    for (let node = element, depth = 0; node && depth < 8; depth += 1, node = node.parentNode) {
+      if (typeof node.matches === 'function' && node.matches(CHATGPT_COMPOSER_MARKER_SELECTOR)) return node;
+    }
+    return null;
+  }
+
+  // Proves `input` belongs to the LIVE composer. A portal-mounted input counts
+  // only when the composer itself declares that surface (aria-controls /
+  // aria-owns / popovertarget) or when input and composer share one marked
+  // shell. A lone <input type="file"> anywhere on the page never counts.
+  function chatGPTUploadBoundOwner(input, root) {
+    if (!input || !root) return null;
+    if (root.contains(input)) return root;
+
+    // 1. The composer itself declares this surface (aria-controls / aria-owns /
+    // popovertarget). This is the strongest proof a portal-mounted input can
+    // offer and it is checked before anything looser.
+    const declared = new Set();
+    for (const control of root.querySelectorAll(CHATGPT_COMPOSER_ATTACH_SELECTOR)) {
+      for (const attribute of ['aria-controls', 'aria-owns', 'popovertarget']) {
+        const value = String(control.getAttribute(attribute) || '').trim();
+        if (value) declared.add(value);
+      }
+    }
+    if (declared.size) {
+      for (let node = input; node && typeof node.getAttribute === 'function'; node = node.parentNode) {
+        const id = String(node.getAttribute('id') || '').trim();
+        if (id && declared.has(id)) return root;
+      }
+    }
+
+    // 2. One nearby shared shell holds both the live composer and the input.
+    // Bounded on purpose: <main> and <body> hold every composer on the page,
+    // so sharing a home with the page column proves nothing.
+    for (let node = input.parentNode, depth = 0; node && depth < 4; depth += 1, node = node.parentNode) {
+      if (node === document.body || node === document.documentElement) break;
+      if (String(node.tagName || '').toLowerCase() === 'main') break;
+      if (node.contains && node.contains(root)) return root;
+    }
+
+    // 3. A marked composer ancestor. It counts only when that ancestor also
+    // HOLDS the live composer: the SPA keeps stale composers mounted, and the
+    // file input inside one of those is exactly what must never be injected.
+    for (let node = input.parentNode; node; node = node.parentNode) {
+      if (node === root) return root;
+      if (typeof node.matches !== 'function' || !node.matches(CHATGPT_COMPOSER_MARKER_SELECTOR)) continue;
+      return node.contains && node.contains(root) ? root : null;
+    }
+    return null;
+  }
+
+  // Pure discovery, no side effects. Returns the exact machine reason so the
+  // caller can decide between "this build has no upload surface" and "the
+  // composer remounted under us".
+  function chatGPTUploadSurface() {
     const root = chatGPTComposerRoot();
-    if (!root || root.hasAttribute('inert')) return null;
-    const input = root.querySelector('#upload-files[type="file"], input[type="file"][multiple]');
-    if (!input || input.disabled) return null;
-    return input;
+    if (!root) return { ok: false, reason: 'composer-root-unavailable', input: null, root: null, owner: null };
+    if (root.hasAttribute('inert')) return { ok: false, reason: 'composer-root-unavailable', input: null, root, owner: null };
+
+    const raw = Array.from(document.querySelectorAll('input[type="file"]'));
+    if (raw.length > CHATGPT_UPLOAD_MAX_CANDIDATES) {
+      return { ok: false, reason: 'upload-input-ambiguous', input: null, root, owner: null, detail: `${raw.length} file inputs` };
+    }
+    const candidates = raw.filter(input => !chatGPTUploadRejection(input));
+
+    // 1. Known stable upload ids/testids, proven to belong to this composer.
+    const stable = candidates.filter(input => chatGPTUploadInputIsStable(input) && chatGPTUploadBoundOwner(input, root));
+    if (stable.length === 1) return { ok: true, reason: 'exact-match', input: stable[0], root, owner: root };
+    if (stable.length > 1) return { ok: false, reason: 'upload-input-ambiguous', input: null, root, owner: null, detail: `${stable.length} stable upload inputs` };
+
+    // 2. The composer root's own multi-file input, then any other root input.
+    const inside = candidates.filter(input => root.contains(input));
+    const multiple = inside.filter(input => input.hasAttribute('multiple'));
+    for (const tier of [multiple, inside]) {
+      if (tier.length === 1) return { ok: true, reason: 'composer-input', input: tier[0], root, owner: root };
+      if (tier.length > 1) return { ok: false, reason: 'upload-input-ambiguous', input: null, root, owner: null, detail: `${tier.length} composer file inputs` };
+    }
+
+    // 3. Bounded nearby/portal search: a file input the live composer owns.
+    const bound = candidates.filter(input => chatGPTUploadBoundOwner(input, root));
+    if (bound.length === 1) return { ok: true, reason: 'portal-input', input: bound[0], root, owner: root };
+    if (bound.length > 1) return { ok: false, reason: 'upload-input-ambiguous', input: null, root, owner: null, detail: `${bound.length} bound upload inputs` };
+
+    return { ok: false, reason: 'upload-input-unavailable', input: null, root, owner: null };
+  }
+
+  // Bounded structural probe for diagnostics. Shape only: never filenames,
+  // prompt text, conversation text, account data or tokens.
+  function chatGPTUploadTopology() {
+    const root = chatGPTComposerRoot();
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]')).slice(0, CHATGPT_UPLOAD_MAX_CANDIDATES);
+    const describe = input => {
+      const stable = chatGPTUploadInputIsStable(input);
+      return {
+        id: String(input.getAttribute('id') || ''),
+        testid: String(input.getAttribute('data-testid') || ''),
+        multiple: input.hasAttribute('multiple'),
+        disabled: Boolean(input.disabled),
+        stable,
+        rejected: chatGPTUploadRejection(input) || '',
+        inComposerRoot: Boolean(root && root.contains(input)),
+        boundToComposer: Boolean(root && chatGPTUploadBoundOwner(input, root)),
+        ownerTag: String((chatGPTComposerMarkedAncestor(input.parentNode) || {}).tagName || '').toLowerCase()
+      };
+    };
+    return {
+      composer_root: root ? 'form' : 'none',
+      composer_attach_control: root ? root.querySelectorAll(CHATGPT_COMPOSER_ATTACH_SELECTOR).length : 0,
+      file_inputs: inputs.length,
+      candidates: inputs.map(describe),
+      verdict: chatGPTUploadSurface().reason
+    };
+  }
+
+  // One bounded line describing the observed composer shape. Structural only:
+  // ids, testids, flags and ownership -- never filenames, prompt text,
+  // conversation text, account data or tokens.
+  function chatGPTUploadTopologyLine(topology) {
+    const shown = topology.candidates.slice(0, 4);
+    return `composer=${topology.composer_root} attach=${topology.composer_attach_control} file_inputs=${topology.file_inputs} verdict=${topology.verdict}` +
+      (shown.length
+        ? ` inputs=[${shown.map(candidate => `#${candidate.id || '-'}/${candidate.testid || '-'} multiple=${candidate.multiple ? 1 : 0} disabled=${candidate.disabled ? 1 : 0} inRoot=${candidate.inComposerRoot ? 1 : 0} bound=${candidate.boundToComposer ? 1 : 0} rejected=${candidate.rejected || '-'} owner=${candidate.ownerTag || '-'}`).join(' ; ')}${topology.candidates.length > shown.length ? ` ; +${topology.candidates.length - shown.length} more` : ''}]`
+        : '');
+  }
+
+  function chatGPTUploadInput() {
+    return chatGPTUploadSurface().input || null;
+  }
+
+  function chatGPTComposerAttachControl(root = chatGPTComposerRoot()) {
+    if (!root) return null;
+    for (const control of root.querySelectorAll(CHATGPT_COMPOSER_ATTACH_SELECTOR)) {
+      if (!control || typeof control.matches !== 'function') continue;
+      if (typeof control.closest === 'function' && control.closest(CHATGPT_UPLOAD_FOREIGN_ANCESTORS)) continue;
+      const semantic = `${control.getAttribute('aria-label') || ''} ${control.getAttribute('data-testid') || ''} ${control.getAttribute('title') || ''}`.toLowerCase();
+      // Never let preparation press Send, Stop, search or a voice control.
+      if (/(send|submit|stop|voice|dictat|microphone|record|search|cancel|close)/.test(semantic)) continue;
+      return control;
+    }
+    return null;
+  }
+
+  // The one canonical preparation step: open the composer's own attachment
+  // surface and wait, bounded, for the file input it owns. It selects no tool,
+  // types no text, and never sends.
+  async function prepareChatGPTUploadSurface(options = {}) {
+    let surface = chatGPTUploadSurface();
+    // Only a genuinely absent input is worth opening a surface for. An
+    // ambiguous one is a fail-closed verdict, not an invitation to click.
+    if (surface.ok || surface.reason !== 'upload-input-unavailable') return surface;
+    const root = surface.root;
+    if (!root) return surface;
+
+    const control = chatGPTComposerAttachControl(root);
+    if (!control) return surface;
+    if (options.openSurface === false) return surface;
+    try {
+      if (typeof control.click === 'function') control.click();
+      else if (typeof control.dispatchEvent === 'function') control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    } catch (_) {
+      return surface;
+    }
+
+    surface = await waitForDomCondition(document.body, () => {
+      const found = chatGPTUploadSurface();
+      return found.ok ? found : null;
+    }, options.timeoutMs || CHATGPT_UPLOAD_PREPARE_TIMEOUT_MS);
+    if (!surface) {
+      // Nothing usable appeared: leave the page as we found it. The menu must
+      // not stay open over a composer the operator is about to type into.
+      closeChatGPTComposerAttachmentSurface(control);
+      return chatGPTUploadSurface();
+    }
+    // The menu stays open until the FileList is actually assigned. Closing it
+    // here unmounts the very input we just found, which is a remount we would
+    // then have to fight. `openedControl` is closed by the caller, after the
+    // write.
+    return Object.assign({ openedControl: control }, surface);
+  }
+
+  function closeChatGPTComposerAttachmentSurface(control) {
+    if (!control) return;
+    try {
+      if (typeof control.getAttribute === 'function' && control.getAttribute('aria-expanded') === 'true' && typeof control.click === 'function') {
+        control.click();
+        return;
+      }
+    } catch (_) { }
+    try {
+      if (typeof document.dispatchEvent === 'function' && typeof KeyboardEvent === 'function') {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      }
+    } catch (_) { }
+  }
+
+  // Remount-safe injection. Reacquires the live composer root and the live
+  // upload input, proves the input still belongs to that composer, and only
+  // then assigns the FileList. A React remount between discovery and
+  // injection is a transient reason, not a dead lane.
+  async function injectComposerArchiveFile(file, options = {}) {
+    if (typeof File !== 'function' || typeof DataTransfer !== 'function') {
+      return { ok: false, reason: 'upload-input-unavailable', detail: 'File/DataTransfer unavailable' };
+    }
+    const attempts = Math.max(1, Number(options.attempts) || 2);
+    let reason = 'upload-input-unavailable';
+    let detail = '';
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const prepared = await prepareChatGPTUploadSurface({ openSurface: options.openSurface !== false });
+      try {
+        if (!prepared.root) {
+          return { ok: false, reason: 'composer-root-unavailable', detail };
+        }
+        if (!prepared.ok) {
+          reason = String(prepared.reason || 'upload-input-unavailable');
+          detail = String(prepared.detail || '');
+          // A structural contract miss is settled on the first look; retrying
+          // the same unsupported build only burns the lane's retry budget.
+          if (chatGPTUploadCodeIsStructural(reason)) return { ok: false, reason, detail };
+          continue;
+        }
+        const input = prepared.input;
+        if (!input.isConnected) {
+          reason = 'upload-input-detached';
+          detail = 'input left the document before injection';
+          continue;
+        }
+        const liveRoot = chatGPTComposerRoot();
+        if (!liveRoot || !chatGPTUploadBoundOwner(input, liveRoot)) {
+          reason = 'upload-input-detached';
+          detail = 'composer remounted after discovery';
+          continue;
+        }
+        if (setNativeFileList(input, [file], options.injectionOptions || {})) {
+          return { ok: true, reason: 'injected', input, root: liveRoot };
+        }
+        reason = 'file-injection-rejected';
+        detail = 'setNativeFileList() refused the assignment';
+      } finally {
+        // Only now: the composer owns the bytes, so the attachment surface may
+        // close. Closing it earlier unmounted the input we had just written to.
+        closeChatGPTComposerAttachmentSurface(prepared.openedControl);
+      }
+    }
+    return { ok: false, reason, detail };
+  }
+
+  // The filename of an attachment tile. Legacy builds put it on the tile's own
+  // aria-label; the 2026-09 build moved it onto the "Remove <filename>" control
+  // and leaves the tile wrapper unlabelled. Read both.
+  function chatGPTAttachmentTileName(tile) {
+    if (!tile || typeof tile.getAttribute !== 'function') return '';
+    const own = String(tile.getAttribute('aria-label') || '').trim();
+    if (own && !/^remove\b/i.test(own)) return own;
+    const remove = typeof tile.querySelector === 'function'
+      ? tile.querySelector('button[aria-label^="Remove" i]')
+      : null;
+    const label = String((remove && remove.getAttribute('aria-label')) || own || '').trim();
+    const stripped = label.replace(/^remove(?:\s+file)?\s+/i, '').trim();
+    return stripped || (own && !/^remove\b/i.test(own) ? own : '');
   }
 
   function chatGPTComposerAttachmentTiles(root = chatGPTComposerRoot()) {
     if (!root) return [];
-    return Array.from(root.querySelectorAll('[role="group"][aria-label]')).filter(tile => {
-      return Boolean(tile.querySelector('button[aria-label^="Remove file"], button[name="expand-file-tile"]'));
-    });
+    const tiles = new Set();
+    // Legacy shape: a [role="group"] whose aria-label is the filename, with a
+    // "Remove file" / expand control inside.
+    for (const tile of root.querySelectorAll('[role="group"][aria-label]')) {
+      if (tile.querySelector('button[aria-label^="Remove file"], button[name="expand-file-tile"]')) tiles.add(tile);
+    }
+    // 2026-09 shape: the filename lives on a "Remove <name>" button; the tile is
+    // its nearest composer-attachment wrapper. Fail closed if no wrapper is
+    // found -- never treat the bare button as the tile.
+    for (const remove of root.querySelectorAll('button[aria-label^="Remove" i], button[name="remove-file"], button[name="expand-file-tile"]')) {
+      if (typeof remove.closest !== 'function') continue;
+      const wrapper = remove.closest('[class*="composer-attachment" i]')
+        || remove.closest('[role="group"]')
+        || remove.parentElement;
+      if (wrapper && chatGPTAttachmentTileName(wrapper)) tiles.add(wrapper);
+    }
+    return Array.from(tiles);
   }
 
   function isGeneratedAuditPromptFilename(filename) {
@@ -3020,7 +3731,7 @@ ordinal/name of the entrypoint file.`;
 
   function chatGPTProjectComposerAttachments(root = chatGPTComposerRoot()) {
     return chatGPTComposerAttachmentTiles(root).filter(tile => {
-      const label = String(tile.getAttribute('aria-label') || '').trim();
+      const label = chatGPTAttachmentTileName(tile).trim();
       return Boolean(label && !isGeneratedAuditPromptFilename(label));
     });
   }
@@ -3093,7 +3804,7 @@ ordinal/name of the entrypoint file.`;
   function composerArchiveFreshness(now = Date.now(), root = chatGPTComposerRoot()) {
     rememberChatGPTComposerFiles();
     const archives = chatGPTProjectComposerAttachments(root)
-      .map(tile => String(tile.getAttribute('aria-label') || '').trim())
+      .map(tile => chatGPTAttachmentTileName(tile).trim())
       .filter(name => /\.(?:tar\.gz|zip|7z|rar|tgz|tar)$/i.test(name));
 
     if (!archives.length) {
@@ -3145,6 +3856,66 @@ ordinal/name of the entrypoint file.`;
     };
   }
 
+  function composerArchiveEntries(root = chatGPTComposerRoot()) {
+    rememberChatGPTComposerFiles();
+    return chatGPTProjectComposerAttachments(root)
+      .map(tile => {
+        const name = chatGPTAttachmentTileName(tile).trim();
+        const metadata = composerAttachmentMetadata.get(name.toLowerCase()) || null;
+        return { tile, name, size: Math.max(0, Number(metadata?.size) || 0) };
+      })
+      .filter(entry => /\.(?:tar\.gz|zip|7z|rar|tgz|tar)$/i.test(entry.name));
+  }
+
+  function composerArchivesForProject(project, root = chatGPTComposerRoot()) {
+    const keys = projectNameKeys(project);
+    if (!keys.length) return [];
+    return composerArchiveEntries(root).filter(entry => {
+      const identity = projectNameFromArtifactFilename(entry.name);
+      if (!identity) return false;
+      const normalized = normalizedProjectIdentity(identity);
+      return keys.includes(String(identity).toLowerCase()) || Boolean(normalized && keys.includes(normalized));
+    });
+  }
+
+  // T-182A: a canonical proof is bound to the EXACT attachment tile whose
+  // upload was proven by the AUTO ZIP transaction. A different DOM element
+  // with the same filename/size must never inherit the digest proof, so the
+  // WeakMap key is the live tile element itself.
+  const canonicalArchiveProofsByTile = new WeakMap();
+
+  function canonicalArchiveProofForTile(tile) {
+    if (!tile) return null;
+    return canonicalArchiveProofsByTile.get(tile) || null;
+  }
+
+  function rememberCanonicalArchiveProof(tile, projectId, proof) {
+    const id = String(projectId || '').trim();
+    if (!tile || !id || !proof) return false;
+    canonicalArchiveProofsByTile.set(tile, {
+      project_id: id,
+      filename: String(proof.filename || ''),
+      size: Math.max(0, Number(proof.size) || 0),
+      sha256: String(proof.sha256 || '').toLowerCase()
+    });
+    return true;
+  }
+
+  function canonicalArchiveProofMatches(projectId, meta, attached) {
+    const id = String(projectId || '').trim();
+    if (!id || !meta || !attached || !attached.tile) return false;
+    const proof = canonicalArchiveProofsByTile.get(attached.tile) || null;
+    if (!proof || !proof.sha256) return false;
+    if (!attached.tile.isConnected) return false;
+    if (String(proof.project_id || '') !== id) return false;
+    if (String(proof.filename || '').toLowerCase() !== String(meta.filename || '').toLowerCase()) return false;
+    if (Number(proof.size) !== Number(meta.size || 0)) return false;
+    if (String(proof.sha256).toLowerCase() !== String(meta.sha256 || '').toLowerCase()) return false;
+    if (String(attached.name || '').toLowerCase() !== String(meta.filename || '').toLowerCase()) return false;
+    if (Number(attached.size || 0) !== Number(meta.size || 0)) return false;
+    return true;
+  }
+
   function currentAuditArchiveFreshness(now = Date.now()) {
     const live = composerArchiveFreshness(now);
     if (live.present) return live;
@@ -3174,7 +3945,7 @@ ordinal/name of the entrypoint file.`;
     return chatGPTProjectComposerAttachments(root).filter(tile => {
       if (!tile?.isConnected || !isVisible(tile) || chatGPTAttachmentIsBusy(tile)) return false;
 
-      const label = String(tile.getAttribute('aria-label') || '').trim();
+      const label = chatGPTAttachmentTileName(tile).trim();
       if (!label) return false;
       return true;
     });
@@ -3219,7 +3990,7 @@ ordinal/name of the entrypoint file.`;
     if (!tiles.length) return 'composer:0';
 
     return `composer:${tiles.map(tile => {
-      const name = String(tile.getAttribute('aria-label') || '').trim().toLowerCase();
+      const name = chatGPTAttachmentTileName(tile).trim().toLowerCase();
       const busy = chatGPTAttachmentIsBusy(tile) ? '1' : '0';
       return `${name}|${busy}`;
     }).sort().join('||')}`;
@@ -3277,7 +4048,7 @@ ordinal/name of the entrypoint file.`;
     const allTiles = chatGPTProjectComposerAttachments(root);
     const readyTiles = chatGPTReadyComposerAttachments(root);
     const names = readyTiles
-      .map(tile => String(tile.getAttribute('aria-label') || '').trim())
+      .map(tile => chatGPTAttachmentTileName(tile).trim())
       .filter(Boolean);
 
     if (readyTiles.length) {
@@ -3307,14 +4078,29 @@ ordinal/name of the entrypoint file.`;
   }
 
   async function waitForReadyAttachment(timeoutMs = 35000) {
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
+    // T-189 rev 2: progress-based and bounded. A stable, non-busy, non-ready
+    // tile will never become a valid ready tile, so it fails to a named HOLD
+    // after a short stabilization window instead of burning the full budget
+    // (START looked dead for ~40s). Genuine activity -- a busy/registering
+    // tile or a changing attachment signature -- keeps the wait alive.
+    const ATTACHMENT_STABLE_GRACE_MS = 1800;
+    const startedAt = performance.now();
+    let lastSignature = composerAttachmentSignature();
+    let lastProgressAt = performance.now();
+    while (performance.now() - startedAt < timeoutMs) {
       const summary = chatGPTReadyAttachmentSummary();
       if (summary && summary.ready) return summary;
       const root = chatGPTComposerRoot();
       const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
       if (allTiles.length === 0) return null;
-      await new Promise(resolve => setTimeout(resolve, 350));
+      const signature = composerAttachmentSignature();
+      if (allTiles.some(tile => chatGPTAttachmentIsBusy(tile)) || signature !== lastSignature) {
+        lastSignature = signature;
+        lastProgressAt = performance.now();
+      } else if (performance.now() - lastProgressAt > ATTACHMENT_STABLE_GRACE_MS) {
+        return null;
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
     }
     return chatGPTReadyAttachmentSummary();
   }
@@ -3339,32 +4125,85 @@ ordinal/name of the entrypoint file.`;
     return 0;
   }
 
-  async function waitForExactProjectAttachment({ filename, expectedSize, timeoutMs = 40000 }) {
-    const startedAt = browserWorkerClockNow();
+  // APP-PERF-003 TARGET T (audit/12.md): both attachment waits carried a
+  // setInterval(..., 60) beside an ALREADY condition-driven MutationObserver.
+  // The observer is what releases the caller the moment the tile is provable;
+  // the interval exists only to notice a React composer remount, so it is
+  // deliberately coarse rather than near-frame-rate. Measured before: ~666
+  // idle wakeups per 40 s wait, paid independently by every worker window.
+  // One primitive, shared, instead of a copy at each call site.
+  const COMPOSER_REMOUNT_FALLBACK_MS = 400;
+
+  function observeComposerRemount({ check, timeoutMs, fallbackMs = COMPOSER_REMOUNT_FALLBACK_MS }) {
+    const deadline = acbWaitNow() + Math.max(1, Number(timeoutMs) || 40000);
+    return new Promise(resolve => {
+      let settled = false;
+      let observer = null;
+      let poll = 0;
+      let observedRoot = null;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        if (poll) clearInterval(poll);
+        resolve(value);
+      };
+      const reanchor = () => {
+        const live = chatGPTComposerRoot();
+        if (!live || live === observedRoot) return;
+        if (observer) observer.disconnect();
+        observedRoot = live;
+        observer.observe(live, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ['class', 'style', 'aria-label']
+        });
+      };
+      const tick = () => {
+        reanchor();
+        const value = check();
+        if (value !== null && value !== undefined && value !== false) finish(value);
+        else if (acbWaitNow() >= deadline) finish(null);
+      };
+      observer = new MutationObserver(tick);
+      reanchor();
+      poll = setInterval(tick, Math.max(250, Number(fallbackMs) || COMPOSER_REMOUNT_FALLBACK_MS));
+      tick();
+    });
+  }
+
+  function waitForExactProjectAttachment({ filename, expectedSize, timeoutMs = 40000 }) {
+    // APP-PERF-001 TARGET T: condition-driven, mirroring the manual path's
+    // injected-tile wait. The old fixed 200 ms polling loop added up to 200 ms
+    // of pure scheduling latency to EVERY worker attach; the observer releases
+    // the caller the MOMENT the exact tile is provable, with a 60 ms poll only
+    // as the composer-remount fallback. The timeout stays a pure upper bound.
+    const wanted = String(filename || '').trim();
     let lastObservedNames = [];
-    while (browserWorkerClockNow() - startedAt < timeoutMs) {
+    const evaluate = () => {
       const root = chatGPTComposerRoot();
-      if (!root || root.hasAttribute('inert')) {
-        await new Promise(resolve => setTimeout(resolve, 250));
-        continue;
-      }
+      if (!root || root.hasAttribute('inert')) return null;
       const tiles = chatGPTProjectComposerAttachments(root);
-      const names = tiles.map(t => String(t.getAttribute('aria-label') || t.textContent || '').trim()).filter(Boolean);
+      const names = tiles.map(t => chatGPTAttachmentTileName(t) || String(t.textContent || '').trim()).filter(Boolean);
       lastObservedNames = names;
-      if (names.length > 0) {
-        const exactTile = tiles.find((tile, index) => names[index] === filename);
-        if (exactTile) {
-          const observedSize = observedAttachmentSize(exactTile);
-          if (Number(expectedSize) > 0 && observedSize > 0 && observedSize !== Number(expectedSize)) {
-            return { ok: false, filename, observedNames: names, observedSize, reason: 'artifact-size-mismatch', detail: `expected ${expectedSize} bytes, observed ${observedSize}` };
-          }
-          return { ok: true, filename, observedNames: names, observedSize, reason: 'exact-match' };
-        }
-        return { ok: false, filename, observedNames: names, reason: 'attachment-identity-mismatch', detail: `expected ${filename}, observed ${names.join(', ')}` };
+      if (names.length === 0) return null;
+      const exactTile = tiles.find((tile, index) => names[index] === wanted);
+      if (!exactTile) {
+        return { ok: false, filename: wanted, observedNames: names, reason: 'attachment-identity-mismatch', detail: `expected ${wanted}, observed ${names.join(', ')}` };
       }
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    return { ok: false, filename, observedNames: lastObservedNames, reason: 'attachment-registration-timeout', detail: 'no matching tile appeared within timeout' };
+      const observedSize = observedAttachmentSize(exactTile);
+      if (Number(expectedSize) > 0 && observedSize > 0 && observedSize !== Number(expectedSize)) {
+        return { ok: false, filename: wanted, observedNames: names, observedSize, reason: 'artifact-size-mismatch', detail: `expected ${expectedSize} bytes, observed ${observedSize}` };
+      }
+      return { ok: true, filename: wanted, observedNames: names, observedSize, reason: 'exact-match' };
+    };
+    const first = evaluate();
+    if (first) return Promise.resolve(first);
+    return observeComposerRemount({ check: evaluate, timeoutMs }).then(value => value || {
+      ok: false, filename: wanted, observedNames: lastObservedNames,
+      reason: 'attachment-registration-timeout', detail: 'no matching tile appeared within timeout'
+    });
   }
 
   async function waitForExactProjectAttachmentWithRetry({ filename, expectedSize, timeoutMs = 40000, maxAttempts = 3 }) {
@@ -3434,7 +4273,7 @@ ordinal/name of the entrypoint file.`;
     const wanted = String(filename || '').trim().toLowerCase();
     if (!wanted) return null;
     return chatGPTComposerAttachmentTiles(root).find(tile => {
-      return String(tile.getAttribute('aria-label') || '').trim().toLowerCase() === wanted;
+      return chatGPTAttachmentTileName(tile).trim().toLowerCase() === wanted;
     }) || null;
   }
 
@@ -3549,17 +4388,36 @@ ordinal/name of the entrypoint file.`;
     return String(preset.text).length >= CHATGPT_LONG_PROMPT_THRESHOLD;
   }
 
-  function setNativeFileList(input, files) {
+  const acbInternalFileChangeEvents = new WeakSet();
+
+  function nativeFileListSignature(files) {
+    return JSON.stringify(Array.from(files || []).map(file => [
+      String(file?.name || ''),
+      Number(file?.size || 0),
+      Number(file?.lastModified || 0)
+    ]));
+  }
+
+  function setNativeFileList(input, files, options = {}) {
     if (!input || typeof DataTransfer !== 'function') return false;
     try {
+      const injectedGeneration = Number(options?.injectedGeneration || 0);
+      const fileList = Array.from(files || []);
+      input._acbInternalFileListChange = injectedGeneration > 0 ? {
+        generation: injectedGeneration,
+        signature: nativeFileListSignature(fileList)
+      } : null;
       const transfer = new DataTransfer();
-      for (const file of files) transfer.items.add(file);
+      for (const file of fileList) transfer.items.add(file);
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
       if (setter) setter.call(input, transfer.files);
       else input.files = transfer.files;
-      input.dispatchEvent(new Event('change', { bubbles: true, cancelable: false }));
+      const changeEvent = new Event('change', { bubbles: true, cancelable: false });
+      acbInternalFileChangeEvents.add(changeEvent);
+      input.dispatchEvent(changeEvent);
       return true;
     } catch (_) {
+      try { input._acbInternalFileListChange = null; } catch (_) { }
       return false;
     }
   }
@@ -3574,10 +4432,6 @@ ordinal/name of the entrypoint file.`;
     let tile = chatGPTFindComposerAttachment(filename, root);
 
     if (!tile) {
-      const upload = chatGPTUploadInput();
-      if (!upload || !root.contains(upload)) {
-        return { ok: false, reason: 'upload-input-unavailable', filename };
-      }
       if (typeof File !== 'function' || typeof DataTransfer !== 'function') {
         return { ok: false, reason: 'file-api-unavailable', filename };
       }
@@ -3587,9 +4441,8 @@ ordinal/name of the entrypoint file.`;
         lastModified: Date.now()
       });
 
-      if (!setNativeFileList(upload, [file])) {
-        return { ok: false, reason: 'file-injection-rejected', filename };
-      }
+      const injected = await injectComposerArchiveFile(file);
+      if (!injected.ok) return { ok: false, reason: injected.reason, filename };
 
       tile = await waitForDomCondition(root, () => {
         const candidate = chatGPTFindComposerAttachment(filename, root);
@@ -3621,54 +4474,59 @@ ordinal/name of the entrypoint file.`;
     return { ok: true, filename, marker, tile };
   }
 
-  async function waitForChatGPTSendReady(timeoutMs = CHATGPT_ATTACHMENT_TIMEOUT_MS, maxMs = CHATGPT_SEND_READY_MAX_MS) {
-    // Do not observe one captured composer root for the whole attachment wait.
-    // ChatGPT can replace the unified-composer subtree while an injected file is
-    // being registered. The old root then receives no more mutations, leaving a
-    // visibly enabled Send button in the NEW root while this function sleeps all
-    // the way to timeout. Re-resolve the live composer/button on every probe.
-    let deadline = Date.now() + Math.max(1, Number(timeoutMs) || CHATGPT_ATTACHMENT_TIMEOUT_MS);
-    // ChatGPT keeps Send aria-disabled while it ingests an attachment, and a
-    // few hundred megabytes take far longer than any fixed wait. Observed
-    // live on four of six dispatches at once: "button=found disabled=false
-    // aria=true tiles=1 composerPrepared=true", the wait expiring, and the
-    // operator told to press Send by hand on a run that was supposed to need
-    // nobody. Progress, not a stopwatch, decides how long to wait: while a
-    // tile is visibly still processing the deadline keeps moving, bounded so
-    // a genuinely stuck upload still ends.
-    const hardDeadline = Date.now() + Math.max(1, Number(maxMs) || CHATGPT_SEND_READY_MAX_MS);
-    while (Date.now() < deadline && Date.now() < hardDeadline) {
-      const button = getChatGPTSend();
-      if (
-        button &&
-        button.isConnected &&
-        isVisible(button) &&
-        !button.disabled &&
-        button.getAttribute('aria-disabled') !== 'true'
-      ) return button;
-
-      try {
-        // The presence of an attachment is the signal, not a spinner inside
-        // it. Keying on a visible `animate-spin` tile missed entirely: at
-        // 15:00:05, on the build carrying that very fix, two dispatches still
-        // reported "aria=true tiles=1" and gave up after the 12s wait --
-        // ChatGPT no longer paints a spinner there, so a composer that was
-        // plainly still ingesting looked idle. A Send held disabled with a
-        // file attached is ingestion; the only case worth failing fast is a
-        // composer with nothing attached at all.
-        if (chatGPTComposerAttachmentTiles().length) {
-          deadline = Math.min(hardDeadline, Date.now() + CHATGPT_ATTACHMENT_TIMEOUT_MS);
-        }
-      } catch (_) { }
-
-      await sleep(Math.min(120, Math.max(20, deadline - Date.now())));
+  // Deadline clock for the bounded readiness/send waits. Monotonic when the
+  // runtime provides it, so an NTP correction or an OS sleep/resume cannot
+  // stretch or truncate a bounded wait. It is anchored to its first reading:
+  // the returned value is always "ms since this widget's first wait", which is
+  // what makes a large pre-existing runtime clock irrelevant to a bounded wait.
+  let acbWaitClockBase = null;
+  let manualArchiveAcceptTrace = null;
+  function acbWaitNow() {
+    let value = null;
+    const perf = globalThis.performance;
+    if (perf && typeof perf.now === 'function') {
+      const candidate = Number(perf.now());
+      if (Number.isFinite(candidate)) value = candidate;
     }
+    if (value === null) value = Date.now();
+    if (acbWaitClockBase === null) acbWaitClockBase = value;
+    return value - acbWaitClockBase;
+  }
 
+  // `idleGiveUpMs`: how long a disabled Send with no visible upload may sit
+  // before the wait gives up early. Automated callers keep the short default so
+  // a dead composer never holds a lane. The operator's ZIP passes its whole
+  // budget: ChatGPT shows no spinner while it uploads a large archive, and the
+  // 1.4 s early exit turned 2 of 3 real 40 MB ZIPs into SEND_TIMEOUT.
+  async function waitForChatGPTSendReady(timeoutMs = CHATGPT_ATTACHMENT_TIMEOUT_MS, maxMs = CHATGPT_SEND_READY_MAX_MS, options = {}) {
+    const idleGiveUpMs = Math.max(0, Number(options.idleGiveUpMs) || 1400);
+    let deadline = acbWaitNow() + Math.max(1, Number(timeoutMs) || CHATGPT_ATTACHMENT_TIMEOUT_MS);
+    const hardDeadline = acbWaitNow() + Math.max(1, Number(maxMs) || CHATGPT_SEND_READY_MAX_MS);
+    let lastSig = composerAttachmentSignature();
+    let stableSince = acbWaitNow();
+    while (acbWaitNow() < deadline && acbWaitNow() < hardDeadline) {
+      const button = getChatGPTSend();
+      if (button && button.isConnected && isVisible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true') return button;
+      const readiness = chatGPTSendReadiness();
+      if (readiness === 'WORK_BLOCKED' || readiness === 'AUTH_BLOCKED' || readiness === 'COMPOSER_BLOCKED') return null;
+      if (readiness === 'ATTACHMENT_REGISTERING') {
+        deadline = Math.min(hardDeadline, acbWaitNow() + CHATGPT_ATTACHMENT_TIMEOUT_MS);
+        lastSig = composerAttachmentSignature();
+        stableSince = acbWaitNow();
+        await sleep(Math.min(120, Math.max(20, deadline - acbWaitNow())));
+        continue;
+      }
+      const stableSig = composerAttachmentSignature();
+      if (stableSig !== lastSig) { lastSig = stableSig; stableSince = acbWaitNow(); }
+      // Patience applies only to a control that EXISTS but is disabled -- the
+      // silent attachment upload. A MISSING control will not enable itself,
+      // so the short exit stands there (T-260 falls through to form submit).
+      const giveUpMs = button ? idleGiveUpMs : 1400;
+      if (acbWaitNow() - stableSince > giveUpMs) return null;
+      await sleep(Math.min(120, Math.max(20, deadline - acbWaitNow())));
+    }
     const button = getChatGPTSend();
-    return button && button.isConnected && isVisible(button) &&
-      !button.disabled && button.getAttribute('aria-disabled') !== 'true'
-      ? button
-      : null;
+    return button && button.isConnected && isVisible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' ? button : null;
   }
 
   const SITES = {
@@ -3875,6 +4733,12 @@ ordinal/name of the entrypoint file.`;
       autoSaveAuditFiles: true,
       bridgeEnabled: true,
       bridgeUrl: BRIDGE_DEFAULT_URL,
+      handoffAutoCapture: true,
+      auditAutoCapture: true,
+      auditAutoAssign: false,
+      saihandoffM1GateClosed: true,
+      saihandoffM1P0GateOpen: false,
+      saihandoffM1GateExplicitV1: false,
       activeCategoryId: audit.id,
       categories: [audit]
     };
@@ -4031,6 +4895,7 @@ ordinal/name of the entrypoint file.`;
 
     const categories = sanitizeCategories(data.categories);
     if (!categories.length) return defaultState();
+    const saihandoffM1GateExplicit = data.saihandoffM1GateExplicitV1 === true;
 
     const clean = {
       stateVersion: STATE_VERSION,
@@ -4064,6 +4929,12 @@ ordinal/name of the entrypoint file.`;
       autoSaveAuditFiles: true, // invariant: every COMPLETE audit is always queued for persistence
       bridgeEnabled: data.bridgeEnabled !== false,
       bridgeUrl: String(data.bridgeUrl || BRIDGE_DEFAULT_URL),
+      handoffAutoCapture: data.handoffAutoCapture !== false,
+      auditAutoCapture: data.auditAutoCapture !== false,
+      auditAutoAssign: data.auditAutoAssign === true,
+      saihandoffM1GateClosed: !saihandoffM1GateExplicit || data.saihandoffM1P0GateOpen !== true,
+      saihandoffM1P0GateOpen: saihandoffM1GateExplicit && data.saihandoffM1P0GateOpen === true,
+      saihandoffM1GateExplicitV1: saihandoffM1GateExplicit,
       activeCategoryId: String(data.activeCategoryId || ''),
       categories
     };
@@ -4595,31 +5466,139 @@ ordinal/name of the entrypoint file.`;
     return chatGPTComposerReceiptState(receipt) === 'present-with-receipt';
   }
 
-  async function chatGPTSendAccepted(receipt = '', beforeText = '', timeoutMs = 900) {
+  // A machine-authored audit Send is THREE facts, and 0.0.90 represented all
+  // three with one boolean:
+  //   1. SUBMISSION_ATTEMPTED     -- a trusted submit was dispatched
+  //   2. PAYLOAD_LEFT_COMPOSER    -- the platform consumed the payload
+  //   3. USER TURN REGISTERED     -- the audit lineage has a concrete owner
+  //
+  // `chatGPTIsGenerating()` proves (2) and nothing more. A Core that is still
+  // sitting in the composer under a live generation Stop returns accepted with
+  // ZERO user turns -- reproduced against the current bytes, and it is what let
+  // the Bridge enter AUDITING over a runtime that owned no wave at all.
+  //
+  // (2) stays the right answer for the manual/fallback send paths, which only
+  // ever needed "did the payload leave?". `chatGPTSendAccepted()` is that
+  // verdict. START and the Auto3 machine waves need (3), and read `.state`.
+  async function chatGPTSendOutcome(receipt = '', beforeText = '', timeoutMs = 900, beforePayloadPresent) {
     const wanted = String(receipt || '').trim();
     const baseline = cleanTurnText(beforeText || '');
-    const deadline = Date.now() + Math.max(120, Number(timeoutMs) || 900);
+    // `beforePayloadPresent` is the caller's PRE-CLICK observation and must win
+    // when supplied: a synchronous submit can clear the composer and detach the
+    // attachment in the same task as the click, so by the time this function
+    // runs the composer no longer shows the payload it just submitted.
+    const baselineTiles = chatGPTComposerAttachmentTiles().filter(tile => tile.isConnected).length;
+    const payloadPresent = beforePayloadPresent === undefined
+      ? (Boolean(baseline) || baselineTiles > 0)
+      : Boolean(beforePayloadPresent);
     let observedPreparedComposer = false;
-
-    while (Date.now() < deadline) {
+    let observedPayloadBefore = payloadPresent;
+    let payloadDeparted = false;
+    let generating = false;
+    let userTurn = null;
+    // The acceptance evidence is evaluated at least once SYNCHRONOUSLY, before
+    // any timer. A browser can (and the test harness does) advance its timer
+    // queue past a whole bounded window in one step; an acceptance that had to
+    // wait for its first timer tick would then never be observed at all even
+    // though the submitted payload had already left the composer.
+    const observe = () => {
+      userTurn = null;
       if (wanted) {
-        if (exactReceiptUserTurn(wanted, getChatGPTTurns())) return true;
+        userTurn = exactReceiptUserTurn(wanted, getChatGPTTurns());
+        if (userTurn) { payloadDeparted = true; return true; }
         const state = chatGPTComposerReceiptState(wanted);
         if (state === 'present-with-receipt') observedPreparedComposer = true;
-        if (state === 'present-without-receipt' && observedPreparedComposer) return true;
+        if (state === 'present-without-receipt' && observedPreparedComposer) { payloadDeparted = true; return true; }
         // composer-unavailable is deliberately UNKNOWN. React can replace the
         // composer during hydration without having submitted the authored turn.
       } else {
         const live = rawChatGPTComposerInput();
         if (live) {
           const current = cleanTurnText(composerPlainText(live));
-          if (baseline && current !== baseline) return true;
+          const liveTiles = chatGPTComposerAttachmentTiles().filter(tile => tile.isConnected).length;
+          if (baseline && current !== baseline) { payloadDeparted = true; return true; }
+          if (observedPayloadBefore && !current && liveTiles === 0) { payloadDeparted = true; return true; }
+          if (current || liveTiles > 0) observedPayloadBefore = true;
         }
       }
-      if (chatGPTIsGenerating()) return true;
-      await sleep(60);
+      // LIVENESS, never lineage identity. ChatGPT reacting proves a submission
+      // happened; it says nothing about WHICH user turn owns the audit. The
+      // START reproduction is exactly this shape and must stay SUBMITTED.
+      generating = chatGPTIsGenerating();
+      // Liveness, never lineage identity -- but only when there WAS something
+      // to submit. An empty composer beside an already-generating page proves
+      // nothing about a click: measured live on dsp-5d5df0f69b3244b8 and
+      // dsp-c6763cc27a1242a9, CDP on the dedicated profile showed the ChatGPT
+      // home with a one-character composer, zero Send controls and zero
+      // attachment tiles, and this accepted the click anyway. The Bridge then
+      // ACKed the irreversible START_PREPARED fence, the lane went STARTED, and
+      // ChatGPT never created a turn (turns=0(u0/a0) for the whole run).
+      if (generating && payloadPresent) return true;
+      return false;
+    };
+
+    const deadline = acbWaitNow() + Math.max(120, Number(timeoutMs) || 900);
+    let submitted = observe();
+    if (typeof __ACB_TEST__ !== 'undefined') {
+      try {
+        const liveNow = rawChatGPTComposerInput();
+        manualArchiveAcceptTrace = {
+          baseline,
+          payloadPresent,
+          observed: submitted,
+          now: acbWaitNow(),
+          deadline,
+          live: Boolean(liveNow),
+          liveText: liveNow ? cleanTurnText(composerPlainText(liveNow)) : null,
+          liveTiles: chatGPTComposerAttachmentTiles().filter(tile => tile.isConnected).length,
+          generating
+        };
+      } catch (_) { }
     }
-    return false;
+    while (!submitted && acbWaitNow() < deadline) {
+      await sleep(60);
+      submitted = observe();
+    }
+
+    // A turn that hydrated on the final tick is still a registration.
+    if (!userTurn && wanted) userTurn = exactReceiptUserTurn(wanted, getChatGPTTurns());
+    const receiptVisible = wanted ? chatGPTComposerStillContainsReceipt(wanted) : false;
+    // ChatGPT submits the turn before it exposes a stable id for it. A turn with
+    // no id yet is SUBMITTED_UNREGISTERED, not registered: the hydration stage
+    // exists for exactly that window.
+    const userTurnId = userTurn ? getTurnId(userTurn) : '';
+    const userTurnRegistered = Boolean(userTurn) && Boolean(userTurnId);
+    const state = !submitted
+      ? 'REJECTED'
+      : userTurnRegistered
+        ? 'REGISTERED'
+        : 'SUBMITTED_UNREGISTERED';
+
+    return {
+      submitted: Boolean(submitted),
+      payloadDeparted: Boolean(payloadDeparted),
+      generating: Boolean(generating || chatGPTIsGenerating()),
+      userTurnRegistered,
+      userTurnId,
+      receiptVisible,
+      userTurn,
+      state,
+      reason: state === 'REJECTED'
+        ? 'no-positive-submission-evidence'
+        : state === 'REGISTERED'
+          ? userTurn ? 'exact-machine-receipt-user-turn' : 'transaction-turn-registered'
+          : receiptVisible
+            ? 'generation-only-payload-still-in-composer'
+            : 'user-turn-not-hydrated'
+    };
+  }
+
+  // The TRANSPORT verdict, unchanged in meaning. Callers that only need "the
+  // message left the composer" -- manual Send, the T-260 form fallback, the
+  // attachment-accepting path -- keep this. Any caller that needs audit lineage
+  // ownership must read `chatGPTSendOutcome()` instead.
+  async function chatGPTSendAccepted(receipt = '', beforeText = '', timeoutMs = 900, beforePayloadPresent) {
+    return (await chatGPTSendOutcome(receipt, beforeText, timeoutMs, beforePayloadPresent)).submitted;
   }
 
   function dispatchElementClick(element) {
@@ -4643,6 +5622,42 @@ ordinal/name of the entrypoint file.`;
     }
   }
 
+  // T-260: the composer form is the platform's own submit unit, and
+  // form.requestSubmit() is a TRUSTED submit. A dispatched KeyboardEvent is not:
+  // a site that binds send to its own keydown handler ignores an untrusted one,
+  // and the widget used to leave it as the only remaining path.
+  //
+  // It was the only path because both trusted paths -- the click and this
+  // requestSubmit -- lived inside clickChatGPTSendVerified(), which requires a
+  // DISCOVERED send control. A build that renames or drops the submit control
+  // therefore did not fall back to a weaker send, it fell back to nothing that
+  // works: the operator watched the archive attach and the audit text appear,
+  // and no message left.
+  //
+  // Acceptance is the same gate as everywhere else: requestSubmit() is a
+  // submission ATTEMPT, never a submission.
+  async function submitChatGPTComposerFormVerified(input, options = {}) {
+    const fence = typeof options.fence === 'function' ? options.fence : null;
+    const liveInput = rawChatGPTComposerInput() || input || null;
+    if (!liveInput) return false;
+    if (fence && !(await fence())) return false;
+
+    const form = liveInput.closest('form');
+    if (!form || typeof form.requestSubmit !== 'function') return false;
+
+    // The pre-submit baseline, taken before anything is dispatched, exactly as
+    // clickChatGPTSendVerified() takes it.
+    const beforeText = composerPlainText(liveInput);
+    const beforePayloadPresent = Boolean(cleanTurnText(beforeText))
+      || chatGPTComposerAttachmentTiles().some(tile => tile.isConnected);
+    if (!beforePayloadPresent) return false;
+
+    try { form.requestSubmit(); } catch (_) { return false; }
+    return chatGPTSendAccepted(
+      String(options.receipt || ''), beforeText, 2500, beforePayloadPresent
+    );
+  }
+
   async function clickChatGPTSendVerified(button, input, options = {}) {
     if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true') {
       return false;
@@ -4650,6 +5665,10 @@ ordinal/name of the entrypoint file.`;
 
     const receipt = String(options.receipt || '');
     const beforeText = composerPlainText(input || rawChatGPTComposerInput());
+    // Captured BEFORE the click: whether the composer actually held a payload
+    // worth submitting. This is the acceptance baseline.
+    const beforePayloadPresent = Boolean(cleanTurnText(beforeText))
+      || chatGPTComposerAttachmentTiles().some(tile => tile.isConnected);
     const ownership = options.autoOwnership || null;
     const fence = typeof options.fence === 'function' ? options.fence : null;
     if (ownership && !(await ownership.verify())) return false;
@@ -4658,15 +5677,24 @@ ordinal/name of the entrypoint file.`;
     try { button.focus({ preventScroll: true }); } catch (_) { }
     if (ownership && !(await ownership.verify())) return false;
     if (fence && !(await fence())) return false;
+    if (options.singleAttempt) {
+      try { button.click(); } catch (_) { return false; }
+      if (button._sendFails && typeof __ACB_TEST__ !== 'undefined') return false;
+      return chatGPTSendAccepted(receipt, beforeText, 2500, beforePayloadPresent);
+    }
     dispatchElementClick(button);
-    if (button._clicked && typeof __ACB_TEST__ !== 'undefined') return true;
+    if (button._sendFails && typeof __ACB_TEST__ !== 'undefined') return false;
+    // A controlled failure is allowed to stand in for "ChatGPT rejected the
+    // submission and the composer still holds the payload". Success is NEVER
+    // taken from the click itself: it must be proven by acceptance below.
+    if (button._sendFails && typeof __ACB_TEST__ !== 'undefined') return false;
 
     const innerTarget = button.querySelector('svg, path, span') || button;
     if (innerTarget !== button) {
       try { dispatchElementClick(innerTarget); } catch (_) { }
     }
 
-    if (await chatGPTSendAccepted(receipt, beforeText, 2500)) return true;
+    if (await chatGPTSendAccepted(receipt, beforeText, 2500, beforePayloadPresent)) return true;
 
     const liveInput = rawChatGPTComposerInput();
     const receiptState = receipt ? chatGPTComposerReceiptState(receipt) : '';
@@ -4691,7 +5719,7 @@ ordinal/name of the entrypoint file.`;
           form.requestSubmit();
         }
       } catch (_) { }
-      if (await chatGPTSendAccepted(receipt, beforeText, 2500)) return true;
+      if (await chatGPTSendAccepted(receipt, beforeText, 2500, beforePayloadPresent)) return true;
     }
 
     if (liveInput) {
@@ -4699,7 +5727,7 @@ ordinal/name of the entrypoint file.`;
         liveInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
         liveInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
       } catch (_) { }
-      if (await chatGPTSendAccepted(receipt, beforeText, 2000)) return true;
+      if (await chatGPTSendAccepted(receipt, beforeText, 2000, beforePayloadPresent)) return true;
     }
 
     return false;
@@ -4731,7 +5759,14 @@ ordinal/name of the entrypoint file.`;
     };
 
     if (site?.key === 'chatgpt' && waitForReadyMs > 0) {
-      const ready = await waitForChatGPTSendReady(waitForReadyMs);
+      // W6-009 for the manual ZIP, and the same contract for every automatic
+      // send: ChatGPT can hold Send disabled for seconds with NO busy tile
+      // while it silently registers a prepared attachment (live 2026-10-04:
+      // ready ~4s after prepare). The 1.4s idle exit misreads that as a dead
+      // composer and dumps the operator into a manual Send on a run that must
+      // need nobody. A send action therefore waits out its own BOUNDED budget
+      // (12s, or 30s with attachment delivery) before any fallback.
+      const ready = await waitForChatGPTSendReady(waitForReadyMs, CHATGPT_SEND_READY_MAX_MS, { idleGiveUpMs: waitForReadyMs });
       if (ready) {
         if (!(await fenceCheck())) return { ok: false, mode: 'ownership-lost' };
         if (!(await beforeClickCheck())) return { ok: false, mode: 'pre-click-checkpoint-failed' };
@@ -4757,6 +5792,36 @@ ordinal/name of the entrypoint file.`;
             ? { ok: true, mode: 'button' }
             : { ok: false, mode: 'click-unverified' };
         }
+      }
+    }
+
+    // T-260: no send control was discovered. Submit the composer's own form --
+    // the platform's trusted submit path, independent of what the submit
+    // control is called this build -- and hold it to the same acceptance gate.
+    // This runs BEFORE the manual-only gate: requestSubmit() is not a manual
+    // action, it is the submission the click would have performed.
+    //
+    // It is fenced on the one thing discovery CAN still say. A discovered
+    // control that is disabled (or aria-disabled) is the platform reporting
+    // that this composer is not ready to submit -- an attachment still
+    // uploading, a model still switching -- and submitting the form behind its
+    // back would override exactly that state. Unidentified means "go ahead";
+    // disabled means "wait", and waiting is what the old code did.
+    if (site?.key === 'chatgpt') {
+      const knownControl = getChatGPTSend();
+      const platformSaysNotReady = Boolean(knownControl) && (
+        knownControl.disabled
+        || knownControl.getAttribute('aria-disabled') === 'true'
+        || !isVisible(knownControl)
+      );
+      if (!platformSaysNotReady) {
+        if (!(await fenceCheck())) return { ok: false, mode: 'ownership-lost' };
+        if (!(await beforeClickCheck())) return { ok: false, mode: 'pre-click-checkpoint-failed' };
+        const submitted = await submitChatGPTComposerFormVerified(input, {
+          receipt: options.receipt,
+          fence: fenceCheck
+        });
+        if (submitted) return { ok: true, mode: 'form-submit' };
       }
     }
 
@@ -4993,7 +6058,7 @@ ordinal/name of the entrypoint file.`;
       }
 
       if (result.mode === 'manual-only') {
-        setStatus(`Prompt was inserted into the verified ${siteLabel} composer, but its Send control did not become ready. Automatic Enter fallback is disabled on this site to prevent sending or editing the wrong field. Press Send manually.`, 'warning');
+        setStatus(`Prompt was inserted into the verified ${siteLabel} composer, but its Send control did not become ready yet (a silent attachment upload can hold it for a while). Automatic Enter fallback is disabled on this site to prevent sending or editing the wrong field, so bounded recovery keeps retrying the Send control automatically; press Send manually only if it stays stuck.`, 'warning');
         return { ok: false, sent: false, mode: result.mode, reason: 'manual-send-required' };
       }
 
@@ -5163,16 +6228,20 @@ ordinal/name of the entrypoint file.`;
   function pruneAuditResultHistory() {
     const index = readAuditResultIndex();
     const entries = Object.entries(index).sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0));
-    const keep = new Set(entries.slice(0, AUDIT_RESULT_MAX_CONVERSATIONS).map(([key]) => key));
+    let changed = false;
     for (const [conversationKey, info] of entries.slice(AUDIT_RESULT_MAX_CONVERSATIONS)) {
-      if (!info?.complete || info.pending || info.failed || keep.has(conversationKey)) continue;
-      const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[info.profileId] || getActiveProfile();
-      for (const wave of profile.waves || []) {
-        try { GM_deleteValue(auditResultStorageKey(conversationKey, wave.id)); } catch (_) { }
+      if (info?.complete && !info.pending && !info.failed) {
+        const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[info.profileId] || getActiveProfile();
+        for (const wave of profile.waves || []) {
+          try { GM_deleteValue(auditResultStorageKey(conversationKey, wave.id)); } catch (_) { }
+        }
       }
       delete index[conversationKey];
+      changed = true;
     }
-    try { GM_setValue(AUDIT_RESULT_INDEX_KEY, JSON.stringify(index)); } catch (_) { }
+    if (changed) {
+      try { GM_setValue(AUDIT_RESULT_INDEX_KEY, JSON.stringify(index)); } catch (_) { }
+    }
   }
 
   function updateAuditResultIndex(record) {
@@ -5191,7 +6260,7 @@ ordinal/name of the entrypoint file.`;
       failed: records.some(item => item.saveError || item.bridgeError)
     };
     try { GM_setValue(AUDIT_RESULT_INDEX_KEY, JSON.stringify(index)); } catch (_) { }
-    if (complete) pruneAuditResultHistory();
+    pruneAuditResultHistory();
   }
 
   function writeAuditResult(record) {
@@ -5918,6 +6987,10 @@ ordinal/name of the entrypoint file.`;
 
   function inauditBlockText(block, turn) {
     if (!block || !assistantStableForInaudit(turn)) return '';
+    // SRC-083: a SAIHANDOFF block is captured as its exact code body, so the
+    // filed handoff never starts with the code-block header chrome.
+    const handoff = handoffBlockText(block);
+    if (handoffCandidateStrength(handoff)) return handoff;
     return String(readableNodeText(block) || '').replace(/\r\n?/g, '\n');
   }
 
@@ -5962,6 +7035,11 @@ ordinal/name of the entrypoint file.`;
       const record = result.data.record;
       const confidence = Math.round(Number(record.classification_confidence || 0) * 100);
       const suggestion = record.suggested_project_name ? ` Suggested: ${record.suggested_project_name} ${confidence}%.` : '';
+      const handoff = handoffResultFrom(result.data);
+      if (handoff) {
+        inauditCaptureButtonState(button, 'saved', `SAIHANDOFF file: ${handoff.path}${handoff.copied ? ' (path copied)' : ''}`);
+        return { ok: true, queued: false, record, handoff };
+      }
       inauditCaptureButtonState(button, 'saved', `Captured ${payload.capture_id.slice(0, 8)}.${suggestion}`);
       return { ok: true, queued: false, record };
     }
@@ -5978,6 +7056,218 @@ ordinal/name of the entrypoint file.`;
       inauditCaptureButtonState(button, 'error', `Capture failed: ${error?.message || 'spool persistence failed'}`);
       return { ok: false, queued: false, error: error?.message || 'spool persistence failed' };
     }
+  }
+
+  // SRC-083: a SAIHANDOFF block is the next agent's whole brief. The Bridge
+  // files it as a ready `.md` and answers with its path; the path goes to the
+  // clipboard so handing it over is one paste. Mirrors
+  // `audapack.handoff_drop.detect_handoff` -- the Bridge stays the authority.
+  const HANDOFF_MARKER_RE = /^SAIHANDOFF(?:\b|_)/;
+  const HANDOFF_TITLE_RE = /^.+?\s+[\u2014-]\s+SAIHANDOFF(?:\s+[\u2014-]\s+.*)?$/;
+
+  function looksLikeSaihandoff(text) {
+    const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 12);
+    if (!lines.length) return false;
+    if (HANDOFF_TITLE_RE.test(lines[0])) return true;
+    return lines.some(line => HANDOFF_MARKER_RE.test(line));
+  }
+
+  // 'strong': an explicit SAIHANDOFF marker. 'weak': a block that merely LOOKS
+  // addressed to a project (a short name line over a real body, e.g.
+  // "LIMISAW / MISSION / ..."). Only the Bridge knows the registry, so a weak
+  // block is offered with `handoff_only` and dropped there unless its first
+  // line is a registered project -- it never becomes inbox noise.
+  function handoffCandidateStrength(text) {
+    if (looksLikeSaihandoff(text)) return 'strong';
+    const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 12);
+    if (lines.length < 5) return '';
+    const first = lines[0].replace(/^#+/, '').trim();
+    if (!first || first.length > 48 || first.split(/\s+/).length > 3) return '';
+    if (/[.:?!;,(){}=<>[\]"'`]/.test(first)) return '';
+    return 'weak';
+  }
+
+  // The block's own code text is what ChatGPT's Copy button yields; the
+  // rendered text of the whole block would drag the header chrome along.
+  function handoffBlockText(block) {
+    if (!block) return '';
+    const code = block.querySelector?.('code');
+    const raw = code ? String(code.textContent || '') : String(readableNodeText(block) || '');
+    return raw.replace(/\r\n?/g, '\n').replace(/\n+$/, '\n');
+  }
+
+  function handoffResultFrom(data) {
+    const handoff = data && typeof data.handoff === 'object' ? data.handoff : null;
+    if (!handoff || handoff.ok !== true || !handoff.path) return null;
+    const path = String(handoff.path).slice(0, 1024);
+    let copied = false;
+    try {
+      if (typeof GM_setClipboard === 'function') {
+        GM_setClipboard(path, 'text');
+        copied = true;
+      }
+    } catch (_) { }
+    const filename = String(handoff.filename || '').slice(0, 160);
+    try {
+      appendBridgeDiagnostic('handoff_saved', {
+        severity: 'info',
+        message: `${String(handoff.label || 'SAIHANDOFF').slice(0, 48)} -> ${filename}${handoff.reused ? ' (existing file)' : ''}`,
+        project: String(handoff.label || '').slice(0, 48)
+      });
+    } catch (_) { }
+    try { setStatus(`SAIHANDOFF saved: ${path}${copied ? ' (path copied)' : ''}`, 'success'); } catch (_) { }
+    return { path, filename, label: String(handoff.label || ''), reused: handoff.reused === true, copied };
+  }
+
+  function handoffTurnKey(turn) {
+    return String(turn?.getAttribute?.('data-message-id') || '') || turn;
+  }
+
+  function rememberHandoffTurn(key, value) {
+    if (handoffTurnSightings.has(key)) handoffTurnSightings.delete(key);
+    handoffTurnSightings.set(key, value);
+    while (handoffTurnSightings.size > HANDOFF_TURN_MEMORY) {
+      handoffTurnSightings.delete(handoffTurnSightings.keys().next().value);
+    }
+  }
+
+  // First sight decides: one cheap final-actions query per turn, ever.
+  function noteHandoffTurnSighting(turn) {
+    if (!turn || turnRole(turn) !== 'assistant') return;
+    const key = handoffTurnKey(turn);
+    if (handoffTurnSightings.has(key)) return;
+    rememberHandoffTurn(key, assistantHasFinalActions(turn) ? 'historical' : 'live');
+  }
+
+  function maybeAutoCaptureHandoffs(turn) {
+    if (!state?.handoffAutoCapture || !state?.bridgeEnabled) return 0;
+    const key = handoffTurnKey(turn);
+    if (handoffTurnSightings.get(key) !== 'live') return 0;
+    rememberHandoffTurn(key, 'captured');
+    let started = 0;
+    for (const block of Array.from(turn.querySelectorAll?.('pre') || [])) {
+      const text = handoffBlockText(block);
+      const strength = handoffCandidateStrength(text);
+      if (!strength) continue;
+      const host = block.parentNode || turn;
+      const button = Array.from(host.querySelectorAll?.('[data-acb-inaudit-scope="block"]') || [])
+        .find(candidate => candidate.__acbInauditTarget === block) || null;
+      if (strength === 'strong') {
+        // An explicit handoff is durable even while the Bridge is down.
+        const payload = { ...inauditCapturePayload(text, 'block'), capture_kind: 'handoff' };
+        persistInauditCapture(payload, button).catch(() => { });
+      } else {
+        offerHandoffCandidate(text, button).catch(() => { });
+      }
+      started += 1;
+    }
+    return started;
+  }
+
+  // A finished reply to a user turn that carried a project archive is that
+  // project's audit. It goes to the INAUDIT Inbox on its own, and the archive
+  // name lets the Bridge pin it to the project -- no IA click, no Inbox
+  // guesswork. Worker-owned runs are excluded: the dispatcher files those.
+  // Only a reply the widget watched finish counts ('live' sighting), so
+  // reopening an old conversation never re-captures its history.
+  const AUDIT_REPLY_MIN_CHARS = 1200;
+  const AUDIT_REPLY_MEMORY = 200;
+  const AUDIT_REPLY_ARCHIVE_RE = /(?:^|[\s"'(\[])([^\s"'()\[\]\\/:*?<>|]{1,160}\.zip)(?=$|[\s"'),.\]])/i;
+  const auditReplyCaptured = new Set();
+
+  function turnWrapperFor(node) {
+    for (const turn of getChatGPTTurns()) {
+      if (turn === node || turn.contains?.(node)) return turn;
+    }
+    return null;
+  }
+
+  function precedingUserTurn(assistantNode) {
+    const turns = getChatGPTTurns();
+    let index = turns.findIndex(turn => turn === assistantNode || turn.contains?.(assistantNode));
+    while (--index >= 0) {
+      const role = turnRole(turns[index]);
+      if (role === 'user') return turns[index];
+      if (role === 'assistant') return null;
+    }
+    return null;
+  }
+
+  function archiveNameInUserTurn(userTurn) {
+    if (!userTurn) return '';
+    const texts = [...userTurnTextCandidates(userTurn), String(readableNodeText(userTurn) || ''), String(userTurn.textContent || '')];
+    for (const text of texts) {
+      const match = AUDIT_REPLY_ARCHIVE_RE.exec(String(text || ''));
+      if (match && projectNameFromArtifactFilename(match[1])) return match[1];
+    }
+    return '';
+  }
+
+  function maybeAutoCaptureAuditReply(turn, wasLive) {
+    if (!wasLive || !state?.auditAutoCapture || !state?.bridgeEnabled) return null;
+    if (browserWorkerLease?.dispatch_id || autoRuntime?.runId) return null;
+    const key = handoffTurnKey(turn);
+    if (auditReplyCaptured.has(key)) return null;
+    const archive = archiveNameInUserTurn(precedingUserTurn(turnWrapperFor(turn) || turn));
+    if (!archive) return null;
+    const text = inauditResponseText(turn);
+    if (!text || text.trim().length < AUDIT_REPLY_MIN_CHARS) return null;
+    auditReplyCaptured.add(key);
+    while (auditReplyCaptured.size > AUDIT_REPLY_MEMORY) {
+      auditReplyCaptured.delete(auditReplyCaptured.values().next().value);
+    }
+    const project = projectNameFromArtifactFilename(archive);
+    const base = inauditCapturePayload(text, 'response');
+    const payload = {
+      ...base,
+      archive_filename: archive,
+      project_hints: [...new Set([...(base.project_hints || []), project, archive.replace(/\.zip$/i, '')].filter(Boolean))]
+    };
+    const button = turn.querySelector?.('[data-acb-inaudit-scope="response"]') || null;
+    const pending = persistInauditCapture(payload, button).then(async result => {
+      if (result?.ok && !result.queued && state?.auditAutoAssign === true && result.record?.target_project_id) {
+        result.assigned = await assignAuditReplyCapture(result.record, button);
+      }
+      if (result?.ok) {
+        const where = result.record?.target_project_name || project;
+        const landed = result.assigned?.ok ? `assigned to ${where} audit inbox` : `captured to INAUDIT${where ? ` for ${where}` : ''}`;
+        const assignNote = result.assigned && !result.assigned.ok ? ` Assign failed: ${result.assigned.message}; it waits in the Inbox.` : '';
+        try { setStatus(`Audit reply ${landed}${result.queued ? ' (queued; Bridge offline)' : ''}.${assignNote}`, result.assigned && !result.assigned.ok ? 'warning' : 'success'); } catch (_) { }
+        try {
+          appendBridgeDiagnostic('audit_reply_captured', {
+            severity: 'info',
+            message: `${archive} -> ${where || 'unpinned'}${result.queued ? ' (queued)' : ''}`,
+            project: String(where || '').slice(0, 48)
+          });
+        } catch (_) { }
+      }
+      return result;
+    }).catch(() => null);
+    return pending;
+  }
+
+  // Opt-in second step: the pin names the project, and an empty project_id
+  // tells the Bridge to use exactly that pin (the same call as Inbox Assign).
+  async function assignAuditReplyCapture(record, button) {
+    const captureId = String(record?.capture_id || '');
+    if (!captureId) return { ok: false, message: 'no capture id' };
+    const result = await inauditCaptureRequest('POST', `/v1/inaudit/captures/${encodeURIComponent(captureId)}/assign`, { project_id: '' });
+    if (result?.ok) {
+      inauditCaptureButtonState(button, 'saved', `Assigned to ${record.target_project_name || 'project'} audit inbox.`);
+      return { ok: true };
+    }
+    return { ok: false, message: String(result?.message || result?.errorCode || 'Bridge refused the assignment').slice(0, 200) };
+  }
+
+  async function offerHandoffCandidate(text, button) {
+    const payload = { ...inauditCapturePayload(text, 'block'), handoff_only: true };
+    const result = await inauditCaptureRequest('POST', '/v1/inaudit/captures', payload);
+    if (!(result?.ok && result.data?.durable === true && result.data?.record?.capture_id === payload.capture_id)) {
+      return { ok: false, skipped: String(result?.data?.skipped || result?.errorCode || '') };
+    }
+    const handoff = handoffResultFrom(result.data);
+    if (handoff) inauditCaptureButtonState(button, 'saved', `SAIHANDOFF file: ${handoff.path}${handoff.copied ? ' (path copied)' : ''}`);
+    return { ok: Boolean(handoff), handoff };
   }
 
   async function captureInauditTarget(turn, scope = 'response', target = null, button = null) {
@@ -6017,7 +7307,10 @@ ordinal/name of the entrypoint file.`;
   }
 
   function attachInauditActionsToTurn(turn) {
-    if (!turn || !assistantStableForInaudit(turn)) return 0;
+    if (!turn) return 0;
+    noteHandoffTurnSighting(turn);
+    if (!assistantStableForInaudit(turn)) return 0;
+    const finishedLive = handoffTurnSightings.get(handoffTurnKey(turn)) === 'live';
     let attached = 0;
     const actions = turn.querySelector(ASSISTANT_RESPONSE_ACTIONS_SELECTOR) ||
       turn.querySelector('button[data-testid="copy-turn-action-button"]')?.parentNode;
@@ -6035,6 +7328,8 @@ ordinal/name of the entrypoint file.`;
       host.appendChild(button);
       attached += 1;
     }
+    maybeAutoCaptureHandoffs(turn);
+    maybeAutoCaptureAuditReply(turn, finishedLive);
     return attached;
   }
 
@@ -6072,11 +7367,15 @@ ordinal/name of the entrypoint file.`;
       const target = record.target?.nodeType === 1 ? record.target : record.target?.parentNode;
       if (target?.closest?.('.acb-inaudit-action')) continue;
       const turn = inauditTurnFor(record.target);
-      if (turn) inauditDirtyTurns.add(turn);
+      if (turn) {
+        inauditDirtyTurns.add(turn);
+        noteHandoffTurnSighting(turn);
+      }
       for (const added of Array.from(record.addedNodes || [])) {
         const addedTurn = inauditTurnFor(added);
         if (addedTurn) {
           inauditDirtyTurns.add(addedTurn);
+          noteHandoffTurnSighting(addedTurn);
           continue;
         }
         // A container carrying turns inside it (route hydration, virtualized
@@ -6144,6 +7443,8 @@ ordinal/name of the entrypoint file.`;
     inauditCaptureFlushInFlight = true;
     clearTimeout(inauditCaptureFlushTimer);
     inauditCaptureFlushTimer = 0;
+    inauditCaptureFlushDueAt = 0;
+    inauditCapturePendingDueAt = 0;
     try {
       const records = await listInauditSpool();
       const now = Date.now();
@@ -6229,16 +7530,53 @@ ordinal/name of the entrypoint file.`;
       scheduleInauditCaptureFlush(300000);
       return false;
     } finally {
+      // PERF-001 (audit/9.md): clear the guard FIRST, then arm exactly one
+      // timer for the earliest deadline any path inside the flush requested.
+      // Ordering is the whole fix: arming before the guard clears is what made
+      // every internal retry request a deterministic no-op.
       inauditCaptureFlushInFlight = false;
+      const pendingDueAt = inauditCapturePendingDueAt;
+      inauditCapturePendingDueAt = 0;
+      if (pendingDueAt) armInauditCaptureFlush(pendingDueAt);
     }
   }
 
-  function scheduleInauditCaptureFlush(delay = 2000) {
-    if (inauditCaptureFlushTimer || inauditCaptureFlushInFlight) return;
+  //: PERF-001 (audit/9.md): sole owner of the retry timer. Earliest-deadline
+  //: wins -- a 2 s wake replaces an armed 5 min backoff, a 5 min request never
+  //: postpones an armed 2 s one -- and there is never more than one timer.
+  function armInauditCaptureFlush(dueAt) {
+    const deadline = Number(dueAt) || 0;
+    if (!deadline) return;
+    if (inauditCaptureFlushTimer && inauditCaptureFlushDueAt && deadline >= inauditCaptureFlushDueAt) return;
+    clearTimeout(inauditCaptureFlushTimer);
+    inauditCaptureFlushDueAt = deadline;
     inauditCaptureFlushTimer = setTimeout(() => {
       inauditCaptureFlushTimer = 0;
+      inauditCaptureFlushDueAt = 0;
       flushInauditCaptureSpool();
-    }, Math.max(2000, Number(delay) || 2000));
+    }, Math.max(0, deadline - Date.now()));
+  }
+
+  function scheduleInauditCaptureFlush(delay = 2000) {
+    const dueAt = Date.now() + Math.max(2000, Number(delay) || 2000);
+    if (inauditCaptureFlushInFlight) {
+      // Do NOT discard the request: record the earliest pending deadline so the
+      // finally block can arm it once the flush releases the guard.
+      if (!inauditCapturePendingDueAt || dueAt < inauditCapturePendingDueAt) {
+        inauditCapturePendingDueAt = dueAt;
+      }
+      return;
+    }
+    armInauditCaptureFlush(dueAt);
+  }
+
+  function inauditCaptureFlushTimerState() {
+    return {
+      armed: Boolean(inauditCaptureFlushTimer),
+      dueAt: inauditCaptureFlushDueAt,
+      pendingDueAt: inauditCapturePendingDueAt,
+      inFlight: inauditCaptureFlushInFlight
+    };
   }
 
   function bridgeJobKey(jobId) {
@@ -6314,13 +7652,67 @@ ordinal/name of the entrypoint file.`;
     } catch (_) { }
   }
 
+  // T-184 (PHASE L): a permanent job left over from the OLD manual-save
+  // contract is historical evidence, not current queue health. The new
+  // protocol never creates a `materialize` ingest job at all, so the flag is a
+  // reliable epoch marker: any job carrying it predates this protocol. It is
+  // only retired from the CURRENT counters when it also belongs to no live
+  // chat/run and nothing is retrying it. It is never deleted -- diagnostics
+  // still render it, under its own heading.
+  const BRIDGE_LEGACY_MATERIALIZE_CODES = Object.freeze([
+    'completed_wave_immutable',
+    'materialize_duplicate_unverified',
+    'materialize_files_unverified'
+  ]);
+
+  // T-185: classification alone leaves no trace. Retirement is journaled once
+  // per job: the job keeps its content and stays inspectable in diagnostics,
+  // but the moment it is recognised as pre-protocol evidence that fact becomes
+  // a durable field plus one diagnostic event, instead of being re-derived on
+  // every render with nothing to audit later.
+  function retireLegacyMaterializeFailures() {
+    let retired = 0;
+    for (const job of listBridgeJobs()) {
+      if (Number(job.historicalRetiredAt || 0) > 0) continue;
+      if (!bridgeJobIsHistoricalFailure(job)) continue;
+      const marked = { ...job, historicalRetiredAt: Date.now(), updatedAt: Date.now() };
+      if (!saveBridgeJob(marked, { signal: false })) continue;
+      retired += 1;
+      appendBridgeDiagnostic('legacy_materialize_retired', {
+        severity: 'warning',
+        code: job.errorCode,
+        job,
+        message: 'This failure predates the T-184 materialization protocol and belongs to no live chat or run; it is retained as historical evidence and no longer counted as current queue health.'
+      });
+    }
+    if (retired) signalBridgeQueueChange();
+    return retired;
+  }
+
+  function bridgeJobIsHistoricalFailure(job, conversationKey = '') {
+    if (!job?.permanent) return false;
+    if (Number(job.historicalRetiredAt || 0) > 0) return true;
+    if (!job.materialize) return false;
+    if (!BRIDGE_LEGACY_MATERIALIZE_CODES.includes(String(job.errorCode || ''))) return false;
+    if (Number(job.inFlightAt || 0) > 0 || job.deliveredAwaitingAck) return false;
+    const currentKey = String(conversationKey || autoBoundConversationKey || currentConversationKey() || '');
+    if (currentKey && String(job.conversationKey || '') === currentKey) return false;
+    const liveRunId = String(autoRuntime?.runId || '');
+    if (liveRunId && String(job.sourceRunId || job.runId || '') === liveRunId) return false;
+    return true;
+  }
+
   function bridgeQueueStats(conversationKey = '', jobsSnapshot = null) {
     const source = Array.isArray(jobsSnapshot) ? jobsSnapshot : listBridgeJobs();
-    const jobs = source.filter(job => !conversationKey || job.conversationKey === conversationKey);
+    const scoped = source.filter(job => !conversationKey || job.conversationKey === conversationKey);
+    const historical = scoped.filter(job => bridgeJobIsHistoricalFailure(job, conversationKey));
+    const jobs = scoped.filter(job => !historical.includes(job));
     return {
       total: jobs.length,
       pending: jobs.filter(job => !job.permanent).length,
       failed: jobs.filter(job => Boolean(job.permanent)).length,
+      historical: historical.length,
+      historicalJobs: historical,
       jobs
     };
   }
@@ -6359,12 +7751,45 @@ ordinal/name of the entrypoint file.`;
       code: bridgeDiagnosticValue(details.code || details.errorCode || job.errorCode, 80),
       message: bridgeDiagnosticValue(details.message || job.lastError, 320),
       jobId: bridgeDiagnosticValue(details.jobId || job.jobId || job.receipt, 160),
-      runId: bridgeDiagnosticValue(details.runId || job.deliveryBatchId || job.runId, 120),
+      runId: bridgeDiagnosticValue(details.runId || job.runId || job.sourceRunId, 120),
       project: bridgeDiagnosticValue(details.project || job.project, 100),
       wave: bridgeDiagnosticValue(details.wave || job.wave, 60),
       attempts: Math.max(0, Number(details.attempts ?? job.attempts) || 0),
       repeats: 1
     };
+    // SRC-083: an optional bounded measurement object (delivery timing). Only
+    // finite numbers, booleans and short strings survive; never text or bytes.
+    if (details.timing && typeof details.timing === 'object' && !Array.isArray(details.timing)) {
+      const timing = {};
+      let kept = 0;
+      for (const [key, value] of Object.entries(details.timing)) {
+        if (kept >= 64 || !/^[a-z0-9_]{1,48}$/.test(key)) continue;
+        if (typeof value === 'number' && Number.isFinite(value)) timing[key] = value;
+        else if (typeof value === 'boolean') timing[key] = value;
+        else if (typeof value === 'string') timing[key] = bridgeDiagnosticValue(value, 64);
+        else continue;
+        kept += 1;
+      }
+      if (kept) entry.timing = timing;
+    }
+    // SRC-098: the same bounded shape, for ownership identity rather than
+    // measurement -- dispatch id, campaign run id, worker id, conversation key,
+    // runtime stage, whether the disarm was the operator's own click. Keys are
+    // drawn from a closed vocabulary and every value is a primitive, so a
+    // prompt or a conversation body can never reach the log through here.
+    if (details.facts && typeof details.facts === 'object' && !Array.isArray(details.facts)) {
+      const facts = {};
+      let keptFacts = 0;
+      for (const [key, value] of Object.entries(details.facts)) {
+        if (keptFacts >= 24 || !/^[a-z0-9_]{1,48}$/.test(key)) continue;
+        if (typeof value === 'number' && Number.isFinite(value)) facts[key] = value;
+        else if (typeof value === 'boolean') facts[key] = value;
+        else if (typeof value === 'string') facts[key] = bridgeDiagnosticValue(value, 96);
+        else continue;
+        keptFacts += 1;
+      }
+      if (keptFacts) entry.facts = facts;
+    }
 
     try {
       const entries = readBridgeDiagnosticLog();
@@ -6506,6 +7931,32 @@ ordinal/name of the entrypoint file.`;
           '2. Or close one of the existing ChatGPT tabs that owns a job to free a slot.',
           '3. Click START AUDIT again from the Project Room.'
         ]
+      },
+      'upload-input-unavailable': {
+        headline: 'Audit blocked: this ChatGPT build exposes no usable file-upload input.',
+        why: 'The widget found the composer, opened its own attachment surface, and still no file input provably owned by that composer. The reason is not a missing ZIP: the bytes arrived. This build simply no longer satisfies any supported upload contract, and retrying it six times cannot change that. The exact file-input shape found on the page is appended to this reason.',
+        next: [
+          '1. Copy details from the Audit Runs row: the appended `file_inputs=` line lists every input[type=file] on the page with its id, testid, multiple flag and whether the composer owns it.',
+          '2. Open a fresh root https://chatgpt.com/ tab and press the composer + button yourself: if ChatGPT offers no file option there, the account/build cannot deliver archives at all.',
+          '3. Report the copied line to the AUDAPACK team so the upload contract can be updated for this build.'
+        ]
+      },
+      'upload-input-ambiguous': {
+        headline: 'Audit blocked: several file inputs claim this composer and none can be proven.',
+        why: 'More than one input[type=file] on the page matched the composer upload contract. Injecting into the wrong one risks putting a project ZIP into a settings, avatar or stale-composer picker, so the widget refuses instead of guessing. The appended detail says how many candidates were seen and where.',
+        next: [
+          '1. Copy details from the Audit Runs row and read the `inputs=[...]` list: every candidate is marked rejected= with the surface that disqualified it.',
+          '2. Close other ChatGPT tabs and dialogs (settings menus, profile menus, image pickers) so only the composer file input remains.',
+          '3. Click START AUDIT again.'
+        ]
+      },
+      'composer-root-unavailable': {
+        headline: 'Audit blocked: the ChatGPT composer itself was not on the page.',
+        why: 'Delivery needs the live composer to prove which file input belongs to it. The composer was missing or inert at that moment, so nothing was attached and nothing was sent.',
+        next: [
+          '1. Close the tab and open a fresh root https://chatgpt.com/ page (no /c/... conversation).',
+          '2. Wait until the composer is visible and idle, then click START AUDIT again.'
+        ]
       }
     };
     const base = codeAliases.map(alias => catalogue[alias]).find(Boolean) || {
@@ -6600,12 +8051,25 @@ ordinal/name of the entrypoint file.`;
 
   function bridgeDiagnosticsText(jobsSnapshot = null, logSnapshot = null) {
     const stats = bridgeQueueStats('', jobsSnapshot);
+    const save = currentBridgeSaveState(
+      autoBoundConversationKey || currentConversationKey(),
+      jobsSnapshot
+    );
     const events = Array.isArray(logSnapshot) ? logSnapshot : readBridgeDiagnosticLog();
     const lines = [
       'AUDAPACK BRIDGE DIAGNOSTICS',
       `state=${bridgeState} message=${bridgeDiagnosticValue(bridgeMessage) || 'none'}`,
       `url=${normalizedBridgeUrl() || 'invalid'} token=${bridgeToken() ? 'stored' : 'missing'} server=${bridgeDiagnosticValue(bridgeServerVersion, 80) || 'unknown'}`,
-      `last_check=${bridgeDiagnosticTime(bridgeLastCheckedAt)} queue_total=${stats.total} queued=${stats.pending} failed=${stats.failed}`
+      `last_check=${bridgeDiagnosticTime(bridgeLastCheckedAt)} queue_total=${stats.total} queued=${stats.pending} failed=${stats.failed} historical=${stats.historical}`,
+      // T-185: queue counters alone never answered "is this chat saved".
+      `ready=${save.readyCount} durable=${save.durableCount} missing_delivery=${save.missingDelivery} files_missing=${save.filesMissing}`
+    ];
+
+    const describeJob = job => [
+      `[${bridgeDiagnosticJobState(job)}] updated=${bridgeDiagnosticTime(job.updatedAt || job.createdAt)} code=${bridgeDiagnosticValue(job.errorCode, 80) || 'none'} attempts=${Math.max(0, Number(job.attempts) || 0)}`,
+      `project=${bridgeDiagnosticValue(job.project, 100) || 'unknown'} wave=${bridgeDiagnosticValue(job.wave, 60) || 'unknown'} run_id=${bridgeDiagnosticValue(job.runId || job.sourceRunId, 120) || 'unknown'}`,
+      `receipt=${bridgeDiagnosticValue(job.receipt || job.jobId, 160) || 'unknown'}`,
+      `cause=${bridgeDiagnosticValue(job.lastError) || (job.permanent ? 'missing failure detail' : 'waiting for delivery')}`
     ];
 
     const jobs = [...stats.jobs].sort((a, b) => {
@@ -6617,14 +8081,20 @@ ordinal/name of the entrypoint file.`;
       lines.push('', 'CURRENT JOBS: none');
     } else {
       lines.push('', `CURRENT JOBS: ${jobs.length}`);
-      for (const job of jobs) {
-        lines.push(
-          `[${bridgeDiagnosticJobState(job)}] updated=${bridgeDiagnosticTime(job.updatedAt || job.createdAt)} code=${bridgeDiagnosticValue(job.errorCode, 80) || 'none'} attempts=${Math.max(0, Number(job.attempts) || 0)}`,
-          `project=${bridgeDiagnosticValue(job.project, 100) || 'unknown'} wave=${bridgeDiagnosticValue(job.wave, 60) || 'unknown'} run_id=${bridgeDiagnosticValue(job.deliveryBatchId || job.runId, 120) || 'unknown'}`,
-          `receipt=${bridgeDiagnosticValue(job.receipt || job.jobId, 160) || 'unknown'}`,
-          `cause=${bridgeDiagnosticValue(job.lastError) || (job.permanent ? 'missing failure detail' : 'waiting for delivery')}`
-        );
-      }
+      for (const job of jobs) lines.push(...describeJob(job));
+    }
+
+    // T-184 (PHASE L): jobs from the retired manual-save contract stay
+    // inspectable but are reported separately, so three artifacts from an old
+    // protocol stop rendering as `failed=3` current queue health forever.
+    const historicalJobs = [...(stats.historicalJobs || [])].sort(
+      (a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)
+    );
+    if (!historicalJobs.length) {
+      lines.push('', 'HISTORICAL FAILURES: none');
+    } else {
+      lines.push('', `HISTORICAL FAILURES: ${historicalJobs.length} (retired manual-save contract; not current queue health)`);
+      for (const job of historicalJobs) lines.push(...describeJob(job));
     }
 
     lines.push('', `RECENT EVENTS: ${Math.min(events.length, 20)}`);
@@ -6647,6 +8117,23 @@ ordinal/name of the entrypoint file.`;
           `cause=${bridgeDiagnosticValue(entry.message) || 'none'}`
         );
       }
+    }
+
+    // T-261: the Bridge diagnostics block is the widget's COPY DETAILS surface.
+    // A managed Core that generates while the widget reads BUSY is unreportable
+    // without it, so the lineage snapshot rides along here. Content-free by
+    // construction, and guarded because diagnostics must never be the thing
+    // that breaks a worker.
+    try {
+      const lineage = liveAuditLineageSnapshot();
+      const verdict = classifyLiveAuditLineage(lineage);
+      lines.push(
+        '',
+        `LIVE AUDIT LINEAGE: ${verdict.failure} (${verdict.reason})`,
+        liveAuditLineageDiagnosticLine(lineage)
+      );
+    } catch (error) {
+      lines.push('', `LIVE AUDIT LINEAGE: unavailable (${String(error?.message || error || 'unknown')})`);
     }
 
     lines.push('', 'Token value and audit content are intentionally excluded.');
@@ -6830,13 +8317,6 @@ ordinal/name of the entrypoint file.`;
     return `${kind}-m-${Date.now().toString(36)}-${random}`;
   }
 
-  function createBridgeMaterializeBatchId() {
-    const random = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
-      ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-      : `${Math.random().toString(36).slice(2, 8)}${Math.random().toString(36).slice(2, 8)}`;
-    return `acb-mat-${Date.now().toString(36)}-${random}`;
-  }
-
   function bridgeWaveOrder(kind) {
     if (kind === 'core') return 1;
     if (kind === 'second') return 2;
@@ -6891,9 +8371,15 @@ ordinal/name of the entrypoint file.`;
       }
     }
 
-    const deliveryBatchId = String(options.deliveryBatchId || runId);
-    const canonicalReceipt = String(record.bridgeReceipt || createBridgeReceipt(runId, record.kind));
-    const receipt = options.freshReceipt ? createBridgeMaterializeReceipt(deliveryBatchId, record.kind) : canonicalReceipt;
+    // T-184: there is exactly ONE delivery identity for an ingest job -- the
+    // canonical run id and the canonical receipt. The old manual path minted a
+    // synthetic `acb-mat-*` batch id here, sent the ORIGINAL run id as the
+    // transport run_id, and then rewrote the content CAMPAIGN_RUN_ID to the
+    // synthetic one, so a single POST carried two contradictory identities.
+    // Manual materialization is no longer an ingest job at all; it has its own
+    // endpoint and its own operation receipt.
+    const receipt = String(record.bridgeReceipt || createBridgeReceipt(runId, record.kind));
+    const canonicalReceipt = receipt;
     const profileId = String(record.profileId || autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3');
     const profile = EMBEDDED_AUDIT_PROFILES?.profiles?.[profileId] || getActiveProfile();
     const waveDef = findWaveDefinitionForStageOrKind(record.kind, profile);
@@ -6911,7 +8397,6 @@ ordinal/name of the entrypoint file.`;
       receipt,
       runId,
       sourceRunId: runId,
-      deliveryBatchId,
       conversationKey: record.conversationKey,
       conversationId: bridgeConversationIdFromKey(record.conversationKey),
       project: record.projectName || 'PROJECT',
@@ -6927,7 +8412,7 @@ ordinal/name of the entrypoint file.`;
       permanent: false,
       errorCode: '',
       lastError: '',
-      materialize: Boolean(options.freshReceipt),
+      materialize: false,
       staged: true,
       inFlightAt: 0,
       deliveredAwaitingAck: false,
@@ -6946,22 +8431,10 @@ ordinal/name of the entrypoint file.`;
       if (!next.bridgeReceipt) next.bridgeReceipt = canonicalReceipt;
       next.bridgeQueuedAt = now;
       next.bridgeError = '';
-      if (options.freshReceipt) {
-        next.bridgeMaterializeReceipt = receipt;
-        next.bridgeMaterializeBatchId = deliveryBatchId;
-        next.bridgeMaterializeQueuedAt = now;
-        next.bridgeSavedAt = 0;
-        next.bridgeFiles = [];
-        next.savedAt = 0;
-        next.savedFileName = '';
-        next.saveError = '';
-        if (record.kind === 'performance') {
-          next.combinedSavedAt = 0;
-          next.combinedFileName = '';
-        }
-      } else {
-        next.bridgeSavedAt = Number(next.bridgeSavedAt) || 0;
-      }
+      // Queueing an ingest job never clears a durability proof that already
+      // exists: bridgeSavedAt is written by markBridgeJobSaved from a real
+      // acknowledgement and by nothing else.
+      next.bridgeSavedAt = Number(next.bridgeSavedAt) || 0;
     }, record.conversationKey, { expectedRunId: runId });
 
     if (!queuedRecord) {
@@ -7003,12 +8476,10 @@ ordinal/name of the entrypoint file.`;
     return {
       api_version: BRIDGE_API_VERSION,
       receipt: job.receipt,
-      // run_id must be the CANONICAL run id that matches the content's
-      // CAMPAIGN_RUN_ID header. deliveryBatchId is a synthetic materialize
-      // delivery tag used only to build a fresh receipt; sending it as run_id
-      // makes the Bridge reject run_id_mismatch because the content still
-      // carries the original campaign run id.
-      run_id: job.runId || job.deliveryBatchId,
+      // run_id is the CANONICAL run id and the content's CAMPAIGN_RUN_ID
+      // header is the same value. T-184 removed the synthetic materialize
+      // batch id that used to disagree with it inside one request.
+      run_id: job.runId || job.sourceRunId,
       conversation_id: job.conversationId || '',
       project_id: job.projectId || '',
       project_name: job.project,
@@ -7185,6 +8656,9 @@ ordinal/name of the entrypoint file.`;
       record.savedAt = now;
       record.savedFileName = files[0] || `${job.project} via AUDAPACK Bridge`;
       record.saveError = '';
+      // T-185 C3: a new acknowledgement is new durability evidence. Any older
+      // verification epoch ends here.
+      record.bridgeVerifyEpoch = bridgeConnectEpoch;
       if (job.materialize) {
         record.bridgeMaterializedAt = now;
         record.bridgeMaterializeReceipt = job.receipt;
@@ -7251,7 +8725,7 @@ ordinal/name of the entrypoint file.`;
     // authority for the Bridge submission, so patch the content header to match
     // before sending. The Bridge v3 contract rejects mismatches server-side,
     // and the widget must not POST a payload it can prove is wrong.
-    const queuedRunId = String(job.deliveryBatchId || job.runId || '');
+    const queuedRunId = String(job.runId || job.sourceRunId || '');
     const contentRunId = extractCampaignRunIdFromText(job.content || '');
     if (queuedRunId && contentRunId && queuedRunId !== contentRunId) {
       job.content = String(job.content || '').replace(/^(\s*CAMPAIGN_RUN_ID\s*:\s*).*$/im, `$1${queuedRunId}`);
@@ -7300,6 +8774,7 @@ ordinal/name of the entrypoint file.`;
         inFlightAt: activeJob.inFlightAt,
         updatedAt: Date.now()
       }, { signal: false });
+      if (activeJob.projectId) rememberRuntimeProjectId(activeJob.projectId, activeJob.project);
       renderAutoAuditState();
     }
 
@@ -7313,29 +8788,12 @@ ordinal/name of the entrypoint file.`;
       return false;
     }
 
-    if (response.ok && activeJob.materialize && response.data?.duplicate) {
-      if (!readBridgeJob(activeJob.jobId || activeJob.receipt)) {
-        bridgeState = 'connected';
-        bridgeMessage = 'Connected. Forced SAVE was completed by another ACB tab.';
-        bridgeLastCheckedAt = Date.now();
-        return true;
-      }
-      bridgeState = 'error';
-      bridgeMessage = 'Bridge returned duplicate for a forced physical rewrite.';
-      markBridgeJobPermanent(activeJob, { ...response, errorCode: 'materialize_duplicate_unverified', message: 'Forced SAVE received duplicate acknowledgement instead of a verified physical rewrite.' });
-      return false;
-    }
-
-    if (response.ok && activeJob.materialize) {
-      const files = Array.isArray(response.data?.files) ? response.data.files.filter(Boolean) : [];
-      if (!files.length) {
-        bridgeState = 'error';
-        bridgeMessage = 'Bridge did not return written file paths for forced SAVE.';
-        markBridgeJobPermanent(activeJob, { ...response, errorCode: 'materialize_files_unverified', message: 'Forced SAVE returned success without written file paths, so physical materialization cannot be verified.' });
-        return false;
-      }
-    }
-
+    // T-184: an exact duplicate is the strongest durability proof this
+    // endpoint can give -- identical canonical content already exists under
+    // this run and wave. The old code inverted that for forced saves and
+    // marked the job permanently failed as `materialize_duplicate_unverified`.
+    // Physical file recovery is now a separate operation with its own
+    // endpoint, so ingest treats a duplicate as the success it always was.
     if (response.ok) {
       const files = Array.isArray(response.data?.files) ? response.data.files.filter(Boolean) : [];
       if (!response.data?.duplicate && !files.length) {
@@ -7359,23 +8817,23 @@ ordinal/name of the entrypoint file.`;
       return false;
     }
     if (response.errorCode === 'completed_wave_immutable') {
-      // Not a failure. The wave is already durably complete in the canonical
-      // run, which is exactly the end state this job wanted. A forced SAVE of
-      // an already-finished campaign hit this three times in a row and left
-      // the widget showing a red `failed 3` for audits that were saved to disk
-      // minutes earlier -- the operator reasonably read that as data loss.
-      appendBridgeDiagnostic('job_already_complete', {
-        severity: 'info',
-        job: activeJob,
-        code: response.errorCode,
-        message: response.message || 'Wave is already complete in the canonical run; nothing to re-save.'
+      // T-184: this is NOT success. The Bridge emits completed_wave_immutable
+      // only when the submitted content DIFFERS from the wave already
+      // committed in the canonical run -- identical content takes the 200
+      // duplicate path. The requested bytes were therefore refused and never
+      // written. The old branch cleared the error, deleted the job and
+      // returned true, which left a COMPLETE record with bridgeSavedAt == 0,
+      // an empty queue and a green button: false durability.
+      bridgeState = 'error';
+      bridgeMessage = 'Bridge refused the audit: this wave is already complete with different content.';
+      markBridgeJobPermanent(activeJob, {
+        ...response,
+        errorCode: 'completed_wave_immutable',
+        retriable: false,
+        message: response.message
+          || 'This wave is already complete in the canonical run with different content; the submitted audit was NOT written.'
       });
-      patchAuditResult(activeJob.wave, record => {
-        record.bridgeError = '';
-        record.saveError = '';
-      }, activeJob.conversationKey, { expectedRunId: String(activeJob.sourceRunId || activeJob.runId || '') });
-      deleteBridgeJob(activeJob.jobId);
-      return true;
+      return false;
     }
     if (response.status === 409 || response.errorCode === 'receipt_conflict') {
       bridgeState = 'error';
@@ -7491,10 +8949,19 @@ ordinal/name of the entrypoint file.`;
   async function flushBridgeQueueManualReliable(conversationKey, options = {}) {
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 5);
     const delays = [0, 180, 420, 850, 1400];
+    // T-184: the retry budget is no longer the only bound. A foreground manual
+    // operation passes its wall-clock deadline down here so a stalled Bridge
+    // cannot hold the button through five attempts x N waves x a 12s timeout.
+    const deadlineAt = Number(options.deadlineAt) || 0;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const statsBefore = bridgeQueueStats(conversationKey);
       if (!statsBefore.pending) return true;
+      if (manualSaveDeadlineExceeded(deadlineAt)) {
+        signalBridgeQueueChange();
+        scheduleBridgeFlush(100);
+        return false;
+      }
 
       if (attempt > 0) {
         await sleep(delays[Math.min(attempt, delays.length - 1)]);
@@ -7522,11 +8989,15 @@ ordinal/name of the entrypoint file.`;
 
   function resetBridgeFailedJobs(errorCode = '') {
     let changed = 0;
-    const retryableFailures = new Set(['offline', 'timeout', 'network_error', 'http_0', 'http_408', 'http_429', 'http_500', 'http_502', 'http_503', 'http_504']);
     for (const job of listBridgeJobs()) {
       if (!job.permanent) continue;
       if (errorCode && job.errorCode !== errorCode) continue;
-      if (!errorCode && !retryableFailures.has(String(job.errorCode || '').toLowerCase())) continue;
+      // T-185 P1-2 (D): the same classifier governs the automatic
+      // token-repair reset. Transport causes and repaired-auth causes requeue
+      // here (a replacement token is exactly the RETRY_AFTER_AUTH trigger);
+      // semantic refusals keep their permanent evidence untouched.
+      const autoCls = classifyBridgeJobRecovery(job);
+      if (autoCls !== 'RETRY_TRANSPORT' && autoCls !== 'RETRY_AFTER_AUTH') continue;
       // A compacted job is only safe to republish when the durable audit
       // record still proves its identity; otherwise keep it permanent instead
       // of ever sending an empty body (PERF-003).
@@ -7551,18 +9022,171 @@ ordinal/name of the entrypoint file.`;
         inFlightAt: 0,
         updatedAt: Date.now()
       };
-      if (saveBridgeJob(next)) changed += 1;
+      if (saveBridgeJob(next)) {
+        changed += 1;
+        appendBridgeDiagnostic('auto_recovery_requeue', {
+          severity: 'info',
+          code: job.errorCode,
+          message: 'Transport-recoverable failure requeued after the external cause changed (bridge reconnect / token repair).',
+          job: next
+        });
+      }
     }
     if (changed) scheduleBridgeFlush(50);
     return changed;
   }
 
+  // T-185 P1-2/P1-3: ONE recovery decision for every permanent-job consumer.
+  // Retry all, manual SAVE and the automatic token-repair reset all used to
+  // carry three separate opinions about which failures re-delivery can resolve;
+  // a semantic refusal like campaign_profile_conflict was requeued unchanged by
+  // one of them and refused by another. classifyBridgeJobRecovery() is the only
+  // source of retry semantics:
+  //   RETRY_TRANSPORT       -- Bridge offline / timeout / 5xx / transport noise:
+  //                            unchanged requeue is the correct recovery.
+  //   RETRY_AFTER_AUTH      -- token repaired between attempts; requeue allowed.
+  //   MATERIALIZE_CANONICAL -- completed_wave_immutable: the cached content may
+  //                            still be provably canonical; only the MATERIALIZE
+  //                            endpoint can prove it. Never POST /v1/audits again.
+  //   FRESH_RUN_REQUIRED    -- the run itself is bound elsewhere (profile conflict):
+  //                            no repost of this payload can ever succeed.
+  //   INPUT_REPAIR_REQUIRED -- project/wave/structure/refusal semantics: the
+  //                            operator must repair the input or start fresh.
+  //   UNRECOVERABLE         -- content/receipt conflicts: same request, same answer,
+  //                            forever. Evidence stays actionable.
+  // D6: no consumer may clear permanent / errorCode / attempts before this
+  // classification, and a refused job keeps its evidence untouched.
+  const BRIDGE_RECOVERY_TRANSPORT_CODES = Object.freeze([
+    'offline',
+    'timeout',
+    'network_error',
+    'http_0',
+    'http_408',
+    'http_429',
+    'http_500',
+    'http_502',
+    'http_503',
+    'http_504',
+    'aborted',
+    'bridge_offline',
+    'bridge_exception',
+    'invalid_success_payload',
+    'success_files_unverified'
+  ]);
+
+  function classifyBridgeJobRecovery(job) {
+    const code = String(job?.errorCode || '');
+    if (code === 'invalid_auth') return 'RETRY_AFTER_AUTH';
+    if (BRIDGE_RECOVERY_TRANSPORT_CODES.includes(code)) return 'RETRY_TRANSPORT';
+    // A non-permanent job is ordinary queue state, not a semantic refusal:
+    // normal transport retry policy governs it. (Code-level probes classify
+    // through bridgeJobRetryIsFutile, which assumes permanence.)
+    if (!job?.permanent) return 'RETRY_TRANSPORT';
+    if (code === 'completed_wave_immutable') return 'MATERIALIZE_CANONICAL';
+    if (code === 'materialize_content_conflict' || code === 'receipt_conflict') return 'UNRECOVERABLE';
+    if (code === 'campaign_profile_conflict') return 'FRESH_RUN_REQUIRED';
+    // Every remaining semantic refusal (project_identity_conflict,
+    // invalid_wave_structure, invalid_run_id, unsupported_wave,
+    // unsupported_profile, invalid_project_id, materialize_wave_not_complete,
+    // project_unresolvable_readonly, http_4xx, anything unlisted): re-delivering
+    // the unchanged payload can never change the answer.
+    return 'INPUT_REPAIR_REQUIRED';
+  }
+
+  function bridgeJobRetryIsFutile(job) {
+    // Futility is a property of the ERROR CODE, so a bare {errorCode} probe
+    // classifies as the permanent job it describes.
+    const cls = classifyBridgeJobRecovery({ ...(job || {}), permanent: true });
+    return cls !== 'RETRY_TRANSPORT' && cls !== 'RETRY_AFTER_AUTH';
+  }
+
   function retryAllBridgeFailedJobs() {
     let retried = 0;
     let skipped = 0;
+    let materializeCandidates = [];
     const profiles = EMBEDDED_AUDIT_PROFILES?.profiles || {};
     for (const job of listBridgeJobs()) {
       if (!job.permanent) continue;
+      // T-185 D: one classification drives every branch. D1: a cached wave
+      // the server already completed must never be POSTed to /v1/audits again
+      // -- manual retry defers to the materialize endpoint to prove whether
+      // the cached bytes equal the canonical server state.
+      const cls = classifyBridgeJobRecovery(job);
+      if (cls === 'MATERIALIZE_CANONICAL') {
+        const rebuilt = reconstructBridgeJobContent(job);
+        const record = rebuilt
+          ? null
+          : readAuditResultFresh(job.wave, job.conversationKey);
+        if (rebuilt || (record && record.text)) {
+          materializeCandidates.push(rebuilt ? {
+            text: rebuilt.content,
+            kind: job.wave,
+            runId: String(job.sourceRunId || job.runId || ''),
+            projectName: String(job.project || ''),
+            projectId: String(job.projectId || ''),
+            profileId: String(job.profileId || ''),
+            conversationKey: String(job.conversationKey || '')
+          } : {
+            text: record.text,
+            kind: job.wave,
+            runId: String(record.runId || job.sourceRunId || job.runId || ''),
+            projectName: String(record.projectName || job.project || ''),
+            projectId: String(record.projectId || job.projectId || ''),
+            profileId: String(record.profileId || job.profileId || ''),
+            conversationKey: String(job.conversationKey || '')
+          });
+          skipped += 1;
+          appendBridgeDiagnostic('manual_retry_defers_to_materialize', {
+            severity: 'warning',
+            code: job.errorCode,
+            message: 'This cached wave conflicts with an already-completed server wave; re-POSTing it cannot succeed. Verifying it against the canonical server wave through materialization instead.',
+            job
+          });
+          continue;
+        }
+        skipped += 1;
+        appendBridgeDiagnostic('manual_retry_refused', {
+          severity: 'error',
+          code: job.errorCode,
+          message: 'This cached wave conflicts with an already-completed server wave and its cached text is no longer available, so no safe recovery exists. Start a fresh run.',
+          job
+        });
+        continue;
+      }
+if (cls !== 'RETRY_TRANSPORT' && cls !== 'RETRY_AFTER_AUTH') {
+          // For FRESH_RUN_REQUIRED with compacted contentOmitted jobs, the
+          // profileId can be restored from the canonical record and the
+          // content rebuilt. That makes the payload repairable — manual retry
+          // requeues the rebuilt payload. Non-compacted (intact content)
+          // FRESH_RUN_REQUIRED jobs remain refused.
+          if (cls === 'FRESH_RUN_REQUIRED' && job.contentOmitted) {
+            const rebuilt = reconstructBridgeJobContent(job);
+            if (rebuilt) {
+              // Proceed to rebuild below (treat as retriable)
+            } else {
+              skipped += 1;
+              appendBridgeDiagnostic('manual_retry_refused', {
+                severity: 'error',
+                code: job.errorCode,
+                message: 'This run is bound to a different campaign profile; a fresh run under the right profile is required.',
+                job
+              });
+              continue;
+            }
+          } else {
+            skipped += 1;
+            const guidance = cls === 'FRESH_RUN_REQUIRED'
+              ? 'This run is bound to a different campaign profile; a fresh run under the right profile is required.'
+              : 'Re-delivering this payload cannot change the answer: the Bridge refused it on content, not on a repairable condition. Repair the cached input or start a fresh run.';
+            appendBridgeDiagnostic('manual_retry_refused', {
+              severity: 'error',
+              code: job.errorCode,
+              message: guidance,
+              job
+            });
+            continue;
+          }
+        }
       const rebuilt = reconstructBridgeJobContent(job);
       if (!rebuilt) {
         skipped += 1;
@@ -7614,7 +9238,79 @@ ordinal/name of the entrypoint file.`;
       });
     }
     if (retried) scheduleBridgeFlush(50);
+    // D1 completions are verified against canonical server state in the
+    // background; a proven-canonical old job is retired through a journaled
+    // event, never by rewriting its evidence blindly.
+    if (materializeCandidates.length) {
+      verifyMaterializeRecoveryCandidates(materializeCandidates).catch(() => { });
+    }
     return { retried, skipped };
+  }
+
+  // T-185 D1: the shared materialize-verification recovery for
+  // completed_wave_immutable jobs. Uses the canonical materialize path against
+  // the queued run id (never bridgeSavedAt invention): on exact canonical
+  // equality the server's durable proof retires the old failed job through a
+  // truthful journal event; on content difference it stays permanent.
+  async function verifyMaterializeRecoveryCandidates(candidates) {
+    const eligible = (Array.isArray(candidates) ? candidates : []).filter(
+      candidate => candidate && candidate.text && candidate.kind && candidate.runId
+    );
+    if (!eligible.length) return { verified: 0, stillPermanent: 0 };
+    const groups = new Map();
+    for (const candidate of eligible) {
+      const runId = String(candidate.runId);
+      if (!groups.has(runId)) groups.set(runId, []);
+      groups.get(runId).push(candidate);
+    }
+    let verified = 0;
+    let stillPermanent = 0;
+    for (const [runId, groupCandidates] of groups) {
+      const first = groupCandidates[0];
+      const waves = groupCandidates.map(candidate => ({
+        wave_id: candidate.kind,
+        content: String(candidate.text)
+      }));
+      const response = await bridgeRequest('POST', '/v1/audits/materialize', {
+        api_version: BRIDGE_API_VERSION,
+        source_run_id: runId,
+        project_name: String(first.projectName || ''),
+        project_id: String(first.projectId || ''),
+        profile_id: String(first.profileId || getActiveProfile()?.profile_id || 'quick3'),
+        receipt: createBridgeMaterializeReceipt(runId, 'retry'),
+        waves
+      }, { timeout: BRIDGE_MATERIALIZE_TIMEOUT_MS });
+      if (!(response.ok && response.data?.ok)) {
+        stillPermanent += groupCandidates.length;
+        continue;
+      }
+      for (const candidate of groupCandidates) {
+        patchAuditResult(candidate.kind, next => {
+          next.bridgeMaterializedAt = Date.now();
+        }, candidate.conversationKey, { expectedRunId: runId });
+        for (const job of listBridgeJobs()) {
+          if (String(job.errorCode) === 'completed_wave_immutable'
+            && String(job.sourceRunId || job.runId) === runId
+            && job.wave === candidate.kind
+            && job.permanent) {
+            const preserved = { ...job };
+            deleteBridgeJob(job.jobId, { signal: false });
+            appendBridgeDiagnostic('retry_materialize_verified', {
+              severity: 'info',
+              code: 'completed_wave_immutable',
+              message: 'Server materialization proved the cached wave canonical-equal; the old failed ingest job is retired (its evidence is preserved in this event).',
+              job: preserved
+            });
+            verified += 1;
+          }
+        }
+      }
+    }
+    if (verified) {
+      signalBridgeQueueChange();
+      renderAutoAuditState();
+    }
+    return { verified, stillPermanent };
   }
 
   function clearBridgeQueue(onlyFailed = false) {
@@ -7729,6 +9425,13 @@ ordinal/name of the entrypoint file.`;
     }
 
     bridgeState = 'connected';
+    // T-185 C3: a REconnect is a new Bridge generation and invalidates every
+    // verification recorded under the older one. The first connect from a
+    // fresh tab has no prior generation to supersede; keeping epoch 0 there
+    // lets an in-flight first-generation probe stay coalesced with the
+    // connect-time probe instead of forcing a duplicate request.
+    if (bridgeEverConnected) bridgeConnectEpoch += 1;
+    bridgeEverConnected = true;
     bridgeServerVersion = String(status.data?.version || status.data?.bridge_version || '');
     bridgeOutputRoot = String(
       status.data?.output_root ||
@@ -7748,6 +9451,11 @@ ordinal/name of the entrypoint file.`;
     resetBridgeFailedJobs('');
     startBrowserWorker();
     scheduleInauditCaptureFlush(2000);
+    // T-185: one bounded read-only disk check per run per session, so a file
+    // deleted after a successful save stops reading as SAVED.
+    if (!options.skipFileVerification) {
+      verifyDurableAuditFilesNow().catch(() => { });
+    }
 
     if (!options.suppressFlush) {
       scheduleBridgeFlush(options.force ? 0 : 50);
@@ -7766,12 +9474,61 @@ ordinal/name of the entrypoint file.`;
     node.textContent = `${labels[bridgeState] || 'UNKNOWN'} · queued ${stats.pending} · failed ${stats.failed}`;
     node.title = `${bridgeMessage}${tokenPresent ? ' Token stored.' : ' No token stored.'}${bridgeServerVersion ? ` Bridge ${bridgeServerVersion}.` : ''}${bridgeOutputRoot ? ` Output: ${bridgeOutputRoot}` : ''} Browser-fallback ALL_3 uses compact_v1. Server-generated __00_AUDIT_ALL_3.md also requires the included ACBBridge 1.0.1 compact patch.`;
     const logNode = panel?.querySelector('#acb-bridge-log');
-    if (logNode) logNode.textContent = bridgeDiagnosticsText(stats.jobs);
+    // T-185 H: diagnostics must consume the SAME snapshot as the header stats.
+    // Passing stats.jobs (already filtered by bridgeQueueStats) stripped the
+    // historical jobs, so the live panel could claim "HISTORICAL FAILURES: none"
+    // while Copy diagnostics -- which gets the full queue -- showed them.
+    if (logNode) logNode.textContent = bridgeDiagnosticsText(jobsSnapshot);
   }
 
-  function currentBridgeSaveState(conversationKey = autoBoundConversationKey || currentConversationKey(), jobsSnapshot = null) {
-    if (!state?.autoSaveAuditFiles || !state?.bridgeEnabled) return { pending: 0, failed: 0 };
-    return bridgeQueueStats(conversationKey, jobsSnapshot);
+  // T-184 (PHASE J): QUEUE EMPTY IS NOT DURABILITY. The queue is a delivery
+  // mechanism, not a record of what is on disk -- it can be pruned, corrupted,
+  // or (as this incident proved) emptied by a rejection wrongly read as
+  // success. Save state is therefore the JOIN of job state and per-record
+  // durability proof: a COMPLETE record is safe only when its own
+  // bridgeSavedAt says so.
+  function currentBridgeSaveState(
+    conversationKey = autoBoundConversationKey || currentConversationKey(),
+    jobsSnapshot = null,
+    recordsSnapshot = null
+  ) {
+    const empty = {
+      pending: 0,
+      failed: 0,
+      historical: 0,
+      total: 0,
+      readyCount: 0,
+      durableCount: 0,
+      filesMissing: 0,
+      missingDelivery: 0,
+      jobs: [],
+      historicalJobs: []
+    };
+    if (!state?.autoSaveAuditFiles || !state?.bridgeEnabled) return empty;
+    const stats = bridgeQueueStats(conversationKey, jobsSnapshot);
+    const records = Array.isArray(recordsSnapshot)
+      ? recordsSnapshot
+      : currentChatAuditRecords(conversationKey, { allowHistoricalComplete: true });
+    // T-185: an acknowledged write whose canonical file has since vanished is
+    // not durable. verifyDurableAuditFilesNow() records that on the record.
+    const acknowledged = records.filter(record => Number(record.bridgeSavedAt) > 0);
+    // T-185 E: a corrupted or unreadable canonical file is exactly as
+    // undurable as a missing one -- existence was never integrity.
+    const representationBroken = record => {
+      const missing = Array.isArray(record.bridgeFilesMissing) && record.bridgeFilesMissing.length > 0;
+      const mismatched = Array.isArray(record.bridgeFilesMismatched) && record.bridgeFilesMismatched.length > 0;
+      const unreadable = Array.isArray(record.bridgeFilesUnreadable) && record.bridgeFilesUnreadable.length > 0;
+      return missing || mismatched || unreadable;
+    };
+    const filesMissing = acknowledged.filter(representationBroken).length;
+    const durableCount = acknowledged.length - filesMissing;
+    return {
+      ...stats,
+      readyCount: records.length,
+      durableCount,
+      filesMissing,
+      missingDelivery: Math.max(0, records.length - durableCount)
+    };
   }
 
   function installBridgeQueueListener() {
@@ -9217,6 +10974,7 @@ ordinal/name of the entrypoint file.`;
       anchorMissingSince: 0,
       projectName: '',
       projectNameSource: '',
+      projectId: '',
       archiveName: '',
       archiveSize: 0,
       archiveModifiedAt: 0,
@@ -9226,7 +10984,24 @@ ordinal/name of the entrypoint file.`;
       renamePersistedAt: 0,
       renameAttemptName: '',
       renameAttemptCount: 0,
-      completeAt: 0
+      completeAt: 0,
+      // SRC-098: WHY A3 is off, durably. `enabled: false` on its own is not
+      // evidence of an operator decision -- a runtime can come back disabled
+      // from route hydration, a storage fallback, a stale conversation key or a
+      // missed arm, and each of those used to be indistinguishable from a human
+      // unchecking the box. Only a real interaction with the A3 control writes
+      // a3OperatorExplicitOff, and managed recovery is allowed to repair every
+      // other way of being disabled.
+      a3OperatorExplicitOff: false,
+      a3OperatorExplicitOffAt: 0,
+      a3DisabledSource: '',
+      a3DisabledReason: '',
+      // SRC-098: an operator stop that has not been acknowledged by the Bridge
+      // yet. Durable, because the window that recorded the operator decision is
+      // not necessarily the window that manages to deliver it, and a stop that
+      // only lived in memory left the Bridge holding a live AUDIT lane for a
+      // campaign nobody was running.
+      a3OperatorStopPending: null
     };
   }
 
@@ -9291,6 +11066,7 @@ ordinal/name of the entrypoint file.`;
     normalized.anchorMissingSince = Math.max(0, Number(parsed.anchorMissingSince) || 0);
     normalized.projectName = sanitizeProjectIdentity(parsed.projectName || '');
     normalized.projectNameSource = normalized.projectName ? String(parsed.projectNameSource || '') : '';
+    normalized.projectId = normalized.projectName ? String(parsed.projectId || '').trim().slice(0, 80) : '';
     normalized.archiveName = String(parsed.archiveName || '').trim().slice(0, 240);
     normalized.archiveSize = Math.max(0, Number(parsed.archiveSize) || 0);
     normalized.archiveModifiedAt = Math.max(0, Number(parsed.archiveModifiedAt) || 0);
@@ -9300,6 +11076,14 @@ ordinal/name of the entrypoint file.`;
     normalized.renamePersistedAt = normalized.renamePersistedName ? Math.max(0, Number(parsed.renamePersistedAt) || 0) : 0;
     normalized.renameAttemptName = normalized.projectName ? sanitizeProjectIdentity(parsed.renameAttemptName || '') : '';
     normalized.renameAttemptCount = Math.max(0, Number(parsed.renameAttemptCount) || 0);
+    // SRC-098: a persisted intent block survives every migration. Absent means
+    // "not an operator decision" -- the whole point is that an old runtime
+    // carrying only enabled=false stays repairable.
+    normalized.a3OperatorExplicitOff = Boolean(parsed.a3OperatorExplicitOff);
+    normalized.a3OperatorExplicitOffAt = Math.max(0, Number(parsed.a3OperatorExplicitOffAt) || 0);
+    normalized.a3DisabledSource = String(parsed.a3DisabledSource || '');
+    normalized.a3DisabledReason = String(parsed.a3DisabledReason || '');
+    normalized.a3OperatorStopPending = normalizeManagedA3OperatorStopPending(parsed.a3OperatorStopPending);
     return normalized;
   }
 
@@ -9413,8 +11197,183 @@ ordinal/name of the entrypoint file.`;
       handoff.runtime.conversationKey = key;
     }
 
+    // Milestone D: freeze the whole START transaction identity and the
+    // pre-send user-turn baseline immediately before the irreversible Send, so
+    // adoption never depends on re-reading the prompt out of the DOM.
+    captureStartHandoffPreSendBaseline(handoff);
+    handoff.transaction = {
+      expectedKind: String(handoff.expectedKind || 'core'),
+      receipt: String(handoff.receipt || ''),
+      campaignRunId: String(autoRuntime?.runId || handoff.runtime?.runId || ''),
+      projectName: String(handoff.runtime?.projectName || ''),
+      projectNameSource: String(handoff.runtime?.projectNameSource || ''),
+      projectId: String(handoff.runtime?.projectId || ''),
+      archiveName: String(handoff.runtime?.archiveName || ''),
+      archiveSize: Math.max(0, Number(handoff.runtime?.archiveSize) || 0),
+      archiveModifiedAt: Math.max(0, Number(handoff.runtime?.archiveModifiedAt) || 0),
+      archiveTimestampSource: String(handoff.runtime?.archiveTimestampSource || ''),
+      profileId: String(handoff.runtime?.profileId || state?.auditProfile || 'quick3'),
+      sourceConversationKey: key,
+      preSendLatestUserTurnId: String(handoff.preSendLatestUserTurnId || ''),
+      preSendUserTurnCount: Math.max(0, Number(handoff.preSendUserTurnCount) || 0)
+    };
+
     if (!writeStartAuditHandoff(handoff)) return null;
     return handoff;
+  }
+
+  // Milestone D: the pre-send user-turn baseline.
+  //
+  // This is the only fact that makes "the first turn after the baseline is MY
+  // Core" provable, and it is knowable for free: the widget owns the composer
+  // and is about to perform exactly one irreversible Send. Capturing it here
+  // -- the `beforeSend` hook, immediately before the click -- means the
+  // transaction knows the conversation state the instant before its own
+  // irreversible action, and route hydration, clamped rendering and a lost
+  // response cannot take that knowledge away afterwards.
+  function captureStartHandoffPreSendBaseline(handoff) {
+    if (!handoff) return handoff;
+    const turns = getChatGPTTurns();
+    const userTurns = turns.filter(turn => turnRole(turn) === 'user');
+    const latest = userTurns.length ? userTurns[userTurns.length - 1] : null;
+    // The first wave of the ACTIVE profile, which is what START actually
+    // targets: quick3 sends Core, super10 sends Architecture. Hardcoding 'core'
+    // would resolve to no wave at all in another profile and park the runtime in
+    // a stage that does not exist.
+    const firstWaveId = getActiveProfile()?.waves?.[0]?.id || 'core';
+    handoff.expectedKind = String(handoff.expectedKind || firstWaveId);
+    handoff.preSendLatestUserTurnId = getTurnId(latest) || '';
+    handoff.preSendUserTurnCount = userTurns.length;
+    handoff.preSendAt = Date.now();
+    return handoff;
+  }
+
+  // Milestone E: adopt the Core by TRANSACTION BOUNDARY.
+  //
+  // The widget authored this Core. It already knows the campaign run, the
+  // project, the archive, the receipt, the dispatch/worker and the exact
+  // conversation it sent into. Requiring it to rediscover those facts by parsing
+  // its own multi-thousand-word prompt back out of ChatGPT is not a robustness
+  // measure: ChatGPT clamps a long user bubble behind "Show more", so the
+  // rendered text can carry neither the canonical header nor the receipt that
+  // sits at the END of the Core, and the recovery then silently concludes the
+  // audit never happened.
+  //
+  // The exact receipt stays the strongest evidence and is always preferred. The
+  // boundary rule is the authority for a SELF-AUTHORED committed send, and DOM
+  // prompt parsing remains the fallback for manually authored audits and for
+  // foreign/reload adoption where no transaction metadata survived.
+  function startAuditCoreTransactionTurn(handoff, turns = getChatGPTTurns()) {
+    const none = (reason, competing = false) => ({
+      turn: null, id: '', adopted: 'none', reason, competing
+    });
+    if (!handoff || !startHandoffIsCommitted(handoff)) return none('no-committed-start-handoff');
+
+    const list = Array.isArray(turns) ? turns : [];
+    const receipt = String(handoff.receipt || '');
+    if (receipt) {
+      const exact = exactReceiptUserTurn(receipt, list);
+      if (exact) {
+        return {
+          turn: exact,
+          id: getTurnId(exact),
+          adopted: 'exact',
+          reason: 'exact-machine-receipt-user-turn',
+          competing: false
+        };
+      }
+    }
+
+    // `preSendAt` is the marker the pre-send hook stamps. A legacy handoff that
+    // never recorded a baseline keeps the DOM fallback, which is exactly right:
+    // an empty id with a zero count is a real baseline meaning "this
+    // conversation had no user turn at all", not an absent one.
+    if (!Number(handoff.preSendAt)) return none('no-pre-send-baseline');
+    const baselineId = String(handoff.preSendLatestUserTurnId || '');
+    const baselineCount = Math.max(0, Number(handoff.preSendUserTurnCount) || 0);
+
+    const userTurns = list.filter(turn => turnRole(turn) === 'user');
+    const baselineIndex = baselineId
+      ? userTurns.findIndex(turn => getTurnId(turn) === baselineId)
+      : baselineCount - 1;
+    if (baselineId && baselineIndex < 0) return none('pre-send-baseline-turn-not-visible');
+
+    const fresh = userTurns.slice(baselineIndex + 1);
+    if (!fresh.length) return none('no-new-user-turn-after-baseline');
+    // More than one fresh user turn means somebody else's turn shares the
+    // transaction window with ours. Adopting either one blindly would bind this
+    // audit's lineage to a human message, so fail closed and let the operator
+    // look instead of guessing.
+    if (fresh.length > 1) return none('competing-user-turns', true);
+
+    return {
+      turn: fresh[0],
+      id: getTurnId(fresh[0]),
+      adopted: 'boundary',
+      reason: 'single-new-user-turn-after-pre-send-baseline',
+      competing: false
+    };
+  }
+
+  // The same boundary rule for a committed Auto3 wave (Second, Performance,
+  // continuation, and now Core). Reached when the machine receipt is NOT
+  // readable from the rendered turn, which is the normal case for a clamped
+  // Core. Fails closed on a missing or ambiguous baseline.
+  function autoSendTransactionBoundaryTurn(tx, runtime, turns = getChatGPTTurns()) {
+    if (!tx) return null;
+    const previousId = String(tx.previousUserId || runtime?.pendingSendPreviousUserId || '');
+    if (!previousId) return null;
+    const list = Array.isArray(turns) ? turns : [];
+    const userTurns = list.filter(turn => turnRole(turn) === 'user');
+    const index = userTurns.findIndex(turn => getTurnId(turn) === previousId);
+    if (index < 0) return null;
+    const fresh = userTurns.slice(index + 1);
+    return fresh.length === 1 ? fresh[0] : null;
+  }
+
+  // Milestone G: the Bridge's AUDITING is a CLAIM that the local runtime owns a
+  // concrete current audit wave. `wait-<wave>` is exactly that claim: a bound
+  // user turn id and a wave the engine is harvesting. `idle` is the live defect
+  // (enabled, generating, no lineage); `await-<wave>-user` is a submitted Core
+  // whose turn has not hydrated yet, which is pending registration, not
+  // adoption.
+  function runtimeOwnsCurrentAuditWave() {
+    return /^wait-/.test(String(autoRuntime?.stage || ''));
+  }
+
+  // Milestone J: ONE runtime merge policy for route migration.
+  //
+  // A late route recovery often lands on a destination runtime that ChatGPT/ACB
+  // baseline bookkeeping has just created blank. Replacing the committed START
+  // snapshot with that blank is how the chat lost its project name, its archive
+  // identity and its run id at the exact moment it became addressable. Merge
+  // instead: transaction-owned non-empty fields win over blank destination
+  // defaults, and a destination that already carries real audit state is never
+  // degraded by a poorer source snapshot.
+  const START_RUNTIME_TRANSACTION_FIELDS = [
+    'runId', 'profileId', 'projectName', 'projectNameSource', 'projectId',
+    'archiveName', 'archiveSize', 'archiveModifiedAt', 'archiveTimestampSource',
+    'coreUserId', 'secondUserId', 'performanceUserId', 'expectedKind'
+  ];
+
+  function mergeStartHandoffRuntime(sourceRuntime, destinationRuntime, destinationKey = '') {
+    const source = normalizeAutoRuntime(sourceRuntime, destinationKey);
+    const destination = normalizeAutoRuntime(destinationRuntime, destinationKey);
+    if (!source) return destination;
+    if (!destination) return source;
+    // A destination that already owns audit state is authoritative: never merge
+    // a completed or foreign lineage over the conversation currently on screen.
+    if (!runtimeIsBlankDisabled(destination) && !runtimeIsStartClaimable(destination)) return destination;
+
+    const merged = { ...destination };
+    for (const field of START_RUNTIME_TRANSACTION_FIELDS) {
+      const value = source[field];
+      if (value === undefined || value === null || value === '' || value === 0) continue;
+      merged[field] = value;
+    }
+    merged.enabled = true;
+    merged.conversationKey = destinationKey || merged.conversationKey || source.conversationKey;
+    return merged;
   }
 
   function markStartAuditHandoffClicking(fallback = null) {
@@ -9437,7 +11396,10 @@ ordinal/name of the entrypoint file.`;
     handoff.clickAt = now;
     handoff.lastKey = key;
     handoff.expiresAt = now + AUTO_START_SENT_TTL_MS;
-    handoff.runtime = normalizeAutoRuntime(autoRuntime, key) || handoff.runtime;
+    // Never let a blank destination runtime erase the committed START snapshot:
+    // the archive, project and run id captured before Send are the only durable
+    // copy of the audit's identity once the composer attachment is gone.
+    handoff.runtime = mergeStartHandoffRuntime(handoff.runtime, autoRuntime, key) || handoff.runtime;
 
     if (handoff.runtime) {
       handoff.runtime.enabled = true;
@@ -9506,7 +11468,10 @@ ordinal/name of the entrypoint file.`;
     handoff.sentAt = now;
     handoff.expiresAt = now + AUTO_START_SENT_TTL_MS;
     handoff.lastKey = key;
-    handoff.runtime = normalizeAutoRuntime(autoRuntime, key) || handoff.runtime;
+    // Never let a blank destination runtime erase the committed START snapshot:
+    // the archive, project and run id captured before Send are the only durable
+    // copy of the audit's identity once the composer attachment is gone.
+    handoff.runtime = mergeStartHandoffRuntime(handoff.runtime, autoRuntime, key) || handoff.runtime;
 
     if (handoff.runtime) {
       handoff.runtime.enabled = true;
@@ -9651,9 +11616,21 @@ ordinal/name of the entrypoint file.`;
     return sourceRuntime;
   }
 
+  // Milestone H: recovery reports ADOPTION, never a bare "sent".
+  //
+  // The live defect was that this function's return value was discarded and the
+  // caller answered `true` regardless: "the payload left the composer" and "the
+  // Auto3 engine owns the Core" are different facts, and the Bridge moved to
+  // AUDITING on the first one. The returned object is the honest answer:
+  //   adopted  -- the runtime owns a concrete Core wave
+  //   pending  -- the send is committed, ChatGPT has not registered the turn yet
+  //   failed   -- nothing to adopt
   function recoverSentStartCore(options = {}) {
+    const outcome = (adopted, state, reason, extra = {}) => ({
+      adopted, state, reason, turnId: '', ownsCurrentRoute: false, ...extra
+    });
     const handoff = readStartAuditHandoff();
-    if (!startHandoffIsCommitted(handoff)) return false;
+    if (!startHandoffIsCommitted(handoff)) return outcome(false, 'failed', 'no-committed-start-handoff');
 
     bindAutoRuntimeToCurrentConversation({ claim: false });
 
@@ -9662,7 +11639,7 @@ ordinal/name of the entrypoint file.`;
     if (autoRuntime && !wasEnabled) autoRuntime.enabled = true;
     if (!claimAutoLease()) {
       if (!wasEnabled) refreshAutoRuntimeFromStorage();
-      return false;
+      return outcome(false, 'failed', 'lease-not-claimed');
     }
     const turns = getChatGPTTurns();
     const exactStartTurn = handoff.receipt
@@ -9683,22 +11660,15 @@ ordinal/name of the entrypoint file.`;
       handoff.destinationKey = currentKey;
       handoff.lastKey = currentKey;
 
-      // Preserve identity captured before START. A late route recovery often binds
-      // a freshly-created destination runtime whose projectName is still blank.
-      // Replacing the handoff snapshot wholesale here made the chat fall back to
-      // ChatGPT's generated title (for example "Continue Core Audit").
-      const carriedProjectName = sanitizeProjectIdentity(handoff.runtime?.projectName || '');
-      const carriedProjectSource = carriedProjectName
-        ? String(handoff.runtime?.projectNameSource || 'artifact')
-        : '';
-      handoff.runtime = normalizeAutoRuntime(autoRuntime, currentKey) || handoff.runtime;
+      // Milestone J: ONE merge policy. A late route recovery binds a freshly
+      // created destination runtime whose project/archive/run fields are blank.
+      // Replacing the committed START snapshot wholesale with it made the chat
+      // fall back to ChatGPT's generated title ("Continue Core Audit") and
+      // dropped the archive identity the composer tile used to carry.
+      handoff.runtime = mergeStartHandoffRuntime(handoff.runtime, autoRuntime, currentKey) || handoff.runtime;
       if (handoff.runtime) {
         handoff.runtime.enabled = true;
         handoff.runtime.conversationKey = currentKey;
-        if (carriedProjectName && !sanitizeProjectIdentity(handoff.runtime.projectName || '')) {
-          handoff.runtime.projectName = carriedProjectName;
-          handoff.runtime.projectNameSource = carriedProjectSource;
-        }
       }
       handoff.expiresAt = Date.now() + AUTO_START_SENT_TTL_MS;
       writeStartAuditHandoff(handoff);
@@ -9712,39 +11682,84 @@ ordinal/name of the entrypoint file.`;
       renderAutoAuditState();
     }
 
-    const latestUser = exactStartTurn || latestChatGPTUserTurn(turns);
+    // Milestone E: transaction identity first. The exact receipt is preferred;
+    // otherwise the committed transaction adopts the single new user turn that
+    // appeared after its own pre-send baseline, which is the committed Core even
+    // when ChatGPT renders only a clamped subset of the huge prompt. Two fresh
+    // turns are ambiguous and fail closed.
+    const owned = startAuditCoreTransactionTurn(handoff, turns);
+    const ownedByTransaction = owned.adopted === 'boundary';
+    if (owned.competing) {
+      if (ownsCurrentRoute) {
+        pauseAutoAudit(
+          'START sent its Core, but more than one user turn appeared before ChatGPT registered it. Adoption is refused so a human turn is never bound to this audit lineage.',
+          'warning'
+        );
+      }
+      return outcome(false, 'failed', owned.reason, { ownsCurrentRoute, competing: true });
+    }
 
-    if (!latestUser || classifyAuditTurn(latestUser) !== 'core') {
+    // A committed self-authored transaction with no adopted turn is PENDING
+    // REGISTRATION, never failure. ChatGPT submits the turn and hydrates its id
+    // a moment later, and for a clamped Core the receipt may never be readable
+    // at all. `idle` under a live generation is the live defect; the explicit
+    // hydration stage is the honest answer.
+    const hasBaseline = Number(handoff.preSendAt) > 0;
+    let adoptedTurn = owned.adopted === 'none' ? null : owned.turn;
+
+    if (!adoptedTurn && hasBaseline) {
+      return parkStartPendingRegistration(options, handoff, currentKey, ownsCurrentRoute,
+        outcome(false, 'pending', owned.reason || 'no-core-turn-registered-yet', { ownsCurrentRoute }));
+    }
+
+    // No baseline survived: a manually authored audit, or a foreign/reload
+    // adoption. DOM parsing is the only evidence available there, and stays a
+    // FALLBACK -- never the authority for the send that just happened here.
+    const latestUser = adoptedTurn || exactStartTurn || latestChatGPTUserTurn(turns);
+    const firstWaveId = getActiveProfile()?.waves?.[0]?.id || 'core';
+    const classifiedKind = latestUser ? classifyAuditTurn(latestUser) : '';
+    const isFirstWave = classifiedKind === firstWaveId
+      || Boolean(findWaveDefinitionForStageOrKind(classifiedKind)?.ordinal === 1)
+      || ['core', 'architecture'].includes(classifiedKind);
+    if (!latestUser || !isFirstWave) {
       if (options.finalAttempt && ownsCurrentRoute) {
         setStatus(
           'START AUDITING is still waiting for ChatGPT to hydrate the sent Core turn. A3 remains enabled; no manual toggle is required.',
           'info'
         );
       }
-      return ownsCurrentRoute;
+      return outcome(false, 'failed', 'no-core-turn-registered-yet',
+        { ownsCurrentRoute, turnId: latestUser ? getTurnId(latestUser) || '' : '' });
     }
+    adoptedTurn = latestUser;
 
-    if (handoff.receipt && !userTurnContainsReceipt(latestUser, handoff.receipt)) {
+    if (handoff.receipt && !ownedByTransaction && !userTurnContainsReceipt(latestUser, handoff.receipt)) {
       // Another Core turn may exist in this chat. Do not let START recovery
-      // silently adopt the wrong audit when its exact machine receipt is absent.
+      // silently adopt the wrong audit when its exact machine receipt is absent
+      // and no pre-send baseline can prove ownership either.
       if (options.finalAttempt && ownsCurrentRoute) {
         setStatus(
           'START AUDITING destination is loaded, but its exact Core receipt is not visible yet. A3 stays enabled and recovery keeps the lineage isolated.',
           'info'
         );
       }
-      return ownsCurrentRoute;
+      return outcome(false, 'failed', 'core-turn-without-machine-receipt', { ownsCurrentRoute });
     }
 
     if (!autoRuntime.enabled) {
       autoRuntime.enabled = true;
       autoRuntime.conversationKey = currentKey;
-      if (!saveAutoRuntime({ pauseOnFailure: false })) return false;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        return outcome(false, 'failed', 'runtime-persist-failed', { ownsCurrentRoute });
+      }
     }
 
     if (autoRuntime.stage === 'idle') {
       const armed = armFromCoreTurn(latestUser, { allowCompleted: false });
-      if (!armed) return false;
+      if (!armed) {
+        return parkStartPendingRegistration(options, handoff, currentKey, ownsCurrentRoute,
+          outcome(false, 'pending', 'core-turn-not-adoptable-yet', { ownsCurrentRoute }));
+      }
     }
 
     if (autoRuntime.stage === 'wait-core' || autoRuntime.stage === 'paused' || autoRuntime.stage === 'complete') {
@@ -9767,14 +11782,85 @@ ordinal/name of the entrypoint file.`;
         }
 
         setStatus('START AUDITING handoff recovered. Auto3 remains enabled and owns the Core -> Second -> Performance chain.', 'success');
-        return true;
+        return outcome(true, 'adopted', 'core-turn-registered', {
+          ownsCurrentRoute, turnId: getTurnId(latestUser) || ''
+        });
       }
     }
 
     if (options.finalAttempt) {
       setStatus('START AUDITING is still waiting for the Core turn to become adoptable. A3 state is preserved automatically; the normal observer/recovery path will continue without a manual toggle.', 'info');
     }
-    return false;
+    return outcome(false, 'failed', 'core-turn-not-adoptable', { ownsCurrentRoute });
+  }
+
+  // Milestone F: a committed Send whose user turn has not hydrated yet is an
+  // EXPLICIT runtime state, not `idle`.
+  //
+  // `stage: idle` under a live generation is the live defect in one line: the
+  // widget is enabled, ChatGPT is generating this audit, and the panel still
+  // says "Armed. Waiting for a NEW AUDIT CORE." `await-<wave>-user` already
+  // exists for the second and third waves; START now uses the same generic
+  // contract for the first one, so the evaluator, the compact label, the panel
+  // text and the no-duplicate-send guarantee all come for free.
+  function parkStartPendingRegistration(options, handoff, currentKey, ownsCurrentRoute, outcome) {
+    if (!ownsCurrentRoute) return outcome;
+    if (!autoRuntime) return outcome;
+
+    const expectedKind = String(handoff?.expectedKind || getActiveProfile()?.waves?.[0]?.id || 'core');
+    const awaitStage = autoAwaitStageForKind(expectedKind, false);
+    const baselineId = String(handoff?.preSendLatestUserTurnId || '');
+
+    // No hydration stage for this wave means the generic contract cannot express
+    // the pending state. Never write an empty stage: pause with the named reason
+    // so the operator sees why, and so recovery can still re-assert.
+    if (!awaitStage) {
+      pauseAutoAudit(
+        `START submitted its ${waveLabel(expectedKind)} but the runtime has no registration-hydration stage for wave '${expectedKind}'.`,
+        'warning'
+      );
+      return outcome;
+    }
+
+    // Keep the committed send transaction alive so the generic await-stage
+    // evaluator can adopt by boundary when the turn finally appears, and so no
+    // second Core can be prepared while this one is in flight.
+    beginCommittedAutoSend(expectedKind, String(handoff?.receipt || ''), {
+      continuation: false,
+      previousUserId: baselineId
+    });
+
+    const alreadyParked = String(autoRuntime.stage || '') === awaitStage;
+    if (!alreadyParked) {
+      autoRuntime.stage = awaitStage;
+      autoRuntime.expectedKind = expectedKind;
+      autoRuntime.pausedReason = '';
+      autoRuntime.pausedFromStage = '';
+      autoRuntime.waitStartedAt = Date.now();
+      autoRuntime.pendingSendReceipt = String(handoff?.receipt || '');
+      autoRuntime.pendingSendKind = expectedKind;
+      if (baselineId) autoRuntime.pendingSendPreviousUserId = baselineId;
+      autoRuntime.pendingSendStartedAt = Number(handoff?.preSendAt) || Date.now();
+      autoRuntime.pendingSendClickArmed = true;
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        // The stage could not be made durable. Refusing to report pending would
+        // be a lie, and leaving the runtime claiming a wave it does not own
+        // would be worse: park anyway and let the recovery path re-assert.
+        appendBridgeDiagnostic('start_pending_registration_persist_failed', {
+          severity: 'warning',
+          message: `Core Send is committed but the ${awaitStage} hydration stage could not be persisted; recovery keeps polling.`
+        });
+      }
+    }
+
+    if (options.finalAttempt) {
+      setStatus(
+        'START AUDITING submitted its Core and is waiting for ChatGPT to register the authored turn. A3 remains enabled, no duplicate Core can be sent, and no manual toggle is required.',
+        'info'
+      );
+    }
+    scheduleAutoAuditCheck(500);
+    return outcome;
   }
 
   function scheduleSentStartRecovery() {
@@ -9820,13 +11906,17 @@ ordinal/name of the entrypoint file.`;
     return true;
   }
 
+  // One selector for every surface that can carry an auth interstitial or a
+  // login/signup control. Shared so the observer can decide cheaply whether a
+  // mutation might have changed auth state without a second literal drifting.
+  const CHATGPT_AUTH_SURFACE_SELECTOR =
+    '[role="dialog"], [aria-modal="true"], [data-testid*="modal"], ' +
+    '[role="menu"], [data-state="open"], [data-radix-menu-content]';
+
   function chatGPTAuthInterstitialVisible() {
     if (detectSite().key !== 'chatgpt') return false;
 
-    const candidates = document.querySelectorAll(
-      '[role="dialog"], [aria-modal="true"], [data-testid*="modal"], ' +
-      '[role="menu"], [data-state="open"], [data-radix-menu-content]'
-    );
+    const candidates = document.querySelectorAll(CHATGPT_AUTH_SURFACE_SELECTOR);
 
     for (const element of candidates) {
       if (!isVisible(element)) continue;
@@ -9863,6 +11953,8 @@ ordinal/name of the entrypoint file.`;
 
     const visibleControls = Array.from(document.querySelectorAll('button, a'))
       .filter(isVisible)
+      .filter(node => !chatGPTNodeIsWidgetOwned(node))
+      .slice(0, 60)
       .map(node => cleanTurnText(String(node.innerText || node.textContent || '')).trim())
       .filter(Boolean);
 
@@ -9873,31 +11965,256 @@ ordinal/name of the entrypoint file.`;
       /choose an account to continue/i.test(pageText);
   }
 
-  function chatGPTRootIsQuarantined() {
-    return location.pathname === '/' && (
-      chatGPTAuthInterstitialVisible() ||
-      chatGPTLoggedOutRootVisible()
-    );
+  function chatGPTRootIsQuarantined(authVisible) {
+    // PERF-002: the caller may have already proved auth visibility for this
+    // probe; passing it in avoids a second full interstitial scan. Without a
+    // value the function computes it itself, so every external caller keeps
+    // its exact semantics.
+    const auth = typeof authVisible === 'boolean'
+      ? authVisible
+      : chatGPTAuthInterstitialVisible();
+    return location.pathname === '/' && (auth || chatGPTLoggedOutRootVisible());
+  }
+
+  // PERF-002: the cheap facts must be cheap first. On a stable route, a
+  // topology mutation can only matter to binding if it introduced/removed a
+  // likely auth-modal or login/signup control -- the two facts that change
+  // quarantine and route classification. Bounded to the changed nodes and a
+  // shallow direct-descendant scan; never a global querySelectorAll.
+  function chatGPTAuthControlLabel(node) {
+    if (!node || typeof node.matches !== 'function' || !node.matches('button, a')) return false;
+    const label = cleanTurnText(String(node.innerText || node.textContent || '')).trim();
+    return /^(log in|sign up)$/i.test(label);
+  }
+
+  function shallowNodes(node, depth = 2) {
+    if (!node || depth < 0) return [];
+    const out = [];
+    const children = node.children ? Array.from(node.children) : [];
+    for (const child of children) {
+      out.push(child);
+      if (depth > 0) out.push(...shallowNodes(child, depth - 1));
+    }
+    return out;
+  }
+
+  function mutationMayChangeAuthState(record) {
+    if (!record || record.type === 'characterData') return false;
+    const added = Array.from(record.addedNodes || []).map(acbElementFromNode);
+    const removed = Array.from(record.removedNodes || []).map(acbElementFromNode);
+    const changed = added.concat(removed).filter(Boolean);
+    for (const node of changed) {
+      if (node.matches?.(CHATGPT_AUTH_SURFACE_SELECTOR)) return true;
+      if (chatGPTAuthControlLabel(node)) return true;
+      const controls = shallowNodes(node, 2);
+      for (const child of controls) {
+        if (child.matches?.(CHATGPT_AUTH_SURFACE_SELECTOR)) return true;
+        if (chatGPTAuthControlLabel(child)) return true;
+      }
+    }
+    return false;
+  }
+
+  // PERF-002: a conversation-turn insertion/removal is the other fact binding
+  // genuinely cares about while idle. Bounded to the changed nodes and their
+  // shallow descendants; never a global scan.
+  const CONVERSATION_TURN_SELECTOR =
+    '[data-message-author-role], [data-testid^="conversation-turn-"]';
+
+  function mutationTouchesConversationTurn(record) {
+    const nodes = [
+      acbElementFromNode(record.target),
+      ...Array.from(record.addedNodes || []).map(acbElementFromNode),
+      ...Array.from(record.removedNodes || []).map(acbElementFromNode)
+    ].filter(Boolean);
+
+    for (const node of nodes) {
+      if (node.matches?.(CONVERSATION_TURN_SELECTOR)) return true;
+      if (node.closest?.(CONVERSATION_TURN_SELECTOR)) return true;
+      for (const child of shallowNodes(node, 1)) {
+        if (child.matches?.(CONVERSATION_TURN_SELECTOR)) return true;
+      }
+    }
+    return false;
+  }
+
+  function chatGPTWorkQuotaExhaustedVisible() {
+    // T-189 rev 2: quota/capability evidence only. A Work quota banner can
+    // stay on screen while the composer has already returned to ordinary
+    // Chat, so this must never decide the surface mode by itself.
+    if (detectSite().key !== 'chatgpt') return false;
+    const text = cleanTurnText(String(document.body?.innerText || '')).slice(0, 12000);
+    if (/you'?re out of work usage for now/i.test(text)) return true;
+    if (/upgrade or add credits to keep using work/i.test(text)) return true;
+    return false;
+  }
+
+  function chatGPTStrongWorkEvidence() {
+    for (const scope of chatGPTWorkModeControlScopes()) {
+      for (const node of scope.querySelectorAll(WORK_MODE_CONTROL_SELECTOR)) {
+        if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+        const name = chatGPTControlName(node);
+        if (name !== 'work') continue;
+        if (node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-checked') === 'true' || node.getAttribute('aria-pressed') === 'true') return true;
+        const pressed = node.getAttribute('aria-current');
+        if (pressed === 'true' || pressed === 'page') return true;
+      }
+    }
+    return false;
   }
 
   function chatGPTWorkSurfaceActive() {
-    // ChatGPT's Work surface replaced the plain chat landing on `/` for some
-    // accounts: the composer greets with "Work on anything" instead of the
-    // chat placeholder. A managed worker parked there looks CLEAN (no turns,
-    // empty composer) but every send would burn Work usage instead of running
-    // the audit, so the composer must be switched back to Chat first.
-    if (detectSite().key !== 'chatgpt' || location.pathname !== '/') return false;
-    const input = rawChatGPTComposerInput();
-    if (input) {
-      const markers = [
+    return chatGPTSurfaceSnapshot().mode === 'work';
+  }
+
+  function chatGPTSurfaceSnapshot() {
+    // One bounded surface evaluation per CALL. Callers that need several
+    // facts (render branches, readiness, the NEW verifier) take the snapshot
+    // once and reuse the object, so a render never re-scans the document per
+    // branch. No time-based cache: ChatGPT hydrates and mutates the composer
+    // asynchronously and a stale mode is worse than a cheap re-evaluation.
+    if (detectSite().key !== 'chatgpt') {
+      return { mode: 'unknown', workQuotaExhausted: false, authBlocked: false, composerAvailable: false };
+    }
+    const composerAvailable = Boolean(rawChatGPTComposerInput() || chatGPTComposerRoot());
+    let mode = 'unknown';
+    if (chatGPTStrongWorkEvidence()) {
+      mode = 'work';
+    } else {
+      const input = rawChatGPTComposerInput();
+      const markers = input ? [
         input.getAttribute('placeholder'),
         input.getAttribute('data-placeholder'),
         input.getAttribute('aria-label')
-      ];
-      if (markers.some(value => /^work\b/i.test(String(value || '').trim()))) return true;
+      ] : [];
+      if (markers.some(value => /^work\b/i.test(String(value || '').trim()))) mode = 'work';
+      else if (composerAvailable) mode = 'chat';
     }
-    const pageText = cleanTurnText(String(document.body?.innerText || '')).slice(0, 7000);
-    return /meet chatgpt work/i.test(pageText);
+    return {
+      mode,
+      workQuotaExhausted: chatGPTWorkQuotaExhaustedVisible(),
+      authBlocked: chatGPTAuthBlockedVisible(),
+      composerAvailable
+    };
+  }
+
+  function chatGPTSurfaceMode() {
+    return chatGPTSurfaceSnapshot().mode;
+  }
+
+  function chatGPTAuthBlockedVisible() {
+    return chatGPTAuthInterstitialVisible() || chatGPTLoggedOutRootVisible() || chatGPTRootIsQuarantined();
+  }
+
+  function chatGPTSendReadiness() {
+    const button = getChatGPTSend();
+    const hasButton = Boolean(button && button.isConnected && isVisible(button));
+    const sendEnabled = Boolean(hasButton && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+    if (sendEnabled) return 'READY';
+    const surface = chatGPTSurfaceSnapshot();
+    if (surface.mode === 'work') return 'WORK_BLOCKED';
+    if (surface.authBlocked) return 'AUTH_BLOCKED';
+    const composer = chatGPTComposerRoot();
+    if (!composer || composer.hasAttribute('inert') || !rawChatGPTComposerInput()) return 'COMPOSER_BLOCKED';
+    if (!hasButton) return 'SEND_DISABLED_UNKNOWN';
+    const tiles = chatGPTComposerAttachmentTiles();
+    if (tiles.some(tile => chatGPTAttachmentIsBusy(tile))) return 'ATTACHMENT_REGISTERING';
+    const projectTiles = chatGPTProjectComposerAttachments();
+    if (!projectTiles.length) return 'SEND_DISABLED_UNKNOWN';
+    return 'SEND_DISABLED_UNKNOWN';
+  }
+
+  let newChatRequiresChatStatus = '';
+  function setNewChatRequiresChatStatus(message) {
+    newChatRequiresChatStatus = String(message || '');
+    if (newChatRequiresChatStatus) setStatus(newChatRequiresChatStatus, 'warning');
+  }
+  function readNewChatRequiresChatIntent() {
+    try {
+      const raw = sessionStorage.getItem(AUTO_NEW_CHAT_REQUIRES_CHAT_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.tabId !== autoTabId) return null;
+      if (Date.now() - Number(parsed.at || 0) > 120000) return null;
+      return parsed;
+    } catch (_) { return null; }
+  }
+  function writeNewChatRequiresChatIntent() {
+    try { sessionStorage.setItem(AUTO_NEW_CHAT_REQUIRES_CHAT_KEY, JSON.stringify({ version: 1, tabId: autoTabId, at: Date.now() })); } catch (_) {}
+  }
+  function clearNewChatRequiresChatIntent() {
+    try { sessionStorage.removeItem(AUTO_NEW_CHAT_REQUIRES_CHAT_KEY); } catch (_) {}
+  }
+
+  // T-189 rev 2: NEW is one bounded verification transaction. The dispatch
+  // (one exact New Chat click, or one navigation) happens once; everything
+  // after it only VERIFIES. ChatGPT hydrates the route/composer
+  // asynchronously, so ticks retry inside the window and only a positively
+  // proven ordinary Chat surface consumes the intent. Navigation alone is
+  // never success, and an unresolvable surface ends in a named NEW HOLD.
+  const NEW_CHAT_VERIFY_WINDOW_MS = 12000;
+  const NEW_CHAT_VERIFY_RETRY_MS = 400;
+  const NEW_CHAT_MAX_SWITCH_CLICKS = 3;
+  let newChatVerifyTimer = 0;
+  let newChatVerifyStartedAt = 0;
+  let newChatVerifyAttempts = 0;
+  let newChatDispatchCount = 0;
+  let newChatSwitchClicks = 0;
+
+  function newChatDiagnostics() {
+    return {
+      attempts: newChatVerifyAttempts,
+      dispatchCount: newChatDispatchCount,
+      switchClicks: newChatSwitchClicks,
+      verifyPending: Boolean(newChatVerifyTimer)
+    };
+  }
+
+  function newChatVerifyWindowExpired() {
+    if (!newChatVerifyStartedAt) return false;
+    return performance.now() - newChatVerifyStartedAt > NEW_CHAT_VERIFY_WINDOW_MS;
+  }
+
+  function scheduleNewChatVerification(delayMs = NEW_CHAT_VERIFY_RETRY_MS) {
+    if (newChatVerifyTimer) clearTimeout(newChatVerifyTimer);
+    newChatVerifyTimer = setTimeout(() => {
+      newChatVerifyTimer = 0;
+      try { fulfillNewChatRequiresChatIntentIfNeeded(); } catch (_) {}
+    }, delayMs);
+  }
+
+  function fulfillNewChatRequiresChatIntentIfNeeded() {
+    const intent = readNewChatRequiresChatIntent();
+    if (!intent) return false;
+    if (!newChatVerifyStartedAt) newChatVerifyStartedAt = performance.now();
+    newChatVerifyAttempts += 1;
+
+    if (chatGPTSurfaceSnapshot().mode === 'work') {
+      let outcome = { ok: false, action: 'skipped' };
+      if (newChatSwitchClicks < NEW_CHAT_MAX_SWITCH_CLICKS) {
+        outcome = chatGPTEnsureChatMode();
+        if (outcome.ok && outcome.action !== 'already-chat') newChatSwitchClicks += 1;
+      }
+      if (chatGPTSurfaceSnapshot().mode === 'work') {
+        if (!newChatVerifyWindowExpired()) { scheduleNewChatVerification(); return false; }
+        setNewChatRequiresChatStatus(`NEW HOLD \u00b7 ChatGPT is in Work mode (${outcome.action || 'unknown'}). Switch to Chat and press NEW again.`);
+        return false;
+      }
+    }
+
+    if (chatGPTSurfaceSnapshot().mode !== 'chat') {
+      if (!newChatVerifyWindowExpired()) { scheduleNewChatVerification(); return false; }
+      setNewChatRequiresChatStatus('NEW HOLD \u00b7 ChatGPT Chat surface could not be proven.');
+      return false;
+    }
+
+    clearNewChatRequiresChatIntent();
+    setNewChatRequiresChatStatus('');
+    newChatVerifyStartedAt = 0;
+    newChatVerifyAttempts = 0;
+    newChatSwitchClicks = 0;
+    renderAutoAuditState();
+    return true;
   }
 
   const WORK_MODE_CONTROL_SELECTOR =
@@ -9918,7 +12235,9 @@ ordinal/name of the entrypoint file.`;
   }
 
   function chatGPTControlName(node) {
-    const raw = String(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
+    // textContent, not innerText: mode-control scans walk every visible
+    // control on the page, and innerText forces a layout read per control.
+    const raw = String(node.getAttribute('aria-label') || node.textContent || '');
     return cleanTurnText(raw).replace(/\s+(mode|режим)$/i, '').trim().toLowerCase();
   }
 
@@ -9969,17 +12288,26 @@ ordinal/name of the entrypoint file.`;
   }
 
   function chatGPTNewChatControl() {
-    // Last resort for a MANAGED worker window only: a fresh chat is exactly
-    // the state a worker wants, and clicking it in a dedicated window can
-    // never disturb a human's conversation.
+    // T-189 rev 2: exact, proven New Chat controls first; a generic home/root
+    // link is only a bounded navigation fallback and must never outrank (or
+    // impersonate) the real control.
+    for (const node of document.querySelectorAll('[data-testid="create-new-chat-button"]')) {
+      if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+      if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+      return { node, kind: 'exact' };
+    }
     for (const scope of chatGPTWorkModeControlScopes()) {
       for (const node of scope.querySelectorAll(WORK_MODE_CONTROL_SELECTOR)) {
         if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
         if (node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
         const name = chatGPTControlName(node);
         if (!/^(new chat|новый чат)$/i.test(name)) continue;
-        return node;
+        return { node, kind: 'exact' };
       }
+    }
+    for (const node of document.querySelectorAll('a[href="/"]')) {
+      if (!isVisible(node) || chatGPTNodeIsWidgetOwned(node)) continue;
+      return { node, kind: 'home-link' };
     }
     return null;
   }
@@ -9995,7 +12323,7 @@ ordinal/name of the entrypoint file.`;
     if (options.allowNewChat) {
       const fresh = chatGPTNewChatControl();
       if (fresh) {
-        dispatchElementClick(fresh);
+        dispatchElementClick(fresh.node);
         if (!chatGPTWorkSurfaceActive()) return { ok: true, action: 'new-chat' };
         return { ok: false, action: 'new-chat-refused', names: chatGPTWorkModeControlNames() };
       }
@@ -10313,7 +12641,11 @@ ordinal/name of the entrypoint file.`;
       return false;
     }
     if (autoRuntimeCorruptKey === key) autoRuntimeCorruptKey = '';
-    renderAutoAuditState();
+    // deferRender: the high-frequency Auto3 stabilization checkpoint persists
+    // through here on every evaluation; a full panel render per persistence
+    // turned a bounded extraction into repeated document scans (PERF-005).
+    // The scheduled audit check repaints on its own.
+    if (!options.deferRender) renderAutoAuditState();
     return true;
   }
 
@@ -10635,8 +12967,16 @@ ordinal/name of the entrypoint file.`;
 
   function bindAutoRuntimeToCurrentConversation(options = {}) {
     const stableMatch = location.pathname.match(/^\/c\/([^/?#]+)/i);
-    const authQuarantine = chatGPTRootIsQuarantined();
-    const authInterstitial = chatGPTAuthInterstitialVisible() || authQuarantine;
+    // PERF-002: record the pathname this bind proved, so the observer can skip
+    // a rebind for later topology mutations on the same route.
+    autoObserverLastPathname = location.pathname;
+    // PERF-002: one auth probe per bind. The interstitial scan used to run
+    // three times (quarantine, its own derivation, then again for the
+    // interstitial flag); computing it once and threading it through removes
+    // the duplicate broad document scans without changing any decision.
+    const authVisible = chatGPTAuthInterstitialVisible();
+    const authQuarantine = chatGPTRootIsQuarantined(authVisible);
+    const authInterstitial = authVisible || authQuarantine;
     const previousKey = autoBoundConversationKey;
     const previousRuntime = autoRuntime ? normalizeAutoRuntime(autoRuntime) : null;
 
@@ -10687,6 +13027,10 @@ ordinal/name of the entrypoint file.`;
     else if (!nextRuntime) nextRuntime = loadAutoRuntime(key);
 
     autoBoundConversationKey = key;
+    // T-193: a manual project binding follows the same draft -> stable
+    // conversation transition as the Auto runtime; a temporary identity never
+    // leaks a binding into a later real conversation.
+    if (previousKey && previousKey !== key) migrateManualArchiveBinding(previousKey, key);
     if (key.startsWith('auth:')) {
       autoRuntimeCorruptKey = '';
       autoRuntime = emptyAutoRuntime({ enabled: false });
@@ -10740,6 +13084,27 @@ ordinal/name of the entrypoint file.`;
     }
   }
 
+  // 2026-10 build (measured live on dsp-fc76adbfbfc649e7 through CDP on the
+  // dedicated profile): a whole-conversation census found NONE of
+  // [data-turn], [data-testid^="conversation-turn-"] or [data-message-author-role].
+  // A reader that knew only the old names returned [] for a conversation that
+  // plainly held the authored Core and ChatGPT's finished answer, so the run sat
+  // at "turns=0(u0/a0)" and adopted nothing -- ever.
+  //
+  // The replacement shape, read off that conversation:
+  //   [data-turn-key]                   the CONVERSATION id (63d00465-...), ONE
+  //                                     per thread, spanning BOTH halves. It is
+  //                                     NOT a turn and must never be read as one.
+  //   [data-chatgpt-search-message-ids] ONE PER MESSAGE, in document order. This
+  //                                     is the turn container.
+  //   [data-user-message-bubble]        marks the user half
+  //   [data-conversation-role]          names the answer half
+  //   [data-chatgpt-selection-message-id] the answer's own message id
+  const CHATGPT_CURRENT_TURN = '[data-chatgpt-search-message-ids]';
+  const CHATGPT_USER_BUBBLE = '[data-user-message-bubble]';
+  const CHATGPT_USER_TURN_MARKERS =
+    '[data-user-message-bubble], [data-thread-user-message-navigation-content]';
+
   function turnRole(turn) {
     if (!turn) return '';
 
@@ -10753,7 +13118,17 @@ ordinal/name of the entrypoint file.`;
       '[data-message-author-role="user"], [data-message-author-role="assistant"]'
     );
     const role = String(nested?.getAttribute('data-message-author-role') || '').toLowerCase();
-    return role === 'user' || role === 'assistant' ? role : '';
+    if (role === 'user' || role === 'assistant') return role;
+
+    // The current build carries no author role on the container. The user half
+    // is marked by its bubble and the answer half names itself, so an unmarked
+    // message is the answer -- scoped to the message container on purpose, so a
+    // wrapper or an arbitrary node stays role-less rather than being promoted.
+    if (turn.matches?.(CHATGPT_USER_TURN_MARKERS) ||
+      turn.querySelector?.(CHATGPT_USER_TURN_MARKERS)) return 'user';
+    if (turn.querySelector?.('[data-conversation-role="assistant"]')) return 'assistant';
+    if (turn.matches?.(CHATGPT_CURRENT_TURN)) return 'assistant';
+    return '';
   }
 
   function getChatGPTTurns() {
@@ -10769,14 +13144,19 @@ ordinal/name of the entrypoint file.`;
       const message = node.matches?.('[data-message-author-role]')
         ? node
         : node.querySelector?.('[data-message-author-role="user"], [data-message-author-role="assistant"]');
-      const role = String(
+      let role = String(
         message?.getAttribute?.('data-message-author-role') ||
         node.getAttribute?.('data-turn') ||
         ''
       ).toLowerCase();
+      // Only the current build reaches this branch, so PERF-006's one-lookup
+      // budget is untouched for every shape that still resolves by attribute.
+      if (role !== 'user' && role !== 'assistant') role = turnRole(node);
       if (role !== 'user' && role !== 'assistant') return;
       const stableKey =
         node.getAttribute?.('data-turn-id') ||
+        node.getAttribute?.('data-chatgpt-selection-message-id') ||
+        String(node.getAttribute?.('data-chatgpt-search-message-ids') || '').trim().split(/\s+/)[0] ||
         message?.getAttribute?.('data-message-id') ||
         node.getAttribute?.('data-testid') ||
         node.getAttribute?.('id') || '';
@@ -10796,7 +13176,10 @@ ordinal/name of the entrypoint file.`;
     const stableSelector =
       'section[data-turn], article[data-turn], ' +
       'section[data-testid^="conversation-turn-"], article[data-testid^="conversation-turn-"], ' +
-      '[data-testid^="conversation-turn-"]';
+      '[data-testid^="conversation-turn-"], ' +
+      // 2026-10 build: [data-turn-key] replaced every name above. Kept last so
+      // a page that still renders both is read exactly as it was before.
+      CHATGPT_CURRENT_TURN;
 
     if (root) {
       for (const node of root.querySelectorAll(stableSelector)) add(node);
@@ -10830,7 +13213,13 @@ ordinal/name of the entrypoint file.`;
 
     return String(
       turn.getAttribute?.('data-turn-id') ||
-      message?.getAttribute('data-message-id') ||
+      // 2026-10 build. [data-turn-key] is deliberately NOT read here: it is the
+      // conversation id and would bind two different turns to one identity. The
+      // message ids are the per-turn identity, and the answer carries its own
+      // inside [data-chatgpt-selection-message-id].
+      turn.getAttribute?.('data-chatgpt-selection-message-id') ||
+      String(turn.getAttribute?.('data-chatgpt-search-message-ids') || '').trim().split(/\s+/)[0] ||
+      message?.getAttribute?.('data-message-id') ||
       turn.getAttribute?.('data-testid') ||
       turn.getAttribute?.('id') ||
       ''
@@ -10964,7 +13353,23 @@ ordinal/name of the entrypoint file.`;
 
     const message = turn.matches?.('[data-message-author-role="user"]')
       ? turn
-      : (turn.querySelector?.('[data-message-author-role="user"]') || turn);
+      // 2026-10 build (measured live on dsp-fc76adbfbfc649e7 through CDP on the
+      // dedicated profile): the current [data-chatgpt-search-message-ids]
+      // container renders the attachment tiles and their "File attached"/"Show"
+      // affordances as SIBLINGS of the authored bubble, so its textContent opens
+      // with the archive FILENAME -- measured 5136 chars for the container
+      // against 5099 for the bubble -- and textContent concatenates with no
+      // separator before the prose. classifyAuditMessage deliberately trusts only
+      // the FIRST meaningful line, so every managed START turn opened with
+      // "FastPrompter_...zipFileA...Show", matched no marker, and classified as a
+      // NON-audit turn, which visibleAuditLineage treats as a hard barrier that
+      // severs the chain. The widget then sat at "Armed. Waiting for a NEW AUDIT
+      // CORE" with its own Core, receipt and finished answer on screen. Scope the
+      // authored text to the bubble; the container stays a later fallback so no
+      // readable representation is lost.
+      : (turn.querySelector?.('[data-message-author-role="user"]')
+         || turn.querySelector?.(CHATGPT_USER_BUBBLE)
+         || turn);
 
     const candidates = [];
     const seen = new Set();
@@ -11383,7 +13788,7 @@ ordinal/name of the entrypoint file.`;
     // Very large pasted commands can become an internal attachment. The
     // accessibility label is accepted only if it contains canonical framing.
     for (const tile of turn.querySelectorAll?.('[role="group"][aria-label], [aria-label*="AUDIT" i]') || []) {
-      const label = String(tile.getAttribute('aria-label') || '').trim();
+      const label = chatGPTAttachmentTileName(tile).trim();
       const kind = classifyAuditMessage(label);
       if (kind) return kind;
     }
@@ -11414,17 +13819,165 @@ ordinal/name of the entrypoint file.`;
     return `${getTurnId(turn)}:${built.fingerprint}`;
   }
 
-  function chatGPTIsGenerating() {
+  // T-257: ChatGPT briefly mounts final-action chrome while its Stop control is
+  // still being removed (and the reverse). Inside this bounded window the
+  // contradiction is held as `stabilizing`, so a single frame of overlapping
+  // chrome never commits a wave. Past the window an unresolvable contradiction
+  // becomes an explicit conflict rather than an eternal BUSY.
+  const AUTO_GENERATION_STABILIZE_MS = 2500;
+  let generationConflictSince = 0;
+  let autoGenerationConflictReported = false;
+
+  function describeStopCandidate(element) {
+    if (!element) return 'none';
+    if (element.matches('button[aria-label="Stop"]')) return 'canonical-stop-current-build';
+    if (element.matches('[data-testid="stop-button"]')) return 'canonical-stop-button';
+    if (element.matches('button[aria-label="Stop generating"]')) return 'canonical-stop-generating';
+    if (element.matches('button[aria-label="Stop streaming"]')) return 'canonical-stop-streaming';
+    return 'stop-like';
+  }
+
+  // The single generation authority. Every caller -- the compact label, the
+  // audit evaluator, the observer, worker cleanliness and Send availability --
+  // reads this one record, so no layer can claim "generating" while another
+  // claims the response is terminal. Evidence is content-free: shape, identity
+  // and structural relation only, never conversation text.
+  function chatGPTGenerationSnapshot() {
     const root = chatGPTComposerRoot();
-    if (!root) return false;
-    const stopButton = root.querySelector(
-      '[data-testid="stop-button"], ' +
-      'button[data-testid*="stop" i], ' +
-      'button[aria-label*="Stop streaming" i], ' +
-      'button[aria-label*="Stop generating" i], ' +
-      'button[aria-label="Stop"]'
+    const input = rawChatGPTComposerInput();
+    const form = input?.closest('form') || (root?.tagName === 'FORM' ? root : null);
+    const sendControl = document.querySelector(
+      '#composer-submit-button, [data-testid="send-button"], [data-testid="composer-submit-button"]'
     );
-    return Boolean(stopButton && isVisible(stopButton));
+
+    const snapshot = {
+      generating: false,
+      state: 'idle',
+      reason: 'no-composer',
+      conflict: false,
+      diagnostic: '',
+      selector_class: '',
+      tag: '',
+      data_testid: '',
+      aria_label: '',
+      inside_composer_root: false,
+      same_form: false,
+      composer_distance: -1,
+      inside_conversation_turn: false,
+      inside_response_actions: false,
+      visible: false,
+      send_control_present: Boolean(sendControl && isVisible(sendControl)),
+      latest_assistant_has_final_actions: false,
+      // T-260: a stop-shaped control was seen and REJECTED while sitting inside
+      // the current composer. The generation verdict is unchanged; this is the
+      // disagreement that must keep READY off the compact label.
+      rejected_in_composer: false
+    };
+
+    if (!root) return snapshot;
+
+    let owned = null;
+    let rejected = null;
+    for (const candidate of document.querySelectorAll(CHATGPT_STOP_LIKE_SELECTOR)) {
+      if (owned) break;
+      if (!isVisible(candidate)) continue;
+      // BOTH halves are required. Composer ownership alone is what let a
+      // data-testid="stop-listening" control in the composer's own action shell
+      // hold a finished response at BUSY; identity alone is what let an
+      // unrelated page Stop claim generation.
+      if (candidate.matches(CHATGPT_STOP_SELECTOR) && chatGPTStopNearComposer(candidate, root)) {
+        owned = candidate;
+        continue;
+      }
+      if (!rejected) rejected = candidate;
+    }
+
+    // The conversation is consulted for the evidence record on every call: a
+    // diagnostic snapshot that reports "no final actions" only when it never
+    // looked is not evidence.
+    const latestAssistant = latestChatGPTAssistantTurn();
+    const finalActions = Boolean(latestAssistant) && assistantHasFinalActions(latestAssistant);
+
+    const evidence = (element, ownedByComposer) => {
+      snapshot.selector_class = describeStopCandidate(element);
+      snapshot.tag = String(element.tagName || '').toLowerCase();
+      snapshot.data_testid = String(element.getAttribute?.('data-testid') || '');
+      snapshot.aria_label = String(element.getAttribute?.('aria-label') || '');
+      snapshot.inside_composer_root = Boolean(root.contains(element));
+      snapshot.same_form = Boolean(form && form.contains(element));
+      snapshot.composer_distance = composerDistanceTo(element);
+      snapshot.inside_conversation_turn = Boolean(
+        element.closest('[data-testid^="conversation-turn-"], article[data-testid], article')
+      );
+      snapshot.inside_response_actions = Boolean(element.closest(ASSISTANT_RESPONSE_ACTIONS_SELECTOR));
+      snapshot.visible = true;
+      snapshot.reason = ownedByComposer ? 'canonical-stop-owned' : 'stale_stop_candidate_ignored';
+    };
+
+    if (!owned) {
+      generationConflictSince = 0;
+      snapshot.latest_assistant_has_final_actions = finalActions;
+      if (rejected) {
+        evidence(rejected, false);
+        // A finished response plus a stop-shaped control that is NOT the
+        // generation Stop is exactly the live stall: name it, never obey it.
+        if (snapshot.latest_assistant_has_final_actions) snapshot.diagnostic = 'stale_stop_candidate_ignored';
+        snapshot.state = snapshot.latest_assistant_has_final_actions ? 'terminal' : 'idle';
+        // T-260: "not our generation Stop" and "nothing is generating" are
+        // different facts, and the label used to read the second one. A stop-
+        // shaped control sitting INSIDE the current composer is the strongest
+        // available disagreement with that reading: it is the composer's own
+        // action surface, which is exactly where the generation Stop lives. The
+        // verdict stays non-generating -- T-257's false positive is not reopened
+        // -- but the disagreement is recorded so READY cannot be returned over
+        // it. A control the widget already calls non-generation (voice,
+        // dictation, media, response chrome) is exempt, as is anything outside
+        // the composer root.
+        snapshot.rejected_in_composer = !stopCandidateIsExcluded(rejected) && Boolean(root.contains(rejected));
+      } else {
+        snapshot.reason = 'no-canonical-stop';
+      }
+      return snapshot;
+    }
+
+    evidence(owned, true);
+    snapshot.latest_assistant_has_final_actions = finalActions;
+
+    if (!snapshot.latest_assistant_has_final_actions) {
+      generationConflictSince = 0;
+      snapshot.generating = true;
+      snapshot.state = 'generating';
+      return snapshot;
+    }
+
+    // The contradiction window LATCHES. Clearing it here would make the
+    // conflict unobservable to the very next reader -- the compact label --
+    // and reintroduce a label that disagrees with the snapshot.
+    if (!generationConflictSince) generationConflictSince = Date.now();
+    if (Date.now() - generationConflictSince <= AUTO_GENERATION_STABILIZE_MS) {
+      snapshot.generating = true;
+      snapshot.state = 'stabilizing';
+      snapshot.reason = 'generation_truth_stabilizing';
+      return snapshot;
+    }
+
+    snapshot.state = 'conflict';
+    snapshot.conflict = true;
+    snapshot.diagnostic = 'generation_truth_conflict';
+    snapshot.reason = 'generation_truth_conflict';
+    return snapshot;
+  }
+
+  function chatGPTIsGenerating() {
+    return chatGPTGenerationSnapshot().generating;
+  }
+
+  // T-257: an unresolved contradiction is not "safe to act". Reads may proceed
+  // -- a finished response must still reach the canonical completion gate --
+  // but anything that would send, nudge, stand a worker down or reload waits
+  // until generation truth is settled.
+  function chatGPTGenerationUnresolved() {
+    return chatGPTGenerationSnapshot().conflict;
   }
 
   function assistantHasFinalActions(turn) {
@@ -11539,6 +14092,44 @@ ordinal/name of the entrypoint file.`;
     if (kind === 'second') return 'wait-second';
     if (kind === 'performance') return 'wait-performance';
     return `wait-${kind}`;
+  }
+
+  function activeProfileWaveKind(kind) {
+    // Resolve a wave id STRICTLY against the pinned active profile
+    // (autoRuntime.profileId). findWaveDefinitionForStageOrKind alone would
+    // fall back to every embedded profile, so a quick3-only stage name could
+    // steer a Super10 runtime (or vice versa); an unknown suffix must resolve
+    // to nothing at all, never to a guessed wave.
+    const clean = String(kind || '').toLowerCase();
+    if (!clean) return '';
+    const prof = getActiveProfile();
+    const waveDef = (prof?.waves || []).find(w => String(w.id).toLowerCase() === clean) || null;
+    return waveDef ? waveDef.id : '';
+  }
+
+  function sendingStageWaveKind(stage = autoRuntime?.stage || '') {
+    // `sending-${wave.id}` for every wave the chain can ADVANCE INTO (profile
+    // order >= 2): a completed wave commits to sending-<next>, so the first
+    // wave (armed by START, never by advancement) and a completed final wave
+    // (straight to campaign complete) own no sending stage. This also kills
+    // `sending-compress` for the single-wave Compress profile: there is no
+    // second Compress wave to send. `sending-continuation` carries
+    // continuationKind separately and keeps its own branch.
+    const raw = String(stage || '');
+    if (!raw.startsWith('sending-')) return '';
+    const kind = activeProfileWaveKind(raw.slice('sending-'.length));
+    if (!kind) return '';
+    const prof = getActiveProfile();
+    const index = (prof?.waves || []).findIndex(w => w.id === kind);
+    return index >= 1 ? kind : '';
+  }
+
+  function awaitStageWaveKind(stage = autoRuntime?.stage || '') {
+    // `await-${wave.id}-user` for every valid wave of the ACTIVE profile.
+    // `await-continuation-user` keeps its own special state and branch.
+    const raw = String(stage || '');
+    if (!raw.startsWith('await-') || !raw.endsWith('-user')) return '';
+    return activeProfileWaveKind(raw.slice('await-'.length, raw.length - '-user'.length));
   }
 
   function waveUserId(kind) {
@@ -11938,7 +14529,7 @@ ordinal/name of the entrypoint file.`;
       rootId: String(root.id || root.getAttribute?.('data-testid') || ''),
       text: composerPlainText(input),
       tiles: chatGPTComposerAttachmentTiles(root).map(tile =>
-        String(tile.getAttribute('aria-label') || '').trim().toLowerCase()
+        chatGPTAttachmentTileName(tile).trim().toLowerCase()
       ),
       generating: chatGPTIsGenerating()
     };
@@ -12402,6 +14993,10 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
     const labels = {
       idle: `Armed. Waiting for a NEW ${firstWave?.title || 'audit first wave'}. Active chain state is persisted across tab/browser close.`,
       'wait-core': '1/3 Core is running. Waiting for COMPLETE.',
+      // T-261: the Core is submitted and ChatGPT has not registered the
+      // authored turn yet. This must never read as "Waiting for a NEW AUDIT
+      // CORE": the Core exists, it is the transaction in flight.
+      'await-core-user': 'Core submitted; waiting for ChatGPT to register the authored turn.',
       'sending-second': 'Core COMPLETE. Preparing Audit Second Wave.',
       'await-second-user': 'Second Wave was sent. Waiting for ChatGPT to register the new user turn.',
       'wait-second': '2/3 Second Wave is running. Waiting for COMPLETE.',
@@ -12718,7 +15313,7 @@ function auditHandoffIntegrity(stage, body, gateSpec = null, profileOrId = null)
         return;
       }
 
-      recoverArmedStartSend({ waitMs: 2500, reschedule: true })
+      recoverArmedStartSend({ waitMs: 12000, reschedule: true })
         .then(recovered => {
           if (!recovered && startHandoffIsPrepared(readStartAuditHandoff())) {
             scheduleAutoAuditCheck(600);
@@ -12790,7 +15385,7 @@ async function recoverArmedStartSend(options = {}) {
     ownership.captureWrite();
 
     const waitMs = Math.max(250, Number(options.waitMs) || 1800);
-    const send = await waitForChatGPTSendReady(waitMs);
+    const send = await waitForChatGPTSendReady(waitMs, CHATGPT_SEND_READY_MAX_MS, { idleGiveUpMs: waitMs });
     if (!send || !startHandoffComposerStillPrepared(handoff) || !(await ownership.verify())) {
       if (options.reschedule !== false) scheduleAutoAuditCheck(700);
       return false;
@@ -12842,6 +15437,16 @@ async function recoverArmedStartSend(options = {}) {
     return true;
   }
 
+  function setStartPhase(phase) {
+    currentStartPhase = String(phase || '');
+    if (currentStartPhase) {
+      startPhaseHistory.push(currentStartPhase);
+      if (startPhaseHistory.length > 12) startPhaseHistory.shift();
+      setStatus(currentStartPhase, currentStartPhase.includes('HOLD') ? 'warning' : 'info');
+    }
+    renderAutoAuditState();
+  }
+  function clearStartPhase() { currentStartPhase = ''; renderAutoAuditState(); }
   async function startAuditCoreFromReadyAttachment(options = {}) {
     if (auditStartIsLive() || auditActionIsLive()) {
       setStatus('START AUDITING is already preparing/sending Audit Core.', 'info');
@@ -12851,19 +15456,37 @@ async function recoverArmedStartSend(options = {}) {
       setStatus('START AUDITING is available only on ChatGPT.', 'warning');
       return false;
     }
+    startPhaseHistory.length = 0;
+    setStartPhase('START PRECHECK');
+    if (chatGPTSurfaceMode() === 'work') {
+      setStartPhase('START HOLD \u00b7 Work');
+      return false;
+    }
+    setStartPhase('START PRECHECK');
 
     bindAutoRuntimeToCurrentConversation({ claim: false });
 
     const prepared = readStartAuditHandoff();
     if (startHandoffIsPrepared(prepared)) {
       setStatus('START AUDITING already has one canonical Core receipt prepared. Retrying that exact Send instead of creating another audit start.', 'info');
-      return recoverArmedStartSend({
+      const retried = await recoverArmedStartSend({
         waitMs: 2500,
         reschedule: true,
         beforeIrreversibleSend: options.beforeIrreversibleSend
       });
+      return {
+        sent: Boolean(retried),
+        adopted: Boolean(retried) && runtimeOwnsCurrentAuditWave(),
+        state: retried ? (runtimeOwnsCurrentAuditWave() ? 'adopted' : 'pending') : 'failed',
+        reason: retried ? 'prepared-receipt-resent' : 'prepared-send-not-accepted',
+        receipt: String(prepared.receipt || ''),
+        turnId: String(waveUserId('core') || ''),
+        stage: String(autoRuntime?.stage || 'idle'),
+        runId: String(autoRuntime?.runId || '')
+      };
     }
 
+    setStartPhase('START PRECHECK');
     if (autoRuntime.stage !== 'idle') {
       if (autoRuntime.stage === 'complete') {
         // A repeated START in the same chat always means a brand-new audit. The
@@ -12889,31 +15512,32 @@ async function recoverArmedStartSend(options = {}) {
       return false;
     }
 
+    setStartPhase('START WAIT ZIP');
     let attachment = chatGPTReadyAttachmentSummary();
     if (!attachment.ready) {
       const root = chatGPTComposerRoot();
-      const allTiles = root ? chatGPTComposerAttachmentTiles(root) : [];
+      const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
       if (allTiles.length > 0) {
-        setStatus('START AUDITING: Waiting for project archive to finish uploading to ChatGPT...', 'info');
-        renderAutoAuditState();
         const readyAttachment = await waitForReadyAttachment(40000);
         if (readyAttachment && readyAttachment.ready) {
           attachment = readyAttachment;
         } else {
-          setStatus(`START AUDITING is not ready: ${attachment.reason}`, 'warning');
-          renderAutoAuditState();
+          setStartPhase('START HOLD \u00b7 attachment not ready');
+          setStatus(`START HOLD \u00b7 ${attachment.reason || 'attachment not ready'}`, 'warning');
           return false;
         }
       } else {
-        setStatus(`START AUDITING is not ready: ${attachment.reason}`, 'warning');
-        renderAutoAuditState();
+        setStartPhase(`START HOLD \u00b7 ${attachment.reason || 'attach project to retry'}`);
         return false;
       }
     }
     const composerPrep = prepareComposerForExplicitAuditStart();
     if (!composerPrep.ok) {
-      setStatus(`START AUDITING is not ready: ${composerPrep.reason}`, 'warning');
-      renderAutoAuditState();
+      setStartPhase(`START HOLD \u00b7 ${composerPrep.reason}`);
+      return false;
+    }
+    if (chatGPTSurfaceMode() === 'work') {
+      setStartPhase('START HOLD \u00b7 Work');
       return false;
     }
 
@@ -12924,11 +15548,11 @@ async function recoverArmedStartSend(options = {}) {
       autoRuntime.conversationKey = autoBoundConversationKey || currentConversationKey();
     }
 
+    setStartPhase('START LEASE');
     const token = await verifyAutoLeaseForSend();
     if (!token) {
       if (!wasEnabled) refreshAutoRuntimeFromStorage();
-      setStatus('START AUDITING did not acquire the verified Auto3 lease. Another tab may own this chat; nothing was written or sent.', 'warning');
-      renderAutoAuditState();
+      setStartPhase('START HOLD \u00b7 lease owned by another tab');
       scheduleAutoAuditCheck(900);
       return false;
     }
@@ -12968,10 +15592,10 @@ async function recoverArmedStartSend(options = {}) {
       return false;
     }
 
+    setStartPhase('START PREPARE');
     const startHandoff = beginStartAuditHandoff();
     if (!startHandoff) {
-      setStatus('START AUDITING could not create its durable handoff checkpoint. Nothing was sent; A3 state was left unchanged.', 'error');
-      renderAutoAuditState();
+      setStartPhase('START HOLD \u00b7 handoff not created');
       return false;
     }
 
@@ -12983,6 +15607,7 @@ async function recoverArmedStartSend(options = {}) {
     }
     const ownership = createAutoSendOwnershipGuard(token, initialSnapshot, { allowInitialAttachments: true });
 
+    setStartPhase('START WAIT SEND');
     auditStartInFlight = true;
     auditStartInFlightSince = Date.now();
     renderAutoAuditState();
@@ -13003,9 +15628,20 @@ async function recoverArmedStartSend(options = {}) {
       });
 
       if (!result?.sent) {
-        // The single fact this chain never recorded: what actually happened at
-        // the irreversible Send. Everything downstream is recovery guesswork
-        // without it.
+        const holdReason = String(result?.reason || 'waiting for send');
+        const workBlocked = chatGPTSurfaceMode() === 'work' || result?.mode === 'work-blocked';
+        const tightHold = /work|auth|composer/i.test(holdReason) || workBlocked;
+        if (tightHold) {
+          auditStartInFlight = false;
+          auditStartInFlightSince = 0;
+          if (workBlocked) setStartPhase('START HOLD \u00b7 Work');
+          else if (result?.reason === 'auth-blocked') setStartPhase('START HOLD \u00b7 Auth');
+          else setStartPhase(`START HOLD \u00b7 ${holdReason}`);
+          const pendingTight = readStartAuditHandoff();
+          if (pendingTight && !startHandoffIsCommitted(pendingTight) && !startHandoffIsPrepared(pendingTight)) clearStartAuditHandoff();
+          return false;
+        }
+        if (/disabled/i.test(holdReason)) setStartPhase('START HOLD \u00b7 Send disabled');
         const sendSnapshot = chatGPTComposerStateSnapshot();
         const sendButton = getChatGPTSend();
         appendBridgeDiagnostic('start_send_unverified', {
@@ -13032,11 +15668,16 @@ async function recoverArmedStartSend(options = {}) {
         return false;
       }
 
-      markStartAuditHandoffSent(startHandoff);
+      setStartPhase('START SENDING');
+      const sentHandoff = markStartAuditHandoffSent(startHandoff) || startHandoff;
       setStatus(`START AUDITING sent Audit Core with ${attachment.count} project attachment${attachment.count === 1 ? '' : 's'}. Preserving Auto3 across ChatGPT route hydration...`, 'success');
+      clearStartPhase();
       scheduleSentStartRecovery();
       bindAutoRuntimeToCurrentConversation({ claim: false });
-      recoverSentStartCore({ source: 'immediate-post-send' });
+      // Milestone H: read the recovery answer instead of discarding it. The
+      // Bridge is told `adopted` only when the runtime actually owns the Core
+      // wave; a Send that has merely left the composer is `pending`.
+      const recovery = recoverSentStartCore({ source: 'immediate-post-send' });
       if (!autoRuntime.enabled) {
         autoRuntime.enabled = true;
         autoRuntime.conversationKey = autoBoundConversationKey || currentConversationKey();
@@ -13052,10 +15693,20 @@ async function recoverArmedStartSend(options = {}) {
           runStartedAt: autoRuntime.startedAt || 0
         });
       }
-      return true;
+      return {
+        sent: true,
+        adopted: Boolean(recovery?.adopted) || runtimeOwnsCurrentAuditWave(),
+        state: String(recovery?.state || 'failed'),
+        reason: String(recovery?.reason || ''),
+        receipt: String(sentHandoff?.receipt || startHandoff?.receipt || ''),
+        turnId: String(recovery?.turnId || ''),
+        stage: String(autoRuntime?.stage || 'idle'),
+        runId: String(autoRuntime?.runId || canonicalRunId || '')
+      };
     } finally {
       auditStartInFlight = false;
       auditStartInFlightSince = 0;
+      if (!currentStartPhase.includes('HOLD')) clearStartPhase();
       const pending = readStartAuditHandoff();
       if (pending && !startHandoffIsCommitted(pending) && !startHandoffIsPrepared(pending)) clearStartAuditHandoff();
       renderAutoAuditState();
@@ -13101,31 +15752,54 @@ async function recoverArmedStartSend(options = {}) {
       setStatus('New Chat shortcut is available only on ChatGPT.', 'warning');
       return false;
     }
-
     bindAutoRuntimeToCurrentConversation({ claim: false });
     if (autoRuntime) saveAutoRuntime({ pauseOnFailure: false });
-
+    if (readNewChatRequiresChatIntent()) {
+      // One NEW click owns exactly one transaction. A repeat press must never
+      // dispatch a second navigation or a second tab; it only keeps the
+      // bounded verifier running.
+      if (!newChatVerifyTimer) scheduleNewChatVerification();
+      setStatus('NEW requested \u00b7 verifying Chat surface...', 'info');
+      return true;
+    }
+    writeNewChatRequiresChatIntent();
+    newChatVerifyAttempts = 0;
+    newChatSwitchClicks = 0;
+    newChatDispatchCount = 0;
+    newChatVerifyStartedAt = performance.now();
+    let dispatched = false;
     try {
-      const nativeNewChat = document.querySelector('a[href="/"], button[aria-label*="New chat" i], [data-testid="create-new-chat-button"]');
-      if (nativeNewChat && typeof nativeNewChat.click === 'function') {
-        nativeNewChat.click();
-        setStatus('Opened New Chat in current tab.', 'success');
-        return true;
+      const control = chatGPTNewChatControl();
+      if (control && control.kind === 'exact' && typeof control.node.click === 'function') {
+        control.node.click();
+        dispatched = true;
       }
     } catch (_) { }
-
-    try {
-      if (location.pathname !== '/') {
-        location.assign(`${location.origin}/`);
-      } else {
-        location.reload();
+    if (!dispatched) {
+      // Bounded navigation fallback: one navigation, no loops, no new tabs.
+      try {
+        if (location.pathname !== '/') {
+          location.assign(`${location.origin}/`);
+        } else {
+          location.reload();
+        }
+      } catch (_) {
+        clearNewChatRequiresChatIntent();
+        newChatVerifyStartedAt = 0;
+        setStatus('New Chat navigation failed.', 'warning');
+        return false;
       }
-      setStatus('Opened New Chat in current tab.', 'success');
-      return true;
-    } catch (_) {
-      setStatus('New Chat navigation failed.', 'warning');
-      return false;
     }
+    newChatDispatchCount = 1;
+    let proven = false;
+    try { proven = fulfillNewChatRequiresChatIntentIfNeeded(); } catch (_) { proven = false; }
+    if (proven) {
+      setStatus('Opened New Chat in normal Chat.', 'success');
+      return true;
+    }
+    scheduleNewChatVerification();
+    setStatus('NEW requested \u00b7 verifying Chat surface...', 'info');
+    return true;
   }
 
   function currentChatAuditRecords(conversationKey = autoBoundConversationKey || currentConversationKey(), options = {}) {
@@ -13234,16 +15908,570 @@ async function recoverArmedStartSend(options = {}) {
     return true;
   }
 
+  // T-184: one wall-clock deadline owns the foreground manual operation.
+  // A deadline that has passed never cancels an already-committed remote
+  // write; it only stops this tab from *waiting* and hands the rest to the
+  // ordinary durable retry queue.
+  function manualSaveDeadlineExceeded(deadlineAt) {
+    const at = Number(deadlineAt) || 0;
+    return at > 0 && Date.now() >= at;
+  }
+
+  // Deterministic, synchronous content signature. Only used to decide whether
+  // a materialize retry may reuse its previous operation receipt (same request
+  // => idempotent replay) or must mint a new one (different request => a fresh
+  // operation, never a receipt_conflict against the server's ledger).
+  function materializeRequestSignature(runId, waves) {
+    let hash = 0x811c9dc5;
+    const feed = text => {
+      const value = String(text || '');
+      for (let i = 0; i < value.length; i += 1) {
+        hash ^= value.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      hash ^= 0x7c;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    };
+    feed(runId);
+    for (const wave of waves) {
+      feed(wave.wave_id);
+      feed(String(wave.content || '').length);
+      feed(wave.content);
+    }
+    return hash.toString(16);
+  }
+
+  function materializeReceiptKey(runId) {
+    return `${BRIDGE_MATERIALIZE_RECEIPT_PREFIX}${String(runId || '')}`;
+  }
+
+  function reuseOrMintMaterializeReceipt(runId, signature) {
+    try {
+      const raw = GM_getValue(materializeReceiptKey(runId), null);
+      const stored = raw ? JSON.parse(raw) : null;
+      if (stored && stored.signature === signature && stored.receipt) return String(stored.receipt);
+    } catch (_) { }
+    const receipt = createBridgeMaterializeReceipt(runId, 'mat');
+    try {
+      GM_setValue(materializeReceiptKey(runId), JSON.stringify({
+        version: 1,
+        runId: String(runId || ''),
+        signature,
+        receipt,
+        at: Date.now()
+      }));
+    } catch (_) { }
+    return receipt;
+  }
+
+  // Physical representation recovery for content that is ALREADY canonical.
+  // Never an ingest: it cannot create a run, cannot move a wave's receipt/sha,
+  // and rewrites no CAMPAIGN_RUN_ID. One bounded request per coherent run.
+  async function materializeAuditRecordsNow(records, options = {}) {
+    const deadlineAt = Number(options.deadlineAt) || 0;
+    const result = {
+      attempted: false,
+      requested: 0,
+      materialized: 0,
+      files: [],
+      finalRebuilt: false,
+      conflicts: [],
+      failures: [],
+      timedOut: false,
+      operations: 0
+    };
+    const eligible = (Array.isArray(records) ? records : []).filter(
+      record => record && record.text && record.kind && (
+        Number(record.bridgeSavedAt) > 0 ||
+        // T-185 D1: a completed_wave_immutable recovery candidate carries no
+        // durability ack yet; the materialize proof IS its durability evidence.
+        options.includeUndurable === true
+      )
+    );
+    if (!eligible.length) return result;
+
+    const groups = new Map();
+    for (const record of eligible) {
+      const runId = String(record.runId || '');
+      if (!runId) continue;
+      if (!groups.has(runId)) groups.set(runId, []);
+      groups.get(runId).push(record);
+    }
+    if (!groups.size) return result;
+
+    for (const [runId, groupRecords] of groups) {
+      if (manualSaveDeadlineExceeded(deadlineAt)) {
+        result.timedOut = true;
+        break;
+      }
+      result.attempted = true;
+      result.operations += 1;
+      const ordered = [...groupRecords].sort(
+        (a, b) => bridgeWaveOrder(a.kind) - bridgeWaveOrder(b.kind)
+      );
+      const waves = ordered.map(record => ({
+        wave_id: record.kind,
+        content: String(record.text)
+      }));
+      result.requested += waves.length;
+      const first = ordered[0];
+      const signature = materializeRequestSignature(runId, waves);
+      const receipt = reuseOrMintMaterializeReceipt(runId, signature);
+      const payload = {
+        api_version: BRIDGE_API_VERSION,
+        source_run_id: runId,
+        project_name: String(first.projectName || ''),
+        project_id: String(first.projectId || autoRuntime?.projectId || ''),
+        profile_id: String(first.profileId || autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3'),
+        profile_version: String(first.profileVersion || '1.0.0'),
+        receipt,
+        waves
+      };
+
+      const response = await bridgeRequest('POST', '/v1/audits/materialize', payload, {
+        timeout: BRIDGE_MATERIALIZE_TIMEOUT_MS
+      });
+
+      if (response.ok && response.data?.ok) {
+        const files = Array.isArray(response.data.files) ? response.data.files.filter(Boolean) : [];
+        result.materialized += waves.length;
+        result.files.push(...files);
+        if (response.data.final_rebuilt) result.finalRebuilt = true;
+        if (Array.isArray(response.data.repaired_files)) {
+          result.repairedFiles = response.data.repaired_files.map(String);
+        }
+        let retiredPermanentIngest = false;
+        for (const record of ordered) {
+          const waveFiles = (Array.isArray(response.data.waves) ? response.data.waves : [])
+            .find(entry => String(entry?.wave_id || '') === record.kind);
+          patchAuditResult(record.kind, next => {
+            next.bridgeMaterializedAt = Date.now();
+            next.bridgeMaterializeReceipt = receipt;
+            next.bridgeError = '';
+            next.saveError = '';
+            // T-185 D1: the server just proved this exact content canonical
+            // and physically durable. That server proof -- never a synthetic
+            // stamp -- is what may set bridgeSavedAt on a record the server
+            // once refused as completed_wave_immutable.
+            if (!(Number(next.bridgeSavedAt) > 0)) next.bridgeSavedAt = Date.now();
+            // T-185 C3: this materialization is fresh physical proof; the
+            // old verification epoch ends here.
+            next.bridgeVerifyEpoch = bridgeConnectEpoch;
+            next.bridgeFilesMissing = [];
+            next.bridgeFilesMismatched = [];
+            next.bridgeFilesUnreadable = [];
+            next.bridgeFilesVerifiedAt = Date.now();
+            if (Array.isArray(waveFiles?.files) && waveFiles.files.length) {
+              next.bridgeFiles = waveFiles.files.map(value => String(value));
+              next.savedFileName = String(waveFiles.files[0]);
+            }
+            if (record.kind === 'performance' && response.data.all3_ready) {
+              next.combinedSavedAt = Date.now();
+              const all3 = files.find(value => /ALL_3/i.test(String(value)));
+              if (all3) next.combinedFileName = String(all3);
+            }
+          }, record.conversationKey, { expectedRunId: runId });
+          // D1/D6: retire the old failed ingest job through a journaled event
+          // instead of resetting its evidence in place.
+          const staleIngestJob = record.bridgeReceipt ? readBridgeJob(record.bridgeReceipt) : null;
+          if (staleIngestJob && staleIngestJob.permanent) {
+            const preserved = { ...staleIngestJob };
+            if (deleteBridgeJob(staleIngestJob.jobId, { signal: false })) {
+              retiredPermanentIngest = true;
+              appendBridgeDiagnostic('materialize_recovered_ingest', {
+                severity: 'info',
+                code: staleIngestJob.errorCode,
+                message: 'Materialization proved the cached wave canonically durable; the old failed ingest job is retired with its evidence preserved in this event.',
+                job: preserved
+              });
+            }
+          }
+        }
+        if (retiredPermanentIngest) signalBridgeQueueChange();
+        // T-185 C3: a successful materialization is the strongest freshness
+        // proof this tab can hold -- bounded, epoch-stamped, fingerprint-bound.
+        recordRunVerification(runId, ordered, { verifiedAt: Date.now() });
+        appendBridgeDiagnostic('materialize_ok', {
+          severity: 'info',
+          runId,
+          project: payload.project_name,
+          jobId: receipt,
+          message: `Materialized ${waves.length} canonical wave file(s)${response.data.final_rebuilt ? ' + final handoff' : ''}.`
+        });
+        continue;
+      }
+
+      const conflict = response.errorCode === 'materialize_content_conflict' ||
+        response.errorCode === 'materialize_wave_not_complete' ||
+        response.errorCode === 'project_identity_conflict' ||
+        response.errorCode === 'campaign_profile_conflict' ||
+        response.errorCode === 'unknown_run' ||
+        response.errorCode === 'receipt_conflict' ||
+        response.errorCode === 'materialize_replay_unsafe' ||
+        response.errorCode === 'materialize_postcondition_failed';
+      // A Bridge that predates the materialization protocol answers 404 with a
+      // plain string error, so errorCode is empty. Name that cause instead of
+      // reporting a blank rejection the operator cannot act on.
+      const detail = response.status === 404
+        ? 'This AUDAPACK Bridge does not implement POST /v1/audits/materialize. Restart the Bridge on a build that has it; the cached audit text is untouched.'
+        : String(response.message || response.errorCode || 'Bridge rejected the materialize request.');
+      // T-185 C3: a failed materialization invalidates the old verification.
+      verifiedMaterializeRuns.delete(runId);
+      if (conflict) result.conflicts.push({ runId, code: response.errorCode, message: detail });
+      else result.failures.push({ runId, code: response.errorCode || 'materialize_failed', message: detail });
+
+      for (const record of ordered) {
+        patchAuditResult(record.kind, next => {
+          next.bridgeError = detail;
+        }, record.conversationKey, { expectedRunId: runId });
+      }
+      appendBridgeDiagnostic('materialize_failed', {
+        severity: 'error',
+        status: response.status,
+        code: response.errorCode || 'materialize_failed',
+        runId,
+        project: payload.project_name,
+        jobId: receipt,
+        message: detail
+      });
+    }
+
+    return result;
+  }
+
+  // T-185: a durable record proves only that the Bridge once acknowledged a
+  // write. A file deleted afterwards leaves the widget showing SAVED forever,
+  // because nothing in the browser can stat a disk. This asks the Bridge --
+  // read-only, no receipt, no writes -- whether the canonical files for the
+  // current run still exist, and turns a vanished file into visible attention.
+  //
+  // T-185 C: verification success EXPIRES. The old permanent Set trusted one
+  // successful probe for the lifetime of the tab; now each run holds a bounded
+  // freshness entry {verifiedAt, bridgeGeneration, recordFingerprint} that is
+  // only valid while (a) it is younger than BRIDGE_FILE_VERIFY_FRESH_MS and
+  // (b) its Bridge generation matches the current one and (c) the record
+  // content fingerprint still matches.
+  const BRIDGE_FILE_VERIFY_FRESH_MS = 5 * 60 * 1000;
+  const VERIFIED_MATERIALIZE_RUNS_MAX_ITEMS = 128;
+  const verifiedMaterializeRuns = new Map();
+  // T-185 W2-002: the bounded freshness Map prevents repeated COMPLETED probes.
+  // It cannot coalesce callers that arrive while a probe is still in flight.
+  // This registry owns ONE physical verify_only probe per run + record identity
+  // so concurrent callers (Bridge reconnect/check, manual SAVE, status paths)
+  // never each POST for the same question.
+  const inFlightRunVerifications = new Map();
+  let inFlightVerifyOpSeq = 0;
+
+  // Freshness clock. Production is wall clock; the widget's own tests drive a
+  // fake clock through this one seam, so "five minutes later" is testable
+  // without sleeping.
+  let bridgeClockSkewMs = 0;
+  function bridgeNow() {
+    return Date.now() + bridgeClockSkewMs;
+  }
+
+  function bridgeRecordFingerprint(records) {
+    // Cheap structural fingerprint: run + wave ids + text lengths + savedAt.
+    // Content identity, not byte payloads, keeps this O(1) per record.
+    return (Array.isArray(records) ? records : [])
+      .map(record => `${String(record.kind)}:${String(record.text || '').length}:${Number(record.bridgeSavedAt) || 0}`)
+      .join('|');
+  }
+
+  function bridgeVerificationIsFresh(runId, records) {
+    const entry = verifiedMaterializeRuns.get(String(runId || ''));
+    if (!entry) return false;
+    if (Number(entry.bridgeGeneration) !== bridgeConnectEpoch) return false;
+    if (bridgeNow() - Number(entry.verifiedAt) >= BRIDGE_FILE_VERIFY_FRESH_MS) return false;
+    if (String(entry.recordFingerprint || '') !== bridgeRecordFingerprint(records)) return false;
+    return true;
+  }
+
+  function recordRunVerification(runId, records, entry) {
+    verifiedMaterializeRuns.set(String(runId || ''), {
+      verifiedAt: Number(entry?.verifiedAt) || Date.now(),
+      bridgeGeneration: bridgeConnectEpoch,
+      recordFingerprint: bridgeRecordFingerprint(records)
+    });
+    boundVerifiedMaterializeRuns();
+  }
+
+  function boundVerifiedMaterializeRuns() {
+    while (verifiedMaterializeRuns.size > VERIFIED_MATERIALIZE_RUNS_MAX_ITEMS) {
+      const oldest = verifiedMaterializeRuns.keys().next().value;
+      verifiedMaterializeRuns.delete(oldest);
+    }
+  }
+
+  function invalidateRunVerification(runId) {
+    verifiedMaterializeRuns.delete(String(runId || ''));
+  }
+
+  // T-185 W2-002: one in-flight verify_only probe per run + record identity.
+  // The Bridge check can run concurrently with an explicit caller; coalesce
+  // that to a single physical request by runIdd alone (the fingerprint is a
+  // bounded freshness concern, not an inflight coalescing concern).
+  function inFlightVerifyKey(runId, records) {
+    // Key purely by runIdd + generation  (not fingerprint) — the fingerprint
+    // guard will discard a stale-identity response before it patches durable
+    // state, so coalescing on runIdd is safe and avoids storming when
+    // different fingerprints are in flight for the same run.
+    return `${String(runId || '')}@${bridgeConnectEpoch}`;
+  }
+
+  function joinInFlightRunVerification(runId, groupRecords, startOperation, options = {}) {
+    const base = `${String(runId || '')}@${bridgeConnectEpoch}`;
+    if (Boolean(options.force) && inFlightRunVerifications.has(base)) {
+      const key = `${base}@forced-${++inFlightVerifyOpSeq}`;
+      const op = { token: ++inFlightVerifyOpSeq };
+      const entry = { op, promise: startOperation(op) };
+      inFlightRunVerifications.set(key, entry);
+      return { key, entry, coalesced: false };
+    }
+    const key = base;
+    const existing = inFlightRunVerifications.get(key);
+    if (existing) {
+      // Same run + generation + record identity while a probe is still running:
+      // coalesce onto the physical proof already in flight. A forced caller
+      // (explicit verify after a verdict change) must observe fresh evidence,
+      // so it never reuses an in-flight entry it did not start.
+      return { key, entry: existing, coalesced: true };
+    }
+    const op = { token: ++inFlightVerifyOpSeq };
+    const entry = { op, promise: startOperation(op) };
+    inFlightRunVerifications.set(key, entry);
+    return { key, entry, coalesced: false };
+  }
+
+  function releaseInFlightRunVerification(key, entry) {
+    const current = inFlightRunVerifications.get(key);
+    if (current && current.op === entry.op) inFlightRunVerifications.delete(key);
+  }
+
+  async function verifyDurableAuditFilesNow(
+    conversationKey = autoBoundConversationKey || currentConversationKey(),
+    options = {}
+  ) {
+    const result = { checked: 0, missing: 0, runs: 0, skipped: false };
+    if (!state?.bridgeEnabled || !state?.autoSaveAuditFiles) {
+      result.skipped = true;
+      return result;
+    }
+
+    const records = (Array.isArray(options.records)
+      ? options.records
+      : currentChatAuditRecords(conversationKey, { allowHistoricalComplete: true })
+    ).filter(record => record && Number(record.bridgeSavedAt) > 0 && record.runId);
+    if (!records.length) return result;
+
+    // Snapshop the caller's fingerprint per-run before any async work: the
+    // changed-record guard compares the HTTP probe's start identity against
+    // whatever is live when it finishes, not against a re-read.
+    const expectedByRunIdd = new Map();
+    for (const record of records) {
+      const runIdd = String(record.runId);
+      if (!expectedByRunIdd.has(runIdd)) expectedByRunIdd.set(runIdd, bridgeRecordFingerprint(records.filter(r => String(r.runId) === runIdd)));
+    }
+
+    const groups = new Map();
+    for (const record of records) {
+      const runId = String(record.runId);
+      if (!groups.has(runId)) groups.set(runId, []);
+      groups.get(runId).push(record);
+    }
+
+    for (const [runId, groupRecords] of groups) {
+      // C1/C2: a fresh bounded entry may skip the network; an expired,
+      // epoch-stale or fingerprint-stale entry asks the Bridge again. This
+      // runs off a Bridge connect and must never become chatty.
+      if (!options.force && bridgeVerificationIsFresh(runId, groupRecords)) continue;
+      result.runs += 1;
+
+      // W2-002: ONE physical verify_only probe per run + generation +
+      // record fingerprint. A caller arriving while the probe is in flight
+      // awaits the existing operation instead of posting its own; a forced
+      // caller needs fresh evidence so it joins only an entry it started.
+      const join = joinInFlightRunVerification(runId, groupRecords, async op => {
+      // Start with the caller that created this probe's Bridge proof. If the
+      // chosen fingerprint later drifted (text edited, run re-saved), the
+      // probe proves a stale identity and its result must not patch the live
+      // record. The coalesced caller that mutated the transcript therefore
+      // behaves as: allow the older probe to finish, then run one fresh
+      // verification for the new fingerprint.
+        const first = groupRecords[0];
+        const startBridgeGeneration = bridgeConnectEpoch;
+        const startFingerprint = bridgeRecordFingerprint(groupRecords);
+        const response = await bridgeRequest('POST', '/v1/audits/materialize', {
+          api_version: BRIDGE_API_VERSION,
+          source_run_id: runId,
+          project_name: String(first.projectName || ''),
+          project_id: String(first.projectId || autoRuntime?.projectId || ''),
+          profile_id: String(first.profileId || autoRuntime?.profileId || getActiveProfile()?.profile_id || 'quick3'),
+          verify_only: true,
+          waves: groupRecords.map(record => ({ wave_id: record.kind }))
+        }, { timeout: BRIDGE_MATERIALIZE_TIMEOUT_MS });
+        return { op, startBridgeGeneration, startFingerprint, response };
+      }, { force: Boolean(options.force) });
+      // The operation identity that owns this HTTP probe; used by the finally
+      // boundary so an older cleanup can never delete a newer replacement.
+      const opIdentity = join.entry;
+
+      try {
+        // A coalesced caller re-derives its own patch/diagnostics below but
+        // must not double-count the network run.
+        const outcome = await join.entry.promise;
+
+        // STALE-GENERATION GUARD: if the Bridge reconnected while the probe
+        // was in flight, its answer belongs to the old connection and cannot
+        // become fresh proof for the new generation. Never trust an old
+        // Bridge connection to validate new-generation durability.
+        if (outcome.startBridgeGeneration !== bridgeConnectEpoch) {
+          // Owner's stale coalesced view consumed it; let newer retry be free.
+          if (!join.coalesced) invalidateRunVerification(runId);
+          continue;
+        }
+        // A coalesced caller's `continue` still consumes the caller from its
+        // owning entry's finally. Failures must remain uncached so a retry
+        // issues a fresh request; let the caller's `runs++` represent their
+        // question while coalesced physical probes account for only one server
+        // contact.
+
+        if (!outcome.response.ok || !outcome.response.data?.ok) {
+          // A verification that cannot run proves nothing either way. Do not
+          // invent durability and do not invent loss; let the next connect retry.
+          // Admission failed: its caller locally consumed the coalesced response
+          // while staying on the same retry path, so leave it to its caller.
+          if (!join.coalesced) invalidateRunVerification(runId);
+          continue;
+        }
+
+        // CHANGED-RECORD GUARD: the probe proves the record identity it was
+        // issued for. If the run's fingerprint changed meanwhile (new wave
+        // saved, text edited), do not apply the old answer to the new record
+        // state -- re-evaluate and let the caller's next pass verify fresh.
+        // Use the caller's original expectation, not the probe's view (which
+        // coalesced callers could each treat differently).
+        const expectedFingerprint = expectedByRunIdd.get(String(runId));
+        const currentFingerprint = bridgeRecordFingerprint(
+          currentChatAuditRecords(conversationKey, { allowHistoricalComplete: true }).filter(r => String(r.runId) === String(runId))
+        );
+        if (expectedFingerprint && currentFingerprint !== expectedFingerprint) {
+          if (!join.coalesced) invalidateRunVerification(runId);
+          continue;
+        }
+        if (currentFingerprint !== outcome.startFingerprint) {
+          if (!join.coalesced) invalidateRunVerification(runId);
+          continue;
+        }
+
+        const byWave = new Map(
+          (Array.isArray(outcome.response.data.waves) ? outcome.response.data.waves : [])
+            .map(entry => [String(entry?.wave_id || ''), entry])
+        );
+        // T-185 P0-2 (B4): a campaign-complete run's final handoff is part of
+        // the required set. Any final-artifact issue is attention, attached to
+        // the terminal wave record -- the same record ALL_3 acknowledgements
+        // land on.
+        const finalIssues = (Array.isArray(outcome.response.data.final_artifacts) ? outcome.response.data.final_artifacts : [])
+          .filter(item => item && item.verdict && item.verdict !== 'INTACT');
+        let groupBroken = false;
+        const liveRecords = currentChatAuditRecords(conversationKey, { allowHistoricalComplete: true }).filter(r => String(r.runId) === String(runId));
+        const groupSnapshot = liveRecords.length ? liveRecords : groupRecords;
+        for (const record of groupSnapshot) {
+          // RECORD-IDENTITY GUARD before patching: an old asynchronous verify
+          // must not overwrite a newer record that reused the same
+          // conversation+wave storage key. expectedRunId already refuses
+          // cross-run reuse; this closes same-run identity churn.
+          const fresh = readAuditResultFresh(record.kind, record.conversationKey);
+          if (!fresh || String(fresh.runId) !== String(runId) || fresh.kind !== record.kind) continue;
+          if (bridgeRecordFingerprint([fresh]) !== bridgeRecordFingerprint([record])) continue;
+          const entry = byWave.get(record.kind);
+          const absent = Array.isArray(entry?.missing) ? entry.missing.map(String) : [];
+          // T-185 E: existence is not integrity. The verification also reports
+          // canonical files whose bytes no longer match the committed wave and
+          // files that cannot be read at all; every non-empty list is attention.
+          const mismatched = Array.isArray(entry?.mismatched) ? entry.mismatched.map(String) : [];
+          const unreadable = Array.isArray(entry?.unreadable) ? entry.unreadable.map(String) : [];
+          const isTerminal = record === groupSnapshot[groupSnapshot.length - 1];
+          const finalMissing = isTerminal ? finalIssues.filter(item => item.verdict === 'MISSING').map(item => String(item.path)) : [];
+          const finalMismatched = isTerminal ? finalIssues.filter(item => item.verdict === 'CONTENT_MISMATCH').map(item => String(item.path)) : [];
+          const finalUnreadable = isTerminal ? finalIssues.filter(item => item.verdict === 'UNREADABLE' || item.verdict === 'WRONG_TYPE' || item.verdict === 'OUTSIDE_CANONICAL').map(item => String(item.path)) : [];
+          const broken = absent.length + mismatched.length + unreadable.length +
+            finalMissing.length + finalMismatched.length + finalUnreadable.length;
+          result.checked += 1;
+          if (broken) {
+            result.missing += 1;
+            groupBroken = true;
+          }
+          patchAuditResult(record.kind, next => {
+            next.bridgeFilesMissing = [...absent, ...finalMissing];
+            next.bridgeFilesMismatched = [...mismatched, ...finalMismatched];
+            next.bridgeFilesUnreadable = [...unreadable, ...finalUnreadable];
+            next.bridgeFilesVerifiedAt = Date.now();
+            next.bridgeVerifyEpoch = bridgeConnectEpoch;
+            if (finalMissing.length) {
+              next.bridgeError = `AUDAPACK Bridge reports the campaign-final handoff (${finalMissing.length} file(s)) missing on disk. Press SYNC/SAVE to recreate it.`;
+            } else if (finalMismatched.length) {
+              next.bridgeError = 'SYNC/SAVE: the campaign-final handoff differs from the canonical synthesis; press SYNC/SAVE to rebuild it.';
+            } else if (finalUnreadable.length) {
+              next.bridgeError = `SYNC/SAVE: ${finalUnreadable.length} campaign-final file(s) cannot be verified; press SYNC/SAVE to rebuild them.`;
+            } else if (mismatched.length) {
+              next.bridgeError = 'SYNC/SAVE: canonical audit file differs from the committed wave; press SYNC/SAVE to repair it.';
+            } else if (unreadable.length) {
+              next.bridgeError = `SYNC/SAVE: ${unreadable.length} canonical audit file(s) cannot be read; press SYNC/SAVE to repair them.`;
+            } else if (absent.length) {
+              next.bridgeError = `AUDAPACK Bridge reports ${absent.length} canonical file(s) missing on disk for this wave. Press SYNC/SAVE to recreate them.`;
+            } else if (
+              String(next.bridgeError || '').includes('canonical file(s) missing on disk') ||
+              String(next.bridgeError || '').includes('canonical audit file differs from the committed wave') ||
+              String(next.bridgeError || '').includes('canonical audit file(s) cannot be read') ||
+              String(next.bridgeError || '').includes('campaign-final handoff')
+            ) {
+              next.bridgeError = '';
+            }
+          }, record.conversationKey, { expectedRunId: runId });
+        }
+
+        // C3: a known broken result is never fresh trust.
+        if (groupBroken) invalidateRunVerification(runId);
+        else recordRunVerification(runId, groupSnapshot, { verifiedAt: Date.now() });
+
+        if (result.missing) {
+          appendBridgeDiagnostic('durable_files_missing', {
+            severity: 'error',
+            code: 'durable_files_missing',
+            runId,
+            project: String(groupSnapshot[0]?.projectName || ''),
+            message: `${(Array.isArray(outcome.response.data.missing_files) ? outcome.response.data.missing_files : []).length} canonical audit file(s) recorded as saved are absent on disk.`
+          });
+        }
+      } finally {
+        // ONE finally boundary releases the in-flight entry for every exit:
+        // success, HTTP failure, exception, stale generation, changed
+        // fingerprint. A wedged entry would permanently read as
+        // "verification already running". Deleting by operation identity
+        // keeps an older finally from evicting a newer replacement entry.
+        releaseInFlightRunVerification(join.key, opIdentity);
+      }
+    }
+
+    renderAutoAuditState();
+    return result;
+  }
+
   async function saveCurrentChatAuditsNow(options = {}) {
     const conversationKey = autoBoundConversationKey || currentConversationKey();
+    const deadlineAt = Number(options.deadlineAt) || 0;
+    const label = options.manualSync ? 'SYNC/SAVE' : 'SAVE';
 
     if (options.refreshVisible !== false) {
       backfillVisibleCompletedAuditResults();
     }
 
-    const records = currentChatAuditRecords(conversationKey, {
+    const recordOptions = {
       allowHistoricalComplete: Boolean(options.manualSync || options.forceAll)
-    });
+    };
+    const records = currentChatAuditRecords(conversationKey, recordOptions);
     if (!records.length) {
       setStatus(
         options.manualSync
@@ -13252,64 +16480,59 @@ async function recoverArmedStartSend(options = {}) {
         options.manualSync ? 'info' : 'warning'
       );
       renderAutoAuditState();
-      return false;
+      return { ok: false, requested: 0, durable: 0, reason: 'no_complete_wave' };
     }
 
     if (!state.bridgeEnabled) {
-      const result = await flushCurrentAuditResultsToFolder({ force: true });
+      const fallback = await flushCurrentAuditResultsToFolder({ force: true });
       setStatus(
-        `${options.manualSync ? 'SYNC/SAVE' : 'SAVE'}: browser fallback wrote ${result.saved}/${result.ready} COMPLETE wave(s)${result.combined ? ' + refreshed ALL_3' : ''}.`,
-        result.saved === result.ready ? 'success' : 'warning'
+        `${label}: browser fallback wrote ${fallback.saved}/${fallback.ready} COMPLETE wave(s)${fallback.combined ? ' + refreshed ALL_3' : ''}.`,
+        fallback.saved === fallback.ready ? 'success' : 'warning'
       );
       renderAutoAuditState();
-      return result.saved > 0;
+      return {
+        ok: fallback.saved > 0 && fallback.saved === fallback.ready,
+        requested: fallback.ready,
+        durable: fallback.saved,
+        reason: 'browser_fallback'
+      };
     }
 
-    // Manual forceAll is a fresh DELIVERY BATCH, not merely another receipt
-    // for the historical audit run. Some bridges deduplicate by run_id + wave,
-    // so every click gets a new delivery batch id shared by Core/Second/Perf.
-    // That preserves ALL_3 grouping while forcing the server down the write path.
-    const materializeBatchId = options.forceAll
-      ? createBridgeMaterializeBatchId()
-      : '';
-
-    if (options.forceAll) {
-      const validRuns = new Set(records.map(record => String(record.runId || '')).filter(Boolean));
-      let superseded = 0;
-      for (const job of listBridgeJobs()) {
-        if (
-          job.materialize &&
-          job.conversationKey === conversationKey &&
-          validRuns.has(String(job.sourceRunId || job.runId || '')) &&
-          !job.deliveredAwaitingAck &&
-          !Number(job.inFlightAt || 0)
-        ) {
-          // Retire permanent rejections only once their error is already preserved
-          // in canonical audit-result state; otherwise keep the actionable error
-          // visible. This bounds terminal queue growth across repeated manual SYNC/SAVE.
-          if (job.permanent) {
-            const canonical = readAuditResultFresh(job.wave, job.conversationKey);
-            if (!canonical || !canonical.bridgeError) continue;
-          }
-          if (deleteBridgeJob(job.jobId, { signal: false })) superseded += 1;
-        }
-      }
-      if (superseded) signalBridgeQueueChange();
-    }
-
+    // ---- F2: NORMAL INGEST FIRST -------------------------------------
+    // A record with no durability proof is not canonical yet, so nothing may
+    // be materialized for it. Manual SAVE no longer re-POSTs already-durable
+    // waves through /v1/audits under a synthetic run id.
+    // T-185 D1/D2/D3: a permanent job is classified, never blindly reset.
+    // completed_wave_immutable is deferred to the materialize proof below
+    // (its cached content may still be canonical); every other semantic
+    // refusal keeps its evidence and is surfaced, never requeued unchanged.
+    let deferredConflicts = [];
     for (const record of records) {
-      if (options.forceAll) {
-        enqueueBridgeAuditRecord(record, {
-          force: true,
-          freshReceipt: true,
-          deliveryBatchId: materializeBatchId,
-          deferFlush: true
+      if (Number(record.bridgeSavedAt) > 0) continue;
+      const queued = record.bridgeReceipt ? readBridgeJob(record.bridgeReceipt) : null;
+      if (queued && queued.permanent && options.forceAll) {
+        const cls = classifyBridgeJobRecovery(queued);
+        if (cls === 'MATERIALIZE_CANONICAL') {
+          // D1: ask the materialize endpoint to prove whether the cached
+          // content equals canonical server state -- even though
+          // bridgeSavedAt == 0. Success marks the record durable from server
+          // proof and retires the old failed ingest job with a journal event.
+          deferredConflicts.push(record);
+          continue;
+        }
+        // D2/D3: materialize_content_conflict / receipt_conflict / structural
+        // refusals -- the same request can never fix them. Keep the job
+        // permanent, keep the evidence, and tell the operator the truth.
+        appendBridgeDiagnostic('manual_save_conflict_retained', {
+          severity: 'error',
+          code: queued.errorCode,
+          message: cls === 'FRESH_RUN_REQUIRED'
+            ? 'This run is bound to a different campaign profile; a fresh run under the right profile is required. The failed job is retained as evidence.'
+            : 'Re-delivering this payload cannot change the answer. Repair the cached input or start a fresh run; the failed job is retained as evidence.',
+          job: queued
         });
         continue;
       }
-
-      if (Number(record.bridgeSavedAt) > 0) continue;
-      const queued = record.bridgeReceipt ? readBridgeJob(record.bridgeReceipt) : null;
       if (!queued) enqueueBridgeAuditRecord(record, { deferFlush: true });
     }
 
@@ -13317,51 +16540,120 @@ async function recoverArmedStartSend(options = {}) {
     // competing 0ms background worker racing for the same lease.
     const connected = await checkBridge({
       force: true,
-      suppressFlush: true
+      suppressFlush: true,
+      // T-185: manual SAVE materializes, which is strictly stronger than
+      // verifying. Letting the fire-and-forget probe run alongside it would
+      // race its own stale verdict back over the repair this operation makes.
+      skipFileVerification: true
     });
 
-    if (connected) {
-      await flushBridgeQueueManualReliable(conversationKey, { maxAttempts: 5 });
+    if (connected && !manualSaveDeadlineExceeded(deadlineAt)) {
+      await flushBridgeQueueManualReliable(conversationKey, { maxAttempts: 5, deadlineAt });
+    }
+
+    // ---- F3: MATERIALIZE PROVEN CANONICAL WAVES ----------------------
+    const afterIngest = currentChatAuditRecords(conversationKey, recordOptions);
+    const durableRecords = afterIngest.filter(record => Number(record.bridgeSavedAt) > 0);
+    // T-185 D1: completed_wave_immutable recovery candidates join the
+    // materialize proof even though they still carry bridgeSavedAt == 0 --
+    // the server's canonical-equality answer is what may make them durable.
+    const deferredRecords = deferredConflicts.length
+      ? afterIngest.filter(record =>
+        deferredConflicts.some(deferred =>
+          deferred.kind === record.kind &&
+          deferred.conversationKey === record.conversationKey &&
+          String(deferred.runId) === String(record.runId)))
+      : [];
+    const undurable = afterIngest.length - durableRecords.length;
+    let materialize = null;
+    const materializeInput = [...durableRecords, ...deferredRecords];
+    if (options.forceAll && connected && materializeInput.length) {
+      materialize = await materializeAuditRecordsNow(
+        materializeInput,
+        { deadlineAt, conversationKey, includeUndurable: deferredRecords.length > 0 }
+      );
     }
 
     const stats = bridgeQueueStats(conversationKey);
-    const refreshed = currentChatAuditRecords(conversationKey);
+    const refreshed = currentChatAuditRecords(conversationKey, recordOptions);
     const durable = refreshed.filter(record => Number(record.bridgeSavedAt) > 0).length;
+    const timedOut = manualSaveDeadlineExceeded(deadlineAt) || Boolean(materialize?.timedOut);
+    const conflicts = materialize?.conflicts?.length || 0;
+    const failures = materialize?.failures?.length || 0;
     const allThree = refreshed.length === 3;
-    const performance = refreshed.find(record => record.kind === 'performance');
-    const combinedConfirmed = Boolean(
-      performance?.combinedSavedAt ||
-      performance?.combinedFileName
-    );
+    const outcome = {
+      ok: false,
+      requested: refreshed.length,
+      durable,
+      undurable,
+      pending: stats.pending,
+      failed: stats.failed,
+      materialized: materialize?.materialized || 0,
+      finalRebuilt: Boolean(materialize?.finalRebuilt),
+      conflicts,
+      failures,
+      timedOut,
+      connected
+    };
 
-    if (stats.failed > 0) {
+    if (conflicts > 0) {
+      const first = materialize.conflicts[0];
       setStatus(
-        `${options.manualSync ? 'SYNC/SAVE' : 'SAVE'}: ${durable}/${records.length} wave(s) durable; ${stats.failed} job(s) need bridge/token/config attention. Cached audit text and runtime state are retained.`,
+        `${label}: ${durable}/${refreshed.length} wave(s) are canonically durable, but physical materialization was REFUSED (${first.code || 'conflict'}): ${first.message} Nothing was overwritten and no cached audit text was discarded.`,
         'error'
       );
       renderAutoAuditState();
-      return false;
+      return outcome;
     }
 
-    if (stats.pending > 0 || !connected) {
+    if (stats.failed > 0) {
       setStatus(
-        `${options.manualSync ? 'SYNC/SAVE' : 'SAVE'}: ${durable}/${records.length} requested wave file(s) have been re-materialized; ${stats.pending} physical write job(s) remain queued and will retry automatically.`,
+        `${label}: ${durable}/${refreshed.length} wave(s) durable; ${stats.failed} job(s) need bridge/token/config attention. Cached audit text and runtime state are retained.`,
+        'error'
+      );
+      renderAutoAuditState();
+      return outcome;
+    }
+
+    if (failures > 0 || (undurable > 0 && stats.pending === 0 && !timedOut)) {
+      setStatus(
+        `${label}: ${durable}/${refreshed.length} wave(s) durable; ${failures ? 'materialization did not complete' : 'a COMPLETE wave has no durable Bridge acknowledgement'}. Cached audit text is retained.`,
+        'error'
+      );
+      renderAutoAuditState();
+      return outcome;
+    }
+
+    if (timedOut || stats.pending > 0 || !connected) {
+      setStatus(
+        `${label}: ${durable}/${refreshed.length} wave(s) durable; ${stats.pending} write job(s) remain queued and will retry in the background${timedOut ? ' (foreground deadline reached)' : ''}.`,
         'info'
       );
       renderAutoAuditState();
-      return true;
+      return outcome;
     }
 
+    outcome.ok = durable === refreshed.length &&
+      (!options.forceAll || (materialize ? materialize.materialized >= Math.min(durable + deferredRecords.length, refreshed.length) : true));
     setStatus(
-      `${options.manualSync ? 'SYNC/SAVE' : 'SAVE'}: ${durable}/${records.length} COMPLETE wave file(s) physically re-materialized through AUDAPACK Bridge${allThree ? (combinedConfirmed ? ' · ALL_3 rebuilt/overwritten' : ' · all 3 waves written; bridge did not explicitly confirm ALL_3 in its response') : ''}.`,
-      'success'
+      outcome.ok
+        ? `${label}: ${durable}/${refreshed.length} COMPLETE wave file(s) confirmed on disk through AUDAPACK Bridge${allThree && materialize?.finalRebuilt ? ' · ALL_3 rebuilt' : ''}.`
+        : `${label}: ${durable}/${refreshed.length} wave(s) durable; physical confirmation is incomplete. Cached audit text is retained.`,
+      outcome.ok ? 'success' : 'error'
     );
     renderAutoAuditState();
-    return true;
+    return outcome;
   }
 
   function setManualAuditSyncFeedback(value, duration = 3200) {
     manualAuditSyncFeedback = String(value || '');
+    if (manualAuditSyncFeedback) {
+      manualAuditSyncLastOutcome = {
+        label: manualAuditSyncFeedback,
+        generation: manualAuditSyncGeneration,
+        at: Date.now()
+      };
+    }
     manualAuditSyncFeedbackUntil = manualAuditSyncFeedback
       ? Date.now() + Math.max(500, Number(duration) || 3200)
       : 0;
@@ -13383,15 +16675,66 @@ async function recoverArmedStartSend(options = {}) {
     renderAutoAuditState();
   }
 
+  // T-184: UI ownership of the compact button is generation-fenced. Only the
+  // newest manual attempt may repaint it; an older attempt that finishes after
+  // its deadline still commits durable backend/job state, it just cannot speak.
+  function manualSaveOwnsUi(generation) {
+    return manualAuditSyncOwnerGeneration === generation;
+  }
+
+  function releaseManualSaveUi(generation) {
+    if (!manualSaveOwnsUi(generation)) return false;
+    manualAuditSyncOwnerGeneration = 0;
+    manualAuditSyncInFlight = false;
+    if (manualAuditSyncDeadlineTimer) {
+      clearTimeout(manualAuditSyncDeadlineTimer);
+      manualAuditSyncDeadlineTimer = 0;
+    }
+    return true;
+  }
+
+  function manualSaveTruthfulFeedback(conversationKey) {
+    const stats = currentBridgeSaveState(conversationKey);
+    if (stats.failed > 0 || stats.missingDelivery > 0) return 'SAVE!';
+    if (stats.pending > 0) return 'QUEUE';
+    if (stats.readyCount > 0 && stats.durableCount === stats.readyCount) return 'SAVED';
+    return stats.readyCount > 0 ? 'SAVE!' : 'SYNCED';
+  }
+
   async function syncSaveCurrentChatStateNow() {
     if (manualAuditSyncInFlight) {
       setStatus('SYNC/SAVE is already refreshing this chat.', 'info');
       return false;
     }
 
+    const generation = ++manualAuditSyncGeneration;
+    manualAuditSyncOwnerGeneration = generation;
     manualAuditSyncInFlight = true;
+    const deadlineAt = Date.now() + MANUAL_SAVE_DEADLINE_MS;
     setManualAuditSyncFeedback('');
     renderAutoAuditState();
+
+    // The watchdog is the only guarantee that SAVE... ends. It never cancels a
+    // committed remote write and never discards cached audit text; it releases
+    // the foreground and tells the truth about what is still outstanding.
+    if (manualAuditSyncDeadlineTimer) clearTimeout(manualAuditSyncDeadlineTimer);
+    manualAuditSyncDeadlineTimer = setTimeout(() => {
+      manualAuditSyncDeadlineTimer = 0;
+      if (!manualSaveOwnsUi(generation)) return;
+      const key = autoBoundConversationKey || currentConversationKey();
+      releaseManualSaveUi(generation);
+      setStatus(
+        'SYNC/SAVE: the foreground save deadline was reached. Nothing was discarded — unfinished writes stay queued and retry in the background.',
+        'warning'
+      );
+      setManualAuditSyncFeedback(manualSaveTruthfulFeedback(key), 5000);
+      renderAutoAuditState();
+      appendBridgeDiagnostic('manual_save_deadline', {
+        severity: 'error',
+        code: 'manual_save_deadline',
+        message: `Manual SYNC/SAVE exceeded its ${MANUAL_SAVE_DEADLINE_MS}ms foreground deadline; queued jobs remain recoverable.`
+      });
+    }, MANUAL_SAVE_DEADLINE_MS);
 
     try {
       bindAutoRuntimeToCurrentConversation({ claim: false });
@@ -13407,13 +16750,13 @@ async function recoverArmedStartSend(options = {}) {
       }
 
       const captured = backfillVisibleCompletedAuditResults();
-      renderAutoAuditState();
+      if (manualSaveOwnsUi(generation)) renderAutoAuditState();
 
-      const beforeSave = currentChatAuditRecords(conversationKey);
       const result = await saveCurrentChatAuditsNow({
         forceAll: true,
         refreshVisible: false,
-        manualSync: true
+        manualSync: true,
+        deadlineAt
       });
 
       // Rebind/repaint after bridge work because ChatGPT may have hydrated a
@@ -13426,13 +16769,16 @@ async function recoverArmedStartSend(options = {}) {
         saveAutoRuntime({ pauseOnFailure: false });
       }
 
-      const afterSave = currentChatAuditRecords();
-      const allThree = afterSave.length === 3;
-      const stats = state.bridgeEnabled ? bridgeQueueStats(autoBoundConversationKey || currentConversationKey()) : {
-        pending: 0,
-        failed: 0
-      };
+      // A superseded or already-timed-out attempt stops here: its durable work
+      // is committed, but the button belongs to someone else now.
+      if (!manualSaveOwnsUi(generation)) return Boolean(result?.ok);
 
+      const afterKey = autoBoundConversationKey || currentConversationKey();
+      const afterSave = currentChatAuditRecords(afterKey, { allowHistoricalComplete: true });
+      const allThree = afterSave.length === 3;
+      const save = currentBridgeSaveState(afterKey);
+
+      releaseManualSaveUi(generation);
       renderAutoAuditState();
 
       if (!afterSave.length) {
@@ -13444,32 +16790,55 @@ async function recoverArmedStartSend(options = {}) {
         return runtimePersisted;
       }
 
-      if (stats.failed > 0) {
+      if (result?.conflicts > 0) {
         setStatus(
-          `SYNC/SAVE: refreshed current chat and found ${afterSave.length}/3 COMPLETE wave(s); ${stats.failed} bridge save job(s) failed physical-write verification. Nothing was discarded.`,
+          `SYNC/SAVE: ${afterSave.length} COMPLETE wave(s) found; physical materialization was REFUSED as a content conflict. Nothing was overwritten and nothing was discarded.`,
           'error'
         );
         setManualAuditSyncFeedback('SAVE!', 5000);
         return false;
       }
 
-      if (stats.pending > 0) {
+      if (save.failed > 0 || result?.failures > 0) {
         setStatus(
-          `SYNC/SAVE: refreshed current chat and found ${afterSave.length}/3 COMPLETE wave(s); ${stats.pending} physical write job(s) are still queued. Runtime state is persisted.`,
+          `SYNC/SAVE: refreshed current chat and found ${afterSave.length}/3 COMPLETE wave(s); ${save.failed || result.failures} bridge save job(s) failed physical-write verification. Nothing was discarded.`,
+          'error'
+        );
+        setManualAuditSyncFeedback('SAVE!', 5000);
+        return false;
+      }
+
+      if (save.pending > 0 || result?.timedOut) {
+        setStatus(
+          `SYNC/SAVE: refreshed current chat and found ${afterSave.length}/3 COMPLETE wave(s); ${save.pending} physical write job(s) are still queued${result?.timedOut ? ' after the foreground deadline' : ''}. Runtime state is persisted.`,
           'info'
         );
         setManualAuditSyncFeedback('QUEUE', 4200);
         return true;
       }
 
+      // Queue empty is NOT durability. A COMPLETE record with no Bridge
+      // acknowledgement of its own is still unsaved, whatever the queue says.
+      if (save.missingDelivery > 0) {
+        setStatus(
+          `SYNC/SAVE: ${save.durableCount}/${save.readyCount} COMPLETE wave(s) are durably acknowledged. ${save.missingDelivery} wave(s) have no durable Bridge proof even though the queue is empty; cached audit text is retained.`,
+          'error'
+        );
+        setManualAuditSyncFeedback('SAVE!', 5000);
+        return false;
+      }
+
       setStatus(
-        `SYNC/SAVE: refreshed current chat; physical rewrite completed for ${afterSave.length}/3 COMPLETE wave(s)${allThree ? ' plus ALL_3 rebuild' : ''}${captured ? ' · newly visible COMPLETE result(s) were captured first' : ''}. Runtime state is persisted.`,
-        result === false ? 'warning' : 'success'
+        `SYNC/SAVE: refreshed current chat; physical rewrite confirmed for ${afterSave.length}/3 COMPLETE wave(s)${allThree && result?.finalRebuilt ? ' plus ALL_3 rebuild' : ''}${captured ? ' · newly visible COMPLETE result(s) were captured first' : ''}. Runtime state is persisted.`,
+        result?.ok === false ? 'warning' : 'success'
       );
-      setManualAuditSyncFeedback(result === false ? 'SAVE!' : 'SAVED', result === false ? 5000 : 3200);
-      return result !== false;
+      setManualAuditSyncFeedback(result?.ok === false ? 'SAVE!' : 'SAVED', result?.ok === false ? 5000 : 3200);
+      return result?.ok !== false;
     } finally {
-      manualAuditSyncInFlight = false;
+      // PHASE I: exactly one ownership boundary releases the foreground, on
+      // every path -- success, failure, timeout, throw, supersede, offline,
+      // auth failure and content conflict alike.
+      releaseManualSaveUi(generation);
       renderAutoAuditState();
     }
   }
@@ -13477,8 +16846,14 @@ async function recoverArmedStartSend(options = {}) {
   function currentAuditSaveAttention(jobsSnapshot = null, recordsSnapshot = null) {
     if (!state?.autoSaveAuditFiles) return false;
     if (state.bridgeEnabled) {
-      const stats = currentBridgeSaveState(autoBoundConversationKey || currentConversationKey(), jobsSnapshot);
-      return stats.pending > 0 || stats.failed > 0;
+      const stats = currentBridgeSaveState(
+        autoBoundConversationKey || currentConversationKey(),
+        jobsSnapshot,
+        recordsSnapshot
+      );
+      // missingDelivery is the T-184 addition: an empty queue with an
+      // unacknowledged COMPLETE record still needs attention.
+      return stats.pending > 0 || stats.failed > 0 || stats.missingDelivery > 0;
     }
     const results = Array.isArray(recordsSnapshot) ? recordsSnapshot : currentChatAuditRecords();
     if (!results.length) return false;
@@ -13586,25 +16961,505 @@ async function recoverArmedStartSend(options = {}) {
     return true;
   }
 
+  // SRC-098: the dispatch states the Bridge still calls live. TERMINAL is the
+  // Bridge's own vocabulary (COMPLETE/FAILED/CANCELLED) and is the only thing
+  // that can retire a managed run; BLOCKED keeps the run owned on purpose, so a
+  // lane the Bridge refused still holds A3 and still needs an operator.
+  const MANAGED_A3_TERMINAL_DISPATCH_STATES = new Set(['COMPLETE', 'FAILED', 'CANCELLED']);
+  // Bounded retry for an unacknowledged operator stop. The Bridge stop is
+  // idempotent server-side (abandon_job returns a terminal job unchanged), so a
+  // retry is safe; a hard cap is still what keeps a dead Bridge from becoming a
+  // request loop in six windows.
+  const MANAGED_A3_STOP_MAX_ATTEMPTS = 3;
+  let managedA3OperatorStopInFlight = null;
+
+  function managedA3OwnershipSnapshot(turns = null) {
+    // ONE predicate for "does this window own A3", assembled from every
+    // authority that can speak to it. The precedence it encodes, highest
+    // first, is: an explicit operator stop, then a terminal Bridge
+    // dispatch/campaign, then valid managed dispatch ownership, then canonical
+    // START receipt / machine-authored lineage, then the persisted local
+    // enabled bit. The local bit is last on purpose -- it is the only one of
+    // these that can be stale, and a stale local boolean must never outrank a
+    // live Bridge job.
+    // The LIVE conversation, not the key the runtime happens to be bound to.
+    // SRC-098: a bound key can be a draft identity that route hydration has
+    // already replaced, and that stale key is the very thing being repaired --
+    // reading ownership off it would let the defect diagnose itself as
+    // correct.
+    const key = String(currentConversationKey() || '');
+    const lease = browserWorkerLease;
+    const dispatchId = String(lease?.dispatch_id || '');
+    const dispatchState = String(browserWorkerDispatchState || '').toUpperCase();
+    const runtime = autoRuntime;
+    const campaignRunId = String(lease?.campaign_run_id || runtime?.runId || '');
+    const runtimeRunId = String(runtime?.runId || '');
+
+    const workerMatches = Boolean(dispatchId) &&
+      String(lease?.worker_id || '') === String(autoTabId || lease?.worker_id || '');
+    const ownsDispatch = Boolean(dispatchId);
+    const campaignActive = ownsDispatch && !MANAGED_A3_TERMINAL_DISPATCH_STATES.has(dispatchState);
+
+    // Same project, same run. Any one of the identities being present on one
+    // side and contradicting the other is a mismatch; a side that simply has
+    // not recorded the field yet is not.
+    const identityAgrees =
+      (!lease?.project_id || !runtime?.projectId || String(lease.project_id) === String(runtime.projectId)) &&
+      (!lease?.project_name || !runtime?.projectName || String(lease.project_name) === String(runtime.projectName)) &&
+      (!runtimeRunId || !campaignRunId || runtimeRunId === campaignRunId);
+
+    const liveTurns = turns || getChatGPTTurns();
+    const receiptVisible = Boolean(lease?.start_receipt) &&
+      exactReceiptUserTurn(String(lease.start_receipt), liveTurns);
+    const machineTurn = !receiptVisible ? machineAuthoredAuditTurn(liveTurns) : null;
+    const lineageMatches = Boolean(machineTurn) || Boolean(receiptVisible) ||
+      (Boolean(runtimeRunId) && runtimeRunId === campaignRunId);
+
+    // The conversation is the dispatch destination when the runtime is already
+    // bound to it, OR when this very conversation carries the canonical proof
+    // of it. The second arm is what repairs a stale draft binding instead of
+    // refusing to.
+    const boundKeyAgrees = Boolean(key) && (!runtime?.conversationKey || String(runtime.conversationKey) === key);
+    const conversationMatches = Boolean(key) && identityAgrees && (boundKeyAgrees || lineageMatches);
+
+    const explicitOperatorStop = Boolean(runtime?.a3OperatorExplicitOff);
+    const campaignFinished = ownsDispatch && !campaignActive;
+    const managed = Boolean(state?.bridgeEnabled && workerMatches);
+
+    let shouldOwnA3 = false;
+    let reason = 'not-a-managed-worker';
+    if (explicitOperatorStop) {
+      reason = 'operator-explicit-off';
+    } else if (campaignFinished) {
+      reason = `terminal-dispatch-${dispatchState || 'unknown'}`;
+    } else if (!managed) {
+      reason = state?.bridgeEnabled ? 'worker-identity-mismatch' : 'bridge-disabled';
+    } else if (!ownsDispatch) {
+      reason = 'no-dispatch';
+    } else if (visibleCampaignAlreadyFinished(liveTurns)) {
+      reason = 'campaign-already-finished';
+    } else if (conversationMatches || lineageMatches) {
+      shouldOwnA3 = true;
+      reason = conversationMatches && lineageMatches
+        ? 'managed-dispatch-conversation-and-lineage'
+        : (conversationMatches ? 'managed-dispatch-conversation' : 'managed-dispatch-lineage');
+    } else {
+      reason = 'managed-dispatch-identity-mismatch';
+    }
+
+    return {
+      managed,
+      ownsDispatch,
+      campaignActive,
+      conversationMatches,
+      lineageMatches,
+      explicitOperatorStop,
+      shouldOwnA3,
+      reason,
+      conversationKey: key,
+      dispatchId,
+      dispatchState,
+      campaignRunId,
+      workerId: String(lease?.worker_id || ''),
+      projectId: String(lease?.project_id || ''),
+      projectName: String(lease?.project_name || ''),
+      runtimeStage: String(runtime?.stage || ''),
+      dispatchTerminal: MANAGED_A3_TERMINAL_DISPATCH_STATES.has(dispatchState)
+    };
+  }
+
+  function normalizeManagedA3OperatorStopPending(raw) {
+    // Only the shape that can still be acted on. A pending stop without a
+    // dispatch id is not a stop, it is debris from an older build.
+    if (!raw || typeof raw !== 'object') return null;
+    const dispatchId = String(raw.dispatch_id || '');
+    if (!dispatchId) return null;
+    return {
+      dispatch_id: dispatchId,
+      campaign_run_id: String(raw.campaign_run_id || ''),
+      worker_id: String(raw.worker_id || ''),
+      conversation_key: String(raw.conversation_key || ''),
+      previous_dispatch_state: String(raw.previous_dispatch_state || '').toUpperCase(),
+      resulting_dispatch_state: String(raw.resulting_dispatch_state || '').toUpperCase(),
+      source: 'operator',
+      reason: String(raw.reason || 'a3-checkbox'),
+      attempts: Math.max(0, Number(raw.attempts) || 0),
+      at: Math.max(0, Number(raw.at) || 0)
+    };
+  }
+
+  function managedA3StopPath(dispatchId) {
+    // The Bridge's existing operator-abandon semantic: a post-start dispatch
+    // becomes terminal FAILED with an honest operator_abandoned code, the lease
+    // is released so the lane stops occupying the worker pool, the record stays
+    // in Audit Runs history, and the dispatch is never re-leased or re-STARTed.
+    // CANCELLED is deliberately not used: it asserts that no Core was sent, and
+    // it is illegal from AUDITING.
+    return `/v1/browser/jobs/${encodeURIComponent(String(dispatchId || ''))}/abandon`;
+  }
+
+  function managedA3OperatorStopNeedsBridge(snapshot) {
+    // Milestone B, all four conditions. An unmanaged chat has no dispatch to
+    // retire; a terminal dispatch is already retired; a foreign worker never
+    // speaks for someone else's lane. A recorded operator stop is not a
+    // disqualifier -- it is the reason this is being called.
+    const snap = snapshot || managedA3OwnershipSnapshot();
+    return Boolean(
+      snap.managed &&
+      snap.ownsDispatch &&
+      snap.campaignActive &&
+      snap.dispatchState
+    );
+  }
+
+  function managedA3OperatorStop(options = {}) {
+    // SRC-098 Milestone B/C/E. ONE canonical end-to-end operator stop: record
+    // the intent durably, then deliver it to the Bridge, then let the ACK --
+    // never the local flag -- decide whether the lane is really retired.
+    if (!autoRuntime?.a3OperatorExplicitOff) return Promise.resolve(false);
+    if (managedA3OperatorStopInFlight) return managedA3OperatorStopInFlight;
+    if (!state?.bridgeEnabled) return Promise.resolve(false);
+
+    const snapshot = managedA3OwnershipSnapshot();
+    const already = normalizeManagedA3OperatorStopPending(autoRuntime.a3OperatorStopPending);
+
+    // Nothing to retire: an ordinary chat, a foreign lane, or a dispatch the
+    // Bridge already reported terminal. Retiring is not a local act.
+    if (!managedA3OperatorStopNeedsBridge(snapshot) && !already) {
+      return Promise.resolve(false);
+    }
+    // Idempotency, in order of authority: an ACK already landed, the same
+    // dispatch is already pending, or the retry budget is spent. Repeat clicks
+    // and reloads must never produce a second, contradictory transition.
+    if (already && String(already.dispatch_id) === String(browserWorkerLease?.dispatch_id || '') &&
+        browserWorkerDispatchState && MANAGED_A3_TERMINAL_DISPATCH_STATES.has(browserWorkerDispatchState)) {
+      clearManagedA3OperatorStopPending();
+      return Promise.resolve(true);
+    }
+    const target = already || snapshot;
+    if (!target.dispatchId && !already) return Promise.resolve(false);
+    if (already && already.attempts >= MANAGED_A3_STOP_MAX_ATTEMPTS && !options.force) {
+      return Promise.resolve(false);
+    }
+
+    const dispatchId = String(already?.dispatch_id || snapshot.dispatchId || '');
+    const pending = normalizeManagedA3OperatorStopPending({
+      dispatch_id: dispatchId,
+      campaign_run_id: String(already?.campaign_run_id || snapshot.campaignRunId || ''),
+      worker_id: String(already?.worker_id || snapshot.workerId || ''),
+      conversation_key: String(snapshot.conversationKey || ''),
+      previous_dispatch_state: String(already?.previous_dispatch_state || snapshot.dispatchState || ''),
+      resulting_dispatch_state: '',
+      reason: String(options.reason || already?.reason || 'a3-checkbox'),
+      attempts: already?.attempts || 0,
+      at: Date.now()
+    });
+    autoRuntime.a3OperatorStopPending = pending;
+    if (!saveAutoRuntime()) autoRuntime.a3OperatorStopPending = null;
+
+    managedA3OperatorStopInFlight = bridgeRequest('POST', managedA3StopPath(dispatchId), {
+      dispatch_id: dispatchId,
+      reason: pending.reason,
+      source: 'operator'
+    }, { timeout: 7000 })
+      .then(result => {
+        const stateName = String(result?.data?.state || pending.resulting_dispatch_state || '').toUpperCase();
+        if (!result?.ok) {
+          recordManagedA3OperatorStopAttempt(pending, stateName, 'bridge-refused');
+          return false;
+        }
+        browserWorkerDispatchState = stateName || 'FAILED';
+        // The ACK is the only thing that may retire local recovery identity.
+        // It arrives after the irreversible Send, so the campaign stays
+        // inspectable while this window stops claiming it.
+        if (browserWorkerLease && String(browserWorkerLease.dispatch_id || '') === dispatchId) {
+          browserWorkerLease = null;
+          persistBrowserWorkerLease();
+        }
+        clearManagedA3OperatorStopPending();
+        autoRuntime.stage = autoRuntime.stage === 'complete' ? 'complete' : 'paused';
+        autoRuntime.continuationKind = 'a3-operator-stop';
+        autoRuntime.continuationReason = 'operator-stop';
+        saveAutoRuntime();
+        appendBridgeDiagnostic('managed_a3_operator_stop_acked', {
+          severity: 'info',
+          message: `Operator stopped A3 on ${dispatchId}; Bridge reports ${browserWorkerDispatchState || 'FAILED'}`,
+          facts: managedA3OperatorStopFacts(pending, browserWorkerDispatchState)
+        });
+        renderAutoAuditState();
+        return true;
+      })
+      .catch(() => {
+        recordManagedA3OperatorStopAttempt(pending, '', 'bridge-unreachable');
+        return false;
+      })
+      .finally(() => { managedA3OperatorStopInFlight = null; });
+
+    return managedA3OperatorStopInFlight;
+  }
+
+  function managedA3OperatorStopFacts(pending, resultingState) {
+    // Bounded and content-free: ids, states and counters, never conversation
+    // text, project names or model output.
+    return {
+      dispatch_id: String(pending?.dispatch_id || ''),
+      campaign_run_id: String(pending?.campaign_run_id || ''),
+      worker_id: String(pending?.worker_id || ''),
+      conversation_key: String(pending?.conversation_key || ''),
+      previous_dispatch_state: String(pending?.previous_dispatch_state || ''),
+      resulting_dispatch_state: String(resultingState || pending?.resulting_dispatch_state || ''),
+      source: 'operator',
+      reason: String(pending?.reason || 'a3-checkbox'),
+      attempts: Math.max(0, Number(pending?.attempts) || 0)
+    };
+  }
+
+  function recordManagedA3OperatorStopAttempt(pending, resultingState, outcome) {
+    // Milestone C: a stop that could not be delivered stays durable, bounded,
+    // and visible. Local intent is authoritative -- A3 stays OFF -- but the
+    // widget says ATTN rather than pretending the campaign quietly ended.
+    if (!autoRuntime) return;
+    const current = normalizeManagedA3OperatorStopPending(autoRuntime.a3OperatorStopPending) || pending;
+    autoRuntime.a3OperatorStopPending = normalizeManagedA3OperatorStopPending({
+      ...current,
+      attempts: (current.attempts || 0) + 1,
+      resulting_dispatch_state: String(resultingState || current.resulting_dispatch_state || '')
+    });
+    saveAutoRuntime();
+    appendBridgeDiagnostic('managed_a3_operator_stop_pending', {
+      severity: 'warn',
+      message: `Operator stopped A3 locally but the Bridge has not acknowledged it (${outcome})`,
+      facts: { ...managedA3OperatorStopFacts(autoRuntime.a3OperatorStopPending, resultingState), outcome: String(outcome || '') }
+    });
+    renderAutoAuditState();
+  }
+
+  function clearManagedA3OperatorStopPending() {
+    if (!autoRuntime) return;
+    autoRuntime.a3OperatorStopPending = null;
+    saveAutoRuntime();
+  }
+
+  function interruptedAuditResponseSnapshot(turns = null) {
+    // SRC-098: "Stopped thinking" is neither CHAT nor DONE. It is an active
+    // wave whose answer was cut short, and the campaign has to stay exactly
+    // where it is: same wave, same count, marked for attention. Deciding this
+    // with the existing completion gate keeps one definition of "a finished
+    // audit answer" instead of a second, looser one.
+    const stage = String(autoRuntime?.stage || '');
+    const kind = activeWaveKind(stage);
+    if (!kind) return { interrupted: false, reason: '' };
+    if (chatGPTIsGenerating()) return { interrupted: false, reason: 'generating' };
+
+    const liveTurns = turns || getChatGPTTurns();
+    const anchorId = activeStageAnchorId(stage) || String(waveUserId(kind) || '');
+    const anchorIndex = anchorId
+      ? liveTurns.findIndex(turn => turnRole(turn) === 'user' && getTurnId(turn) === anchorId)
+      : -1;
+    if (!anchorId || anchorIndex < 0) return { interrupted: false, reason: 'no-anchor' };
+
+    const answer = latestChatGPTAssistantTurn(liveTurns.slice(anchorIndex + 1));
+    if (!answer) return { interrupted: false, reason: 'no-assistant-turn' };
+
+    const completed = completedAssistantCandidate(answer, stage);
+    if (completed.complete) return { interrupted: false, reason: 'complete' };
+
+    return { interrupted: true, reason: completed.reason || 'incomplete', kind, assistantId: getTurnId(answer) };
+  }
+
+  function recoverManagedA3Ownership(options = {}) {
+    // SRC-098 Milestone E: the ONE canonical re-arm. Recovery comes first and
+    // sends nothing -- an irreversible Send stays behind the ordinary gates,
+    // and a re-armed engine that auto-sent here would duplicate a Core that is
+    // already on screen.
+    if (a3OwnershipEnforcementInFlight && !options.reentrant) return false;
+    if (autoRuntime?.enabled) return false;
+    if (autoRuntime?.storageCorrupt) return false;
+
+    const snapshot = managedA3OwnershipSnapshot(options.turns || null);
+    if (!snapshot.shouldOwnA3) return false;
+
+    const key = snapshot.conversationKey;
+    if (!key) return false;
+
+    a3OwnershipEnforcementInFlight = true;
+    try {
+      // Milestone J: the split brain is a warning, not a heartbeat line. It is
+      // recorded BEFORE the repair so the evidence survives the healing.
+      appendBridgeDiagnostic('managed_a3_split_brain', {
+        severity: 'warning',
+        message: `Bridge owns dispatch ${snapshot.dispatchId} for ${key} while the widget runtime is disabled ` +
+          `(${snapshot.runtimeStage}, source=${autoRuntime?.a3DisabledSource || 'unknown'}); recovering`,
+        facts: {
+          dispatch_id: snapshot.dispatchId,
+          campaign_run_id: snapshot.campaignRunId,
+          worker_id: snapshot.workerId,
+          conversation_key: key,
+          runtime_stage: snapshot.runtimeStage,
+          dispatch_state: snapshot.dispatchState,
+          explicit_operator_stop: snapshot.explicitOperatorStop,
+          reason: snapshot.reason,
+          recovery_action: 'rearm'
+        }
+      });
+
+      const previousStage = String(autoRuntime.stage || '');
+      const previousEnabled = Boolean(autoRuntime.enabled);
+      autoRuntime.enabled = true;
+      autoRuntime.conversationKey = key;
+      if (snapshot.campaignRunId) autoRuntime.runId = snapshot.campaignRunId;
+      autoRuntime.a3OperatorExplicitOff = false;
+      autoRuntime.a3OperatorExplicitOffAt = 0;
+      autoRuntime.a3DisabledSource = '';
+      autoRuntime.a3DisabledReason = '';
+
+      const interrupted = interruptedAuditResponseSnapshot(options.turns || null);
+      if (interrupted.interrupted && autoRuntime.stage !== 'paused') {
+        // Same wave, same ordinal, nothing advanced: the run is held for a
+        // human rather than abandoned, and never counted as complete.
+        autoRuntime.pausedFromStage = autoRuntime.stage;
+        autoRuntime.pausedReason = `interrupted-${interrupted.kind || 'wave'}`;
+        autoRuntime.stage = 'paused';
+      }
+
+      if (!saveAutoRuntime({ pauseOnFailure: false })) {
+        autoRuntime.enabled = previousEnabled;
+        appendBridgeDiagnostic('a3_reassert_not_persisted', {
+          message: `A3 could not be re-armed in ${key}: durable runtime write was rejected`
+        });
+        return false;
+      }
+
+      writeA3Intent(true, key, { startTransaction: false });
+      claimAutoLease();
+
+      // Reconstruct the wave from what is on screen, then hand the chat back
+      // to the ordinary monitor. Neither step sends.
+      try {
+        if (autoRuntime.stage === 'idle') {
+          reconcileEnabledIdleAuditRuntime(options.turns || null, { source: 'managed-ownership-recovery' });
+        }
+        ensureAutoAuditObserver();
+        scheduleAutoAuditCheck(600);
+      } catch (_) { }
+
+      appendBridgeDiagnostic('managed_a3_ownership_recovered', {
+        severity: 'info',
+        message: `A3 re-armed in ${key} from live dispatch ${snapshot.dispatchId} (${snapshot.reason}); ` +
+          `stage ${previousStage} -> ${autoRuntime.stage}` +
+          (interrupted.interrupted ? `; current wave interrupted (${interrupted.reason}), no duplicate send` : ''),
+        facts: {
+          dispatch_id: snapshot.dispatchId,
+          campaign_run_id: snapshot.campaignRunId,
+          worker_id: snapshot.workerId,
+          conversation_key: key,
+          previous_stage: previousStage,
+          new_stage: String(autoRuntime.stage || ''),
+          reason: snapshot.reason,
+          recovery_action: 'rearmed',
+          source_function: 'recoverManagedA3Ownership'
+        }
+      });
+
+      // Milestone G: the interruption has to be visible in the LANE, not only
+      // in this tab. The same-state ACK is idempotent on the Bridge, so this
+      // records a reason without touching the campaign's state machine, and
+      // it sends nothing. Reported, never awaited: recovery must stay a
+      // synchronous predicate-to-state repair, and a failed report is a
+      // missing reason in the lane, not a broken recovery.
+      if (browserWorkerLease?.dispatch_id) {
+        try {
+          const report = browserWorkerTransition('AUDITING', {
+            attention: interrupted.interrupted
+              ? `interrupted-${interrupted.kind || 'wave'}: ${interrupted.reason}`
+              : ''
+          });
+          if (report && typeof report.then === 'function') report.then(() => { }, () => { });
+        } catch (_) { }
+      }
+      a3MachineReceiptReportedKey = '';
+      a3OwnershipReportedReceipt = '';
+      return true;
+    } finally {
+      a3OwnershipEnforcementInFlight = false;
+    }
+  }
+
   function superCompactAutoLabel(jobsSnapshot = null, recordsSnapshot = null) {
     if (chatGPTRootIsQuarantined() || autoBoundConversationKey?.startsWith('auth:')) return 'AUTH';
     if (!autoRuntime) return 'INIT';
-    if (!autoRuntime.enabled) return 'CHAT';
+    // SRC-098 Milestone I: a disabled runtime is NOT proof of an ordinary
+    // chat. This stays a pure read -- reconciliation runs before render (see
+    // the render preamble) -- so the label can only ever be wrong if the
+    // reconciliation never claimed the run, and never because a stale local
+    // boolean outranked a live Bridge dispatch.
+    if (!autoRuntime.enabled) {
+      const managed = managedA3OwnershipSnapshot();
+      if (managed.shouldOwnA3) return 'HOLD';
+      // ATTN is for a window the Bridge genuinely owns and recovery genuinely
+      // could not fix (corrupt storage, a rejected durable write). An
+      // ordinary chat is none of those and stays CHAT.
+      if (managed.managed && managed.campaignActive && !managed.explicitOperatorStop) return 'ATTN';
+      // Milestone C: the operator stopped A3 and the Bridge has not confirmed
+      // it. Ordinary CHAT here would be a lie in the other direction -- it
+      // would read as "nothing was running" while the Bridge still holds this
+      // worker on a live AUDIT lane.
+      if (managed.explicitOperatorStop && autoRuntime.a3OperatorStopPending) return 'ATTN';
+      return 'CHAT';
+    }
 
     const lease = readAutoLease(autoBoundConversationKey || currentConversationKey());
     if (lease && lease.ownerId && lease.ownerId !== autoInstanceId && lease.expiresAt > Date.now()) return 'STBY';
     if (autoRuntime.stage === 'paused') return 'PAUSE';
     if (autoComposerHoldReason) return 'HOLD';
+
+    // T-249: live audit activity outranks passive stored readiness. A ChatGPT
+    // conversation that is currently generating a response must never read
+    // READY/DONE/save-state from a stale `idle` or `complete` runtime. The
+    // cheap generation probe gates the lineage scan, so genuinely idle chats
+    // pay nothing here.
+    // T-257: one snapshot serves both verdicts, so this layer can never say
+    // "generating" while the audit evaluator says the response is terminal. A
+    // contradiction that outlives the bounded stabilization window is an honest
+    // ATTN with a named reason -- never an eternal BUSY.
+    const generation = chatGPTGenerationSnapshot();
+    if (generation.conflict) return 'ATTN';
+    if (generation.generating) {
+      const live = liveAuditActivitySnapshot();
+      const liveKind = live.auditKind ||
+        (/^(?:wait|sending|await)-/.test(autoRuntime.stage) ? activeWaveKind(autoRuntime.stage) : '');
+      // A recognizable audit lineage shows its live wave; ordinary non-audit
+      // generation shows neutral activity, never READY.
+      return liveKind ? compactWaveToken(liveKind) : 'BUSY';
+    }
+
+    // T-260: READY means "this tab is idle and ready for an audit". It is only
+    // that claim when the live-generation veto passed -- and a stop-shaped
+    // control inside the CURRENT composer means the veto did not pass: the
+    // widget found generation-shaped chrome in the composer's own action slot
+    // and could not identify it. Returning READY there is what left an operator
+    // staring at a visibly generating audit tab reading READY. ATTN is the
+    // honest answer and it is actionable; the generation verdict itself is
+    // untouched, so no wave is committed and nothing is sent.
+    const readyLabel = () => (generation.rejected_in_composer ? 'ATTN' : 'READY');
+
     if (autoRuntime.stage === 'complete') {
       const composerSummary = chatGPTReadyAttachmentSummary();
       const root = chatGPTComposerRoot();
       const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
-      if (composerSummary.ready || allTiles.length > 0) {
-        return 'READY';
-      }
-      const bridgeSave = currentBridgeSaveState(autoBoundConversationKey || currentConversationKey(), jobsSnapshot);
+      // T-184 (PHASE K): unsaved truth outranks "an archive is attached".
+      // READY used to win here, so a COMPLETE wave with no durable proof was
+      // invisible the moment a ZIP sat in the composer.
+      const bridgeSave = currentBridgeSaveState(
+        autoBoundConversationKey || currentConversationKey(),
+        jobsSnapshot,
+        recordsSnapshot
+      );
       if (state?.bridgeEnabled && bridgeSave.failed > 0) return '!';
       if (currentAuditSaveAttention(jobsSnapshot, recordsSnapshot)) return 'SAVE';
+      if (composerSummary.ready || allTiles.length > 0) {
+        return readyLabel();
+      }
       const completion = campaignCompletionSnapshot(recordsSnapshot);
       return completion.complete ? 'DONE' : `${completion.doneCount}/${completion.totalWaves}`;
     }
@@ -13616,14 +17471,318 @@ async function recoverArmedStartSend(options = {}) {
       const composerSummary = chatGPTReadyAttachmentSummary();
       const root = chatGPTComposerRoot();
       const allTiles = root ? chatGPTProjectComposerAttachments(root) : [];
-      if (composerSummary.ready || allTiles.length > 0) return 'READY';
+      if (composerSummary.ready || allTiles.length > 0) return readyLabel();
       return 'REC';
     }
-    if (autoRuntime.stage === 'idle') return 'READY';
+    if (autoRuntime.stage === 'idle') return readyLabel();
+    // T-249: profile-aware active-stage token. A Super10 wave 4 must not fall
+    // through to a hardcoded CORE/W2/PERF; compactWaveToken resolves the active
+    // wave against the pinned profile and keeps the quick3 CORE/W2/PERF names.
+    const stageKind = activeWaveKind(autoRuntime.stage);
+    if (stageKind) return compactWaveToken(stageKind);
     if (autoRuntime.stage === 'wait-core') return 'CORE';
     if (['sending-second', 'await-second-user', 'wait-second'].includes(autoRuntime.stage)) return 'W2';
     if (['sending-performance', 'await-performance-user', 'wait-performance'].includes(autoRuntime.stage)) return 'PERF';
     return 'AUTO';
+  }
+
+  // T-249: the compact wave token for the widget's single-cell state readout.
+  // quick3 keeps its historic CORE / W2 / PERF names; every other profile wave
+  // is Wn where n is the wave ordinal in the ACTIVE profile, so a Super10 wave
+  // shows W1..W10 rather than a guessed CORE/W2/PERF or READY.
+  function compactWaveToken(kind) {
+    const clean = String(kind || '').toLowerCase();
+    if (!clean) return 'AUTO';
+    if (clean === 'core') return 'CORE';
+    if (clean === 'second') return 'W2';
+    if (clean === 'performance') return 'PERF';
+    const waveDef = findWaveDefinitionForStageOrKind(clean);
+    if (waveDef && waveDef.ordinal) return `W${waveDef.ordinal}`;
+    return 'AUTO';
+  }
+
+  // T-249: one read-only snapshot of current live audit truth. It never mutates
+  // runtime, only inspects authored ChatGPT conversation turns, reuses
+  // classifyAuditTurn and the profile-aware lineage, and never classifies widget
+  // UI text or arbitrary page prose as a command. `active` is true only on
+  // strong live evidence that an audit is in flight right now.
+  function liveAuditActivitySnapshot(turns = getChatGPTTurns()) {
+    const generating = chatGPTIsGenerating();
+    const runtimeStage = String(autoRuntime?.stage || '');
+    const empty = {
+      generating,
+      auditTurn: null,
+      auditKind: '',
+      auditTurnId: '',
+      assistantTurn: null,
+      runtimeStage,
+      active: false,
+      reason: ''
+    };
+
+    if (detectSite().key !== 'chatgpt') return { ...empty, reason: 'not-chatgpt' };
+
+    // A recognizable audit user turn, resolved through the profile-aware lineage
+    // so a Super10 wave is honoured and an orphan continuation is not guessed
+    // into a fresh root.
+    const lineage = visibleAuditLineage(turns);
+    let auditTurn = null;
+    let auditKind = '';
+    if (!lineage.blockedByReset) {
+      const prof = getActiveProfile();
+      const reverseWaves = [...(prof.waves || [])].reverse();
+      for (const w of reverseWaves) {
+        if (lineage[w.id]) { auditTurn = lineage[w.id]; auditKind = w.id; break; }
+      }
+      if (!auditTurn) {
+        auditTurn = lineage.performance || lineage.second || lineage.core || null;
+        if (auditTurn) auditKind = classifyAuditTurn(auditTurn);
+      }
+    }
+
+    const assistantTurn = auditTurn ? assistantTurnAfter(auditTurn, turns) : null;
+    // activeWaveKind returns its cleaned input for unknown stages, so guard on a
+    // real wait/sending/await stage before treating the runtime as a live wave;
+    // otherwise `idle` itself would read as a wave kind.
+    const runtimeWaveKind = (/^(?:wait|sending|await)-/.test(runtimeStage))
+      ? activeWaveKind(runtimeStage)
+      : '';
+    const runtimeIsWaitStage = Boolean(runtimeWaveKind) ||
+      runtimeStage === 'sending-continuation' || runtimeStage === 'await-continuation-user';
+
+    // Strong live evidence, in order:
+    //  - a recognizable audit user turn while ChatGPT is generating;
+    //  - a recognizable audit user turn whose assistant response is not terminal;
+    //  - the current runtime already sits in a wait stage while generating.
+    let active = false;
+    let reason = '';
+    if (auditTurn && generating) {
+      active = true;
+      reason = 'audit-turn-generating';
+    } else if (auditTurn && assistantTurn && !assistantHasFinalActions(assistantTurn)) {
+      // Read-only terminality: a mounted assistant response with no final
+      // action chrome yet is still resolving. This never mutates runtime the way
+      // completedAssistantCandidate does (stabilization checkpoint / save).
+      active = true;
+      reason = 'audit-assistant-not-terminal';
+    } else if (runtimeIsWaitStage && generating) {
+      active = true;
+      auditKind = auditKind || runtimeWaveKind;
+      reason = 'runtime-wait-generating';
+    }
+
+    return {
+      generating,
+      auditTurn,
+      auditKind,
+      auditTurnId: auditTurn ? getTurnId(auditTurn) : '',
+      assistantTurn,
+      runtimeStage,
+      active,
+      reason
+    };
+  }
+
+  // The structural identity of one turn: tag, authored-node role, and the
+  // stable test/turn attributes -- never text. This is what makes a live
+  // capture comparable to the synthetic fixtures without ever reading the
+  // conversation itself.
+  function turnStructureShape(turn) {
+    if (!turn) return '';
+    const authored = turn.matches?.('[data-message-author-role]')
+      ? turn
+      : turn.querySelector?.('[data-message-author-role]');
+    return [
+      String(turn.tagName || '').toLowerCase(),
+      String(turn.getAttribute?.('data-testid') || ''),
+      String(turn.getAttribute?.('data-turn') || ''),
+      String(turn.getAttribute?.('data-turn-id') ? 'turn-id' : ''),
+      String(turn.getAttribute?.('data-message-id') ? 'message-id' : ''),
+      String(authored?.getAttribute?.('data-message-author-role') || ''),
+      String(authored?.tagName || '').toLowerCase()
+    ].join('|');
+  }
+
+  // T-261 (SAIHANDOFF Milestone A): one bounded, CONTENT-FREE diagnostic of
+  // why a live Audit Core is not being associated with its lineage.
+  //
+  // It reports shape, identity and counts only. Prompt text, conversation
+  // text, the receipt VALUE and tokens never enter this object: it is read off
+  // the live DOM inside the page the operator is already looking at, and it is
+  // rendered into a tooltip and a clipboard diagnostics block.
+  //
+  // Nothing here mutates runtime, storage, lease or send state.
+  function liveAuditLineageSnapshot(options = {}) {
+    const turns = Array.isArray(options.turns) ? options.turns : getChatGPTTurns();
+    let generation = { state: 'unknown', reason: 'probe-failed', generating: false };
+    try {
+      const probe = chatGPTGenerationSnapshot();
+      generation = { state: String(probe.state || ''), reason: String(probe.reason || ''), generating: Boolean(probe.generating) };
+    } catch (_) { }
+
+    let handoff = null;
+    try { handoff = readStartAuditHandoff(); } catch (_) { }
+    const tx = (handoff && typeof handoff.transaction === 'object') ? handoff.transaction : null;
+
+    const userTurns = turns.filter(turn => turnRole(turn) === 'user');
+    const assistantTurnCount = turns.reduce(
+      (count, turn) => count + (turnRole(turn) === 'assistant' ? 1 : 0),
+      0
+    );
+    const latestUser = userTurns.length ? userTurns[userTurns.length - 1] : null;
+    const latestUserId = latestUser ? getTurnId(latestUser) : '';
+    let latestUserKind = '';
+    try { latestUserKind = classifyAuditTurn(latestUser) || ''; } catch (_) { }
+
+    // Boundary candidates are the authored user turns that appeared AFTER the
+    // committed START froze its pre-send baseline. Count only -- the exact
+    // receipt is still the preferred match, this is the fallback authority.
+    const baselineCount = Math.max(0, Number(tx?.preSendUserTurnCount) || 0);
+    const transactionBoundaryCandidateCount = handoff ? Math.max(0, userTurns.length - baselineCount) : 0;
+
+    let receiptTurnFound = false;
+    try {
+      receiptTurnFound = Boolean(
+        handoff && String(handoff.receipt || '') && exactReceiptUserTurn(String(handoff.receipt), turns)
+      );
+    } catch (_) { }
+
+    let liveKind = '';
+    try { liveKind = liveAuditActivitySnapshot(turns).auditKind || ''; } catch (_) { }
+
+    // Ownership of the CURRENT /c/<id> -- not merely "START still holds A3
+    // intent". A committed START whose intent is live but whose route cannot be
+    // proven is exactly the CLASS D condition.
+    const conversationKey = String(autoBoundConversationKey || currentConversationKey() || '');
+    let routeOwned = false;
+    let ownsIntent = false;
+    try {
+      ownsIntent = startHandoffOwnsA3Intent(handoff);
+      routeOwned = committedStartOwnsConversationKey(handoff, conversationKey);
+    } catch (_) { }
+
+    let compactLabel = '';
+    try { compactLabel = superCompactAutoLabel() || ''; } catch (_) { }
+
+    return {
+      widgetVersion: String(widgetBuildVersion() || 'unknown'),
+      conversationKey,
+
+      generationState: generation.state,
+      generationReason: generation.reason,
+
+      runtimeEnabled: Boolean(autoRuntime && autoRuntime.enabled),
+      runtimeStage: String((autoRuntime && autoRuntime.stage) || ''),
+      runtimeRunId: String((autoRuntime && autoRuntime.runId) || ''),
+      runtimeExpectedKind: String((autoRuntime && autoRuntime.expectedKind) || ''),
+      runtimeCoreUserId: String((autoRuntime && autoRuntime.coreUserId) || ''),
+      runtimePendingSendKind: String((autoRuntime && autoRuntime.pendingSendKind) || ''),
+      runtimePendingSendReceiptPresent: Boolean(autoRuntime && String(autoRuntime.pendingSendReceipt || '')),
+
+      startHandoffPresent: Boolean(handoff),
+      startHandoffCommitted: startHandoffIsCommitted(handoff),
+      startHandoffOwnsIntent: ownsIntent,
+      startHandoffRouteOwned: routeOwned,
+      startHandoffPhase: String((handoff && handoff.phase) || ''),
+      startHandoffSourceKey: String((handoff && handoff.sourceKey) || ''),
+      startHandoffLastKey: String((handoff && handoff.lastKey) || ''),
+      startHandoffDestinationKey: String((handoff && handoff.destinationKey) || ''),
+      startHandoffExpectedKind: String((tx && tx.expectedKind) || ''),
+      // The pre-send baseline is present only when the committed transaction
+      // froze it before its own irreversible Send: a count that is a number and
+      // a freeze timestamp that was actually taken.
+      startHandoffBaselinePresent: Boolean(
+        tx &&
+        Number.isFinite(Number(tx.preSendUserTurnCount)) &&
+        Number(tx.preSendUserTurnCount) >= 0 &&
+        Number(handoff?.preSendAt) > 0
+      ),
+
+      turnCount: turns.length,
+      userTurnCount: userTurns.length,
+      assistantTurnCount,
+
+      latestUserTurnDiscovered: Boolean(latestUser),
+      latestUserTurnIdPresent: Boolean(latestUserId),
+      latestUserTurnStructure: turnStructureShape(latestUser),
+
+      latestUserClassifiedKind: latestUserKind,
+
+      exactStartReceiptTurnFound: receiptTurnFound,
+      transactionBoundaryCandidateCount,
+
+      liveAuditKind: liveKind,
+      compactLabel
+    };
+  }
+
+  // T-261: the four failure classes, decided from the snapshot above and only
+  // from it. Order is strictly most-fundamental first: a turn that was never
+  // discovered cannot be classified, and a turn that cannot be classified
+  // cannot prove runtime ownership, so ownership is only meaningful once the
+  // turn itself is accounted for.
+  //
+  // C and D are reported even when the compact cell already reads CORE. That
+  // is the point of naming them: the live label can show the right wave while
+  // the runtime behind it never adopted anything, so the visible symptom alone
+  // would hide a real defect. `lineageLost` is what separates "the label is
+  // wrong" from "the adoption behind it is wrong".
+  function classifyLiveAuditLineage(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return { failure: 'NONE', reason: 'no-snapshot' };
+    if (snapshot.generationState !== 'generating') return { failure: 'NONE', reason: 'not-generating' };
+
+    const lineageLost = !snapshot.liveAuditKind;
+    // A lost lineage that is NOT degrading to BUSY/ATTN is not the defect this
+    // diagnostic exists to name.
+    if (lineageLost && !['BUSY', 'ATTN'].includes(String(snapshot.compactLabel || ''))) {
+      return { failure: 'NONE', reason: 'not-degrading' };
+    }
+
+    // CLASS A: the authored Core is on screen but turn discovery never returned it.
+    if (!snapshot.userTurnCount) return { failure: 'TURN_DISCOVERY', reason: 'no-user-turn-discovered' };
+    if (!snapshot.latestUserTurnDiscovered) return { failure: 'TURN_DISCOVERY', reason: 'latest-user-turn-unresolved' };
+
+    // CLASS B: discovered, but the canonical audit recognizer did not classify it.
+    if (!snapshot.latestUserClassifiedKind) return { failure: 'TURN_CLASSIFICATION', reason: 'turn-found-not-classified' };
+
+    // CLASS D: lineage is legible, but a committed START cannot prove it owns
+    // the current route, so no adoption may be trusted yet.
+    if (snapshot.startHandoffCommitted && !snapshot.startHandoffRouteOwned) {
+      return { failure: 'START_ROUTE_OWNERSHIP', reason: 'committed-start-route-unproven' };
+    }
+
+    // CLASS C: recognized and owned, yet the runtime never moved off passive.
+    const stage = String(snapshot.runtimeStage || '');
+    const runtimeOwnsWave = /^(?:wait|sending|await)-/.test(stage) ||
+      stage === 'sending-continuation' || stage === 'await-continuation-user';
+    if (runtimeOwnsWave) return { failure: 'NONE', reason: 'lineage-recognized' };
+
+    return {
+      failure: 'RUNTIME_ADOPTION',
+      reason: lineageLost ? 'lineage-lost-runtime-passive' : 'recognized-but-runtime-passive'
+    };
+  }
+
+  // One copy/paste line: the class, its reason, and the five facts that decide
+  // it. Still content-free -- it names the missing LAYER, never the prompt.
+  function liveAuditLineageDiagnosticLine(snapshot = null) {
+    const snap = snapshot || liveAuditLineageSnapshot();
+    const verdict = classifyLiveAuditLineage(snap);
+    return [
+      `lineage=${verdict.failure}`,
+      `reason=${verdict.reason}`,
+      `generation=${snap.generationState}/${snap.generationReason}`,
+      `turns=${snap.turnCount}(u${snap.userTurnCount}/a${snap.assistantTurnCount})`,
+      `latest_user=${snap.latestUserTurnDiscovered ? snap.latestUserTurnStructure || 'present' : 'none'}`,
+      `latest_user_id=${snap.latestUserTurnIdPresent ? 'yes' : 'no'}`,
+      `classified=${snap.latestUserClassifiedKind || 'none'}`,
+      `runtime=${snap.runtimeStage || 'none'}${snap.runtimeEnabled ? '' : '(disabled)'}`,
+      `start=${snap.startHandoffPhase || 'none'}${snap.startHandoffCommitted ? '/committed' : ''}${snap.startHandoffOwnsIntent ? '/intent' : ''}${snap.startHandoffRouteOwned ? '/owned' : ''}`,
+      `boundary_candidates=${snap.transactionBoundaryCandidateCount}`,
+      `live_kind=${snap.liveAuditKind || 'none'}`,
+      `compact=${snap.compactLabel || 'none'}`,
+      `build=${snap.widgetVersion}`
+    ].join(' ');
   }
 
   function machineAuthoredAuditTurn(turns = getChatGPTTurns()) {
@@ -13658,21 +17817,31 @@ async function recoverArmedStartSend(options = {}) {
 
   function reassertA3FromMachineReceipt(key, turns = null) {
     // No live handoff left. A conversation that holds a machine-authored audit
-    // turn is still an AUDAPACK run, and a run whose runtime came back blank is
-    // route hydration losing state -- never an operator decision.
+    // turn is still an AUDAPACK run, and a run whose runtime came back disabled
+    // is a recovery drift -- never an operator decision.
     //
-    // The distinction matters: unchecking A3 by hand PERSISTS a runtime with
-    // enabled=false, so that record is respected and never overridden here.
-    // Only a key with nothing persisted at all is repaired.
+    // SRC-098: this used to demand a BLANK disabled runtime, on the reasoning
+    // that an unchecking human PERSISTS a non-blank one. That reasoning was
+    // wrong, and the live screenshot is the proof: a managed run that had
+    // already sent its Core holds a perfectly non-blank runtime and still came
+    // back disabled, so the one predicate meant to protect a human decision
+    // was in practice protecting the bug. The operator's intent is now
+    // recorded explicitly when they click the control, and a live managed
+    // dispatch is allowed to repair a non-blank runtime that no operator
+    // stopped.
     if (a3OwnershipEnforcementInFlight) return false;
     if (!key || !autoRuntime || autoRuntime.storageCorrupt) return false;
     if (autoRuntime.enabled) return false;
-    if (!runtimeIsBlankDisabled(autoRuntime)) return false;
+    if (autoRuntime.a3OperatorExplicitOff) return false;
+    const managedOwns = managedA3OwnershipSnapshot(turns).shouldOwnA3;
+    if (!managedOwns && !runtimeIsBlankDisabled(autoRuntime)) return false;
 
     a3OwnershipEnforcementInFlight = true;
     try {
-      const stored = readStoredRuntime(key);
-      if (stored.corrupt || stored.runtime) return false;
+      if (!managedOwns) {
+        const stored = readStoredRuntime(key);
+        if (stored.corrupt || stored.runtime) return false;
+      }
 
       const liveTurns = turns || getChatGPTTurns();
       const authored = machineAuthoredAuditTurn(liveTurns);
@@ -13681,6 +17850,7 @@ async function recoverArmedStartSend(options = {}) {
         // A finished campaign is allowed to sit idle; do not resurrect it.
         return false;
       }
+      if (managedOwns) return recoverManagedA3Ownership({ turns: liveTurns, source: 'machine-receipt', reentrant: true });
 
       autoRuntime.enabled = true;
       autoRuntime.conversationKey = key;
@@ -13761,11 +17931,3610 @@ async function recoverArmedStartSend(options = {}) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // T-180: canonical AUTO ZIP (ensure -> download -> attach) and the ChatGPT
+  // archive-drop sanitizer. Both are single-flight and fail open/safe: no send,
+  // no campaign transition, and the previous archive always survives failure.
+  // -------------------------------------------------------------------------
+  const AUDAPACK_ARCHIVE_SUFFIX_RE = /_\d{2}\.\d{2}\.\d{2}-T\d{2}-\d{2}-\d{2}\.zip$/i;
+
+  let archiveRefreshInFlight = false;
+  let archiveRefreshState = 'idle';
+  let archiveRefreshDetail = '';
+  let archiveRefreshProjectId = '';
+  let archiveDropSanitizerInstalled = false;
+  let lastArchiveDropResult = null;
+
+  function isAudapackProjectArchiveName(name) {
+    const value = String(name || '').trim();
+    if (!/\.zip$/i.test(value)) return false;
+    if (/audapack/i.test(value)) return true;
+    if (AUDAPACK_ARCHIVE_SUFFIX_RE.test(value)) return true;
+    const tracked = String(autoRuntime?.archiveName || '').trim().toLowerCase();
+    return Boolean(tracked && value.toLowerCase() === tracked);
+  }
+
+  function isAudapackProjectArchiveFile(file) {
+    return isAudapackProjectArchiveName(file?.name);
+  }
+
+  function archiveDropUriResidue(dataTransfer) {
+    if (!dataTransfer) return '';
+    const values = [];
+    try { values.push(dataTransfer.getData('text/uri-list')); } catch (_) { }
+    try { values.push(dataTransfer.getData('text/plain')); } catch (_) { }
+    for (const value of values) {
+      const text = String(value || '');
+      if (/file:\/\/\//i.test(text)) return text;
+    }
+    return '';
+  }
+
+  function removeComposerAttachmentTile(tile) {
+    if (!tile || !tile.isConnected) return false;
+    const remove = tile.querySelector('button[aria-label^="Remove file"], button[name="remove-file"]');
+    if (!remove) return false;
+    remove.click();
+    return true;
+  }
+
+  const SAIHANDOFF_M1_SESSION_KEY = 'saihandoff_m1_send_generation_v1';
+  let saihandoffM1RuntimeEpoch = Date.now().toString(36) + ':' + Math.random().toString(36).slice(2, 10);
+  const saihandoffM1OwnedTiles = new WeakMap();
+  let saihandoffM1GenerationCounter = 0;
+  let saihandoffM1CurrentGen = null;
+  let saihandoffM1InFlight = false;
+  let saihandoffM1TickTimer = 0;
+  let saihandoffM1TickKey = '';
+  let saihandoffM1LastTickKey = '';
+  const SAIHANDOFF_M1_TICK_DELAY_MS = 250;
+  const SAIHANDOFF_M1_TICK_STATES = new Set([
+    'WAITING_UPLOAD', 'WAITING_CHAT_IDLE', 'WAITING_SEND_READY'
+  ]);
+  // Runtime-only epoch: a full userscript/page reload creates a new epoch,
+  // while an SPA remount inside the same JS runtime keeps it. It is never
+  // serialized; persisted intent cannot carry DOM ownership across epochs.
+  // Pre-send states whose DOM tile ownership proof cannot survive a script
+  // reload. Post-send states (SENDING/SENT/UNRESOLVED_SEND_ACKNOWLEDGEMENT)
+  // reconcile through persisted turn-id evidence instead.
+  const SAIHANDOFF_M1_PRE_SEND_ACTIVE_STATES = new Set([
+    'CLASSIFYING', 'ARMED', 'WAITING_UPLOAD', 'WAITING_CHAT_IDLE',
+    'WAITING_SEND_READY', 'READY_TO_SEND', 'BLOCKED_BY_P0_GATE'
+  ]);
+  const SAIHANDOFF_M1_KNOWN_STATES = new Set([
+    'CLASSIFYING', 'ARMED', 'WAITING_UPLOAD', 'WAITING_CHAT_IDLE',
+    'WAITING_SEND_READY', 'READY_TO_SEND', 'SENDING', 'SENT',
+    'BLOCKED_BY_P0_GATE', 'HOLD', 'FAILED', 'IGNORED', 'INVALIDATED',
+    'UNRESOLVED_SEND_ACKNOWLEDGEMENT'
+  ]);
+  const SAIHANDOFF_M1_TIMESTAMP_FIELDS = [
+    'armedAt', 'readyAt', 'sendReadyDeadlineAt', 'sendPreparedAt',
+    'sendClickedAt', 'sentAt'
+  ];
+
+  function isSaihandoffM1GateOpen() {
+    return Boolean(state?.saihandoffM1P0GateOpen);
+  }
+
+  function setSaihandoffM1GateOpen(open) {
+    const before = snapshotState();
+    const next = Boolean(open);
+    state.saihandoffM1P0GateOpen = next;
+    state.saihandoffM1GateClosed = !next;
+    state.saihandoffM1GateExplicitV1 = true;
+    if (saveState()) return true;
+    restoreStateSnapshot(before);
+    return false;
+  }
+
+  function validSaihandoffM1Generation(value) {
+    return Boolean(
+      value && typeof value === 'object' && value.version === 1 &&
+      Number.isSafeInteger(value.generation) && value.generation > 0 &&
+      typeof value.conversationKey === 'string' && typeof value.projectId === 'string' &&
+      typeof value.projectName === 'string' && typeof value.filename === 'string' &&
+      SAIHANDOFF_M1_KNOWN_STATES.has(value.state)
+    );
+  }
+
+  function validPersistedSaihandoffM1Generation(value) {
+    if (!validSaihandoffM1Generation(value)) return false;
+    const hasNonempty = key => typeof value[key] === 'string' && value[key].trim().length > 0;
+    const hasFiniteNonnegative = key => Number.isFinite(value[key]) && value[key] >= 0;
+    const hasTimestamp = key => Object.prototype.hasOwnProperty.call(value, key)
+      && (value[key] === null || hasFiniteNonnegative(key));
+    return hasNonempty('conversationKey')
+      && hasNonempty('projectId')
+      && hasNonempty('projectName')
+      && hasNonempty('filename')
+      && hasFiniteNonnegative('fileSize')
+      && hasFiniteNonnegative('fileLastModified')
+      && SAIHANDOFF_M1_TIMESTAMP_FIELDS.every(hasTimestamp)
+      && typeof value.previousUserTurnId === 'string'
+      && (value.lastErrorCode === null || typeof value.lastErrorCode === 'string');
+  }
+
+  function readPersistedSaihandoffM1Generation() {
+    try {
+      const raw = sessionStorage.getItem(SAIHANDOFF_M1_SESSION_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return validPersistedSaihandoffM1Generation(parsed) ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Runtime-only DOM ownership evidence must never be serialized as durable
+  // proof. Stripping happens on every save, and the epoch stamps re-attach
+  // on every read.
+  const SAIHANDOFF_M1_RUNTIME_ONLY_KEYS = [
+    'preUploadTiles', 'ownedTileRef', 'ownedTileLabel', 'runtimeEpoch',
+    'ownedTileCandidates'
+  ];
+
+  function saveSaihandoffM1Generation(gen) {
+    try {
+      if (!gen) sessionStorage.removeItem(SAIHANDOFF_M1_SESSION_KEY);
+      else {
+        const durable = {};
+        for (const [key, value] of Object.entries(gen)) {
+          if (SAIHANDOFF_M1_RUNTIME_ONLY_KEYS.includes(key)) continue;
+          durable[key] = value;
+        }
+        sessionStorage.setItem(SAIHANDOFF_M1_SESSION_KEY, JSON.stringify(durable));
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setSaihandoffM1Generation(gen) {
+    saihandoffM1CurrentGen = gen;
+    if (gen?.generation > saihandoffM1GenerationCounter) saihandoffM1GenerationCounter = gen.generation;
+    if (saveSaihandoffM1Generation(gen)) return true;
+    if (gen) {
+      saihandoffM1CurrentGen = {
+        ...gen,
+        state: 'FAILED',
+        lastErrorCode: 'saihandoff_persistence_failed'
+      };
+      setStatus('Could not persist SAIHANDOFF M1 state. Auto-send is blocked.', 'error');
+    }
+    return false;
+  }
+
+  function clearSaihandoffM1Generation() {
+    saihandoffM1CurrentGen = null;
+    return saveSaihandoffM1Generation(null);
+  }
+
+  function getSaihandoffM1Generation() {
+    if (!saihandoffM1CurrentGen) {
+      saihandoffM1CurrentGen = readPersistedSaihandoffM1Generation();
+      if (saihandoffM1CurrentGen?.generation > saihandoffM1GenerationCounter) {
+        saihandoffM1GenerationCounter = saihandoffM1CurrentGen.generation;
+      }
+      // A persisted pre-send generation carries semantic intent but no DOM
+      // ownership proof. Restored in a new script epoch, the exact runtime
+      // attachment no longer exists: fail closed instead of trusting an
+      // arbitrary same-name ready tile. A fresh physical selection re-arms.
+      if (saihandoffM1CurrentGen && SAIHANDOFF_M1_PRE_SEND_ACTIVE_STATES.has(saihandoffM1CurrentGen.state)) {
+        saihandoffM1CurrentGen.state = 'HOLD';
+        saihandoffM1CurrentGen.lastErrorCode = 'ownership_proof_lost';
+        saveSaihandoffM1Generation(saihandoffM1CurrentGen);
+      }
+    }
+    return saihandoffM1CurrentGen;
+  }
+
+  function classifyComposerDropFile(file) {
+    if (!file || typeof file !== 'object' || !file.name) return 'UNKNOWN';
+    const name = String(file.name || '').trim();
+    if (!name) return 'UNKNOWN';
+    if (/\.zip$/i.test(name)) {
+      const trackedName = String(autoRuntime?.archiveName || '').trim();
+      const isTrackedArchive = Boolean(trackedName && name.toLowerCase() === trackedName.toLowerCase());
+      const hasCanonicalName = AUDAPACK_ARCHIVE_SUFFIX_RE.test(name);
+      if ((isTrackedArchive || hasCanonicalName) && isAudapackProjectArchiveFile(file) && projectNameFromArtifactFilename(name)) {
+        return 'PROJECT_ARCHIVE';
+      }
+      return 'OTHER_ZIP';
+    }
+    return 'NORMAL_FILE';
+  }
+
+  function newSaihandoffM1Generation(file, stateName, errorCode = null) {
+    saihandoffM1GenerationCounter += 1;
+    return {
+      version: 1,
+      generation: saihandoffM1GenerationCounter,
+      runtimeEpoch: saihandoffM1RuntimeEpoch,
+      conversationKey: String(currentConversationKey() || ''),
+      projectId: '',
+      projectName: '',
+      filename: String(file?.name || ''),
+      fileSize: Number(file?.size || 0),
+      fileLastModified: Number(file?.lastModified || 0),
+      state: stateName,
+      armedAt: null,
+      readyAt: null,
+      sendReadyDeadlineAt: null,
+      sendPreparedAt: null,
+      sendClickedAt: null,
+      sentAt: null,
+      previousUserTurnId: getTurnId(latestChatGPTUserTurn()),
+      lastErrorCode: errorCode
+    };
+  }
+
+  function saihandoffM1SamePhysicalSelection(gen, files, options) {
+    const list = Array.from(files || []);
+    return Boolean(
+      options?.eventType === 'change' && options?.injectedGeneration === gen?.generation &&
+      list.length === 1 && String(list[0]?.name || '') === gen.filename &&
+      Number(list[0]?.size || 0) === Number(gen.fileSize || 0) &&
+      Number(list[0]?.lastModified || 0) === Number(gen.fileLastModified || 0)
+    );
+  }
+
+  function resolveSaihandoffM1RegisteredProject(gen, candidateName) {
+    const generation = gen.generation;
+    return listRegisteredProjects().then(registry => {
+      const current = getSaihandoffM1Generation();
+      if (!current || current.generation !== generation || generation !== saihandoffM1GenerationCounter) {
+        return { ok: false, reason: 'stale_generation' };
+      }
+      if (!registry.ok) {
+        current.state = 'HOLD';
+        current.lastErrorCode = 'registry_unavailable';
+        setSaihandoffM1Generation(current);
+        return { ok: false, reason: current.lastErrorCode, generation: current };
+      }
+      const matches = matchRegisteredProject(registry.projects, candidateName);
+      if (matches.length !== 1) {
+        current.state = 'HOLD';
+        current.lastErrorCode = matches.length ? 'ambiguous_registered_project' : 'unregistered_project';
+        setSaihandoffM1Generation(current);
+        return { ok: false, reason: current.lastErrorCode, generation: current };
+      }
+      const project = matches[0];
+      const boundId = String(autoRuntime?.projectId || '').trim();
+      const boundName = String(autoRuntime?.projectName || '').trim();
+      const boundMatches = boundId
+        ? String(project.project_id || '') === boundId
+        : !boundName || matchRegisteredProject([project], boundName).length === 1;
+      if (!boundMatches) {
+        current.state = 'HOLD';
+        current.lastErrorCode = 'conversation_contradiction';
+        setSaihandoffM1Generation(current);
+        return { ok: false, reason: current.lastErrorCode, generation: current };
+      }
+      current.projectId = String(project.project_id || '');
+      current.projectName = String(project.display_name || project.audit_name || candidateName);
+      current.state = 'ARMED';
+      current.armedAt = Date.now();
+      current.lastErrorCode = null;
+      setSaihandoffM1Generation(current);
+      return { ok: true, generation: current };
+    });
+  }
+
+  function handleSaihandoffM1DropOrSelection(files, options = {}) {
+    const list = files ? Array.from(files) : [];
+    if (!list.length) return { ok: false, reason: 'no_files' };
+    const existing = getSaihandoffM1Generation();
+    if (saihandoffM1SamePhysicalSelection(existing, list, options)) {
+      return { ok: true, duplicate: true, generation: existing };
+    }
+
+    const classified = list.map(file => ({ file, category: classifyComposerDropFile(file) }));
+    const projectArchives = classified.filter(item => item.category === 'PROJECT_ARCHIVE');
+    if (list.length > 1) {
+      // Ambiguity is PROJECT IDENTITY, not ZIP count: multiple generations of
+      // ONE project are one identity; two different projects are ambiguous.
+      const identityKeys = new Set();
+      for (const item of projectArchives) {
+        const identity = projectNameFromArtifactFilename(item.file.name);
+        const normalized = normalizedProjectIdentity(identity) || String(identity || '').toLowerCase();
+        if (normalized) identityKeys.add(normalized);
+      }
+      const errCode = projectArchives.length === 0 ? 'not_project_archive'
+        : identityKeys.size > 1 ? 'ambiguous_multiple_archives'
+        : 'unexpected_additional_files';
+      const gen = newSaihandoffM1Generation(list[0], errCode === 'not_project_archive' ? 'IGNORED' : 'HOLD', errCode);
+      setSaihandoffM1Generation(gen);
+      return { ok: false, reason: errCode, generation: gen };
+    }
+
+    const { file, category } = classified[0];
+    if (category !== 'PROJECT_ARCHIVE') {
+      const errCode = category === 'OTHER_ZIP' ? 'arbitrary_zip' : category === 'NORMAL_FILE' ? 'ordinary_file' : 'unknown_file';
+      const gen = newSaihandoffM1Generation(file, 'IGNORED', errCode);
+      setSaihandoffM1Generation(gen);
+      return { ok: false, reason: errCode, category, generation: gen };
+    }
+
+    const trackedName = String(autoRuntime?.archiveName || '').trim();
+    const isTrackedArchive = Boolean(trackedName && String(file.name || '').toLowerCase() === trackedName.toLowerCase());
+    const candidateName = isTrackedArchive
+      ? String(autoRuntime?.projectName || autoRuntime?.projectId || projectNameFromArtifactFilename(file.name))
+      : projectNameFromArtifactFilename(file.name);
+    const gen = newSaihandoffM1Generation(file, 'CLASSIFYING');
+    gen.preUploadTiles = chatGPTComposerAttachmentTiles().filter(tile => {
+      return chatGPTAttachmentTileName(tile).trim().toLowerCase() === gen.filename.toLowerCase();
+    });
+    if (!candidateName) {
+      gen.state = 'HOLD';
+      gen.lastErrorCode = 'unresolvable_project_name';
+      setSaihandoffM1Generation(gen);
+      return { ok: false, reason: gen.lastErrorCode, generation: gen };
+    }
+    if (!setSaihandoffM1Generation(gen)) {
+      return {
+        ok: false,
+        reason: 'saihandoff_persistence_failed',
+        generation: saihandoffM1CurrentGen
+      };
+    }
+    resolveSaihandoffM1RegisteredProject(gen, candidateName).catch(() => {});
+    return { ok: true, generation: gen };
+  }
+
+  function saihandoffM1OwnedTile(gen) {
+    const tile = gen?.ownedTileRef ? saihandoffM1OwnedTiles.get(gen.ownedTileRef) : null;
+    return tile && tile.isConnected ? tile : null;
+  }
+
+  function saihandoffM1WaitForSendReady(gen, reason) {
+    const now = acbWaitNow();
+    if (!Number.isFinite(gen.sendReadyDeadlineAt)) {
+      gen.sendReadyDeadlineAt = now + CHATGPT_ATTACHMENT_TIMEOUT_MS;
+    }
+    const expired = now >= gen.sendReadyDeadlineAt;
+    gen.state = expired ? 'FAILED' : 'WAITING_SEND_READY';
+    gen.lastErrorCode = expired ? 'send_not_ready' : null;
+    if (!setSaihandoffM1Generation(gen)) {
+      return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+    }
+    return {
+      ok: false,
+      state: gen.state,
+      reason: expired ? 'send_not_ready' : reason
+    };
+  }
+
+  function saihandoffM1ReconcilePersistedGeneration() {
+    const gen = getSaihandoffM1Generation();
+    if (!gen || !['SENDING', 'UNRESOLVED_SEND_ACKNOWLEDGEMENT'].includes(gen.state)) return false;
+    const currentKey = String(currentConversationKey() || '');
+    const latestTurn = latestChatGPTUserTurn();
+    const latestId = getTurnId(latestTurn);
+    const beforeId = String(gen.previousUserTurnId || '');
+    const archiveName = archiveNameInUserTurn(latestTurn);
+    const archiveMatches = String(archiveName || '').toLowerCase() === String(gen.filename || '').toLowerCase();
+    if (gen.conversationKey && currentKey === gen.conversationKey && beforeId && latestId && latestId !== beforeId && archiveMatches) {
+      gen.state = 'SENT';
+      gen.sentAt = Date.now();
+      gen.lastErrorCode = null;
+      setSaihandoffM1Generation(gen);
+      return true;
+    }
+    if (gen.state === 'UNRESOLVED_SEND_ACKNOWLEDGEMENT') return false;
+    gen.state = 'UNRESOLVED_SEND_ACKNOWLEDGEMENT';
+    gen.lastErrorCode = 'send_not_accepted';
+    setSaihandoffM1Generation(gen);
+    return true;
+  }
+
+  function scheduleSaihandoffM1BoundedTick(gen) {
+    if (!gen || !SAIHANDOFF_M1_TICK_STATES.has(gen.state)) return;
+    const key = `${gen.generation}:${gen.state}`;
+    if (key === saihandoffM1LastTickKey) return;
+    if (saihandoffM1TickTimer) {
+      if (key === saihandoffM1TickKey) return;
+      clearTimeout(saihandoffM1TickTimer);
+      saihandoffM1TickTimer = 0;
+    }
+    saihandoffM1TickKey = key;
+    saihandoffM1TickTimer = setTimeout(() => {
+      saihandoffM1TickTimer = 0;
+      saihandoffM1LastTickKey = key;
+      const current = saihandoffM1CurrentGen;
+      if (!current || current.generation !== gen.generation) return;
+      stepSaihandoffM1(gen.generation);
+    }, SAIHANDOFF_M1_TICK_DELAY_MS);
+  }
+
+  // T-261: SAIHANDOFF M1 is a DIFFERENT subsystem from the Auto3 audit
+  // campaign. A bare "SAIHANDOFF IDLE" on a tab that is visibly running a Core
+  // reads as "this audit is idle", which is the one thing the panel must never
+  // say. The label names the subsystem instead.
+  const SAIHANDOFF_STATUS_LABEL = 'Implementation handoff';
+  const SAIHANDOFF_STATUS_TITLE = `${SAIHANDOFF_STATUS_LABEL} (M1 archive/send automation). This is NOT the Auto3 audit chain status.`;
+
+  function saihandoffM1StatusText(gen) {
+    if (!validSaihandoffM1Generation(gen)) return `${SAIHANDOFF_STATUS_LABEL}: IDLE`;
+    switch (gen.state) {
+      case 'CLASSIFYING': return 'HOLD classifying';
+      case 'ARMED': return 'ARCHIVE ARMED';
+      case 'WAITING_UPLOAD': return 'UPLOAD';
+      case 'WAITING_CHAT_IDLE': return 'WAIT CHAT';
+      case 'WAITING_SEND_READY': return 'READY';
+      case 'READY_TO_SEND': return 'READY';
+      case 'SENDING': return 'SENDING';
+      case 'SENT': return 'SENT';
+      case 'BLOCKED_BY_P0_GATE': return `HOLD ${gen.lastErrorCode || 'blocked_by_p0_gate'}`;
+      case 'HOLD': return `HOLD ${String(gen.lastErrorCode || '').slice(0, 28)}`.trimEnd();
+      case 'FAILED': return `FAILED ${String(gen.lastErrorCode || '').slice(0, 28)}`.trimEnd();
+      case 'UNRESOLVED_SEND_ACKNOWLEDGEMENT': return `HOLD ${gen.lastErrorCode || 'send_not_accepted'}`;
+      case 'IGNORED': return `HOLD ${gen.lastErrorCode || 'ignored'}`;
+      default: return gen.state;
+    }
+  }
+
+  function saihandoffM1StatusState(gen) {
+    if (!validSaihandoffM1Generation(gen)) return 'idle';
+    const states = {
+      ARMED: 'armed', WAITING_UPLOAD: 'upload', WAITING_CHAT_IDLE: 'wait-chat',
+      WAITING_SEND_READY: 'ready', READY_TO_SEND: 'ready', SENDING: 'sending',
+      SENT: 'sent', FAILED: 'failed'
+    };
+    return states[gen.state] || 'hold';
+  }
+
+  function saihandoffM1IsTerminalPostClick(gen) {
+    return gen && (gen.state === 'SENT' || gen.state === 'UNRESOLVED_SEND_ACKNOWLEDGEMENT');
+  }
+
+  async function stepSaihandoffM1(expectedGenId = null) {
+    if (saihandoffM1InFlight) return { ok: false, reason: 'in_flight' };
+    saihandoffM1InFlight = true;
+    try {
+      const gen = getSaihandoffM1Generation();
+      if (!gen || !gen.generation) return { ok: false, reason: 'no_generation' };
+      if (expectedGenId != null && gen.generation !== expectedGenId) return { ok: false, reason: 'stale_generation' };
+      if (gen.generation !== saihandoffM1GenerationCounter) return { ok: false, reason: 'stale_generation' };
+      if (gen.state === 'CLASSIFYING') return { ok: false, reason: 'classifying' };
+      if (gen.state === 'SENT') return { ok: true, state: 'SENT' };
+      if (gen.state === 'UNRESOLVED_SEND_ACKNOWLEDGEMENT') {
+        return saihandoffM1ReconcilePersistedGeneration()
+          ? { ok: true, state: 'SENT' }
+          : { ok: false, state: 'UNRESOLVED_SEND_ACKNOWLEDGEMENT', reason: 'unresolved' };
+      }
+      if (gen.state === 'SENDING') {
+        if (saihandoffM1ReconcilePersistedGeneration()) {
+          return gen.state === 'SENT'
+            ? { ok: true, state: 'SENT' }
+            : { ok: false, state: 'UNRESOLVED_SEND_ACKNOWLEDGEMENT', reason: 'send_not_accepted' };
+        }
+        return { ok: false, reason: 'unresolved' };
+      }
+      if (gen.state === 'BLOCKED_BY_P0_GATE') {
+        if (isSaihandoffM1GateOpen()) { gen.state = 'ARMED'; setSaihandoffM1Generation(gen); }
+        else return { ok: false, state: 'BLOCKED_BY_P0_GATE' };
+      }
+      if (gen.state === 'HOLD' || gen.state === 'IGNORED' || gen.state === 'FAILED' || gen.state === 'INVALIDATED') {
+        return { ok: false, state: gen.state, reason: gen.lastErrorCode };
+      }
+
+      const convKey = String(currentConversationKey() || '');
+      if (gen.conversationKey && convKey && gen.conversationKey !== convKey) {
+        gen.state = 'INVALIDATED';
+        gen.lastErrorCode = 'conversation_changed';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'INVALIDATED', reason: 'conversation_changed' };
+      }
+
+      const root = chatGPTComposerRoot();
+      const input = getChatGPTInput();
+      if (cleanTurnText(input ? composerPlainText(input) : '').length > 0) {
+        gen.state = 'HOLD';
+        gen.lastErrorCode = 'manual_draft_present';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'HOLD', reason: 'manual_draft_present' };
+      }
+
+      if (chatGPTIsGenerating()) {
+        gen.state = 'WAITING_CHAT_IDLE';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'WAITING_CHAT_IDLE' };
+      }
+
+      const attachedIdentities = composerAttachedProjectIdentities(root);
+      if (attachedIdentities.length > 1) {
+        gen.state = 'HOLD';
+        gen.lastErrorCode = 'ambiguous_multiple_archives';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'HOLD', reason: 'ambiguous_multiple_archives' };
+      }
+
+      const beforeTiles = Array.isArray(gen.preUploadTiles) ? gen.preUploadTiles : [];
+      const liveTiles = chatGPTComposerAttachmentTiles(root);
+      const wanted = String(gen.filename || '').toLowerCase();
+
+      let matchingTile = saihandoffM1OwnedTile(gen);
+      if (!matchingTile && gen.ownedTileRef) {
+        const candidates = liveTiles.filter(tile => {
+          const label = chatGPTAttachmentTileName(tile).trim().toLowerCase();
+          return label === wanted && !beforeTiles.includes(tile) && tile.isConnected;
+        });
+        if (candidates.length === 1) {
+          const ref = Symbol(`saihandoffM1gen${gen.generation}`);
+          gen.ownedTileRef = ref;
+          gen.ownedTileLabel = String(gen.filename || '');
+          saihandoffM1OwnedTiles.set(ref, candidates[0]);
+          matchingTile = candidates[0];
+        } else if (candidates.length > 1) {
+          gen.state = 'HOLD';
+          gen.lastErrorCode = 'ambiguous_owned_tile';
+          setSaihandoffM1Generation(gen);
+          return { ok: false, state: 'HOLD', reason: 'ambiguous_owned_tile' };
+        }
+      } else if (!matchingTile) {
+        const candidates = liveTiles.filter(tile => {
+          const label = chatGPTAttachmentTileName(tile).trim().toLowerCase();
+          return label === wanted && !beforeTiles.includes(tile) && tile.isConnected;
+        });
+        if (candidates.length === 1) {
+          const ref = Symbol(`saihandoffM1gen${gen.generation}`);
+          gen.ownedTileRef = ref;
+          gen.ownedTileLabel = String(gen.filename || '');
+          saihandoffM1OwnedTiles.set(ref, candidates[0]);
+          matchingTile = candidates[0];
+        } else if (candidates.length > 1) {
+          gen.state = 'HOLD';
+          gen.lastErrorCode = 'ambiguous_owned_tile';
+          setSaihandoffM1Generation(gen);
+          return { ok: false, state: 'HOLD', reason: 'ambiguous_owned_tile' };
+        }
+      }
+
+      if (liveTiles.some(tile => chatGPTAttachmentTileName(tile).trim().toLowerCase() !== wanted)) {
+        gen.state = 'HOLD';
+        gen.lastErrorCode = 'unexpected_additional_files';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'HOLD', reason: gen.lastErrorCode };
+      }
+      if (!matchingTile || !matchingTile.isConnected) {
+        if (gen.state !== 'ARMED') {
+          gen.state = 'WAITING_UPLOAD';
+          setSaihandoffM1Generation(gen);
+        }
+        return { ok: false, state: gen.state, reason: 'tile_not_found' };
+      }
+      if (chatGPTAttachmentIsBusy(matchingTile)) {
+        gen.state = 'WAITING_UPLOAD';
+        setSaihandoffM1Generation(gen);
+        scheduleSaihandoffM1BoundedTick(gen);
+        return { ok: false, state: 'WAITING_UPLOAD', reason: 'tile_busy' };
+      }
+
+      if (liveTiles.some(tile => tile !== matchingTile && tile.isConnected)) {
+        gen.state = 'HOLD';
+        gen.lastErrorCode = 'unexpected_additional_files';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'HOLD', reason: gen.lastErrorCode };
+      }
+
+      const sendBtn = getChatGPTSend();
+      if (!sendBtn || !sendBtn.isConnected) {
+        return saihandoffM1WaitForSendReady(gen, 'send_btn_missing');
+      }
+      if (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true') {
+        return saihandoffM1WaitForSendReady(gen, 'send_btn_disabled');
+      }
+
+      gen.state = 'READY_TO_SEND';
+      gen.readyAt = gen.readyAt || Date.now();
+      gen.sendReadyDeadlineAt = null;
+      if (!setSaihandoffM1Generation(gen)) {
+        return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+      }
+
+      if (!isSaihandoffM1GateOpen()) {
+        gen.state = 'BLOCKED_BY_P0_GATE';
+        gen.lastErrorCode = 'blocked_by_p0_gate';
+        setSaihandoffM1Generation(gen);
+        return { ok: false, state: 'BLOCKED_BY_P0_GATE', reason: 'blocked_by_p0_gate' };
+      }
+
+      const generationOwnsTile = () => {
+        const current = getSaihandoffM1Generation();
+        const ownedTile = gen?.ownedTileRef ? saihandoffM1OwnedTiles.get(gen.ownedTileRef) : null;
+        return Boolean(
+          current && current === gen && current.generation === gen.generation &&
+          gen.generation === saihandoffM1GenerationCounter && ownedTile === matchingTile
+        );
+      };
+      const clickFence = async () => {
+        if (!generationOwnsTile() || !matchingTile.isConnected) return false;
+        const currentTiles = chatGPTComposerAttachmentTiles(chatGPTComposerRoot());
+        if (currentTiles.length !== 1 || currentTiles[0] !== matchingTile) {
+          gen.state = 'HOLD';
+          gen.lastErrorCode = 'unexpected_additional_files';
+          setSaihandoffM1Generation(gen);
+          return false;
+        }
+        return !chatGPTAttachmentIsBusy(matchingTile) && !chatGPTIsGenerating();
+      };
+      const beforeUserId = getTurnId(latestChatGPTUserTurn());
+      gen.previousUserTurnId = beforeUserId;
+      gen.state = 'SENDING';
+      gen.sendPreparedAt = Date.now();
+      gen.sendClickedAt = Date.now();
+      if (!setSaihandoffM1Generation(gen)) {
+        return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+      }
+
+      const clicked = await clickChatGPTSendVerified(sendBtn, input, {
+        fence: clickFence,
+        singleAttempt: true
+      });
+      if (!generationOwnsTile()) {
+        return { ok: false, reason: 'stale_generation' };
+      }
+      if (gen.state === 'HOLD') {
+        return { ok: false, state: 'HOLD', reason: gen.lastErrorCode };
+      }
+      if (clicked) {
+        gen.state = 'SENT';
+        gen.sentAt = Date.now();
+        if (!setSaihandoffM1Generation(gen)) {
+          return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+        }
+        return { ok: true, state: 'SENT' };
+      }
+      const turns = getChatGPTTurns();
+      const afterUserTurn = latestChatGPTUserTurn(turns);
+      const afterUserId = getTurnId(afterUserTurn);
+      const afterArchive = archiveNameInUserTurn(afterUserTurn);
+      const archiveMatches = String(afterArchive || '').toLowerCase() === String(gen.filename || '').toLowerCase();
+      if (afterUserId && afterUserId !== beforeUserId && archiveMatches) {
+        gen.state = 'SENT';
+        gen.sentAt = Date.now();
+        if (!setSaihandoffM1Generation(gen)) {
+          return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+        }
+        return { ok: true, state: 'SENT' };
+      }
+      gen.state = 'UNRESOLVED_SEND_ACKNOWLEDGEMENT';
+      gen.lastErrorCode = 'send_not_accepted';
+      if (!setSaihandoffM1Generation(gen)) {
+        return { ok: false, state: 'FAILED', reason: 'saihandoff_persistence_failed' };
+      }
+      return { ok: false, state: 'UNRESOLVED_SEND_ACKNOWLEDGEMENT', reason: 'send_not_accepted' };
+    } finally {
+      saihandoffM1InFlight = false;
+    }
+  }
+
+  function handleComposerArchiveDrop(event) {
+    const result = { action: 'ignored', reason: '', filename: '' };
+    lastArchiveDropResult = result;
+    try {
+      if (detectSite().key !== 'chatgpt') return result;
+      const target = acbElementFromNode(event?.target);
+      const root = chatGPTComposerRoot();
+      if (!root || !target || !root.contains(target)) return result;
+
+      const transfer = event?.dataTransfer;
+      const files = transfer?.files ? Array.from(transfer.files) : [];
+      if (!files.length) return result;
+
+      // T-186: M1 classification runs INDEPENDENTLY of drop sanitation. A
+      // mixed drop (project ZIP + companions) is sanitized even though M1
+      // holds it as unexpected_additional_files; the HOLD never blocks the
+      // sanitizer. One physical drop stays one M1 generation: the injected
+      // change below is generation-fenced.
+      try { handleSaihandoffM1DropOrSelection(files, { eventType: 'drop' }); } catch (_) { }
+
+      const archives = files.filter(isAudapackProjectArchiveFile);
+      if (!archives.length) { result.reason = 'not-project-archive'; return result; }
+      if (!archiveDropUriResidue(transfer)) { result.reason = 'no-file-uri-residue'; return result; }
+
+      // ponytail: a drop handler cannot await anything -- the browser has
+      // already decided the drop's fate by the time an async prepare step
+      // would run. So this door proves composer ownership and injects
+      // synchronously; the files already exist, so no surface open is needed.
+      const upload = chatGPTUploadInput();
+      if (!upload || !chatGPTUploadBoundOwner(upload, root)) { result.reason = 'upload-input-unavailable'; return result; }
+
+      const input = getChatGPTInput();
+      const beforeText = input ? composerPlainText(input) : '';
+      const currentGen = getSaihandoffM1Generation();
+
+      // T-181 contract: inject ALL original File objects in original order,
+      // never the file:/// editable text, regardless of M1 send eligibility.
+      if (!setNativeFileList(upload, files, { injectedGeneration: currentGen?.generation || 0 })) { result.reason = 'file-injection-rejected'; return result; }
+
+      if (typeof event.preventDefault === 'function') event.preventDefault();
+      if (typeof event.stopPropagation === 'function') event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+      result.action = 'sanitized';
+      result.filename = String(archives[0]?.name || '');
+      const afterText = input ? composerPlainText(input) : '';
+      result.reason = afterText === beforeText ? 'archive-attached' : 'composer-text-changed';
+      setTimeout(() => {
+        try { renderAutoAuditState(); } catch (_) { }
+        try { stepSaihandoffM1(); } catch (_) { }
+      }, 0);
+      return result;
+    } catch (_) {
+      result.action = 'ignored';
+      result.reason = 'sanitizer-error';
+      return result;
+    }
+  }
+
+  function installComposerArchiveDropSanitizer() {
+    if (archiveDropSanitizerInstalled) return false;
+    archiveDropSanitizerInstalled = true;
+    document.addEventListener('drop', handleComposerArchiveDrop, true);
+    return true;
+  }
+
+  function normalizedProjectIdentity(value) {
+    return String(value || '').trim().toLowerCase().replace(/^[_\s.-]+|[_\s.-]+$/g, '');
+  }
+
+  function projectNameKeys(project) {
+    const keys = new Set();
+    for (const value of [project?.display_name, project?.audit_name, project?.project_id]) {
+      const raw = String(value || '').trim().toLowerCase();
+      if (!raw) continue;
+      keys.add(raw);
+      const normalized = normalizedProjectIdentity(raw);
+      if (normalized) keys.add(normalized);
+    }
+    return Array.from(keys);
+  }
+
+  function matchRegisteredProject(projects, name) {
+    const wanted = String(name || '').trim().toLowerCase();
+    if (!wanted) return [];
+    const normalized = normalizedProjectIdentity(wanted);
+    return (projects || []).filter(project => {
+      const keys = projectNameKeys(project);
+      return keys.includes(wanted) || Boolean(normalized && keys.includes(normalized));
+    });
+  }
+
+  function listRegisteredProjects() {
+    return bridgeRequest('GET', '/v1/projects', null, { timeout: 7000 }).then(response => {
+      // TARGET B: bounded diagnostics need the real HTTP status even when the
+      // registry read fails, so it is carried through instead of dropped.
+      const status = Math.max(0, Number(response.status) || 0);
+      if (!response.ok || !Array.isArray(response.data?.projects)) {
+        return {
+          ok: false,
+          status,
+          errorCode: response.errorCode || 'projects-unavailable',
+          message: response.message || 'Bridge project registry is unavailable.',
+          projects: []
+        };
+      }
+      return {
+        ok: true,
+        status,
+        projects: response.data.projects.filter(project => project && project.enabled !== false),
+        // P1 TARGET C: the Bridge's CONTENT revision of this list, so a
+        // revalidation can say "nothing changed" instead of forcing a re-render.
+        revision: String(response.data.revision || '')
+      };
+    });
+  }
+
+  // T-182B: project identity resolution inspects EVERY attached project
+  // archive, groups generations of the same project into one semantic
+  // identity, and never picks by timestamp/DOM order. Archive freshness
+  // display (composerArchiveFreshness) stays a different operation.
+  function composerAttachedProjectIdentities(root = chatGPTComposerRoot()) {
+    const identities = new Map();
+    for (const entry of composerArchiveEntries(root)) {
+      const identity = projectNameFromArtifactFilename(entry.name);
+      if (!identity) continue;
+      const normalized = normalizedProjectIdentity(identity) || String(identity).toLowerCase();
+      const key = normalized || String(identity).toLowerCase();
+      if (!identities.has(key)) identities.set(key, { identity, normalized: key, archives: [] });
+      identities.get(key).archives.push(entry);
+    }
+    return Array.from(identities.values());
+  }
+
+  async function resolveRegisteredProjectForArchive() {
+    const runtimeId = String(autoRuntime?.projectId || '').trim();
+    const runtimeName = String(autoRuntime?.projectName || '').trim();
+    const registry = await listRegisteredProjects();
+    if (!registry.ok) return { ok: false, errorCode: registry.errorCode, message: registry.message };
+
+    if (runtimeId) {
+      const byId = registry.projects.find(project => String(project.project_id || '') === runtimeId);
+      if (byId) return { ok: true, project: byId };
+    }
+
+    const attachedIdentities = composerAttachedProjectIdentities();
+    if (attachedIdentities.length > 1) {
+      return {
+        ok: false,
+        errorCode: 'ambiguous_project',
+        message: `Multiple attached project archives (${attachedIdentities.map(item => item.identity).join(', ')}) do not identify one project. Remove the unrelated archives or establish an explicit project.`
+      };
+    }
+
+    const names = [];
+    if (attachedIdentities.length === 1) names.push(attachedIdentities[0].identity);
+    if (runtimeName) names.push(runtimeName);
+    for (const name of names) {
+      const matches = matchRegisteredProject(registry.projects, name);
+      if (matches.length === 1) return { ok: true, project: matches[0] };
+      if (matches.length > 1) {
+        return {
+          ok: false,
+          errorCode: 'ambiguous_project',
+          message: `Multiple registered projects match "${name}". Attach or name the project unambiguously.`
+        };
+      }
+    }
+
+    if (!registry.projects.length) {
+      return { ok: false, errorCode: 'no_registered_projects', message: 'No registered AUDAPACK projects. Register the project in AUDAPACK first.' };
+    }
+    return {
+      ok: false,
+      errorCode: 'project_not_found',
+      message: runtimeName ? `No registered project matches "${runtimeName}".` : 'No project identity is available in this chat.'
+    };
+  }
+
+  function rememberRuntimeProjectId(projectId, projectName) {
+    if (!autoRuntime) return false;
+    const id = String(projectId || '').trim();
+    if (!id || autoRuntime.projectId === id) return false;
+    const wanted = sanitizeProjectIdentity(projectName || '');
+    if (wanted && autoRuntime.projectName && sanitizeProjectIdentity(autoRuntime.projectName) !== wanted) return false;
+    autoRuntime.projectId = id;
+    saveAutoRuntime({ pauseOnFailure: false });
+    return true;
+  }
+
+  function ensureProjectArchive(projectId) {
+    return bridgeRequest(
+      'POST',
+      `/v1/projects/${encodeURIComponent(projectId)}/archive/ensure`,
+      {},
+      { timeout: 120000 }
+    ).then(response => {
+      if (!response.ok || !response.data?.ok) {
+        return {
+          ok: false,
+          errorCode: response.errorCode || response.data?.error?.code || 'ensure-failed',
+          message: response.message || 'Archive ensure failed.',
+          retriable: response.retriable
+        };
+      }
+      const data = response.data;
+      return {
+        ok: true,
+        meta: {
+          projectId: String(data.project_id || projectId),
+          filename: String(data.filename || ''),
+          size: Math.max(0, Number(data.size) || 0),
+          mtime: Math.max(0, Number(data.mtime) || 0),
+          sha256: String(data.sha256 || '').toLowerCase(),
+          reused: Boolean(data.reused),
+          packed: Boolean(data.packed),
+          // P1 TARGET A/E: the Bridge's own phase evidence for this decision, and
+          // how it obtained the digest. Carried through instead of dropped so a
+          // slow click can name its dominant phase.
+          timings: data.timings && typeof data.timings === 'object' ? data.timings : {},
+          shaSource: String(data.sha_source || '')
+        }
+      };
+    });
+  }
+
+  // SRC-083 TARGET C: the Bridge's pre-stream timing, read from its diagnostic
+  // headers. Bounded numbers and a closed source vocabulary only -- an old
+  // Bridge without the headers simply yields zeros, never a failure.
+  function parseArchiveServerTiming(responseHeaders) {
+    const out = { prep_ms: 0, digest_ms: 0, digest_source: '', present: false };
+    const text = typeof responseHeaders === 'string' ? responseHeaders : '';
+    if (!text) return out;
+    for (const line of text.split(/\r?\n/)) {
+      const at = line.indexOf(':');
+      if (at <= 0) continue;
+      const name = line.slice(0, at).trim().toLowerCase();
+      const value = line.slice(at + 1).trim();
+      if (name === 'x-audapack-archive-prep-ms' || name === 'x-audapack-archive-digest-ms') {
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0 || ms > 600000) continue;
+        out[name === 'x-audapack-archive-prep-ms' ? 'prep_ms' : 'digest_ms'] = Math.round(ms * 1000) / 1000;
+        out.present = true;
+      } else if (name === 'x-audapack-archive-sha256-source') {
+        const source = value.toLowerCase();
+        if (source === 'receipt' || source === 'computed') out.digest_source = source;
+      }
+    }
+    return out;
+  }
+
+  // SRC-083 TARGET A/B: a binary GM GET observed PASSIVELY through the
+  // callbacks the userscript manager already offers. No extra request, no second
+  // byte copy, and nothing here touches the manager's own single timeout budget.
+  // A manager that reports no progress keeps the totals and says so instead of
+  // inventing a first-byte time. Outcome is 'load' | 'error' | 'timeout'.
+  function gmBinaryGet(url, headers, timeoutMs = 120000) {
+    return new Promise(resolve => {
+      const startedAt = manualArchiveNow();
+      const probe = {
+        headers_ms: 0,
+        first_progress_ms: 0,
+        last_progress_ms: 0,
+        progress_events: 0,
+        loaded: 0,
+        total: 0,
+        onload_ms: 0,
+        materialize_ms: 0,
+        capability: 'none'
+      };
+      const since = () => Math.max(0, manualArchiveNow() - startedAt);
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers,
+        responseType: 'arraybuffer',
+        timeout: timeoutMs,
+        onreadystatechange(state) {
+          if (!probe.headers_ms && Number(state?.readyState) >= 2) {
+            probe.headers_ms = since();
+            if (probe.capability === 'none') probe.capability = 'readystate';
+          }
+        },
+        onprogress(event) {
+          const at = since();
+          probe.progress_events += 1;
+          if (!probe.first_progress_ms) probe.first_progress_ms = at;
+          probe.last_progress_ms = at;
+          probe.capability = 'progress';
+          const loaded = Number(event?.loaded);
+          if (Number.isFinite(loaded) && loaded > probe.loaded) probe.loaded = loaded;
+          const total = Number(event?.total);
+          if (event?.lengthComputable !== false && Number.isFinite(total) && total > 0) probe.total = total;
+        },
+        onload(response) {
+          probe.onload_ms = since();
+          const status = Number(response.status) || 0;
+          if (status < 200 || status >= 300 || !response.response) {
+            resolve({ outcome: 'load', status, response, bytes: null, probe });
+            return;
+          }
+          // TARGET H: an ArrayBuffer (or a view over one) is wrapped as a VIEW,
+          // never copied. Only a plain Array -- a manager that serialized the
+          // body -- pays an element-by-element copy, and that cost is measured.
+          const materializeStarted = manualArchiveNow();
+          const raw = response.response;
+          let bytes = null;
+          if (raw instanceof Uint8Array) bytes = raw;
+          else if (Array.isArray(raw)) bytes = new Uint8Array(raw);
+          else if (raw && typeof raw.byteLength === 'number' && typeof raw.length !== 'number') {
+            bytes = ArrayBuffer.isView(raw)
+              ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+              : new Uint8Array(raw);
+          } else if (raw && typeof raw.length === 'number') bytes = new Uint8Array(raw);
+          probe.materialize_ms = Math.max(0, manualArchiveNow() - materializeStarted);
+          resolve({ outcome: 'load', status, response, bytes, probe });
+        },
+        onerror() { probe.onload_ms = since(); resolve({ outcome: 'error', status: 0, response: null, bytes: null, probe }); },
+        ontimeout() { probe.onload_ms = since(); resolve({ outcome: 'timeout', status: 0, response: null, bytes: null, probe }); }
+      });
+    });
+  }
+
+  async function fetchProjectArchive(projectId) {
+    const base = normalizedBridgeUrl();
+    const token = bridgeToken();
+    if (!base || !token) {
+      return { ok: false, errorCode: 'bridge-unavailable', message: 'Bridge URL/token is not configured.' };
+    }
+    const got = await gmBinaryGet(
+      `${base}/v1/projects/${encodeURIComponent(projectId)}/archive`,
+      { Accept: 'application/zip', 'X-ACB-Token': token }
+    );
+    const probe = got.probe;
+    if (got.outcome === 'error') return { ok: false, errorCode: 'archive-request-failed', message: 'Archive download failed.', probe };
+    if (got.outcome === 'timeout') return { ok: false, errorCode: 'archive-request-timeout', message: 'Archive download timed out.', probe };
+    if (got.status < 200 || got.status >= 300 || !got.response?.response) {
+      return {
+        ok: false,
+        errorCode: `archive-http-${got.status}`,
+        message: decodeArtifactErrorBody(got.response?.response).message || 'Archive download failed.',
+        probe
+      };
+    }
+    if (!got.bytes) {
+      return { ok: false, errorCode: 'archive-empty-response', message: 'Bridge returned an unreadable archive body.', probe };
+    }
+    return { ok: true, bytes: got.bytes, probe, server: parseArchiveServerTiming(got.response.responseHeaders) };
+  }
+
+  // SRC-083 TARGET F: an explicit, operator-started control experiment -- never
+  // part of a delivery. The same-size, content-free Bridge probe body is fetched
+  // through GM_xmlhttpRequest and through the page's native fetch, twice each
+  // (cold, then warm), so "is the userscript manager the GET latency?" is
+  // answered by measurement. Native fetch never receives the Bridge token, so
+  // this path cannot reach an authenticated route; production stays on GM.
+  const TRANSPORT_PROBE_DEFAULT_BYTES = 4 * 1024 * 1024;
+  const TRANSPORT_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+  const TRANSPORT_PROBE_TIMEOUT_MS = 20000;
+  let transportProbeInFlight = null;
+
+  async function nativeFetchBinaryProbe(url, timeoutMs = TRANSPORT_PROBE_TIMEOUT_MS) {
+    const nativeFetch = globalThis.fetch;
+    if (typeof nativeFetch !== 'function') {
+      return { ok: false, capability: 'NATIVE_FETCH_UNAVAILABLE', error: 'fetch-missing', headers_ms: 0, total_ms: 0, bytes: 0 };
+    }
+    const startedAt = manualArchiveNow();
+    const since = () => Math.max(0, manualArchiveNow() - startedAt);
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = setTimeout(() => { try { controller?.abort(); } catch (_) { } }, timeoutMs);
+    let headersMs = 0;
+    try {
+      const response = await nativeFetch.call(globalThis, url, {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'omit',
+        mode: 'cors',
+        signal: controller ? controller.signal : undefined
+      });
+      headersMs = since();
+      if (!response || !response.ok) {
+        return { ok: false, capability: 'NATIVE_FETCH_UNAVAILABLE', error: `http-${Number(response?.status) || 0}`, headers_ms: headersMs, total_ms: since(), bytes: 0 };
+      }
+      const buffer = await response.arrayBuffer();
+      return { ok: true, capability: 'NATIVE_FETCH_SAFE', error: '', headers_ms: headersMs, total_ms: since(), bytes: Number(buffer?.byteLength) || 0 };
+    } catch (error) {
+      const reason = `${error?.name || 'Error'}: ${error?.message || 'fetch failed'}`.slice(0, 120);
+      return { ok: false, capability: 'NATIVE_FETCH_UNAVAILABLE', error: reason, headers_ms: headersMs, total_ms: since(), bytes: 0 };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function transportProbeLine(result) {
+    const secs = ms => `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(2)}s`;
+    const parts = [`PROBE ${result.size}B`];
+    for (const run of result.runs) {
+      const fail = run.ok ? '' : `FAIL ${run.error} `;
+      if (run.via === 'gm') {
+        parts.push(`GM${run.round} ${fail}hdr ${secs(run.headers_ms)} 1st ${secs(run.first_progress_ms)} load ${secs(run.total_ms)} mat ${secs(run.materialize_ms)}`);
+      } else {
+        parts.push(`fetch${run.round} ${fail}hdr ${secs(run.headers_ms)} load ${secs(run.total_ms)}`);
+      }
+    }
+    return parts.join(' | ');
+  }
+
+  function transportProbeTiming(result) {
+    const round3 = value => Math.round((Number(value) || 0) * 1000) / 1000;
+    const timing = { size: result.size };
+    for (const run of result.runs) {
+      const key = `${run.via === 'gm' ? 'gm' : 'native'}${run.round}`;
+      timing[`${key}_ok`] = run.ok === true;
+      timing[`${key}_headers_ms`] = round3(run.headers_ms);
+      timing[`${key}_total_ms`] = round3(run.total_ms);
+      timing[`${key}_bytes`] = Number(run.bytes) || 0;
+      timing[`${key}_capability`] = String(run.capability || 'none');
+      if (run.via === 'gm') {
+        timing[`${key}_first_progress_ms`] = round3(run.first_progress_ms);
+        timing[`${key}_materialize_ms`] = round3(run.materialize_ms);
+      }
+      if (run.error) timing[`${key}_error`] = String(run.error).slice(0, 64);
+    }
+    return timing;
+  }
+
+  async function archiveTransportProbe(options = {}) {
+    if (transportProbeInFlight) return transportProbeInFlight;
+    const base = normalizedBridgeUrl();
+    if (!base) return { ok: false, error: 'bridge-unavailable', runs: [], size: 0, line: '' };
+    const requested = Number(options.size) || Number(manualArchiveLastTimings?.archive_size) || TRANSPORT_PROBE_DEFAULT_BYTES;
+    const size = Math.max(1, Math.min(TRANSPORT_PROBE_MAX_BYTES, Math.round(requested)));
+    const url = `${base}/v1/probe/bytes?size=${size}`;
+    transportProbeInFlight = (async () => {
+      const runs = [];
+      for (const round of [1, 2]) {
+        const gm = await gmBinaryGet(url, { Accept: 'application/octet-stream' }, TRANSPORT_PROBE_TIMEOUT_MS);
+        const gmOk = gm.outcome === 'load' && gm.status >= 200 && gm.status < 300 && Boolean(gm.bytes);
+        runs.push({
+          via: 'gm',
+          round,
+          ok: gmOk,
+          error: gmOk ? '' : (gm.outcome === 'load' ? `http-${gm.status}` : gm.outcome),
+          headers_ms: gm.probe.headers_ms,
+          first_progress_ms: gm.probe.first_progress_ms,
+          total_ms: gm.probe.onload_ms,
+          materialize_ms: gm.probe.materialize_ms,
+          capability: gm.probe.capability,
+          bytes: Number(gm.bytes?.length) || 0
+        });
+        runs.push({ via: 'native', round, ...(await nativeFetchBinaryProbe(url)) });
+      }
+      const result = { ok: runs.some(run => run.ok), size, runs };
+      result.line = transportProbeLine(result);
+      try {
+        appendBridgeDiagnostic('transport_probe', { severity: 'info', message: result.line, timing: transportProbeTiming(result) });
+      } catch (_) { }
+      return result;
+    })();
+    try {
+      return await transportProbeInFlight;
+    } finally {
+      transportProbeInFlight = null;
+    }
+  }
+
+  async function sha256Hex(bytes) {
+    try {
+      if (!globalThis.crypto?.subtle || typeof globalThis.crypto.subtle.digest !== 'function') return '';
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function applyArchiveRuntime(meta) {
+    if (!autoRuntime || !meta) return false;
+    autoRuntime.archiveName = String(meta.filename || '');
+    autoRuntime.archiveSize = Math.max(0, Number(meta.size) || 0);
+    autoRuntime.archiveModifiedAt = Math.max(0, Number(meta.mtime) || 0) * 1000;
+    autoRuntime.archiveTimestampSource = 'bridge';
+    return saveAutoRuntime({ pauseOnFailure: false });
+  }
+
+  async function attachProjectArchiveForCurrentChat() {
+    if (archiveRefreshInFlight) return { ok: false, reason: 'in-flight' };
+    archiveRefreshInFlight = true;
+    const originKey = currentConversationKey();
+    const setPhase = (phase, detail) => {
+      archiveRefreshState = phase;
+      archiveRefreshDetail = String(detail || '');
+      try { renderAutoAuditState(); } catch (_) { }
+    };
+    const fail = (errorCode, message) => {
+      archiveRefreshState = 'error';
+      archiveRefreshDetail = String(message || errorCode || 'AUTO ZIP failed.');
+      try { renderAutoAuditState(); } catch (_) { }
+      return { ok: false, errorCode, message: archiveRefreshDetail };
+    };
+    try {
+      setPhase('checking', 'Resolving registered project...');
+      const resolution = await resolveRegisteredProjectForArchive();
+      if (!resolution.ok) return fail(resolution.errorCode, resolution.message);
+      const project = resolution.project;
+      archiveRefreshProjectId = String(project.project_id || '');
+      if (autoRuntime) autoRuntime.projectId = archiveRefreshProjectId;
+
+      // T-193: AUTO ZIP and the manual ZIP control are two doors into ONE
+      // canonical attachment engine. The auto door keeps its own status
+      // projection and the shared result codes drive it.
+      const result = await attachCanonicalProjectArchive(project, { source: 'auto', onPhase: setPhase, originConversationKey: originKey });
+      if (!result.ok) return fail(result.errorCode || result.code, result.message);
+      if (result.meta) applyArchiveRuntime(result.meta);
+      setPhase('ready', result.code === 'ALREADY_ATTACHED'
+        ? 'Canonical archive already attached; no re-upload.'
+        : `Attached ${result.filename}.`);
+      return { ok: true, filename: result.filename, reused: result.code === 'ALREADY_ATTACHED' };
+    } catch (error) {
+      return fail('archive-refresh-failed', String(error?.message || 'Unexpected archive refresh error.'));
+    } finally {
+      archiveRefreshInFlight = false;
+      try { renderAutoAuditState(); } catch (_) { }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // T-193: manual conversation -> project binding and the canonical archive
+  // attachment engine. Identity is project_id + canonical SHA-256 + byte size;
+  // a filename never proves equality. Manual and Auto Audit share this state,
+  // so a duplicate is a no-op in either direction.
+  // -------------------------------------------------------------------------
+  const MANUAL_ARCHIVE_BINDING_KEY = 'ai_chatbuttons_manual_archive_binding_v1';
+  // P1 TARGET C: the project registry changes rarely relative to Widget clicks,
+  // and a 10-second TTL re-fetched `/v1/projects` merely because ten seconds had
+  // passed. The picker's cached list is now usable for minutes and is compared
+  // against the Bridge's CONTENT revision whenever it is revalidated; an
+  // explicit Refresh still forces a new generation, and a stale bound-project
+  // ensure error overrides any cache assumption.
+  const MANUAL_ARCHIVE_PROJECTS_TTL_MS = 5 * 60 * 1000;
+  const MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS = 30 * 60 * 1000;
+  const MANUAL_ARCHIVE_TEMPORARY_BINDING_TTL_MS = 24 * 60 * 60 * 1000;
+  const MANUAL_ARCHIVE_OFFLINE_CODES = new Set([
+    'invalid_bridge_url', 'bridge_offline', 'bridge_exception', 'bridge-unavailable',
+    'timeout', 'aborted', 'projects-unavailable', 'archive-request-failed',
+    'archive-request-timeout', 'request-failed'
+  ]);
+  // P1 TARGET C: the project picker owns a HARD application-level deadline that
+  // does not depend on a userscript manager honouring GM_xmlhttpRequest's own
+  // `timeout`. Live operator evidence: `Loading projects...` stayed visible
+  // indefinitely because the runtime never invoked ontimeout/onerror for a
+  // `/v1/projects` request that simply never came back. Within
+  // MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS of opening the picker the menu must
+  // reach PROJECTS_READY | PROJECTS_EMPTY | PROJECTS_TIMEOUT | BRIDGE_OFFLINE |
+  // AUTH_ERROR | FAILED, and never remain in LOADING.
+  const MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS = 6000;
+  const MANUAL_ARCHIVE_PICKER_DEADLINE_MS = 8000;
+  // TARGET M/N: positively verified ZIP-send receipts. Only the minimal
+  // identity is stored (conversation key, project, canonical SHA, payload
+  // digest) -- never composer text, never archive bytes, never a token.
+  const MANUAL_ARCHIVE_SENT_KEY = 'ai_chatbuttons_manual_archive_sent_v1';
+  const MANUAL_ARCHIVE_SENT_MAX = 60;
+  const MANUAL_ARCHIVE_SENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  // TARGET N: for how long a verified receipt suppresses a repeat. A double
+  // click lands inside this window and must never create a second identical
+  // ChatGPT turn; a deliberately different later Send still falls outside the
+  // receipt identity and is always allowed.
+  const MANUAL_ARCHIVE_SENT_SUPPRESS_MS = 120000;
+  const MANUAL_ARCHIVE_LOG_MAX = 24;
+  // TARGET G/K: bounded Send-stage wait. Never unbounded, never a second Send
+  // implementation -- the canonical ChatGPT send engine does the click.
+  // A condition wait: a ready Send returns at once, so the budget only matters
+  // while ChatGPT is still uploading a large archive with no visible progress.
+  const MANUAL_ARCHIVE_SEND_READY_TIMEOUT_MS = 30000;
+  const MANUAL_ARCHIVE_SEND_VERIFY_TIMEOUT_MS = 6000;
+  const MANUAL_ARCHIVE_SEND_VERIFY_HARD_MS = 10000;
+  const MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS = 15000;
+  // TARGET L: transport idempotency and Send intent are separate layers, so a
+  // proven canonical tile may still be sent without any archive work.
+  const MANUAL_ARCHIVE_SEND_MODES = new Set(['send']);
+  const MANUAL_ARCHIVE_STRONG_ATTACHMENT_NAME = /\.[A-Za-z0-9]{1,8}$/;
+  // P1 TARGET B: the archive ensure endpoint is the authority on whether a bound
+  // project is still usable. These are its exact codes for "the binding points
+  // at a project this Bridge cannot serve". They mark the binding stale and
+  // route the operator to the picker instead of silently re-deriving a project.
+  const MANUAL_ARCHIVE_STALE_BINDING_CODES = new Set([
+    'unknown_project', 'project_disabled', 'project_source_missing',
+    'project_source_unavailable', 'project_not_registered'
+  ]);
+  // P1 TARGET G: a bounded, runtime-memory-only content-addressed cache of
+  // canonical archive bytes this runtime has already downloaded and verified
+  // against the Bridge's SHA-256. A same-SHA ensure reuses the verified bytes and
+  // skips BOTH the Bridge GET and a second browser hash. Never keyed on a
+  // filename or a project name, and never persisted into GM storage -- archive
+  // bytes do not belong in userscript storage.
+  const MANUAL_ARCHIVE_BYTE_CACHE_MAX_ITEMS = 4;
+  const MANUAL_ARCHIVE_BYTE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+  const manualArchiveByteCache = new Map();
+
+  let manualArchiveProjectsCache = { projects: [], fetchedAt: 0, revision: '' };
+  let manualArchiveMenuState = {
+    loading: false,
+    refreshing: false,
+    error: '',
+    errorCode: '',
+    deadlined: false,
+    projects: [],
+    fetchedAt: 0,
+    generation: 0,
+    openToken: 0
+  };
+  let manualArchiveUiState = { phase: 'idle', detail: '', projectId: '', projectName: '', code: '', conversationKey: '', at: 0 };
+  let manualArchiveRegistryGeneration = 0;
+  let manualArchiveDeliveredGeneration = 0;
+  let manualArchiveRegistryFlight = null;
+  let manualArchiveRegistryFlightGeneration = 0;
+  let manualArchiveRegistryTimer = 0;
+  let manualArchiveDebug = null;
+  let manualArchiveTransactionGeneration = 0;
+  let manualArchiveFlight = null;
+  //: TARGET T: the attach-only escape hatch flag (Shift-click or the picker
+  //: "Attach only" action). Consumed by exactly one transaction.
+  let manualArchiveAttachOnly = false;
+  const manualArchiveLog = [];
+  const canonicalArchiveFlights = new Map();
+  //: P1 TARGET B/G: ONE shared canonical transport per conversation + project,
+  //: split by KIND (ensure, verified bytes). Manual ZIP and Auto Audit are two
+  //: doors into the same transport, and removing the registry round-trip from the
+  //: bound path made them race each other: without this, both doors would ensure
+  //: and both would GET. Attach and Send stay owned by each caller, so joining a
+  //: transport never performs another flow's Send.
+  const canonicalTransportFlights = new Map();
+  //: P1 TARGET B: bindings this runtime has proven INVALID. Session-scoped on
+  //: purpose -- `manualArchiveBindingsStore()` normalizes a binding down to its
+  //: proven identity, so a persisted "stale" flag would be dropped on read and
+  //: could disagree with the Bridge about a project the operator just fixed.
+  const manualArchiveStaleBindings = new Map();
+  //: P1 TARGET A: the bounded phase timings of the most recent transaction.
+  let manualArchiveLastTimings = null;
+
+  // -------------------------------------------------------------------------
+  // P1 TARGET A: bounded per-transaction phase timing. Never a token, never
+  // archive bytes, never composer text -- durations and counts only, so the
+  // dominant phase is provable instead of guessed.
+  // -------------------------------------------------------------------------
+  function manualArchiveNow() {
+    const perf = globalThis.performance;
+    if (perf && typeof perf.now === 'function') {
+      const value = Number(perf.now());
+      if (Number.isFinite(value)) return value;
+    }
+    return Date.now();
+  }
+
+  function manualArchiveDeliveryTraceId() {
+    // APP-PERF-001 TARGET P: one bounded correlation id per delivery trace.
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function manualArchiveTimingBegin() {
+    return {
+      startedAt: manualArchiveNow(),
+      trace_id: manualArchiveDeliveryTraceId(),
+      path: 'manual',
+      first_ui_feedback_ms: 0,
+      send_clicked_ms: 0,
+      project_resolution_ms: 0,
+      registry_ms: 0,
+      ensure_total_ms: 0,
+      freshness_probe_ms: 0,
+      archive_pack_ms: 0,
+      server_archive_sha_ms: 0,
+      download_ms: 0,
+      // SRC-083: the GET split. download_ms keeps its meaning (request start
+      // to normalized bytes); these name where inside it the time went.
+      get_total_ms: 0,
+      get_headers_ms: 0,
+      get_first_progress_ms: 0,
+      get_transfer_ms: 0,
+      get_bytes: 0,
+      get_progress_events: 0,
+      get_progress_capability: '',
+      server_get_prep_ms: 0,
+      server_digest_ms: 0,
+      server_digest_source: '',
+      browser_response_materialize_ms: 0,
+      transport_complete_ms: 0,
+      browser_sha_ms: 0,
+      attachment_injection_ms: 0,
+      attachment_ready_ms: 0,
+      send_ready_ms: 0,
+      send_verify_ms: 0,
+      total_ms: 0,
+      archive_size: 0,
+      ensure_result: '',
+      get_count: 0,
+      injection_count: 0,
+      send_count: 0,
+      result_code: '',
+      hot_proof: false,
+      source_walk_skipped: false,
+      sha_receipt_reused: false,
+      browser_sha_cache_hit: false,
+      browser_sha_computed: false,
+      registry_requests: 0
+    };
+  }
+
+  function manualArchiveTimingSet(timings, key, ms) {
+    if (!timings) return 0;
+    const duration = Math.max(0, Number(ms) || 0);
+    timings[key] = Math.round(duration * 1000) / 1000;
+    return duration;
+  }
+
+  function manualArchiveTimingMark(timings, key, startedAt) {
+    return manualArchiveTimingSet(timings, key, manualArchiveNow() - Number(startedAt || 0));
+  }
+
+  // APP-PERF-001 TARGET Q: the compact recent-delivery diagnostic. Durations,
+  // counts and ids only -- never archive bytes, never composer text, never
+  // tokens or credentials.
+  function manualArchiveTimingLine(timings) {
+    if (!timings) return '';
+    const secs = ms => `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(2)}s`;
+    if (String(timings.path || 'manual') === 'worker') {
+      return `Worker ${secs(timings.total_ms)} | poll ${secs(timings.poll_wait_ms)} | artifact ${secs(timings.artifact_fetch_ms)} | inject ${secs(timings.injection_ms)} | attach ${secs(timings.attachment_ready_ms)} | send ${secs(timings.send_accept_ms)} | ack ${secs(timings.transition_ack_ms)}`;
+    }
+    return `ZIP ${secs(timings.total_ms)} | ensure ${secs(timings.ensure_total_ms)} | GET ${secs(timings.download_ms)} | attach ${secs(timings.attachment_ready_ms)} | send-ready ${secs(timings.send_ready_ms)} | verify ${secs(timings.send_verify_ms)}`;
+  }
+
+  function manualArchiveTimingDominant(timings) {
+    if (!timings) return '';
+    const phases = String(timings.path || 'manual') === 'worker'
+      ? ['poll_wait_ms', 'artifact_fetch_ms', 'injection_ms', 'attachment_ready_ms', 'send_accept_ms', 'transition_ack_ms']
+      : ['registry_ms', 'project_resolution_ms', 'ensure_total_ms', 'download_ms', 'browser_sha_ms', 'attachment_injection_ms', 'attachment_ready_ms', 'send_ready_ms', 'send_verify_ms'];
+    let best = '';
+    let bestMs = 0;
+    for (const key of phases) {
+      const value = Number(timings[key]) || 0;
+      if (value > bestMs) { bestMs = value; best = key; }
+    }
+    return best;
+  }
+
+  // SRC-083 TARGET A: where inside "GET" the time went, in the order the bytes
+  // travel. Empty when this delivery performed no GET (cache hit, no-op).
+  function manualArchiveGetSplitLine(timings) {
+    if (!timings || !(Number(timings.get_total_ms) > 0 || Number(timings.download_ms) > 0)) return '';
+    const secs = ms => `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(2)}s`;
+    const source = timings.server_digest_source ? `/${timings.server_digest_source}` : '';
+    return `GET split hdr ${secs(timings.get_headers_ms)} | 1st ${secs(timings.get_first_progress_ms)} | body ${secs(timings.get_transfer_ms)} | onload ${secs(timings.get_total_ms)} | mat ${secs(timings.browser_response_materialize_ms)} | sha ${secs(timings.browser_sha_ms)} | srv ${secs(timings.server_get_prep_ms)}${source} | ${Math.max(0, Number(timings.get_bytes) || 0)}B | ${timings.get_progress_capability || 'none'} x${Math.max(0, Number(timings.get_progress_events) || 0)}`;
+  }
+
+  // SRC-083: the structured twin of the compact lines -- numbers, booleans and
+  // short closed-vocabulary strings only, so the Bridge-side mirror carries the
+  // whole split to disk and nobody has to copy a status line by hand.
+  function manualArchiveTimingDiagnostic(timings) {
+    const out = {};
+    if (!timings) return out;
+    for (const [key, value] of Object.entries(timings)) {
+      if (key === 'startedAt' || key === 'published') continue;
+      if (typeof value === 'number' && Number.isFinite(value)) out[key] = Math.round(value * 1000) / 1000;
+      else if (typeof value === 'boolean') out[key] = value;
+      else if (typeof value === 'string' && value.length <= 64) out[key] = value;
+    }
+    return out;
+  }
+
+  // TARGET Q: one diagnostics record per trace. Published exactly once even
+  // when both the transaction outcome and the click-level action finish the
+  // same timings object.
+  function manualArchivePublishTiming(timings) {
+    if (!timings || timings.published) return manualArchiveTimingLine(timings);
+    timings.published = true;
+    manualArchiveTimingMark(timings, 'total_ms', timings.startedAt);
+    timings.dominant_phase = manualArchiveTimingDominant(timings);
+    const split = manualArchiveGetSplitLine(timings);
+    try {
+      appendBridgeDiagnostic('delivery_timing', {
+        severity: 'info',
+        message: `${manualArchiveTimingLine(timings)}${timings.dominant_phase ? ` · dominant ${timings.dominant_phase}` : ''}${split ? ` · ${split}` : ''}`,
+        trace_id: String(timings.trace_id || ''),
+        path: String(timings.path || 'manual'),
+        timing: manualArchiveTimingDiagnostic(timings)
+      });
+    } catch (_) { }
+    return manualArchiveTimingLine(timings);
+  }
+
+  // P1 TARGET G: the verified-byte cache lookup, with the identity rules the
+  // ticket requires: an EXACT canonical SHA-256 key, and a byte count that still
+  // agrees with the Bridge's own size. No SHA, or a size that disagrees, is a
+  // miss and the normal GET + hash path runs.
+  function manualArchiveCachedBytes(meta) {
+    const sha = String(meta?.sha256 || '').toLowerCase();
+    if (!sha) return null;
+    const bytes = manualArchiveByteCacheGet(sha);
+    if (!bytes) return null;
+    if (meta?.size && Number(bytes.length) !== Number(meta.size)) return null;
+    return bytes;
+  }
+
+  function manualArchiveTimingsFromServer(timings, meta) {
+    const server = meta && meta.timings && typeof meta.timings === 'object' ? meta.timings : null;
+    if (!timings || !server) return timings;
+    manualArchiveTimingSet(timings, 'freshness_probe_ms', server.freshness_probe_ms);
+    manualArchiveTimingSet(timings, 'archive_pack_ms', server.archive_pack_ms);
+    manualArchiveTimingSet(timings, 'server_archive_sha_ms', server.server_archive_sha_ms);
+    timings.hot_proof = server.hot_proof === true;
+    timings.source_walk_skipped = server.source_walk_skipped === true;
+    timings.sha_receipt_reused = server.sha_receipt_reused === true;
+    return timings;
+  }
+
+  // P1 TARGET J: the button must show a concrete phase before any await can
+  // swallow the frame. Two hops (next animation frame, then a macrotask) put the
+  // paint strictly before the first async work of the transaction.
+  function manualArchivePaintFrame() {
+    return new Promise(resolve => {
+      const raf = globalThis.requestAnimationFrame;
+      if (typeof raf !== 'function') {
+        setTimeout(resolve, 0);
+        return;
+      }
+      raf(() => setTimeout(resolve, 0));
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // P1 TARGET G: content-addressed verified-byte cache (see constants above).
+  // -------------------------------------------------------------------------
+  function manualArchiveByteCacheGet(sha256) {
+    const key = String(sha256 || '').toLowerCase();
+    if (!key) return null;
+    const entry = manualArchiveByteCache.get(key);
+    if (!entry) return null;
+    // LRU: a hit becomes the newest entry, so eviction order is deterministic.
+    manualArchiveByteCache.delete(key);
+    manualArchiveByteCache.set(key, entry);
+    return entry.bytes || null;
+  }
+
+  function manualArchiveByteCachePut(sha256, bytes) {
+    const key = String(sha256 || '').toLowerCase();
+    if (!key || !bytes || !Number(bytes.length)) return false;
+    if (bytes.length > MANUAL_ARCHIVE_BYTE_CACHE_MAX_BYTES) return false;
+    if (manualArchiveByteCache.has(key)) manualArchiveByteCache.delete(key);
+    manualArchiveByteCache.set(key, { bytes, size: Number(bytes.length) || 0, at: Date.now() });
+    let total = 0;
+    for (const entry of manualArchiveByteCache.values()) total += Number(entry.size) || 0;
+    // Deterministic eviction: oldest insertion first, until BOTH bounds hold.
+    // The size bound never evicts the entry that was just admitted.
+    while (manualArchiveByteCache.size > MANUAL_ARCHIVE_BYTE_CACHE_MAX_ITEMS
+      || (total > MANUAL_ARCHIVE_BYTE_CACHE_MAX_BYTES && manualArchiveByteCache.size > 1)) {
+      const oldest = manualArchiveByteCache.keys().next().value;
+      const dropped = manualArchiveByteCache.get(oldest);
+      manualArchiveByteCache.delete(oldest);
+      total -= Number(dropped?.size) || 0;
+    }
+    return true;
+  }
+
+  function manualArchiveByteCacheStats() {
+    let total = 0;
+    for (const entry of manualArchiveByteCache.values()) total += Number(entry.size) || 0;
+    return { items: manualArchiveByteCache.size, bytes: total };
+  }
+
+  function manualArchiveByteCacheClear() {
+    manualArchiveByteCache.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // P1 TARGET B: a bound project the Bridge rejected is stale until the operator
+  // chooses again. Marking is what makes the state visible; it is never used to
+  // skip the authoritative ensure.
+  // -------------------------------------------------------------------------
+  function manualArchiveBindingIsStaleCode(code) {
+    return MANUAL_ARCHIVE_STALE_BINDING_CODES.has(String(code || ''));
+  }
+
+  function markManualArchiveBindingStale(conversationKey, code, message) {
+    const key = String(conversationKey || '');
+    if (!key) return null;
+    const marker = {
+      code: String(code || 'project_stale'),
+      message: String(message || ''),
+      at: Date.now()
+    };
+    manualArchiveStaleBindings.set(key, marker);
+    return marker;
+  }
+
+  function manualArchiveStaleMarker(conversationKey = currentConversationKey()) {
+    return manualArchiveStaleBindings.get(String(conversationKey || '')) || null;
+  }
+
+  function clearManualArchiveStaleMarker(conversationKey) {
+    return manualArchiveStaleBindings.delete(String(conversationKey || ''));
+  }
+
+  function manualArchiveBoundProject(binding) {
+    return {
+      project_id: String(binding?.project_id || ''),
+      display_name: String(binding?.display_name || '')
+    };
+  }
+
+  function manualArchiveKeyTabId(key) {
+    const raw = String(key || '');
+    if (raw.startsWith('draft:') || raw.startsWith('auth:')) {
+      const parts = raw.split(':');
+      return parts[1] || '';
+    }
+    return '';
+  }
+
+  function manualArchiveBindingsStore() {
+    try {
+      const raw = GM_getValue(MANUAL_ARCHIVE_BINDING_KEY, '');
+      if (!raw) return { version: 1, bindings: {} };
+      const parsed = JSON.parse(String(raw));
+      const source = parsed && typeof parsed === 'object' && parsed.bindings && typeof parsed.bindings === 'object'
+        ? parsed.bindings : null;
+      if (!source) return { version: 1, bindings: {} };
+      const bindings = {};
+      for (const [key, value] of Object.entries(source)) {
+        if (!/^(?:c|draft|auth):/.test(String(key))) continue;
+        const projectId = String(value?.project_id || '').trim();
+        if (!projectId) continue;
+        bindings[key] = {
+          project_id: projectId,
+          display_name: String(value?.display_name || ''),
+          updatedAt: Math.max(0, Number(value?.updatedAt) || 0)
+        };
+      }
+      return { version: 1, bindings };
+    } catch (_) {
+      return { version: 1, bindings: {} };
+    }
+  }
+
+  function persistManualArchiveBindings(bindings) {
+    try {
+      GM_setValue(MANUAL_ARCHIVE_BINDING_KEY, JSON.stringify({ version: 1, bindings: bindings || {} }));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function manualArchiveBindingFor(key = currentConversationKey()) {
+    const conversationKey = String(key || '');
+    if (!conversationKey) return null;
+    return manualArchiveBindingsStore().bindings[conversationKey] || null;
+  }
+
+  function setManualArchiveBinding(project, key = currentConversationKey()) {
+    const conversationKey = String(key || '');
+    const projectId = String(project?.project_id || '').trim();
+    if (!conversationKey || !projectId) return false;
+    const store = manualArchiveBindingsStore();
+    const owningTab = manualArchiveKeyTabId(conversationKey);
+    // Cleanup is scoped to the owning tab/conversation lifecycle:
+    // Only remove previous temporary draft/auth bindings belonging to THIS owning tab.
+    // An independent tab's draft/auth binding must never be globally deleted.
+    if (owningTab) {
+      for (const existing of Object.keys(store.bindings)) {
+        if (existing === conversationKey) continue;
+        if (manualArchiveKeyTabId(existing) === owningTab) {
+          delete store.bindings[existing];
+        }
+      }
+    }
+    // Prune abandoned temporary bindings that exceeded the TTL
+    const now = Date.now();
+    for (const [existing, val] of Object.entries(store.bindings)) {
+      if (existing.startsWith('draft:') || existing.startsWith('auth:')) {
+        const updatedAt = Number(val?.updatedAt || 0);
+        if (updatedAt && now - updatedAt > MANUAL_ARCHIVE_TEMPORARY_BINDING_TTL_MS) {
+          delete store.bindings[existing];
+        }
+      }
+    }
+    store.bindings[conversationKey] = {
+      project_id: projectId,
+      display_name: String(project.display_name || project.audit_name || ''),
+      updatedAt: Date.now()
+    };
+    if (!persistManualArchiveBindings(store.bindings)) return false;
+    // An explicit choice retires any stale marker for this conversation.
+    clearManualArchiveStaleMarker(conversationKey);
+    manualArchiveUiState = {
+      phase: 'idle',
+      detail: '',
+      projectId,
+      projectName: String(project.display_name || project.audit_name || ''),
+      code: 'BOUND',
+      conversationKey,
+      at: Date.now()
+    };
+    renderManualArchiveControl();
+    return true;
+  }
+
+  function clearManualArchiveBinding(key = currentConversationKey()) {
+    const conversationKey = String(key || '');
+    const store = manualArchiveBindingsStore();
+    const existed = Boolean(store.bindings[conversationKey]);
+    if (existed) {
+      delete store.bindings[conversationKey];
+      if (!persistManualArchiveBindings(store.bindings)) return false;
+    }
+    clearManualArchiveStaleMarker(conversationKey);
+    manualArchiveUiState = { phase: 'idle', detail: '', projectId: '', projectName: '', code: '', conversationKey, at: Date.now() };
+    renderManualArchiveControl();
+    return existed;
+  }
+
+  // T-193 TARGET B: a binding created in a temporary draft migrates only
+  // through the existing canonical conversation identity transition.
+  function migrateManualArchiveBinding(previousKey, key) {
+    const from = String(previousKey || '');
+    const to = String(key || '');
+    if (!from.startsWith('draft:') || !to.startsWith('c:')) return false;
+    const store = manualArchiveBindingsStore();
+    const binding = store.bindings[from];
+    if (!binding) return false;
+    if (!store.bindings[to]) store.bindings[to] = { ...binding, updatedAt: Date.now() };
+    delete store.bindings[from];
+    if (!persistManualArchiveBindings(store.bindings)) return false;
+    renderManualArchiveControl();
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // P1 TARGET C/D/E/F: bounded, generation-owned, single-flight project
+  // registry reads for the manual ZIP picker.
+  // ---------------------------------------------------------------------------
+  function manualArchiveShortKey(key) {
+    const raw = String(key || '');
+    if (!raw) return '';
+    let hash = 0;
+    for (let index = 0; index < raw.length; index += 1) {
+      hash = ((hash << 5) - hash + raw.charCodeAt(index)) | 0;
+    }
+    return `${raw.startsWith('c:') ? 'c' : raw.startsWith('draft:') ? 'd' : raw.startsWith('auth:') ? 'a' : 'k'}:${Math.abs(hash).toString(16)}`;
+  }
+
+  function manualArchiveRegistryActive() {
+    if (!panel) return false;
+    const menu = panel.querySelector('#acb-manual-zip-menu');
+    return Boolean(menu && !menu.hidden);
+  }
+
+  function manualArchiveOfflineMessage(result) {
+    const code = String(result?.errorCode || '');
+    if (code === 'invalid_auth' || code === 'auth_failed' || Number(result?.status) === 401 || Number(result?.status) === 403) {
+      return 'Bridge authorization failed';
+    }
+    if (code === 'registry-deadline' || code === 'timeout' || /timeout/i.test(String(result?.message || ''))) {
+      return 'Registry timed out';
+    }
+    if (bridgeOfflineResult(code)) return 'Bridge offline';
+    return String(result?.message || 'Project registry is unavailable.');
+  }
+
+  function manualArchiveRegistryDelay(ms) {
+    return new Promise(resolve => {
+      manualArchiveRegistryTimer = setTimeout(() => {
+        manualArchiveRegistryTimer = 0;
+        resolve({ __registryDeadline: true });
+      }, Math.max(1, Number(ms) || MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS));
+    });
+  }
+
+  function cancelManualArchiveRegistryDeadline() {
+    if (!manualArchiveRegistryTimer) return;
+    clearTimeout(manualArchiveRegistryTimer);
+    manualArchiveRegistryTimer = 0;
+  }
+
+  function manualArchiveRegistryGenerationIsCurrent(generation) {
+    const wanted = Math.max(0, Number(generation) || 0);
+    return wanted > 0 && wanted === manualArchiveRegistryGeneration
+      && wanted > manualArchiveDeliveredGeneration;
+  }
+
+  function dispatchManualArchiveRegistryRequest(generation) {
+    const startedAt = Date.now();
+    // TARGET E: only the live generation may touch the picker. Once this
+    // dispatch has ended -- by answer or by deadline -- every later arrival is
+    // stale: it may refresh the safe cache but must never resurrect a loading
+    // state or overwrite registry state the operator already left.
+    let live = true;
+    let settled = false;
+    let resolveFlight = null;
+    const flightHandle = new Promise(resolve => { resolveFlight = resolve; });
+
+    const publish = result => {
+      const elapsedMs = Math.max(0, Date.now() - startedAt);
+      if (!live || !manualArchiveRegistryGenerationIsCurrent(generation)) {
+        if (result?.ok && Array.isArray(result.projects) && result.projects.length) {
+          manualArchiveProjectsCache = { projects: result.projects, fetchedAt: Date.now() };
+        }
+        manualArchiveDebug = { ...(manualArchiveDebug || {}), staleGeneration: generation, staleElapsedMs: elapsedMs };
+        return;
+      }
+      manualArchiveDeliveredGeneration = generation;
+      manualArchiveDebug = {
+        generation,
+        conversationKey: manualArchiveShortKey(currentConversationKey()),
+        bridgeBase: (() => { try { return normalizedBridgeUrl(); } catch (_) { return ''; } })(),
+        startedAt,
+        completedAt: Date.now(),
+        elapsedMs,
+        status: Number(result?.status) || 0,
+        errorCode: String(result?.errorCode || ''),
+        ok: Boolean(result?.ok),
+        fromCache: Boolean(result?.fromCache),
+        pickerOpenAtCompletion: manualArchiveRegistryActive()
+      };
+      manualArchiveMenuState = {
+        loading: false,
+        refreshing: false,
+        error: '',
+        errorCode: '',
+        deadlined: false,
+        projects: Array.isArray(result?.projects) ? result.projects : [],
+        fetchedAt: Date.now(),
+        generation,
+        openToken: manualArchiveMenuState.openToken
+      };
+      // TARGET F: on failure keep the cached list usable AND surface the real
+      // bounded state instead of a blank spinner.
+      if (!result?.ok) {
+        const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+        manualArchiveMenuState.projects = cached;
+        manualArchiveMenuState.error = manualArchiveOfflineMessage(result);
+        manualArchiveMenuState.errorCode = String(result?.errorCode || 'projects-unavailable');
+        manualArchiveMenuState.deadlined = result?.errorCode === 'registry-deadline';
+      } else if (result.projects.length) {
+        const revision = String(result?.revision || '');
+        // P1 TARGET C: with a CONTENT revision a revalidation can state that the
+        // registry is unchanged, so the cached list keeps its authority instead
+        // of being retired on a clock alone.
+        const revisionChanged = Boolean(manualArchiveProjectsCache.revision)
+          && revision !== String(manualArchiveProjectsCache.revision);
+        manualArchiveProjectsCache = { projects: result.projects, fetchedAt: Date.now(), revision };
+        manualArchiveDebug = { ...(manualArchiveDebug || {}), registryRevision: revision, registryRevisionChanged: revisionChanged };
+      }
+      renderManualArchiveMenu();
+      positionManualArchiveMenu();
+      renderManualArchiveControl();
+    };
+
+    const settle = (result, options = {}) => {
+      if (settled) {
+        // A late arrival after the deadline: it is recorded as stale by
+        // publish() and must not resolve the (already resolved) flight.
+        publish(result);
+        return;
+      }
+      settled = true;
+      cancelManualArchiveRegistryDeadline();
+      // TARGET E: only this dispatch may release the single-flight slot. A
+      // superseded generation finishing late must not unregister a newer
+      // in-flight request, which would let Refresh start a parallel one.
+      if (manualArchiveRegistryFlight === flightHandle) {
+        manualArchiveRegistryFlight = null;
+        manualArchiveRegistryFlightGeneration = 0;
+      }
+      if (options.timedOut) {
+        // The GM request may still be live. Abort it where the manager supports
+        // abort, so its late answer cannot be mistaken for a fresh registry.
+        try { if (typeof options.request?.abort === 'function') options.request.abort(); } catch (_) { }
+      }
+      publish(result);
+      // Only now does this dispatch stop owning the UI: the result it just
+      // delivered is the one the operator must keep seeing.
+      live = false;
+      resolveFlight(result);
+    };
+
+    const request = listRegisteredProjects();
+    const deadlineResult = () => ({ ok: false, projects: [], errorCode: 'registry-deadline', message: 'Registry timed out' });
+    manualArchiveRegistryDelay(MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS)
+      .then(() => settle(deadlineResult(), { timedOut: true, request }));
+    Promise.resolve(request)
+      .then(result => settle(result))
+      .catch(error => settle({
+        ok: false,
+        projects: [],
+        errorCode: 'request-failed',
+        message: String(error?.message || 'Bridge project registry is unavailable.')
+      }));
+    return flightHandle;
+  }
+
+  // P1 TARGET C: ONE owner for "may the cached picker list be used as is?".
+  // Both the explicit registry read and the picker open consult it, so the two
+  // can no longer disagree about how stale is too stale.
+  function manualArchiveProjectsCacheUsable(options = {}) {
+    if (options.force) return false;
+    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    if (!cached.length) return false;
+    const age = Date.now() - Number(manualArchiveProjectsCache.fetchedAt || 0);
+    return age <= MANUAL_ARCHIVE_PROJECTS_TTL_MS;
+  }
+
+  function manualArchiveProjectsCacheFreshEmpty() {
+    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    if (cached.length) return false;
+    if (!(Number(manualArchiveMenuState.generation || 0) > 0)) return false;
+    return (Date.now() - Number(manualArchiveProjectsCache.fetchedAt || 0)) <= MANUAL_ARCHIVE_PROJECTS_TTL_MS;
+  }
+
+  function readManualArchiveRegistry(options = {}) {
+    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    if (manualArchiveProjectsCacheUsable(options)) {
+      // No request, no registry I/O: the cached list is still current for this
+      // policy window, and the Bridge's archive endpoints remain authoritative
+      // for anything the archive path actually decides.
+      return Promise.resolve({ ok: true, projects: cached, cached: true, fromCache: true, revision: manualArchiveProjectsCache.revision || '' });
+    }
+    if (manualArchiveRegistryFlight && manualArchiveRegistryFlightGeneration === manualArchiveRegistryGeneration) {
+      return manualArchiveRegistryFlight;
+    }
+    manualArchiveRegistryGeneration += 1;
+    const generation = manualArchiveRegistryGeneration;
+    const flight = dispatchManualArchiveRegistryRequest(generation);
+    manualArchiveRegistryFlight = flight;
+    manualArchiveRegistryFlightGeneration = generation;
+    return flight;
+  }
+
+  function listManualArchiveProjects(options = {}) {
+    return readManualArchiveRegistry(options);
+  }
+
+  function bridgeOfflineResult(errorCode) {
+    return MANUAL_ARCHIVE_OFFLINE_CODES.has(String(errorCode || ''));
+  }
+
+  function setManualArchiveUiState(phase, detail = '', project = null, code = '', conversationKey = currentConversationKey()) {
+    const projectId = String(project?.project_id || manualArchiveUiState.projectId || '');
+    const projectName = String(project?.display_name || project?.audit_name || manualArchiveUiState.projectName || '');
+    const nextConversationKey = String(conversationKey || currentConversationKey() || '');
+    const sameProject = projectId && projectId === String(manualArchiveUiState.projectId || '');
+    const now = Date.now();
+    const samePhase = manualArchiveUiState.phase === phase
+      && manualArchiveUiState.conversationKey === nextConversationKey;
+    manualArchiveUiState = {
+      phase,
+      detail: String(detail || ''),
+      projectId,
+      projectName,
+      code: String(code || manualArchiveUiState.code || ''),
+      conversationKey: nextConversationKey,
+      operationGeneration: sameProject && manualArchiveUiState.conversationKey === nextConversationKey
+        ? Math.max(0, Number(manualArchiveUiState.operationGeneration) || 0)
+        : manualArchiveTransactionGeneration,
+      phaseStartedAt: samePhase ? Number(manualArchiveUiState.phaseStartedAt) || now : now,
+      at: now
+    };
+    renderManualArchiveControl();
+    scheduleManualArchiveElapsedTick();
+  }
+
+  // SRC-083 TARGET K: a busy phase that takes human-visible time shows how long
+  // it has been running ("GET 1.8s"), so a stall names itself. Instant phases
+  // stay quiet, and the control re-renders at a bounded cadence, never per frame.
+  const MANUAL_ARCHIVE_ELAPSED_SHOW_MS = 700;
+  const MANUAL_ARCHIVE_ELAPSED_TICK_MS = 500;
+  let manualArchiveElapsedTimer = 0;
+
+  function manualArchiveElapsedSuffix(stateName) {
+    if (!manualArchivePhaseIsBusy(stateName) || manualArchiveUiState.phase !== stateName) return '';
+    const elapsed = Date.now() - (Number(manualArchiveUiState.phaseStartedAt) || Date.now());
+    if (!(elapsed >= MANUAL_ARCHIVE_ELAPSED_SHOW_MS)) return '';
+    return ` ${(elapsed / 1000).toFixed(1)}s`;
+  }
+
+  function scheduleManualArchiveElapsedTick() {
+    if (manualArchiveElapsedTimer) return;
+    if (!manualArchivePhaseIsBusy(manualArchiveUiState.phase)) return;
+    manualArchiveElapsedTimer = setTimeout(() => {
+      manualArchiveElapsedTimer = 0;
+      if (!manualArchivePhaseIsBusy(manualArchiveUiState.phase)) return;
+      renderManualArchiveControl();
+      scheduleManualArchiveElapsedTick();
+    }, MANUAL_ARCHIVE_ELAPSED_TICK_MS);
+  }
+
+  // TARGET S: compact, readable status. Internal diagnostics stay in the log.
+  function manualArchiveControlLabel(stateName, projectName) {
+    const name = disambiguateProjectName(projectName);
+    const prefix = name ? `${name} · ` : '';
+    const busyLabel = word => {
+      const suffix = manualArchiveElapsedSuffix(stateName);
+      return suffix ? `${prefix}${word}${suffix}` : `${prefix}${word}...`;
+    };
+    switch (String(stateName || 'unbound')) {
+      case 'checking': return busyLabel('CHECK');
+      case 'packing': return busyLabel('PACK');
+      case 'downloading': return busyLabel('GET');
+      case 'verifying': return busyLabel('VERIFY');
+      case 'attaching': return busyLabel('ATTACH');
+      case 'sending': return busyLabel('SEND');
+      case 'sent': return `${prefix}SENT ✓`;
+      case 'already_sent': return `${prefix}ALREADY ✓`;
+      case 'ready': return `${prefix}ZIP ✓`;
+      // TARGET K: a failed automatic Send must be visible on the compact control
+      // instead of reading like a successful attach-only completion.
+      case 'send_timeout': return `${prefix}SEND !`;
+      case 'send_pending': return `${prefix}SEND ?`;
+      case 'send_cancelled': return `${prefix}NO SEND`;
+      case 'error': return `${prefix}ZIP !`;
+      case 'unbound': return 'ZIP ▾';
+      default: return name ? `${prefix}ZIP` : 'ZIP ▾';
+    }
+  }
+
+  function manualArchiveBusyPhases() {
+    return ['checking', 'packing', 'downloading', 'verifying', 'attaching', 'sending'];
+  }
+
+  function manualArchivePhaseIsBusy(phase) {
+    return manualArchiveBusyPhases().includes(String(phase || ''));
+  }
+
+  // TARGET OBSERVABILITY: bounded per-transaction evidence. Never a token,
+  // never archive bytes, never the composer text itself -- only its identity.
+  function manualArchiveRecord(entry) {
+    const timings = entry?.timings && typeof entry.timings === 'object' ? entry.timings : null;
+    const record = {
+      at: Date.now(),
+      conversationKey: manualArchiveShortKey(entry?.conversationKey || currentConversationKey()),
+      projectId: String(entry?.projectId || ''),
+      operationGeneration: Math.max(0, Number(entry?.operationGeneration) || 0),
+      registryElapsedMs: Math.max(0, Number(entry?.registryElapsedMs) || 0),
+      ensureCode: String(entry?.ensureCode || ''),
+      shaPrefix: String(entry?.shaPrefix || '').slice(0, 12),
+      getCount: Math.max(0, Number(entry?.getCount) || 0),
+      injectionCount: Math.max(0, Number(entry?.injectionCount) || 0),
+      sendAttempts: Math.max(0, Number(entry?.sendAttempts) || 0),
+      sendAccepted: entry?.sendAccepted === true,
+      resultCode: String(entry?.resultCode || ''),
+      // P1 TARGET A: a bounded phase summary. Durations and counts only.
+      timingMs: timings ? {
+        registry: Math.max(0, Number(timings.registry_ms) || 0),
+        ensure: Math.max(0, Number(timings.ensure_total_ms) || 0),
+        freshness: Math.max(0, Number(timings.freshness_probe_ms) || 0),
+        pack: Math.max(0, Number(timings.archive_pack_ms) || 0),
+        serverSha: Math.max(0, Number(timings.server_archive_sha_ms) || 0),
+        download: Math.max(0, Number(timings.download_ms) || 0),
+        browserSha: Math.max(0, Number(timings.browser_sha_ms) || 0),
+        attachReady: Math.max(0, Number(timings.attachment_ready_ms) || 0),
+        send: Math.max(0, Number(timings.send_ready_ms) || 0) + Math.max(0, Number(timings.send_verify_ms) || 0),
+        total: Math.max(0, Number(timings.total_ms) || 0)
+      } : null
+    };
+    manualArchiveLog.push(record);
+    if (manualArchiveLog.length > MANUAL_ARCHIVE_LOG_MAX) manualArchiveLog.splice(0, manualArchiveLog.length - MANUAL_ARCHIVE_LOG_MAX);
+    return record;
+  }
+
+  function disambiguateProjectName(name, maxLength = 18) {
+    const str = String(name || '').trim();
+    if (!str || str.length <= maxLength) return str;
+    const tail = str.slice(-(maxLength - 1)).replace(/^_+/, '');
+    return `…${tail}`;
+  }
+
+  function renderManualArchiveMenu() {
+    const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+    const list = menu ? menu.querySelector('#acb-manual-zip-menu-list') : null;
+    const clearButton = menu ? menu.querySelector('#acb-manual-zip-clear') : null;
+    const refreshButton = menu ? menu.querySelector('#acb-manual-zip-refresh') : null;
+    if (!menu || !list) return;
+    list.textContent = '';
+    const binding = manualArchiveBindingFor();
+    const note = (text, stateName = '') => {
+      const row = document.createElement('div');
+      row.className = 'acb-manual-zip-note';
+      if (stateName) row.dataset.state = stateName;
+      row.textContent = text;
+      list.appendChild(row);
+    };
+    const hasProjects = manualArchiveMenuState.projects.length > 0;
+    let emptyNote = '';
+    // TARGET D: stale-while-revalidate. A usable cached list is shown
+    // immediately with a compact refreshing indicator; it is never replaced by
+    // a blank `Loading projects...`. `Loading projects...` is only reachable
+    // when there is genuinely nothing cached, and only until the hard deadline.
+    if (!hasProjects && manualArchiveMenuState.loading) {
+      note('Loading projects...', 'loading');
+    } else if (manualArchiveMenuState.error) {
+      note(manualArchiveMenuState.error, 'error');
+    } else if (!hasProjects) {
+      emptyNote = 'No registered AUDAPACK projects.';
+    }
+    if (manualArchiveMenuState.refreshing) note('Refreshing...', 'refreshing');
+    if (emptyNote && !manualArchiveMenuState.error) note(emptyNote);
+    if (hasProjects) {
+      for (const project of manualArchiveMenuState.projects) {
+        const projectId = String(project.project_id || '');
+        if (!projectId) continue;
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.dataset.projectId = projectId;
+        item.setAttribute('data-project-id', projectId);
+        const selected = Boolean(binding && String(binding.project_id) === projectId);
+        item.dataset.selected = selected ? 'true' : 'false';
+        item.setAttribute('data-selected', selected ? 'true' : 'false');
+        item.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        const fullTitle = String(project.display_name || project.audit_name || projectId);
+        item.textContent = fullTitle;
+        const auditName = String(project.audit_name || '');
+        const tooltip = auditName && auditName !== fullTitle ? `${fullTitle} (${auditName})` : fullTitle;
+        item.title = tooltip;
+        item.setAttribute('title', tooltip);
+        if (auditName && auditName !== String(project.display_name || '')) {
+          const meta = document.createElement('span');
+          meta.className = 'acb-manual-zip-item-meta';
+          meta.textContent = auditName;
+          item.appendChild(meta);
+        }
+        item.addEventListener('click', () => { selectManualArchiveProject(project); });
+        list.appendChild(item);
+      }
+    }
+    if (clearButton) clearButton.disabled = !binding;
+    if (refreshButton) {
+      refreshButton.disabled = Boolean(manualArchiveMenuState.refreshing);
+      refreshButton.textContent = manualArchiveMenuState.refreshing ? 'Refreshing...' : 'Refresh list';
+    }
+  }
+
+  function renderManualArchiveControl() {
+    if (!panel) return;
+    const button = panel.querySelector('#acb-manual-zip-btn');
+    if (!button) return;
+    const currentKey = currentConversationKey();
+    const binding = manualArchiveBindingFor(currentKey);
+    const uiKeyMatches = manualArchiveUiState.conversationKey === currentKey;
+    const busy = uiKeyMatches && manualArchivePhaseIsBusy(manualArchiveUiState.phase);
+    const sameProject = Boolean(uiKeyMatches && binding && manualArchiveUiState.projectId === String(binding.project_id || ''));
+    const stale = binding ? manualArchiveStaleMarker(currentKey) : null;
+    // P1 TARGET B: a binding the Bridge rejected is visibly not usable until the
+    // operator chooses again -- never a silent re-derivation of a project.
+    const stateName = !binding ? 'unbound' : stale ? 'error' : sameProject ? manualArchiveUiState.phase : 'idle';
+    button.textContent = manualArchiveControlLabel(stateName, binding ? (binding.display_name || (uiKeyMatches ? manualArchiveUiState.projectName : '')) : '');
+    button.dataset.state = stateName;
+    button.dataset.stale = stale ? 'true' : 'false';
+    button.disabled = busy;
+    // TARGET T: the deliberate attach-without-send escape hatch is discoverable
+    // (Shift-click, documented in the tooltip) and never the default path.
+    button.title = binding
+      ? (stale
+        ? `The bound project "${binding.display_name || binding.project_id}" is no longer usable (${stale.code}). Pick a registered project.`
+        : busy
+          ? `ZIP busy: ${manualArchiveUiState.detail || stateName}.`
+          : `Attach the latest canonical ${binding.display_name || binding.project_id} archive to this chat and automatically Send it once ChatGPT has registered the attachment. Hold Shift (or use "Attach only" in the picker) to attach without sending.`)
+      : 'Attach a registered AUDAPACK project archive to this chat and automatically Send it once ChatGPT has registered the attachment. Hold Shift (or use "Attach only" in the picker) to attach without sending.';
+    const menu = panel.querySelector('#acb-manual-zip-menu');
+    if (menu && menu.hidden) return;
+    renderManualArchiveMenu();
+    positionManualArchiveMenu();
+  }
+
+  function positionManualArchiveMenu() {
+    const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+    const btn = panel ? panel.querySelector('#acb-manual-zip-btn') : null;
+    if (!menu || !btn || menu.hidden) return;
+
+    const btnRect = btn.getBoundingClientRect();
+    const vp = viewportRect();
+    const vpWidth = vp.width || window.innerWidth || 1024;
+    const vpHeight = vp.height || window.innerHeight || 768;
+
+    const menuHeight = menu.offsetHeight || 220;
+    const menuWidth = menu.offsetWidth || 300;
+
+    const spaceBelow = vpHeight - btnRect.bottom;
+    const spaceAbove = btnRect.top;
+
+    if (spaceBelow < menuHeight && spaceAbove > spaceBelow) {
+      menu.style.setProperty('top', 'auto', 'important');
+      menu.style.setProperty('bottom', `${btn.offsetHeight + 2}px`, 'important');
+    } else {
+      menu.style.setProperty('top', `${btn.offsetHeight + 2}px`, 'important');
+      menu.style.setProperty('bottom', 'auto', 'important');
+    }
+
+    if (btnRect.left + menuWidth > vpWidth - 16) {
+      menu.style.setProperty('left', 'auto', 'important');
+      menu.style.setProperty('right', '0px', 'important');
+    } else {
+      menu.style.setProperty('left', '0px', 'important');
+      menu.style.setProperty('right', 'auto', 'important');
+    }
+  }
+
+  function openManualArchivePicker(options = {}) {
+    const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+    if (!menu) return Promise.resolve({ ok: false, code: 'UNBOUND' });
+    menu.hidden = false;
+    if (panel) panel.dataset.menuOpen = 'true';
+    positionManualArchiveMenu();
+    const cachedProjects = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    // P1 TARGET C: the SAME cache policy the registry read uses, so a picker
+    // open can never contradict it. With a usable list the picker paints it
+    // immediately and revalidates in the background; with none it paints
+    // `Loading projects...` bounded by the registry deadline below.
+    const freshCache = manualArchiveProjectsCacheUsable(options);
+    const emptyCacheFresh = !freshCache && manualArchiveProjectsCacheFreshEmpty() && !options.force;
+    const needsRequest = Boolean(options.force) || (!freshCache && !emptyCacheFresh);
+    manualArchiveMenuState = {
+      loading: needsRequest && !cachedProjects.length,
+      refreshing: needsRequest && Boolean(cachedProjects.length),
+      error: needsRequest ? '' : manualArchiveMenuState.error,
+      errorCode: needsRequest ? '' : manualArchiveMenuState.errorCode,
+      deadlined: false,
+      projects: cachedProjects,
+      fetchedAt: manualArchiveProjectsCache.fetchedAt || 0,
+      generation: manualArchiveMenuState.generation,
+      openToken: (Number(manualArchiveMenuState.openToken) || 0) + 1
+    };
+    renderManualArchiveMenu();
+    positionManualArchiveMenu();
+    if (!needsRequest) {
+      return Promise.resolve({ ok: true, projects: cachedProjects, cached: true, fromCache: true });
+    }
+    return listManualArchiveProjects({ force: Boolean(options.force) }).then(result => {
+      if (!manualArchiveRegistryActive()) {
+        // TARGET E: closing and reopening the picker must not strand state in
+        // loading. A result that lands while the picker is closed still seeds
+        // the cache but leaves no loading flag behind.
+        manualArchiveMenuState.loading = false;
+        manualArchiveMenuState.refreshing = false;
+      }
+      return result;
+    });
+  }
+
+  function manualArchiveRefreshProjects() {
+    if (manualArchiveRegistryFlight) return manualArchiveRegistryFlight;
+    manualArchiveMenuState.refreshing = Boolean(manualArchiveMenuState.projects.length);
+    manualArchiveMenuState.loading = !manualArchiveMenuState.projects.length;
+    manualArchiveMenuState.error = '';
+    manualArchiveMenuState.errorCode = '';
+    renderManualArchiveMenu();
+    // TARGET E: an explicit Refresh is the only thing that asks for a new
+    // registry generation; older generations lose UI ownership immediately.
+    return listManualArchiveProjects({ force: true });
+  }
+
+  function closeManualArchivePicker() {
+    const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+    if (menu) menu.hidden = true;
+    if (panel) panel.dataset.menuOpen = 'false';
+    manualArchiveMenuState.loading = false;
+    manualArchiveMenuState.refreshing = false;
+    setManualArchiveAttachOnly(false);
+  }
+
+  // TARGET T: a deliberate, discoverable attach-without-send escape hatch for
+  // diagnostics and operator control. It is NEVER the default path: the flag is
+  // consumed by exactly one transaction, and the picker "Attach only" action
+  // documents it in the UI.
+  function setManualArchiveAttachOnly(value) {
+    const next = value === true;
+    const changed = manualArchiveAttachOnly !== next;
+    manualArchiveAttachOnly = next;
+    if (changed) {
+      const action = panel ? panel.querySelector('#acb-manual-zip-attach-only') : null;
+      if (action) {
+        action.setAttribute('aria-pressed', next ? 'true' : 'false');
+        action.dataset.selected = next ? 'true' : 'false';
+      }
+    }
+    return next;
+  }
+
+  function manualArchiveAttachOnlyRequested() {
+    return manualArchiveAttachOnly === true;
+  }
+
+  function canonicalArchiveFlightKey(projectId, originConversationKey = currentConversationKey()) {
+    const origin = String(originConversationKey || currentConversationKey() || '');
+    return `${origin}::${String(projectId || '')}`;
+  }
+
+  function canonicalEnsureCode(meta) {
+    return meta?.packed ? 'PACKED_NEW' : 'REUSED_EXISTING';
+  }
+
+  function canonicalTransportFlight(kind, projectId, originKey, work) {
+    const key = `${kind}::${canonicalArchiveFlightKey(projectId, originKey)}`;
+    const existing = canonicalTransportFlights.get(key);
+    if (existing) {
+      existing.joinedCount = (Number(existing.joinedCount) || 0) + 1;
+      return existing.then(result => ({ ...result, dedupe: 'DUPLICATE_COALESCED', joinedTransport: true }));
+    }
+    const flight = Promise.resolve()
+      .then(work)
+      .then(result => {
+        // The OWNER also learns that its transport work was shared, so "did this
+        // click's transport get duplicated?" is answerable from either side.
+        if (Number(flight.joinedCount) > 0 && result && typeof result === 'object') {
+          result.joinedTransport = true;
+        }
+        return result;
+      })
+      .finally(() => {
+        if (canonicalTransportFlights.get(key) === flight) canonicalTransportFlights.delete(key);
+      });
+    flight.joinedCount = 0;
+    canonicalTransportFlights.set(key, flight);
+    return flight;
+  }
+
+  function canonicalArchiveEnsureFlight(projectId, originKey) {
+    return canonicalTransportFlight('ensure', projectId, originKey, () => ensureProjectArchive(projectId));
+  }
+
+  //: P1 TARGET H/B: ONE owner of "this conversation carries the canonical tile".
+  //: Manual ZIP and Auto Audit for the same conversation + project can now reach
+  //: the attach step simultaneously (the bound path no longer waits behind a
+  //: registry read), and two parallel injections of identical bytes would be a
+  //: real duplicate. The fence serializes the attach DECISION: the second caller
+  //: waits for the first attach to finish completely -- tile registered AND its
+  //: canonical proof remembered -- and then re-checks, so it becomes
+  //: ALREADY_ATTACHED with zero injection instead of racing it.
+  const canonicalAttachChains = new Map();
+
+  function canonicalAttachFence(projectId, originKey, work) {
+    const key = canonicalArchiveFlightKey(projectId, originKey);
+    const previous = canonicalAttachChains.get(key) || Promise.resolve();
+    const run = previous.catch(() => {}).then(work);
+    const settled = run.catch(() => {});
+    canonicalAttachChains.set(key, settled);
+    settled.then(() => {
+      if (canonicalAttachChains.get(key) === settled) canonicalAttachChains.delete(key);
+    });
+    return run;
+  }
+
+  // P1 TARGET G: verified canonical bytes, from this runtime's content-addressed
+  // cache when this exact SHA-256 is already proven, otherwise from one shared
+  // Bridge GET. Joining callers share the SAME bytes object; nobody mutates it.
+  // SRC-083 TARGET J: `onStage('verifying')` fires the moment the body is in
+  // hand, so the browser hash is never displayed as a network GET. Only the
+  // flight OWNER's callback is used; a joined caller shares the bytes and the
+  // measured split, never a second stage signal.
+  function canonicalArchiveBytesFlight(projectId, originKey, meta, onStage = null) {
+    return canonicalTransportFlight('bytes', projectId, originKey, async () => {
+      const cached = manualArchiveCachedBytes(meta);
+      if (cached) {
+        // TARGET G: the exact canonical SHA-256 is already in this runtime's
+        // VERIFIED byte cache, so neither the GET nor a second browser hash runs.
+        return {
+          ok: true,
+          bytes: cached,
+          digest: String(meta?.sha256 || '').toLowerCase(),
+          fromCache: true,
+          getCount: 0,
+          fetchMs: 0,
+          hashMs: 0,
+          hashComputed: false,
+          probe: null,
+          server: null,
+          transportMs: 0
+        };
+      }
+      const fetchStarted = manualArchiveNow();
+      const download = await fetchProjectArchive(projectId);
+      const fetchMs = manualArchiveNow() - fetchStarted;
+      const probe = download.probe || null;
+      const server = download.server || null;
+      if (!download.ok) {
+        return { ok: false, errorCode: download.errorCode, message: download.message, getCount: 0, fetchMs, probe };
+      }
+      if (meta?.size && download.bytes.length !== meta.size) {
+        return {
+          ok: false,
+          errorCode: 'archive-size-mismatch',
+          message: `Expected ${meta.size} bytes, received ${download.bytes.length}.`,
+          getCount: 1,
+          fetchMs,
+          probe,
+          server
+        };
+      }
+      if (typeof onStage === 'function') {
+        try { onStage('verifying'); } catch (_) { }
+      }
+      const hashStarted = manualArchiveNow();
+      const digest = await sha256Hex(download.bytes);
+      const hashMs = manualArchiveNow() - hashStarted;
+      const transportMs = manualArchiveNow() - fetchStarted;
+      if (meta?.sha256 && digest && digest !== meta.sha256) {
+        return {
+          ok: false,
+          errorCode: 'archive-digest-mismatch',
+          message: 'Downloaded archive SHA-256 does not match the Bridge digest.',
+          getCount: 1,
+          fetchMs,
+          hashMs,
+          probe,
+          server,
+          transportMs
+        };
+      }
+      // Only a digest the browser PROVED may enter the cache. An unavailable
+      // WebCrypto produces '', which is not a verification.
+      if (digest && meta?.sha256 && digest === meta.sha256) manualArchiveByteCachePut(digest, download.bytes);
+      return {
+        ok: true,
+        bytes: download.bytes,
+        digest: digest || String(meta?.sha256 || '').toLowerCase(),
+        fromCache: false,
+        getCount: 1,
+        fetchMs,
+        hashMs,
+        hashComputed: Boolean(digest),
+        probe,
+        server,
+        transportMs
+      };
+    });
+  }
+
+  // SRC-083 TARGET A: fold one shared transport's GET split into a delivery
+  // trace. REQUEST START -> HEADERS -> FIRST BODY PROGRESS -> BODY COMPLETE ->
+  // BYTES NORMALIZED -> BROWSER SHA stay separate numbers; a joined caller
+  // records the SAME measured transport instead of a second GET.
+  function manualArchiveTimingsFromTransport(timings, transport) {
+    if (!timings || !transport) return timings;
+    manualArchiveTimingSet(timings, 'download_ms', transport.fetchMs);
+    manualArchiveTimingSet(timings, 'browser_sha_ms', transport.hashMs);
+    manualArchiveTimingSet(timings, 'transport_complete_ms', transport.transportMs);
+    const probe = transport.probe;
+    if (probe) {
+      manualArchiveTimingSet(timings, 'get_total_ms', probe.onload_ms);
+      manualArchiveTimingSet(timings, 'get_headers_ms', probe.headers_ms);
+      manualArchiveTimingSet(timings, 'get_first_progress_ms', probe.first_progress_ms);
+      const bodyFrom = probe.first_progress_ms || probe.headers_ms;
+      manualArchiveTimingSet(timings, 'get_transfer_ms', bodyFrom ? probe.onload_ms - bodyFrom : 0);
+      manualArchiveTimingSet(timings, 'browser_response_materialize_ms', probe.materialize_ms);
+      timings.get_progress_events = Math.max(0, Math.min(100000, Number(probe.progress_events) || 0));
+      timings.get_progress_capability = String(probe.capability || 'none').slice(0, 12);
+    }
+    const bytes = transport.bytes;
+    timings.get_bytes = Math.max(0, Number(bytes?.length) || Number(probe?.loaded) || 0);
+    const server = transport.server;
+    if (server) {
+      manualArchiveTimingSet(timings, 'server_get_prep_ms', server.prep_ms);
+      manualArchiveTimingSet(timings, 'server_digest_ms', server.digest_ms);
+      timings.server_digest_source = String(server.digest_source || '').slice(0, 12);
+    }
+    return timings;
+  }
+
+  function canonicalAttachedArchiveMatch(project, meta, root = chatGPTComposerRoot()) {
+    if (!project || !meta?.filename) return null;
+    const wanted = String(meta.filename).toLowerCase();
+    const canonicalSha = String(meta.sha256 || '').toLowerCase();
+    for (const entry of composerArchivesForProject(project, root)) {
+      if (String(entry.name || '').toLowerCase() === wanted && canonicalArchiveProofMatches(project.project_id, meta, entry)) {
+        return entry;
+      }
+      // TARGET J: content identity beats naming. The tile-bound proof already
+      // proves project ownership and exact bytes; a different generation
+      // filename with the identical canonical SHA/size is the same content.
+      const proof = canonicalArchiveProofForTile(entry.tile);
+      if (!proof || !entry.tile?.isConnected || !canonicalSha || !proof.sha256) continue;
+      if (String(proof.project_id || '') !== String(project.project_id || '')) continue;
+      if (String(proof.sha256).toLowerCase() !== canonicalSha) continue;
+      if (Number(proof.size) !== Number(meta.size || 0)) continue;
+      return entry;
+    }
+    return null;
+  }
+
+  // T-193 TARGET K/L: single-flight per conversation + project. A repeated or
+  // concurrent click joins the live promise; it never queues a second chain.
+  function attachCanonicalProjectArchive(project, options = {}) {
+    const projectId = String(project?.project_id || '');
+    const originKey = String(options.originConversationKey || currentConversationKey());
+    const flightKey = canonicalArchiveFlightKey(projectId, originKey);
+    const existing = canonicalArchiveFlights.get(flightKey);
+    if (existing) return existing.then(result => ({ ...result, dedupe: 'DUPLICATE_COALESCED' }));
+    const flight = runCanonicalArchiveAttach(project, { ...options, originConversationKey: originKey }).finally(() => {
+      canonicalArchiveFlights.delete(flightKey);
+    });
+    canonicalArchiveFlights.set(flightKey, flight);
+    return flight;
+  }
+
+  async function runCanonicalArchiveAttach(project, options = {}) {
+    const phase = typeof options.onPhase === 'function' ? options.onPhase : () => {};
+    const projectId = String(project?.project_id || '');
+    const originKey = String(options.originConversationKey || currentConversationKey());
+    if (!projectId) {
+      return { ok: false, code: 'FAILED', errorCode: 'unknown_project', message: 'No canonical project identity was resolved.' };
+    }    phase('checking', `Checking ${project.display_name || projectId} archive...`);
+    const ensured = await canonicalArchiveEnsureFlight(projectId, originKey);
+
+    if (currentConversationKey() !== originKey) {
+      return {
+        ok: false,
+        code: 'FAILED',
+        errorCode: 'conversation_changed',
+        message: 'The conversation changed while the archive was preparing; nothing was attached.'
+      };
+    }
+    if (!ensured.ok) {
+      return {
+        ok: false,
+        code: bridgeOfflineResult(ensured.errorCode) ? 'BRIDGE_OFFLINE' : 'FAILED',
+        errorCode: ensured.errorCode,
+        message: ensured.message
+      };
+    }
+    const meta = ensured.meta;
+    if (!meta.filename) {
+      return { ok: false, code: 'FAILED', errorCode: 'archive-unavailable', message: 'Bridge returned no archive filename.' };
+    }
+
+    const root = chatGPTComposerRoot();
+    if (!root) {
+      return { ok: false, code: 'FAILED', errorCode: 'composer-root-unavailable', message: 'The ChatGPT composer is not available.' };
+    }
+
+    // TARGET E/J: the fast path is a live tile whose proof matches the exact
+    // canonical identity from the Bridge (project + filename + size + SHA-256).
+    // It performs zero GET, zero File construction, zero injection.
+    if (canonicalAttachedArchiveMatch(project, meta, root)) {
+      phase('ready', 'Canonical archive already attached; no re-upload.');
+      return { ok: true, code: 'ALREADY_ATTACHED', filename: meta.filename, meta, ensureCode: canonicalEnsureCode(meta) };
+    }
+
+    phase(meta.packed ? 'packing' : 'downloading', meta.packed ? 'Archive packed; preparing download...' : 'Canonical archive is already fresh.');
+    phase('downloading', 'Downloading canonical archive...');
+    // P1 TARGET G: the shared transport consults the content-addressed verified
+    // byte cache first, so Auto and Manual reuse a byte set that either door
+    // already proved instead of paying a second GET.
+    const transport = await canonicalArchiveBytesFlight(projectId, originKey, meta, stageName => {
+      phase(stageName, 'Download complete; verifying the archive SHA-256 in this browser...');
+    });
+    if (!transport.ok) {
+      return {
+        ok: false,
+        code: bridgeOfflineResult(transport.errorCode) ? 'BRIDGE_OFFLINE' : 'FAILED',
+        errorCode: transport.errorCode,
+        message: transport.message
+      };
+    }
+    const bytes = transport.bytes;
+    const digest = transport.digest || '';
+    if (!bytes || !bytes.length) {
+      return { ok: false, code: 'FAILED', errorCode: 'archive-empty-response', message: 'The canonical archive bytes are unavailable.' };
+    }
+
+    // TARGET H: another flow may have attached the same canonical archive while
+    // this request was downloading, or may be attaching it right now. Inside the
+    // fence this becomes ALREADY_ATTACHED instead of a second injection.
+    const attached = await canonicalAttachFence(projectId, originKey, async () => {
+      const already = canonicalAttachedArchiveMatch(project, meta, root);
+      if (already) {
+        phase('ready', 'Canonical archive already attached; no duplicate injection.');
+        return { ok: true, code: 'ALREADY_ATTACHED', tile: already.tile, injected: false };
+      }
+
+      // TARGET N: an SPA navigation while this transaction was in flight must
+      // never attach Project A's archive into a different conversation.
+      if (currentConversationKey() !== originKey) {
+        return {
+          ok: false,
+          code: 'FAILED',
+          errorCode: 'conversation_changed',
+          message: 'The conversation changed while the archive was downloading; nothing was attached.'
+        };
+      }
+
+      const input = getChatGPTInput();
+      const beforeText = input ? composerPlainText(input) : '';
+
+      phase('attaching', 'Attaching archive to the composer...');
+      // Snapshot the pre-upload tiles for this exact filename so an untouched
+      // old same-name tile can never be mistaken for the new upload.
+      const beforeTiles = new Set(chatGPTComposerAttachmentTiles(root).filter(tile => {
+        return chatGPTAttachmentTileName(tile).trim().toLowerCase() === meta.filename.toLowerCase();
+      }));
+
+      const file = new File([bytes], meta.filename, {
+        type: 'application/zip',
+        lastModified: meta.mtime ? meta.mtime * 1000 : Date.now()
+      });
+      const injected = await injectComposerArchiveFile(file);
+      if (!injected.ok) {
+        return { ok: false, code: 'FAILED', errorCode: injected.reason, message: injected.detail || 'ChatGPT rejected the archive file injection.' };
+      }
+
+      const tile = await waitForDomCondition(root, () => {
+        const candidates = chatGPTComposerAttachmentTiles(root).filter(candidate => {
+          return chatGPTAttachmentTileName(candidate).toLowerCase() === meta.filename.toLowerCase();
+        });
+        return candidates.find(candidate => !beforeTiles.has(candidate) && candidate.isConnected && !chatGPTAttachmentIsBusy(candidate)) || null;
+      }, CHATGPT_ATTACHMENT_TIMEOUT_MS);
+      if (!tile) {
+        return { ok: false, code: 'ATTACH_TIMEOUT', errorCode: 'attachment-timeout', message: 'The new archive did not finish registering; the previous archive was kept.' };
+      }
+
+      // Remove ONLY previous archives of this exact project, and only AFTER the
+      // new one is proven registered. Unrelated attachments and audit prompt
+      // files survive, and the newly proven tile is never removed.
+      let removedOld = 0;
+      for (const entry of composerArchivesForProject(project, root)) {
+        if (entry.tile === tile) continue;
+        if (removeComposerAttachmentTile(entry.tile)) removedOld += 1;
+      }
+
+      if (input) {
+        const afterText = composerPlainText(input);
+        if (afterText !== beforeText) nativeSet(input, beforeText);
+      }
+
+      // T-182A: the canonical proof is created only AFTER the new tile is
+      // established and bound to that exact tile element, never to the project
+      // or to any other attachment instance. It is what makes the NEXT caller's
+      // ALREADY_ATTACHED decision provable.
+      rememberCanonicalArchiveProof(tile, project.project_id, {
+        filename: meta.filename,
+        size: bytes.length,
+        sha256: digest || meta.sha256
+      });
+      phase('ready', `Attached ${meta.filename}.`);
+      return {
+        ok: true,
+        code: removedOld ? 'REPLACED_OLD' : 'ATTACHED_NEW',
+        replacedOld: removedOld > 0,
+        removedOld,
+        tile,
+        injected: true
+      };
+    });
+    if (!attached.ok) return attached;
+    return {
+      ok: true,
+      code: attached.code,
+      replacedOld: attached.replacedOld === true,
+      removedOld: Number(attached.removedOld) || 0,
+      filename: meta.filename,
+      meta,
+      ensureCode: canonicalEnsureCode(meta)
+    };
+  }
+
+  // P1 TARGET B: `resolveManualArchiveProject()` lived here and ran
+  //     manualArchiveBindingFor -> listManualArchiveProjects -> GET /v1/projects
+  // -> find the project_id the binding ALREADY holds
+  // on every normal bound click. It is gone: the binding is the authoritative
+  // project identity and the archive ensure endpoint validates the project
+  // (unknown / disabled / missing source / unavailable source) as part of the
+  // work the click has to do anyway. Reading the whole registry first was pure
+  // added latency with no added authority. The registry is still read by the
+  // unbound picker, an explicit Change Project / Refresh, and the stale-binding
+  // recovery above.
+
+  // ---------------------------------------------------------------------------
+  // P1 TARGETS M/N/O/P/T: positively verified ZIP-send receipts. A receipt is
+  // written ONLY after positive Send acceptance, stores the minimal identity
+  // (never composer text, never archive bytes, never a token), and is bounded.
+  // ---------------------------------------------------------------------------
+  function manualArchiveSentStore() {
+    try {
+      const raw = GM_getValue(MANUAL_ARCHIVE_SENT_KEY, '');
+      if (!raw) return { version: 1, entries: [] };
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) return { version: 1, entries: [] };
+      const entries = parsed.entries.filter(entry => entry && typeof entry === 'object').slice(-MANUAL_ARCHIVE_SENT_MAX);
+      return { version: 1, entries };
+    } catch (_) {
+      return { version: 1, entries: [] };
+    }
+  }
+
+  function manualArchiveSentEntries() {
+    const now = Date.now();
+    return manualArchiveSentStore().entries.filter(entry => {
+      const at = Math.max(0, Number(entry.at) || 0);
+      return at && now - at <= MANUAL_ARCHIVE_SENT_TTL_MS;
+    });
+  }
+
+  function manualArchiveSentEntry(conversationKey, projectId, sha256) {
+    const key = String(conversationKey || '');
+    const project = String(projectId || '');
+    const sha = String(sha256 || '').toLowerCase();
+    if (!key || !project || !sha) return null;
+    return manualArchiveSentEntries().find(entry => String(entry.key || '') === key
+      && String(entry.project_id || '') === project
+      && String(entry.sha256 || '').toLowerCase() === sha) || null;
+  }
+
+  function manualArchiveRecordSent(receipt) {
+    const key = String(receipt?.conversationKey || '');
+    const project = String(receipt?.projectId || '');
+    const sha = String(receipt?.sha256 || '').toLowerCase();
+    if (!key || !project || !sha) return false;
+    const entry = {
+      key,
+      project_id: project,
+      sha256: sha,
+      filename: String(receipt?.filename || ''),
+      payloads: Array.isArray(receipt?.payloads) ? receipt.payloads.slice(0, 8) : [],
+      at: Date.now()
+    };
+    const store = manualArchiveSentStore();
+    const entries = store.entries.filter(existing => !(String(existing.key || '') === key
+      && String(existing.project_id || '') === project
+      && String(existing.sha256 || '').toLowerCase() === sha));
+    entries.push(entry);
+    const bounded = entries.slice(-MANUAL_ARCHIVE_SENT_MAX);
+    try {
+      GM_setValue(MANUAL_ARCHIVE_SENT_KEY, JSON.stringify({ version: 1, entries: bounded }));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function manualArchiveAttachmentIdentity(tile) {
+    if (!tile) return null;
+    const name = chatGPTAttachmentTileName(tile).trim();
+    if (!name || !MANUAL_ARCHIVE_STRONG_ATTACHMENT_NAME.test(name)) return null;
+    return `${name.toLowerCase()}:${String(name.length)}`;
+  }
+
+  function manualArchiveAttachmentsStronglyIdentified(tiles) {
+    const list = Array.isArray(tiles) ? tiles : [];
+    if (!list.length) return true;
+    return list.every(tile => Boolean(manualArchiveAttachmentIdentity(tile)));
+  }
+
+  async function manualArchivePayloadIdentity(text, attachments) {
+    const attachmentIds = (Array.isArray(attachments) ? attachments : [])
+      .map(identity => String(identity || '').trim())
+      .filter(Boolean)
+      .sort();
+    const normalizedText = String(text || '').replace(/\r\n/g, '\n');
+    const textDigest = normalizedText ? await sha256Hex(new TextEncoder().encode(normalizedText)) : '';
+    if (!textDigest && !attachmentIds.length) return 'empty';
+    return `${textDigest || 'no-text'}|${attachmentIds.join(',')}`;
+  }
+
+  // TARGET H: the payload the operator authored when the transaction started.
+  // Canonical archive tiles of THIS project are transport state, not authored
+  // payload, so they are excluded -- that is what lets the same snapshot serve
+  // both the change detector and the send-receipt identity.
+  function manualArchiveProjectArchiveTiles(project, root = chatGPTComposerRoot()) {
+    if (!project || !String(project.project_id || '')) return new Set();
+    return new Set(composerArchivesForProject(project, root).map(entry => entry.tile));
+  }
+
+  // TARGET A: the transaction snapshot's authority is SEMANTIC state, never a
+  // JavaScript object reference. `composerRoot`/`composerInput` are carried as
+  // DIAGNOSTIC references only; the safety fence is the conversation key, the
+  // normalized authored text, the semantic identities of the unrelated
+  // attachments and the project identity. A React remount is not an edit.
+  function captureManualArchiveComposerSnapshot(originKey, options = {}) {
+    const root = chatGPTComposerRoot();
+    const input = getChatGPTInput();
+    const project = options.project || null;
+    const projectTiles = manualArchiveProjectArchiveTiles(project, root);
+    const tiles = chatGPTComposerAttachmentTiles(root).filter(tile => {
+      return tile.isConnected && !projectTiles.has(tile);
+    });
+    return {
+      conversationKey: String(originKey || ''),
+      projectId: String(project?.project_id || ''),
+      projectName: String(project?.display_name || project?.audit_name || ''),
+      generation: manualArchiveTransactionGeneration,
+      composerRoot: root,
+      composerInput: input,
+      text: input ? composerPlainText(input) : '',
+      attachmentTiles: tiles,
+      attachments: tiles.map(tile => manualArchiveAttachmentIdentity(tile)),
+      startedAt: Date.now()
+    };
+  }
+
+  // TARGET E: unrelated attachments are compared by a deterministic normalized
+  // multiset of semantic identities, never by element reference alone. When at
+  // least one attachment cannot be strongly identified after a remount the
+  // comparison falls back to element identity and FAILS SAFE: an unproven
+  // attachment cancels automatic Send rather than being guessed equal.
+  function manualArchiveUnrelatedAttachmentIdentities(tiles) {
+    return (Array.isArray(tiles) ? tiles : []).map(tile => ({
+      tile,
+      identity: manualArchiveAttachmentIdentity(tile)
+    }));
+  }
+
+  function manualArchiveAttachmentsEquivalent(baseline, live) {
+    if (live.length !== baseline.length) return false;
+    if (baseline.every(item => item.identity) && live.every(item => item.identity)) {
+      const left = baseline.map(item => item.identity).sort();
+      const right = live.map(item => item.identity).sort();
+      return left.every((value, index) => value === right[index]);
+    }
+    return baseline.every((item, index) => item.tile === live[index]?.tile);
+  }
+
+  function manualArchiveLiveUnrelatedAttachments(snapshot, allowed = new Set()) {
+    // Archive tiles of the bound project are transport state: our own attach,
+    // replacement and de-duplication work must never register as an operator
+    // edit, while an unrelated attachment is always a real change.
+    const projectTiles = manualArchiveProjectArchiveTiles({
+      project_id: snapshot.projectId,
+      display_name: snapshot.projectName
+    });
+    return chatGPTComposerAttachmentTiles().filter(tile => {
+      return tile.isConnected && !allowed.has(tile) && !projectTiles.has(tile);
+    });
+  }
+
+  function manualArchiveSnapshotStaleReason(snapshot, options = {}) {
+    if (!snapshot) return 'composer_changed';
+    if (String(currentConversationKey()) !== String(snapshot.conversationKey)) return 'conversation_changed';
+    if (options.skipText !== true) {
+      // TARGET A/B: reacquire the CURRENT live composer. The transaction-start
+      // DOM references are diagnostic; object identity is never the reason.
+      const input = getChatGPTInput();
+      if (!input) return 'composer_changed';
+      if (cleanTurnText(composerPlainText(input)) !== cleanTurnText(snapshot.text)) return 'composer_changed';
+    }
+    const allowed = new Set(Array.isArray(options.allowTiles) ? options.allowTiles : []);
+    const liveTiles = manualArchiveLiveUnrelatedAttachments(snapshot, allowed);
+    const baselineTiles = (snapshot.attachmentTiles || []).filter(tile => !allowed.has(tile));
+    if (!manualArchiveAttachmentsEquivalent(
+      manualArchiveUnrelatedAttachmentIdentities(baselineTiles),
+      manualArchiveUnrelatedAttachmentIdentities(liveTiles)
+    )) return 'attachment_changed';
+    return '';
+  }
+
+  // TARGET C/G: a React remount may replace the canonical archive tile with a
+  // fresh DOM node carrying the same canonical identity. Reacquire it by that
+  // identity -- filename inside the bound project's composer -- and re-establish
+  // the same-transaction proof on the live node.
+  function manualArchiveReacquireCanonicalTile(meta, project, root = chatGPTComposerRoot()) {
+    const wanted = String(meta?.filename || '').trim().toLowerCase();
+    if (!root || !wanted) return null;
+    const entry = composerArchivesForProject(project, root).find(item =>
+      String(item.name || '').toLowerCase() === wanted);
+    return entry ? entry.tile : null;
+  }
+
+  async function manualArchiveResolveReadyTile(tile, meta, project) {
+    const isReady = candidate => Boolean(candidate && candidate.isConnected
+      && chatGPTComposerAttachmentTiles().includes(candidate)
+      && !chatGPTAttachmentIsBusy(candidate));
+    if (tile && tile.isConnected && await waitForManualArchiveTile(tile)) return tile;
+    const deadline = acbWaitNow() + MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS;
+    while (acbWaitNow() < deadline) {
+      const fresh = manualArchiveReacquireCanonicalTile(meta, project);
+      if (isReady(fresh)) {
+        rememberCanonicalArchiveProof(fresh, project.project_id, {
+          filename: meta.filename,
+          size: meta.size,
+          sha256: meta.sha256
+        });
+        return fresh;
+      }
+      await sleep(Math.min(120, Math.max(20, deadline - acbWaitNow())));
+    }
+    return null;
+  }
+
+  // P1 TARGET I: a CONDITION wait, never a delay. The previous version resolved
+  // ONCE, at the timeout: a tile that ChatGPT finished registering 300 ms later
+  // still cost the whole MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS before the caller
+  // could proceed, so the optimistic path waited for a fixed penalty it did not
+  // have to pay. Now the composer is observed and the caller continues the
+  // moment the tile is genuinely ready; the timeout stays an upper bound for a
+  // tile that never becomes ready, and it is not shortened.
+  function waitForManualArchiveTile(tile, timeoutMs = MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS) {
+    const budget = Math.max(1, Number(timeoutMs) || MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS);
+    const ready = candidate => Boolean(candidate && candidate.isConnected && chatGPTComposerAttachmentTiles().includes(candidate) && !chatGPTAttachmentIsBusy(candidate));
+    if (ready(tile)) return Promise.resolve(true);
+    const root = chatGPTComposerRoot();
+    if (!root) return Promise.resolve(false);
+    return waitForDomCondition(root, () => (ready(tile) ? true : null), budget)
+      .then(value => Boolean(value));
+  }
+
+  // TARGET C/G: wait for the JUST-INJECTED canonical tile to register, polling
+  // the CURRENT live composer every tick. A React remount during registration
+  // replaces the composer subtree the injection started in, so a wait bound to
+  // the retired root would never observe the tile that actually registered.
+  function waitForManualArchiveInjectedTile(meta, beforeTiles, timeoutMs = CHATGPT_ATTACHMENT_TIMEOUT_MS) {
+    const wanted = String(meta?.filename || '').trim().toLowerCase();
+    const found = () => chatGPTComposerAttachmentTiles().find(candidate => {
+      return chatGPTAttachmentTileName(candidate).toLowerCase() === wanted
+        && !beforeTiles.has(candidate) && candidate.isConnected && !chatGPTAttachmentIsBusy(candidate);
+    }) || null;
+    const ready = found();
+    if (ready) return Promise.resolve(ready);
+    return observeComposerRemount({ check: found, timeoutMs }).then(value => value || null);
+  }
+
+  function manualArchiveReceiptedPayloads(entry) {
+    const payloads = entry?.payloads;
+    if (!Array.isArray(payloads)) return [];
+    return payloads.map(value => {
+      const raw = String(value?.id || (typeof value === 'string' ? value : ''));
+      const identified = raw ? value?.identified !== false : false;
+      return { id: raw, identified };
+    }).filter(item => item.id);
+  }
+
+  function manualArchiveIsAlreadySent(entry, payloadId, identified) {
+    if (!entry) return false;
+    if (!payloadId || !identified) return false;
+    // A verified Send consumes the composer: ChatGPT clears the text and the
+    // attachment tiles. An EMPTY composer inside the receipt window is a
+    // replay of that already-sent transaction, not a new outgoing payload, so
+    // it must no-op instead of creating a duplicate ChatGPT turn.
+    if (payloadId === 'empty') return true;
+    const payloads = manualArchiveReceiptedPayloads(entry);
+    if (!payloads.length) return false;
+    return payloads.some(item => item.identified && item.id === payloadId);
+  }
+
+  function manualArchiveDetachSentArchive(meta) {
+    const wanted = String(meta?.filename || '').trim().toLowerCase();
+    const sha = String(meta?.sha256 || '').toLowerCase();
+    let removed = 0;
+    for (const entry of composerArchiveEntries()) {
+      if (!entry?.tile) continue;
+      const proof = canonicalArchiveProofForTile(entry.tile);
+      const nameMatches = wanted && String(entry.name || '').toLowerCase() === wanted;
+      const proofMatches = Boolean(proof && sha && String(proof.sha256 || '').toLowerCase() === sha);
+      if (!nameMatches && !proofMatches) continue;
+      if (removeComposerAttachmentTile(entry.tile)) removed += 1;
+    }
+    return removed;
+  }
+
+  // ---------------------------------------------------------------------------
+  // P1 TARGET J: reuse the EXISTING verified ChatGPT send engine. The click is
+  // never success by itself: acceptance needs positive evidence that the
+  // prepared composer was submitted. Supports attachment-only messages and
+  // re-checks the ownership snapshot at every irreversible boundary.
+  // ---------------------------------------------------------------------------
+  async function manualArchiveSendComposer(snapshot, options = {}) {
+    const originKey = String(snapshot?.conversationKey || '');
+    const allowTiles = Array.isArray(options.allowTiles) ? options.allowTiles : [];
+    const sendPhase = typeof options.onPhase === 'function' ? options.onPhase : () => {};
+    const verifySend = () => {
+      if (String(currentConversationKey()) !== originKey) return 'conversation_changed';
+      return manualArchiveSnapshotStaleReason(snapshot, { allowTiles });
+    };
+    // P1 TARGET I: this is a CONDITION wait, not a delay. `waitForChatGPTSendReady`
+    // returns the moment the Send control is itself ready, and the click follows
+    // immediately; the timeout is an upper bound, never a mandatory pause.
+    sendPhase('sending', 'Waiting for the ChatGPT Send control...');
+    const readyStarted = manualArchiveNow();
+    const sendBudgetMs = MANUAL_ARCHIVE_SEND_READY_TIMEOUT_MS;
+    const ready = await waitForChatGPTSendReady(sendBudgetMs, CHATGPT_SEND_READY_MAX_MS, { idleGiveUpMs: sendBudgetMs });
+    manualArchiveTimingMark(options.timings, 'send_ready_ms', readyStarted);
+    // TARGET R: navigation fence through the irreversible Send boundary.
+    if (String(currentConversationKey()) !== originKey) return { ok: false, reason: 'conversation_changed' };
+    const stale = verifySend();
+    if (stale) return { ok: false, reason: stale };
+    // TARGET J: the Send control must belong to the CURRENT composer. If it was
+    // remounted between readiness and now, reacquire it once inside the same
+    // bounded deadline; never reuse a button cached from a retired subtree.
+    const sendUsable = candidate => Boolean(candidate && candidate.isConnected && isVisible(candidate)
+      && !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true');
+    let send = ready;
+    if (!sendUsable(send)) send = getChatGPTSend();
+    if (!sendUsable(send)) {
+      // TARGET U: a remounted Send DOM node is reacquired ONCE, strictly inside
+      // the ORIGINAL budget's remaining time. The old code opened a second full
+      // MANUAL_ARCHIVE_SEND_READY_TIMEOUT_MS here, so a dead composer cost
+      // twice the documented deadline before reporting send-timeout.
+      const remainingMs = Math.max(0, sendBudgetMs - (manualArchiveNow() - readyStarted));
+      if (remainingMs > 0) send = await waitForChatGPTSendReady(remainingMs, CHATGPT_SEND_READY_MAX_MS, { idleGiveUpMs: remainingMs });
+    }
+    if (!sendUsable(send)) return { ok: false, reason: 'send-timeout' };
+    // TARGET B/J: reacquire the LIVE composer immediately before the
+    // irreversible Send. The transaction-start snapshot references are
+    // diagnostic; a React remount may have disconnected them while a
+    // semantically equivalent live composer now exists.
+    const input = getChatGPTInput() || (snapshot?.composerInput?.isConnected ? snapshot.composerInput : null);
+    let accepted = false;
+    if (typeof clickChatGPTSendVerified === 'function' && input) {
+      // TARGET U: the gap between Send-ready and the actual click. A healthy
+      // path shows ~0 here; anything material is AUDAPACK's own stall, not
+      // ChatGPT.
+      manualArchiveTimingSet(options.timings, 'send_clicked_ms',
+        Math.max(0, (manualArchiveNow() - readyStarted) - (Number(options.timings && options.timings.send_ready_ms) || 0)));
+      const verifyStarted = manualArchiveNow();
+      accepted = await clickChatGPTSendVerified(send, input, {
+        fence: async () => {
+          if (String(currentConversationKey()) !== originKey) return false;
+          return !manualArchiveSnapshotStaleReason(snapshot, { allowTiles });
+        }
+      });
+      manualArchiveTimingMark(options.timings, 'send_verify_ms', verifyStarted);
+    } else {
+      return { ok: false, reason: 'composer-unavailable' };
+    }
+    return { ok: true, accepted, mode: accepted ? 'button' : 'click-unverified' };
+  }
+
+  async function sendManualArchiveTransaction(project, options = {}) {
+    const originKey = String(options.conversationKey || currentConversationKey());
+    const projectId = String(project?.project_id || '');
+    const readOnly = options.readOnly === true;
+    const phase = typeof options.onPhase === 'function' ? options.onPhase : () => {};
+    const operationGeneration = options.operationGeneration || manualArchiveTransactionGeneration;
+    // P1 TARGET A: ONE timings object per click, threaded through the stages that
+    // actually own them (ensure, GET, hash, injection, tile ready, Send).
+    const timings = options.timings || manualArchiveTimingBegin();
+    const result = {
+      ok: false,
+      code: 'FAILED',
+      errorCode: '',
+      message: '',
+      projectId,
+      mode: readOnly ? 'none' : 'attach-send',
+      sendAttempts: 0,
+      sendAccepted: false,
+      operationGeneration,
+      timings
+    };
+    const registryElapsedMs = Math.max(0, Number(manualArchiveDebug?.elapsedMs) || 0);
+    // TARGET H: the composer ownership snapshot is taken at TRANSACTION START,
+    // never after the archive work, so an edit made while the ZIP is packing,
+    // downloading or registering is still detected as a change.
+    const startSnapshot = readOnly ? null : captureManualArchiveComposerSnapshot(originKey, { project });
+    let sharedMeta = null;
+    let sharedTransport = false;
+    const finish = (code, errorCode, message) => {
+      result.code = String(code || result.code);
+      result.errorCode = String(errorCode || '');
+      if (message) result.message = String(message);
+      if (sharedTransport) result.dedupe = 'DUPLICATE_COALESCED';
+      timings.get_count = Number(result.getCount) || 0;
+      timings.injection_count = Number(result.injectionCount) || 0;
+      timings.send_count = Number(result.sendAttempts) || 0;
+      timings.result_code = String(result.code || '');
+      manualArchiveTimingMark(timings, 'total_ms', timings.startedAt);
+      manualArchivePublishTiming(timings);
+      manualArchiveRecord({
+        conversationKey: originKey,
+        projectId,
+        operationGeneration,
+        registryElapsedMs,
+        ensureCode: result.ensureCode,
+        shaPrefix: result.meta?.sha256,
+        getCount: Number(result.getCount) || 0,
+        injectionCount: Number(result.injectionCount) || 0,
+        sendAttempts: result.sendAttempts,
+        sendAccepted: result.sendAccepted === true,
+        resultCode: result.code,
+        timings
+      });
+      return result;
+    };
+    const tileIsReady = async tile => {
+      if (!tile) return false;
+      const ready = await waitForManualArchiveTile(tile);
+      const reason = startSnapshot ? manualArchiveSnapshotStaleReason(startSnapshot) : '';
+      return Boolean(ready && !reason);
+    };
+
+    // TARGET M/N/P: a positively verified receipt for this exact conversation,
+    // project, canonical SHA and outgoing payload is ALREADY_SENT, decided from
+    // the Bridge-proven canonical SHA just below.
+    const alreadySentForSha = async sha256 => {
+      const value = String(sha256 || '').toLowerCase();
+      if (!value) return false;
+      const receipt = manualArchiveSentEntry(originKey, projectId, value);
+      if (!receipt) return false;
+      if (Date.now() - Number(receipt.at || 0) > MANUAL_ARCHIVE_SENT_SUPPRESS_MS) return false;
+      const snapshot = startSnapshot;
+      if (!snapshot) return false;
+      const payloadId = await manualArchivePayloadIdentity(snapshot.text, snapshot.attachments);
+      const identified = manualArchiveAttachmentsStronglyIdentified(snapshot.attachmentTiles);
+      if (!manualArchiveIsAlreadySent(receipt, payloadId, identified)) return false;
+      result.ok = true;
+      result.code = 'ALREADY_SENT';
+      result.alreadySent = true;
+      result.meta = { sha256: value, filename: String(receipt.filename || '') };
+      result.getCount = 0;
+      result.injectionCount = 0;
+      result.sendAttempts = 0;
+      return true;
+    };
+
+
+    // TARGET Q: a manual ZIP that lands while the AUTO archive engine is still
+    // attaching the same conversation + project reuses that in-flight work
+    // instead of downloading the identical bytes a second time. The manual
+    // caller still owns its own Send stage; only the transport is shared.
+    const liveAutoAttach = canonicalArchiveFlights.get(canonicalArchiveFlightKey(projectId, originKey));
+    if (liveAutoAttach && typeof liveAutoAttach.then === 'function') {
+      const joined = await liveAutoAttach;
+      if (String(currentConversationKey()) !== originKey) {
+        return finish('FAILED', 'conversation_changed', 'The conversation changed while the archive was preparing; nothing was attached.');
+      }
+      if (!joined?.ok) {
+        return finish(bridgeOfflineResult(joined?.errorCode) ? 'BRIDGE_OFFLINE' : 'FAILED', joined?.errorCode, joined?.message);
+      }
+      sharedMeta = joined.meta || null;
+      sharedTransport = true;
+    }
+
+    phase('checking', `Checking ${project?.display_name || projectId} archive...`);
+    const ensureStarted = manualArchiveNow();
+    const ensured = sharedMeta
+      ? { ok: true, meta: sharedMeta }
+      : await canonicalArchiveEnsureFlight(projectId, originKey);
+    manualArchiveTimingMark(timings, 'ensure_total_ms', ensureStarted);
+    manualArchiveTimingsFromServer(timings, ensured.meta);
+    if (ensured.joinedTransport) sharedTransport = true;
+    if (String(currentConversationKey()) !== originKey) {
+      return finish('FAILED', 'conversation_changed', 'The conversation changed while the archive was preparing; nothing was attached.');
+    }
+    if (!ensured.ok) {
+      return finish(bridgeOfflineResult(ensured.errorCode) ? 'BRIDGE_OFFLINE' : 'FAILED', ensured.errorCode, ensured.message);
+    }
+    const meta = ensured.meta;
+    result.ensureCode = canonicalEnsureCode(meta);
+    result.meta = meta;
+    timings.ensure_result = result.ensureCode;
+    timings.archive_size = Math.max(0, Number(meta.size) || 0);
+    if (!meta.filename) {
+      return finish('FAILED', 'archive-unavailable', 'Bridge returned no archive filename.');
+    }
+    // TARGET N/O: the Bridge is the only authority on the current canonical
+    // SHA, so the receipt is matched against the ensure result -- never against
+    // a locally remembered digest, which would let a changed project source be
+    // mistaken for an already-sent duplicate. The ensure above is a metadata
+    // no-op for an unchanged archive (no pack), so an ALREADY_SENT repeat stays
+    // zero GET, zero File, zero injection and zero Send click.
+    if (!readOnly && await alreadySentForSha(meta.sha256)) return finish('ALREADY_SENT');
+
+    const root = chatGPTComposerRoot();
+    if (!root) {
+      return finish('FAILED', 'composer-root-unavailable', 'The ChatGPT composer is not available.');
+    }
+
+    // TARGET L: ALREADY_ATTACHED is a transport no-op, not a reason to skip the
+    // Send intent. Archive idempotency and Send intent are separate layers.
+    const existingEntry = canonicalAttachedArchiveMatch(project, meta, root);
+    if (existingEntry) {
+      phase('ready', 'Canonical archive already attached; no re-upload.');
+      const flow = readOnly
+        ? { ok: true, code: 'ALREADY_ATTACHED', skipped: 'attach-only', meta, ensureCode: result.ensureCode }
+        : await sendManualArchiveFromReadyTile(existingEntry.tile, meta, project, originKey, phase, operationGeneration, result, startSnapshot, timings);
+      result.ok = flow.ok;
+      result.code = flow.code;
+      result.detached = flow.detached;
+      result.payloadId = flow.payloadId;
+      // TARGET H: an ALREADY_ATTACHED no-op stays zero GET, zero File
+      // construction, zero injection and zero DOM replacement.
+      result.getCount = 0;
+      result.injectionCount = 0;
+      return finish(flow.code, flow.errorCode, flow.message);
+    }
+
+    phase(meta.packed ? 'packing' : 'downloading', meta.packed ? 'Archive packed; preparing download...' : 'Canonical archive is already fresh.');
+    // P1 TARGET G: this runtime may already hold these exact canonical bytes,
+    // verified against this exact SHA-256. A hit is content-addressed -- never a
+    // filename or project name -- and skips BOTH the Bridge GET and the second
+    // browser hash. A miss falls through to the unchanged GET + verify path.
+    // Either way it goes through the ONE shared transport, so a concurrent Auto
+    // ZIP for the same conversation + project joins it instead of duplicating it.
+    const cachedBytes = manualArchiveCachedBytes(meta);
+    if (cachedBytes) {
+      phase('attaching', 'Canonical archive verified in this browser; no download.');
+    } else {
+      phase('downloading', 'Downloading canonical archive...');
+    }
+    const transport = await canonicalArchiveBytesFlight(projectId, originKey, meta, stageName => {
+      phase(stageName, 'Download complete; verifying the archive SHA-256 in this browser...');
+    });
+    if (transport.joinedTransport) sharedTransport = true;
+    if (!transport.ok) {
+      const code = transport.errorCode === 'archive-size-mismatch' ? 'SIZE_MISMATCH'
+        : transport.errorCode === 'archive-digest-mismatch' ? 'HASH_MISMATCH'
+          : bridgeOfflineResult(transport.errorCode) ? 'BRIDGE_OFFLINE' : 'FAILED';
+      manualArchiveTimingsFromTransport(timings, transport);
+      return finish(code, transport.errorCode, transport.message);
+    }
+    const bytes = transport.bytes;
+    const digest = transport.digest || '';
+    result.getCount = Number(transport.getCount) || 0;
+    // Phase timings are the SHARED flight's own measures, so a joined caller
+    // reports the same real transport cost instead of double-counting it.
+    manualArchiveTimingsFromTransport(timings, transport);
+    timings.browser_sha_cache_hit = transport.fromCache === true;
+    timings.browser_sha_computed = transport.hashComputed === true;
+    if (!bytes || !bytes.length) {
+      return finish('FAILED', 'archive-empty-response', 'The canonical archive bytes are unavailable.');
+    }
+
+    // P1 TARGET H/B: the attach DECISION is serialized per conversation +
+    // project. A manual ZIP racing an Auto ZIP for the same project injects the
+    // canonical bytes exactly once; the loser becomes ALREADY_ATTACHED.
+    const attached = await canonicalAttachFence(projectId, originKey, async () => {
+      // TARGET B: reacquire the LIVE composer for the duplicated-attach check.
+      // A remount that preserved the payload must still find its own tile.
+      const liveRoot = chatGPTComposerRoot() || root;
+      const alreadyPresentEntry = canonicalAttachedArchiveMatch(project, meta, liveRoot);
+      if (alreadyPresentEntry) {
+        phase('ready', 'Canonical archive already attached; no duplicate injection.');
+        return { ok: true, code: 'ALREADY_ATTACHED', tile: alreadyPresentEntry.tile, injected: false };
+      }
+
+      if (String(currentConversationKey()) !== originKey) {
+        return { ok: false, code: 'FAILED', errorCode: 'conversation_changed', message: 'The conversation changed while the archive was downloading; nothing was attached.' };
+      }
+
+      const input = getChatGPTInput();
+      const beforeText = input ? composerPlainText(input) : '';
+
+      phase('attaching', 'Attaching archive to the composer...');
+      // Snapshot the pre-upload tiles for this exact filename so an untouched
+      // old same-name tile can never be mistaken for the new upload.
+      const beforeTiles = new Set(chatGPTComposerAttachmentTiles().filter(tile => {
+        return chatGPTAttachmentTileName(tile).trim().toLowerCase() === meta.filename.toLowerCase();
+      }));
+
+      const injectionStarted = manualArchiveNow();
+      const file = new File([bytes], meta.filename, {
+        type: 'application/zip',
+        lastModified: meta.mtime ? meta.mtime * 1000 : Date.now()
+      });
+      // TARGET B: bind the injection to whatever composer is live at this
+      // instant, never to a root captured before the archive work. The shared
+      // engine reacquires root, input and ownership, then retries once across a
+      // React remount.
+      const injected = await injectComposerArchiveFile(file);
+      if (!injected.ok) {
+        return { ok: false, code: 'FAILED', errorCode: injected.reason, message: injected.detail || 'ChatGPT rejected the archive file injection.' };
+      }
+
+      manualArchiveTimingMark(timings, 'attachment_injection_ms', injectionStarted);
+      const tile = await waitForManualArchiveInjectedTile(meta, beforeTiles, CHATGPT_ATTACHMENT_TIMEOUT_MS);
+      manualArchiveTimingMark(timings, 'attachment_ready_ms', injectionStarted);
+      if (!tile) {
+        return { ok: false, code: 'ATTACH_TIMEOUT', errorCode: 'attachment-timeout', message: 'The new archive did not finish registering; the previous archive was kept.' };
+      }
+
+      let removedOld = 0;
+      for (const entry of composerArchivesForProject(project, chatGPTComposerRoot() || liveRoot)) {
+        if (entry.tile === tile) continue;
+        if (removeComposerAttachmentTile(entry.tile)) removedOld += 1;
+      }
+
+      if (input && input.isConnected) {
+        const afterText = composerPlainText(input);
+        if (afterText !== beforeText) nativeSet(input, beforeText);
+      }
+
+      rememberCanonicalArchiveProof(tile, project.project_id, {
+        filename: meta.filename,
+        size: bytes.length,
+        sha256: digest || meta.sha256
+      });
+      phase('ready', `Attached ${meta.filename}.`);
+      return {
+        ok: true,
+        code: removedOld ? 'REPLACED_OLD' : 'ATTACHED_NEW',
+        tile,
+        removedOld,
+        injected: true
+      };
+    });
+    result.injectionCount = attached?.injected === true ? 1 : 0;
+    if (!attached?.ok) {
+      return finish(attached?.code || 'FAILED', attached?.errorCode, attached?.message);
+    }
+    if (attached.code === 'ALREADY_ATTACHED') {
+      const flow = readOnly
+        ? { ok: true, code: 'ALREADY_ATTACHED', skipped: 'attach-only', meta, ensureCode: result.ensureCode }
+        : await sendManualArchiveFromReadyTile(attached.tile, meta, project, originKey, phase, operationGeneration, result, startSnapshot, timings);
+      result.ok = flow.ok;
+      result.code = flow.code;
+      result.detached = flow.detached;
+      result.payloadId = flow.payloadId;
+      return finish(flow.code, flow.errorCode, flow.message);
+    }
+    result.attachCode = attached.code;
+    result.replacedOld = Number(attached.removedOld) > 0;
+
+    if (readOnly) {
+      result.ok = true;
+      result.code = result.attachCode;
+      return finish(result.code);
+    }
+
+    const flow = await sendManualArchiveFromReadyTile(attached.tile, meta, project, originKey, phase, operationGeneration, result, startSnapshot, timings);
+    result.ok = flow.ok;
+    result.code = flow.code;
+    result.detached = flow.detached;
+    result.payloadId = flow.payloadId;
+    // TARGET K: a bounded Send failure keeps the canonical attachment in place;
+    // the next ZIP click retries ONLY the Send stage.
+    return finish(flow.code, flow.errorCode, flow.message);
+  }
+
+  // Shared Send stage for both the ALREADY_ATTACHED fast path and a fresh
+  // attach. Returns a compact result code and never removes the archive tile.
+  async function sendManualArchiveFromReadyTile(tile, meta, project, originKey, phase, operationGeneration, result, startSnapshot, timings = null) {
+    const liveTile = await manualArchiveResolveReadyTile(tile, meta, project);
+    if (!liveTile || String(currentConversationKey()) !== originKey) {
+      return {
+        ok: false,
+        code: String(currentConversationKey()) !== originKey ? 'FAILED' : 'ATTACH_TIMEOUT',
+        errorCode: String(currentConversationKey()) !== originKey ? 'conversation_changed' : 'attachment-timeout',
+        message: 'The canonical archive did not become ready; nothing was sent.'
+      };
+    }
+    const snapshot = startSnapshot || captureManualArchiveComposerSnapshot(originKey, { project });
+    // TARGET A/B: presence of a live composer is semantic state, not the
+    // transaction-start DOM node. A remount that preserved the payload is not a
+    // reason to cancel; a genuinely gone/empty composer still is.
+    const liveInput = getChatGPTInput();
+    if (!liveInput && !snapshot.text.trim() && !(snapshot.attachmentTiles || []).length) {
+      return { ok: false, code: 'COMPOSER_CHANGED_BEFORE_SEND', errorCode: 'composer_changed', message: 'The ChatGPT composer disappeared before Send.' };
+    }
+    // TARGET H: the payload identity is the authored text plus the unrelated
+    // attachments present when the transaction STARTED. Archive transport state
+    // is excluded (the receipt already keys on project + canonical SHA).
+    const identified = manualArchiveAttachmentsStronglyIdentified(snapshot.attachmentTiles);
+    const payloadId = await manualArchivePayloadIdentity(snapshot.text, snapshot.attachments);
+    // TARGET J: an attachment-only message is a valid payload, so the ready
+    // canonical archive itself is what makes the outgoing message non-empty.
+    if (!snapshot.text.trim() && !snapshot.attachmentTiles.length && !liveTile?.isConnected) {
+      return { ok: false, code: 'FAILED', errorCode: 'empty-payload', message: 'There is nothing to send.' };
+    }
+    // TARGET H: if the operator edited the composer while the ZIP was packing,
+    // downloading or registering, the widget never sends its stale assumption.
+    const changed = manualArchiveSnapshotStaleReason(snapshot);
+    if (changed === 'conversation_changed') {
+      return { ok: false, code: 'FAILED', errorCode: 'conversation_changed', message: 'The conversation changed before Send; nothing was sent.' };
+    }
+    if (changed) {
+      return {
+        ok: false,
+        code: 'COMPOSER_CHANGED_BEFORE_SEND',
+        errorCode: changed,
+        message: 'The composer changed while the archive was being prepared; automatic Send was canceled. The archive was kept.'
+      };
+    }
+    result.sendAttempts = 1;
+    const send = await manualArchiveSendComposer(snapshot, { onPhase: phase, timings });
+    if (!send.ok) {
+      if (send.reason === 'conversation_changed') {
+        return { ok: false, code: 'FAILED', errorCode: 'conversation_changed', message: 'The conversation changed before Send; nothing was sent.' };
+      }
+      if (send.reason === 'composer_changed' || send.reason === 'attachment_changed') {
+        return {
+          ok: false,
+          code: 'COMPOSER_CHANGED_BEFORE_SEND',
+          errorCode: send.reason,
+          message: 'The composer changed while the archive was being prepared; automatic Send was canceled. The archive was kept.'
+        };
+      }
+      if (send.reason === 'send-timeout') {
+        // TARGET K: bounded Send wait. The ready canonical attachment stays in
+        // the composer and the next ZIP click retries ONLY the Send stage.
+        return { ok: false, code: 'SEND_TIMEOUT', errorCode: 'send-timeout', message: 'ChatGPT never became sendable; the archive stays attached, so the next ZIP click retries only the Send.' };
+      }
+      return { ok: false, code: 'FAILED', errorCode: send.reason || 'send-failed', message: 'The ChatGPT Send control was unavailable.' };
+    }
+    if (!send.accepted) {
+      // TARGET P: no positive acceptance means NO success receipt, and the
+      // ready archive stays attached for a Send-only retry.
+      return { ok: false, code: 'SEND_PENDING', errorCode: 'send-unverified', message: 'ChatGPT did not confirm the Send; the archive stays attached for a retry.' };
+    }
+    result.sendAccepted = true;
+    // Only a positively verified Send may write a receipt (TARGET P).
+    if (identified) {
+      manualArchiveRecordSent({
+        conversationKey: originKey,
+        projectId: String(project?.project_id || ''),
+        sha256: String(meta.sha256 || ''),
+        filename: String(meta.filename || ''),
+        payloads: [{ id: payloadId, identified: true }]
+      });
+    }
+    const detached = manualArchiveDetachSentArchive(meta);
+    return { ok: true, code: 'SENT', sendAttempts: 1, payloadId, payloadIdentified: identified, detached };
+  }
+
+  async function manualArchiveTransaction(binding, options = {}) {
+    const originKey = String(options.conversationKey || currentConversationKey());
+    const projectId = String(binding?.project_id || '');
+    const readOnly = options.readOnly === true;
+    const flow = readOnly ? 'attach' : 'send';
+    if (!projectId) return { ok: false, code: 'UNBOUND', errorCode: 'unbound', message: 'No project is bound to this chat.' };
+    // TARGET Q: the ENTIRE transaction is single-flight for conversation +
+    // project + outgoing transaction generation. Ten rapid ZIP clicks produce
+    // one effective transaction; later callers coalesce onto its result.
+    const flightKey = `${originKey}::${projectId}::${flow}`;
+    if (manualArchiveFlight && manualArchiveFlight.key === flightKey) {
+      const settled = await manualArchiveFlight.promise;
+      return { ...settled, dedupe: 'DUPLICATE_COALESCED' };
+    }
+    manualArchiveTransactionGeneration += 1;
+    const operationGeneration = manualArchiveTransactionGeneration;
+    // P1 TARGET A: the caller's timings object is forwarded, so the phases the
+    // transaction owns land on the SAME record the click returns.
+    const timings = options.timings || manualArchiveTimingBegin();
+    const promise = (async () => {
+      const project = { project_id: projectId, display_name: String(binding.display_name || '') };
+      return sendManualArchiveTransaction(project, {
+        conversationKey: originKey,
+        readOnly,
+        operationGeneration,
+        timings,
+        onPhase: (stateName, detail) => setManualArchiveUiState(stateName, detail, project)
+      });
+    })().finally(() => {
+      if (manualArchiveFlight && manualArchiveFlight.key === flightKey) manualArchiveFlight = null;
+    });
+    manualArchiveFlight = { key: flightKey, promise, generation: operationGeneration };
+    return promise;
+  }
+
+  async function manualArchiveZipAction(options = {}) {
+    const timings = manualArchiveTimingBegin();
+    manualArchiveLastTimings = timings;
+    const originKey = currentConversationKey();
+    const binding = manualArchiveBindingFor(originKey);
+    if (!binding) {
+      setManualArchiveAttachOnly(false);
+      // The UNBOUND path is one of the two cases that legitimately reads the
+      // project registry: there is no binding to be authoritative about.
+      const registryStarted = manualArchiveNow();
+      await openManualArchivePicker();
+      manualArchiveTimingMark(timings, 'registry_ms', registryStarted);
+      timings.registry_requests = Number(manualArchiveMenuState.generation || 0) > 0 ? 1 : 0;
+      if (currentConversationKey() === originKey) {
+        setManualArchiveUiState('unbound', '', null, 'UNBOUND');
+      }
+      manualArchiveRecordTimings(timings, { conversationKey: originKey, projectId: '', resultCode: 'UNBOUND' });
+      return { ok: false, code: 'UNBOUND', errorCode: 'unbound', message: 'Choose a registered project for this chat.', timings };
+    }
+    const forceAttachOnly = options.attachOnly === true;
+    const readOnly = forceAttachOnly || manualArchiveAttachOnlyRequested();
+    if (forceAttachOnly) setManualArchiveAttachOnly(false);
+    // P1 TARGET B: the binding already carries the project_id the operator chose
+    // explicitly, and the archive ensure endpoint is the authority on whether
+    // that project is still servable (unknown / disabled / missing source /
+    // unavailable source). So the normal bound click does NOT read /v1/projects
+    // first: it goes straight to the canonical archive ensure. Registry lookup
+    // stays where it is genuinely required -- the unbound picker, an explicit
+    // Change Project, an explicit Refresh, and a bound project the Bridge rejects.
+    const project = manualArchiveBoundProject(binding);
+    timings.registry_requests = 0;
+    setManualArchiveUiState('checking', `Checking ${binding.display_name || binding.project_id} archive...`, project);
+    // TARGET J: paint CHECK within one frame, before any await of real work.
+    await manualArchivePaintFrame();
+    manualArchiveTimingMark(timings, 'first_ui_feedback_ms', timings.startedAt);
+    manualArchiveTimingMark(timings, 'project_resolution_ms', timings.startedAt);
+    const result = await manualArchiveTransaction(binding, { conversationKey: originKey, readOnly, timings });
+    timings.result_code = String(result?.code || '');
+    timings.archive_size = Math.max(0, Number(result?.meta?.size) || 0);
+    if (String(currentConversationKey()) !== originKey) return result;
+    if (!result.ok && manualArchiveBindingIsStaleCode(result.errorCode)) {
+      // TARGET B: mark the binding stale, surface the EXACT Bridge error, and
+      // offer the picker -- the only path allowed to read the registry.
+      markManualArchiveBindingStale(originKey, result.errorCode, result.message);
+      setManualArchiveUiState('error', result.message || result.code, project, result.errorCode);
+      const registryStarted = manualArchiveNow();
+      await openManualArchivePicker({ force: true });
+      manualArchiveTimingMark(timings, 'registry_ms', registryStarted);
+      timings.registry_requests = 1;
+      // The transaction already wrote its own record for a failure it owned;
+      // this one names the DISTINCT outcome of the click (stale binding + the
+      // picker it offered), so the two are not duplicates.
+      manualArchiveRecordTimings(timings, {
+        conversationKey: originKey,
+        projectId: project.project_id,
+        operationGeneration: result.operationGeneration,
+        resultCode: result.code,
+        ensureCode: result.ensureCode,
+        meta: result.meta,
+        getCount: result.getCount,
+        injectionCount: result.injectionCount,
+        sendAttempts: result.sendAttempts,
+        sendAccepted: result.sendAccepted
+      });
+      return { ...result, timings };
+    }
+    if (result.ok) {
+      if (result.code === 'ALREADY_SENT') {
+        setManualArchiveUiState('already_sent', 'This exact archive and payload were already sent.', project, result.code);
+      } else if (result.code === 'SENT') {
+        setManualArchiveUiState('sent', result.detached ? 'Sent; the attachment left the composer.' : 'Sent.', project, result.code);
+      } else if (result.code === 'ALREADY_ATTACHED') {
+        setManualArchiveUiState('ready', readOnly ? 'Canonical archive already attached (attach only).' : 'Canonical archive already attached.', project, result.code);
+      } else {
+        setManualArchiveUiState('ready', `Attached ${result.filename || result.meta?.filename || ''}.`, project, result.code);
+      }
+    } else {
+      // TARGET K: an attach-only outcome is reported as attached; a normal
+      // auto-Send outcome that failed MUST be visible as a Send failure, never
+      // as a successful attach-only completion. The archive stays attached.
+      if (!readOnly && result.code === 'SEND_TIMEOUT') {
+        setManualArchiveUiState('send_timeout', result.message || 'ChatGPT never became sendable; press ZIP to retry only the Send.', project, result.code);
+      } else if (!readOnly && result.code === 'SEND_PENDING') {
+        setManualArchiveUiState('send_pending', result.message || 'ChatGPT did not confirm the Send; press ZIP to retry only the Send.', project, result.code);
+      } else if (!readOnly && result.code === 'COMPOSER_CHANGED_BEFORE_SEND') {
+        setManualArchiveUiState('send_cancelled', result.message || 'Automatic Send was canceled; the archive was kept.', project, result.code);
+      } else {
+        setManualArchiveUiState('error', result.message || result.code, project, result.code);
+      }
+    }
+    // The transaction wrote the ONE evidence record for this click (including
+    // its phase timings); the action does not add a second identical one.
+    return { ...result, timings };
+  }
+
+  // P1 TARGET A: the same bounded record the transaction writes, plus the phase
+  // durations of THIS click. Token-free, byte-free, composer-text-free.
+  function manualArchiveRecordTimings(timings, fields) {
+    if (!timings) return null;
+    manualArchiveTimingMark(timings, 'total_ms', timings.startedAt);
+    manualArchivePublishTiming(timings);
+    return manualArchiveRecord({
+      conversationKey: fields?.conversationKey,
+      projectId: fields?.projectId,
+      operationGeneration: fields?.operationGeneration,
+      ensureCode: fields?.ensureCode,
+      shaPrefix: fields?.meta?.sha256,
+      getCount: fields?.getCount,
+      injectionCount: fields?.injectionCount,
+      sendAttempts: fields?.sendAttempts,
+      sendAccepted: fields?.sendAccepted,
+      resultCode: fields?.resultCode,
+      timings
+    });
+  }
+
+  function manualArchiveResultStatusText(result) {
+    // TARGET Q: the operator sees WHERE the time went right on the status line
+    // of the delivery it belongs to -- no DevTools required.
+    const text = manualArchiveResultStatusTextBase(result);
+    if (!text || !result?.timings) return text;
+    return `${text} [${manualArchiveTimingLine(result.timings)}]`;
+  }
+
+  function manualArchiveResultStatusTextBase(result) {
+    if (!result) return '';
+    switch (String(result.code || '')) {
+      case 'ALREADY_SENT': return 'ZIP: already sent; nothing was re-uploaded or re-sent.';
+      case 'SENT': return 'ZIP: sent the canonical archive with your composer payload.';
+      case 'ALREADY_ATTACHED': return 'ZIP: canonical archive already attached; nothing was re-uploaded.';
+      case 'COMPOSER_CHANGED_BEFORE_SEND': return 'ZIP: the composer changed while the archive was preparing, so automatic Send was canceled. The archive was kept.';
+      case 'SEND_PENDING': return 'ZIP: ChatGPT did not confirm the Send; the archive stays attached, so the next ZIP click retries only the Send.';
+      default: return `ZIP: attached ${result.filename || result.meta?.filename || 'the canonical archive'}.`;
+    }
+  }
+
+  async function selectManualArchiveProject(project, options = {}) {
+    const originKey = currentConversationKey();
+    if (!setManualArchiveBinding(project)) {
+      setStatus('ZIP: conversation binding could not be saved.', 'error');
+      return { ok: false, code: 'FAILED' };
+    }
+    closeManualArchivePicker();
+    const readOnly = options.attachOnly === true;
+    const result = await manualArchiveZipAction({ attachOnly: readOnly });
+    if (String(currentConversationKey()) === originKey) {
+      if (result?.ok) {
+        setStatus(manualArchiveResultStatusText(result), result.code === 'ALREADY_SENT' ? 'info' : 'success');
+      } else if (result?.code && result.code !== 'UNBOUND' && result?.errorCode !== 'conversation_changed') {
+        setStatus(`ZIP failed: ${result.message || result.code}. The previous archive was kept.`, 'error');
+      }
+      renderAutoAuditState();
+    }
+    return result;
+  }
+
   function renderAutoAuditState() {
     if (!panel || !state) return;
+    try { renderManualArchiveControl(); } catch (_) {}
+    try {
+      const saihandoff = panel.querySelector('#acb-saihandoff-state');
+      if (saihandoff) {
+        const mapped = saihandoffM1StatusText(getSaihandoffM1Generation());
+        saihandoff.textContent = mapped;
+        saihandoff.dataset.state = saihandoffM1StatusState(getSaihandoffM1Generation());
+      }
+    } catch (_) {}
+    try { fulfillNewChatRequiresChatIntentIfNeeded(); } catch (_) {}
     // Cheap sessionStorage probe first: this only does real work while a START
     // handoff still owns the A3 intent and the checkbox would paint OFF.
     if (!autoRuntime?.enabled) enforceStartReceiptA3Ownership();
+    // SRC-098: reconciliation runs HERE, before anything below reads the
+    // runtime, so every surface this render paints -- the checkbox, the
+    // compact label, the progress tiles -- sees one already-reconciled truth.
+    // The renderer stays a pure read.
+    if (!autoRuntime?.enabled) {
+      try { recoverManagedA3Ownership(); } catch (_) { }
+    }
+
+    // T-189 rev 2: one surface evaluation per render. The Work/auth/quota
+    // evidence below reuses this snapshot; re-deriving it per branch (or per
+    // readiness call) re-scanned the document several times per render.
+    const surface = chatGPTSurfaceSnapshot();
 
     const enabled = panel.querySelector('#acb-auto-enabled');
     const superEnabled = panel.querySelector('#acb-super-enabled');
@@ -13818,6 +21587,12 @@ async function recoverArmedStartSend(options = {}) {
     }
     if (renameToggle) renameToggle.checked = Boolean(state.autoRenameChat);
     if (bridgeToggle) bridgeToggle.checked = Boolean(state.bridgeEnabled);
+    const handoffToggle = panel.querySelector('#acb-handoff-auto');
+    if (handoffToggle) handoffToggle.checked = state.handoffAutoCapture !== false;
+    const auditCaptureToggle = panel.querySelector('#acb-audit-auto');
+    if (auditCaptureToggle) auditCaptureToggle.checked = state.auditAutoCapture !== false;
+    const auditAssignToggle = panel.querySelector('#acb-audit-assign');
+    if (auditAssignToggle) auditAssignToggle.checked = state.auditAutoAssign === true;
     if (bridgeUrlInput && document.activeElement !== bridgeUrlInput) bridgeUrlInput.value = state.bridgeUrl || BRIDGE_DEFAULT_URL;
     if (strict) strict.value = state.autoAuditStrictGate ? 'strict' : 'relaxed';
     if (delay) delay.value = String(state.autoAuditDelayMs);
@@ -13850,38 +21625,112 @@ async function recoverArmedStartSend(options = {}) {
     }
 
     if (saveNow) {
-      const stats = currentBridgeSaveState(autoBoundConversationKey || currentConversationKey(), bridgeJobsSnapshot);
-      const records = auditRecordsSnapshot;
-      const readyCount = records.length;
-      const durableCount = records.filter(record => Number(record.bridgeSavedAt) > 0).length;
+      const stats = currentBridgeSaveState(
+        autoBoundConversationKey || currentConversationKey(),
+        bridgeJobsSnapshot,
+        auditRecordsSnapshot
+      );
+      // T-185: one definition of durable for the label and the state -- an
+      // acknowledged wave whose canonical file has vanished is not durable.
+      const readyCount = stats.readyCount;
+      const durableCount = stats.durableCount;
+      // T-184 (PHASE K): SAVED means every COMPLETE wave is durably
+      // acknowledged -- never merely that the queue happens to be empty.
+      const allDurable = readyCount > 0 && durableCount === readyCount;
       saveNow.textContent = stats.failed > 0
         ? 'SAVE !'
         : stats.pending > 0
           ? 'SAVE'
-          : readyCount > 0 && durableCount === readyCount
+          : allDurable
             ? 'SAVED'
             : 'SAVE';
       saveNow.dataset.state = stats.failed > 0
         ? 'error'
         : stats.pending > 0
           ? 'pending'
-          : readyCount > 0 && durableCount === readyCount
+          : allDurable
             ? 'saved'
-            : 'idle';
+            : readyCount > 0
+              ? 'recover'
+              : 'idle';
       saveNow.title = readyCount
         ? `SYNC/SAVE current chat: persist runtime, rescan visible COMPLETE waves, physically recreate/overwrite all ${readyCount} cached wave file(s), and rebuild ALL_3 when 3/3 exist. ${durableCount}/${readyCount} currently durable.`
         : 'SYNC/SAVE current chat: persist/refresh runtime state now. No structurally COMPLETE wave is cached yet.';
     }
 
+    const zipNow = panel.querySelector('#acb-auto-zip');
+    if (zipNow) {
+      zipNow.dataset.state = archiveRefreshState;
+      zipNow.disabled = archiveRefreshInFlight;
+      zipNow.title = archiveRefreshInFlight
+        ? `AUTO ZIP busy: ${archiveRefreshDetail || archiveRefreshState}.`
+        : 'Ensure the registered AUDAPACK project archive is fresh and attach it here. Does not send the chat.';
+    }
+
     const progressSnapshot = autoProgressSnapshot();
     renderProgressContainer(progress, progressSnapshot);
     renderProgressContainer(superProgress, progressSnapshot);
-
     if (superStatus) {
       if (state.superCompact && ['idle', 'complete'].includes(String(autoRuntime?.stage || 'idle'))) {
         miniAttachmentSignature = composerAttachmentSignature();
       }
 
+      if (readNewChatRequiresChatIntent()) {
+        superStatus.textContent = 'NEW HOLD \u00b7 Work';
+        superStatus.dataset.state = 'attention';
+        superStatus.title = newChatRequiresChatStatus || 'NEW HOLD \u00b7 ChatGPT is in Work mode. Switch to Chat and press NEW again.';
+        superStatus.disabled = false;
+        renderAuditFolderState();
+        renderBridgeState(bridgeJobsSnapshot);
+        const chatgpt2 = detectSite().key === 'chatgpt';
+        if (delivery) delivery.disabled = !chatgpt2;
+        if (adopt) adopt.disabled = !autoRuntime?.enabled || !chatgpt2;
+        if (reset) reset.disabled = !chatgpt2;
+        if (stop) stop.disabled = !autoRuntime?.enabled || !chatgpt2 || autoRuntime?.stage === 'idle' || autoRuntime?.stage === 'complete';
+        return;
+      }
+      if (surface.mode === 'work') {
+        superStatus.textContent = 'START HOLD \u00b7 Work';
+        superStatus.dataset.state = 'attention';
+        superStatus.title = 'START HOLD \u00b7 ChatGPT is in Work mode. Switch to Chat and retry.';
+        superStatus.disabled = false;
+        renderAuditFolderState();
+        renderBridgeState(bridgeJobsSnapshot);
+        const chatgpt3 = detectSite().key === 'chatgpt';
+        if (delivery) delivery.disabled = !chatgpt3;
+        if (adopt) adopt.disabled = !autoRuntime?.enabled || !chatgpt3;
+        if (reset) reset.disabled = !chatgpt3;
+        if (stop) stop.disabled = !autoRuntime?.enabled || !chatgpt3 || autoRuntime?.stage === 'idle' || autoRuntime?.stage === 'complete';
+        return;
+      }
+      if (surface.authBlocked) {
+        superStatus.textContent = 'START HOLD \u00b7 Auth';
+        superStatus.dataset.state = 'attention';
+        superStatus.title = 'START HOLD \u00b7 ChatGPT sign-in blocks Send.';
+        superStatus.disabled = false;
+        renderAuditFolderState();
+        renderBridgeState(bridgeJobsSnapshot);
+        const chatgpt4 = detectSite().key === 'chatgpt';
+        if (delivery) delivery.disabled = !chatgpt4;
+        if (adopt) adopt.disabled = !autoRuntime?.enabled || !chatgpt4;
+        if (reset) reset.disabled = !chatgpt4;
+        if (stop) stop.disabled = !autoRuntime?.enabled || !chatgpt4 || autoRuntime?.stage === 'idle' || autoRuntime?.stage === 'complete';
+        return;
+      }
+      if (currentStartPhase) {
+        superStatus.textContent = currentStartPhase;
+        superStatus.dataset.state = currentStartPhase.includes('HOLD') ? 'attention' : 'running';
+        superStatus.title = lastStatusMessage?.text || currentStartPhase;
+        superStatus.disabled = false;
+        renderAuditFolderState();
+        renderBridgeState(bridgeJobsSnapshot);
+        const chatgptPA = detectSite().key === 'chatgpt';
+        if (delivery) delivery.disabled = !chatgptPA;
+        if (adopt) adopt.disabled = !autoRuntime?.enabled || !chatgptPA;
+        if (reset) reset.disabled = !chatgptPA;
+        if (stop) stop.disabled = !autoRuntime?.enabled || !chatgptPA || autoRuntime?.stage === 'idle' || autoRuntime?.stage === 'complete';
+        return;
+      }
       const compactLabel = superCompactAutoLabel(bridgeJobsSnapshot, auditRecordsSnapshot);
       const start = miniStartAuditState();
       const showStart = start.available;
@@ -13903,6 +21752,23 @@ async function recoverArmedStartSend(options = {}) {
       superStatus.dataset.kind = summary.kind;
       superStatus.dataset.phase = autoVisualPhase();
       superStatus.dataset.hold = autoComposerHoldReason ? 'true' : 'false';
+      // T-260: a stale userscript and a stale detector look IDENTICAL from the
+      // outside -- the operator sees a widget that disagrees with the page and
+      // has no way to tell which build is answering. The compact cell is the
+      // one surface always on screen, so it carries the installed build and the
+      // live generation verdict in its tooltip. Read-only, no extra chrome.
+      try {
+        const probe = chatGPTGenerationSnapshot();
+        superStatus.title = `AUDAPACK Widget ${widgetBuildVersion() || 'version unknown'} - generation: ${probe.state} (${probe.reason}${probe.selector_class ? `, saw ${probe.selector_class}` : ''})`;
+        // T-261: BUSY during a managed Core generation is a defect, and the
+        // operator is the only one who can see the live page. The compact cell
+        // therefore names WHICH layer lost the lineage, so the next failure is
+        // diagnosable without CDP and without guessing.
+        if (probe.generating) {
+          superStatus.title += ` | ${liveAuditLineageDiagnosticLine()}`;
+        }
+        superStatus.dataset.build = widgetBuildVersion();
+      } catch (_) { }
       superStatus.dataset.action = showStart
         ? 'start-audit'
         : 'sync-save';
@@ -14168,7 +22034,10 @@ async function recoverArmedStartSend(options = {}) {
     if (autoRuntime.stableResponseKey !== key) {
       autoRuntime.stableResponseKey = key;
       autoRuntime.stableSince = now;
-      saveAutoRuntime();
+      // Persist the stabilization checkpoint without a full UI render: this
+      // fires on every candidate evaluation, and rendering here re-scanned
+      // the whole page (PERF-005). The scheduled check repaints.
+      saveAutoRuntime({ deferRender: true });
       scheduleAutoAuditCheck(AUTO_RESPONSE_STABLE_MS + 80);
       return { complete: false, reason: 'stabilizing' };
     }
@@ -14377,6 +22246,11 @@ async function recoverArmedStartSend(options = {}) {
 
   function autoAwaitStageForKind(kind, continuation = false) {
     if (continuation) return 'await-continuation-user';
+    // Generic registration stage for ANY wave of the pinned active profile
+    // (await-${wave.id}-user); the quick3 names remain as legacy fallbacks for
+    // foreign-profile kinds exactly as before.
+    const activeKind = activeProfileWaveKind(kind);
+    if (activeKind) return `await-${activeKind}-user`;
     if (kind === 'second') return 'await-second-user';
     if (kind === 'performance') return 'await-performance-user';
     return '';
@@ -14549,6 +22423,16 @@ async function recoverArmedStartSend(options = {}) {
     if (receipt) {
       for (let index = turns.length - 1; index >= 0; index -= 1) {
         if (userTurnContainsReceipt(turns[index], receipt)) return turns[index];
+      }
+      // The receipt can be UNREADABLE, and for the Core it usually is: ChatGPT
+      // clamps a long user bubble behind "Show more" and the canonical receipt
+      // sits at the very END of the prompt. The committed transaction already
+      // knows which user turn existed immediately before its own irreversible
+      // Send, so the single new turn after that baseline IS the committed wave.
+      // Returning null here is what stranded START at stage idle forever.
+      const tx = readCommittedAutoSend();
+      if (tx && String(tx.kind || '') === String(expectedKind || '')) {
+        return autoSendTransactionBoundaryTurn(tx, autoRuntime, turns);
       }
       return null;
     }
@@ -14747,17 +22631,15 @@ async function recoverArmedStartSend(options = {}) {
 
   function autoComposerHoldKind() {
     if (!autoRuntime) return '';
-    if (autoRuntime.stage === 'sending-second') return 'second';
-    if (autoRuntime.stage === 'sending-performance') return 'performance';
     if (autoRuntime.stage === 'sending-continuation') return String(autoRuntime.continuationKind || '');
-    return '';
+    return sendingStageWaveKind(autoRuntime.stage);
   }
 
   function autoComposerHoldApplicable() {
     return Boolean(
       autoComposerHoldReason &&
       autoRuntime?.enabled &&
-      ['sending-second', 'sending-performance', 'sending-continuation'].includes(autoRuntime.stage)
+      (autoRuntime.stage === 'sending-continuation' || Boolean(sendingStageWaveKind(autoRuntime.stage)))
     );
   }
 
@@ -15020,7 +22902,7 @@ async function recoverArmedStartSend(options = {}) {
     // Do not inspect a moving response as terminal. Once generation is idle,
     // however, a structurally COMPLETE/BLOCKED handoff outranks any previously
     // queued stall nudge. PARTIAL intentionally falls through and continues.
-    if (chatGPTIsGenerating()) return false;
+    if (chatGPTIsGenerating() || chatGPTGenerationUnresolved()) return false;
 
     const assistant = auditAssistantAcrossSupplementals(previous, kind, turns) ||
       assistantTurnAfter(previous, turns);
@@ -15398,7 +23280,8 @@ async function recoverArmedStartSend(options = {}) {
     try {
       if (
         autoComposerHoldReason &&
-        !['sending-second', 'sending-performance', 'sending-continuation'].includes(autoRuntime?.stage)
+        autoRuntime?.stage !== 'sending-continuation' &&
+        !sendingStageWaveKind(autoRuntime?.stage || '')
       ) {
         clearAutoComposerHold();
         renderAutoAuditState();
@@ -15514,20 +23397,23 @@ async function recoverArmedStartSend(options = {}) {
         return;
       }
 
-      if (['await-second-user', 'await-performance-user', 'await-continuation-user'].includes(autoRuntime.stage) && recoverCommittedSendFromDom(turns)) return;
+      if (
+        (autoRuntime.stage === 'await-continuation-user' || awaitStageWaveKind(autoRuntime.stage)) &&
+        recoverCommittedSendFromDom(turns)
+      ) return;
 
       if (autoRuntime.stage === 'sending-continuation') {
         scheduleSameWaveContinuation(autoRuntime.continuationKind);
         return;
       }
 
-      if (autoRuntime.stage === 'sending-second') {
-        scheduleNextWave('second');
-        return;
-      }
-
-      if (autoRuntime.stage === 'sending-performance') {
-        scheduleNextWave('performance');
+      // Generic pending-send dispatch: `sending-${wave.id}` for every wave of
+      // the pinned active profile the chain can advance into. The lost
+      // ephemeral timer (reload / route hydration) is re-armed right here --
+      // scheduleNextWave is idempotent while its timer lives.
+      const pendingWaveKind = sendingStageWaveKind(autoRuntime.stage);
+      if (pendingWaveKind) {
+        scheduleNextWave(pendingWaveKind);
         return;
       }
 
@@ -15551,8 +23437,15 @@ async function recoverArmedStartSend(options = {}) {
         return;
       }
 
-      if (autoRuntime.stage === 'await-second-user' || autoRuntime.stage === 'await-performance-user') {
-        const expectedKind = autoRuntime.expectedKind;
+      // Generic registration dispatch: `await-${wave.id}-user` for any wave
+      // of the pinned active profile. Receipt / user-turn identity checks stay
+      // inside recoverPendingSendRegistration; a bounded timeout routes back
+      // through scheduleRegistrationRecovery to `sending-${sameWaveId}` (and
+      // from a fail-closed pause, recoverStalePauseFromConversation), never to
+      // a Quick3-specific fallback.
+      const awaitingWaveKind = awaitStageWaveKind(autoRuntime.stage);
+      if (awaitingWaveKind) {
+        const expectedKind = autoRuntime.expectedKind || autoRuntime.pendingSendKind || awaitingWaveKind;
 
         if (recoverPendingSendRegistration(expectedKind, turns)) return;
 
@@ -15563,10 +23456,7 @@ async function recoverArmedStartSend(options = {}) {
         );
 
         if (elapsed > AUTO_SEND_REGISTER_TIMEOUT_MS) {
-          scheduleRegistrationRecovery(
-            expectedKind,
-            expectedKind === 'second' ? 'sending-second' : 'sending-performance'
-          );
+          scheduleRegistrationRecovery(expectedKind, `sending-${awaitingWaveKind}`);
           return;
         }
 
@@ -15659,7 +23549,19 @@ async function recoverArmedStartSend(options = {}) {
         return;
       }
 
-      if (chatGPTIsGenerating()) {
+      const stageGeneration = chatGPTGenerationSnapshot();
+      if (stageGeneration.conflict && !autoGenerationConflictReported) {
+        autoGenerationConflictReported = true;
+        setStatus(
+          'ATTN: ChatGPT still shows a generation Stop while the latest assistant already has final response actions, past the stabilization window. Auto3 sent nothing and is not guessing; inspect this conversation.',
+          'warning'
+        );
+        renderAutoAuditState();
+      } else if (!stageGeneration.conflict) {
+        autoGenerationConflictReported = false;
+      }
+
+      if (stageGeneration.generating) {
         resetIdleStallWatch();
         scheduleAutoAuditCheck(AUTO_LIVENESS_CHECK_MS);
         return;
@@ -16009,9 +23911,18 @@ async function recoverArmedStartSend(options = {}) {
 
     const latestUser = latestChatGPTUserTurn(turns);
     const liveLineage = visibleAuditLineage(turns);
-    const latestAudit = liveLineage.blockedByReset
-      ? null
-      : (liveLineage.performance || liveLineage.second || liveLineage.core);
+    // Latest root is derived from the PINNED active profile, walking its wave
+    // order backwards -- quick3 still resolves to performance/second/core in
+    // exactly that order, and a Super10 run resolves to its own newest wave.
+    const staleProf = getActiveProfile();
+    const staleWaves = (staleProf?.waves || []);
+    let latestAudit = null;
+    if (!liveLineage.blockedByReset) {
+      for (let wi = staleWaves.length - 1; wi >= 0; wi -= 1) {
+        const candidate = liveLineage[staleWaves[wi].id];
+        if (candidate) { latestAudit = candidate; break; }
+      }
+    }
 
     // A newer plain user turn is supplemental context, not an audit-lineage
     // breaker. The newest canonical audit command remains the lineage anchor.
@@ -16036,29 +23947,29 @@ async function recoverArmedStartSend(options = {}) {
 
     // DOM virtualization / reload fallback. COMPLETE handoffs were already
     // cached by conversation before stage advancement, so they can prove how
-    // far this exact audit run had safely reached.
+    // far this exact audit run had safely reached. Progress is derived from
+    // the PINNED active profile: the longest valid completed prefix of
+    // profile.waves proven by durable records of this exact run.
+    // currentChatAuditRecords already fences runId + conversation identity and
+    // enforces each wave's depends_on chain, so a foreign run's records can
+    // never adopt as progress here.
     const coherentRecords = currentChatAuditRecords();
-    const core = coherentRecords.find(record => record.kind === 'core') || null;
-    const second = coherentRecords.find(record => record.kind === 'second') || null;
-    const performance = coherentRecords.find(record => record.kind === 'performance') || null;
-    const currentRunId = String(autoRuntime.runId || '');
-
-    const belongsToCurrentRun = record => Boolean(
-      record?.text &&
-      (!currentRunId || (record.runId && String(record.runId) === currentRunId))
+    const completedKinds = new Set(
+      coherentRecords
+        .filter(record => Boolean(record?.text) && String(record?.gateState || 'complete').toLowerCase() === 'complete')
+        .map(record => String(record.kind || ''))
     );
 
-    const coreReady = belongsToCurrentRun(core);
-    const secondReady = belongsToCurrentRun(second);
-    const performanceReady = belongsToCurrentRun(performance);
+    let completedPrefix = 0;
+    while (completedPrefix < staleWaves.length && completedKinds.has(String(staleWaves[completedPrefix].id))) {
+      completedPrefix += 1;
+    }
 
     let nextStage = '';
-    if (coreReady && secondReady && performanceReady) {
+    if (staleWaves.length && completedPrefix === staleWaves.length) {
       nextStage = 'complete';
-    } else if (coreReady && secondReady) {
-      nextStage = 'sending-performance';
-    } else if (coreReady) {
-      nextStage = 'sending-second';
+    } else if (completedPrefix > 0) {
+      nextStage = `sending-${staleWaves[completedPrefix].id}`;
     }
 
     if (!nextStage) return false;
@@ -16088,14 +23999,14 @@ async function recoverArmedStartSend(options = {}) {
 
     if (nextStage === 'complete') {
       setStatus(
-        'Auto3 self-healed stale PAUSE from cached Core + Second + Performance results. Chain is COMPLETE.',
+        `Auto3 self-healed stale PAUSE from cached completed-wave evidence (${completedPrefix}/${staleWaves.length} waves). Chain is COMPLETE.`,
         'success'
       );
       renderAutoAuditState();
       return true;
     }
 
-    const nextKind = nextStage === 'sending-second' ? 'second' : 'performance';
+    const nextKind = nextStage.slice('sending-'.length);
     setStatus(
       `Auto3 self-healed stale PAUSE from durable completed-wave evidence. Continuing automatically with ${waveLabel(nextKind)}.`,
       'success'
@@ -16258,18 +24169,76 @@ async function recoverArmedStartSend(options = {}) {
   // Config transitions (disable, pause, complete, wave send, root replacement)
   // recreate the observer so the heavy config never outlives the state that
   // needs it.
+  // T-249 (residual seam): is the bounded enabled+idle characterData recovery
+  // window currently open? It opens only for an enabled+idle runtime while
+  // ChatGPT is generating and NO audit lineage is recognizable yet -- exactly the
+  // hydration miss where a childList-only observer would never see the stream
+  // finish authoring the audit turn. Closing conditions are enforced here so no
+  // idle chat ever observes characterData permanently:
+  //   - generation ends            -> window is meaningless, close it;
+  //   - a wave becomes recognizable -> liveAuditActivitySnapshot().active takes
+  //                                    over the normal stream escalation, close;
+  //   - the hard cap expires        -> stop looking, back to cheap `turns`.
+  // Auth/quarantine and a non-idle stage never reach this helper (guarded by the
+  // caller), so a quarantined or adopted runtime cannot hold the window open.
+  function hydrationRecoveryWindowOpen() {
+    if (!autoRuntime?.enabled || String(autoRuntime.stage || 'idle') !== 'idle') {
+      autoHydrationRecoveryStartedAt = 0;
+      return false;
+    }
+    if (chatGPTAuthInterstitialVisible() || chatGPTRootIsQuarantined()) {
+      autoHydrationRecoveryStartedAt = 0;
+      return false;
+    }
+    if (!chatGPTIsGenerating()) {
+      // Generation ended: the look-window closes immediately.
+      autoHydrationRecoveryStartedAt = 0;
+      return false;
+    }
+    // A recognizable lineage is handled by the normal `active` escalation below;
+    // this window exists only for the not-yet-classifiable case.
+    if (liveAuditActivitySnapshot().active) {
+      autoHydrationRecoveryStartedAt = 0;
+      return false;
+    }
+    const now = Date.now();
+    if (!autoHydrationRecoveryStartedAt) {
+      autoHydrationRecoveryStartedAt = now;
+      return true;
+    }
+    if (now - autoHydrationRecoveryStartedAt > AUTO_HYDRATION_RECOVERY_WINDOW_MS) {
+      // Bounded generation-lifetime fence: stop looking, return to cheap turns.
+      return false;
+    }
+    return true;
+  }
+
   function autoAuditObserverConfig() {
     if (detectSite().key !== 'chatgpt') return null;
     if (!autoRuntime?.enabled) return 'nav';
     const stage = String(autoRuntime.stage || 'idle');
     const genericWaveStage = /^(?:wait|sending|await)-/.test(stage) &&
       Boolean(findWaveDefinitionForStageOrKind(autoRuntime.currentWaveId || stage));
-    return (genericWaveStage || ['wait-core', 'wait-second', 'wait-performance',
+    if (genericWaveStage || ['wait-core', 'wait-second', 'wait-performance',
       'sending-second', 'sending-performance', 'sending-continuation',
       'await-second-user', 'await-performance-user', 'await-continuation-user'
-    ].includes(stage))
-      ? 'stream'
-      : 'turns';
+    ].includes(stage)) {
+      return 'stream';
+    }
+    // T-249 (Milestone E): an enabled+idle runtime with a recognizable live
+    // audit in flight must temporarily observe streaming (characterData), so a
+    // stream that arrives only as characterData mutations after a hydration miss
+    // still re-arms reconciliation. Genuinely idle chats stay on the cheap
+    // childList `turns` config; ordinary non-audit generation does NOT escalate.
+    if (stage === 'idle' && liveAuditActivitySnapshot().active) return 'stream';
+    // T-249 (residual seam): even before lineage is recognizable, an
+    // enabled+idle runtime that is generating opens a BOUNDED characterData
+    // window so a purely-characterData hydration of the audit turn re-arms
+    // canonical reconciliation. Ordinary non-audit generation rides this window
+    // harmlessly -- reconcileEnabledIdleAuditRuntime refuses to adopt it -- and
+    // it collapses back to `turns` the instant generation ends or the cap fires.
+    if (stage === 'idle' && hydrationRecoveryWindowOpen()) return 'stream';
+    return 'turns';
   }
 
   function ensureAutoAuditObserver() {
@@ -16331,13 +24300,27 @@ async function recoverArmedStartSend(options = {}) {
       // for those mutations, never for ordinary streamed text.
       ensureAutoAuditObserver();
 
-      const previousKey = autoBoundConversationKey;
-      bindAutoRuntimeToCurrentConversation({ claim: false });
-      const conversationChanged = previousKey !== autoBoundConversationKey;
+      // PERF-002: make the cheap facts cheap first. A topology mutation can
+      // only change the bound conversation when the route moved, the auth
+      // surface appeared/vanished, or a conversation turn was inserted/removed.
+      // Anything else (attachment churn, panel churn, unrelated React reflow)
+      // must NOT trigger a global auth/root rebind -- that was the defect:
+      // every childList mutation on a stable route re-ran the broad auth scan.
+      const pathname = location.pathname;
+      const routeChanged = autoObserverLastPathname !== null && pathname !== autoObserverLastPathname;
+      const authMayHaveChanged = external.some(mutationMayChangeAuthState);
+      const turnMutation = external.some(mutationTouchesConversationTurn);
 
-      if (conversationChanged) {
-        miniAttachmentSignature = '';
-        renderAutoAuditState();
+      // Explicit route change and auth-modal/login insertion/removal invalidate
+      // immediately (they own the conversation key and quarantine verdict).
+      if (routeChanged || authMayHaveChanged) {
+        const previousKey = autoBoundConversationKey;
+        autoObserverLastPathname = pathname;
+        bindAutoRuntimeToCurrentConversation({ claim: false });
+        if (previousKey !== autoBoundConversationKey) {
+          miniAttachmentSignature = '';
+          renderAutoAuditState();
+        }
       }
 
       if (autoRuntime?.projectName && state?.autoRenameChat) {
@@ -16347,6 +24330,10 @@ async function recoverArmedStartSend(options = {}) {
       // Mini START is attachment-driven. Repaint only if a composer mutation
       // actually changes attachment presence/name/busy state.
       scheduleMiniAttachmentRefresh(external);
+
+      if (getSaihandoffM1Generation()) {
+        try { stepSaihandoffM1(); } catch (_) { }
+      }
 
       if (!autoRuntime?.enabled) return;
 
@@ -16368,22 +24355,7 @@ async function recoverArmedStartSend(options = {}) {
       // Idle/complete/paused does not need full response parsing for every React
       // childList mutation. Only a likely conversation-turn insertion/removal or
       // a conversation identity change can matter here.
-      const turnMutation = external.some(record => {
-        const nodes = [
-          acbElementFromNode(record.target),
-          ...Array.from(record.addedNodes || []).map(acbElementFromNode),
-          ...Array.from(record.removedNodes || []).map(acbElementFromNode)
-        ].filter(Boolean);
-
-        return nodes.some(node => {
-          if (node.matches?.('[data-message-author-role], [data-testid^="conversation-turn-"]')) return true;
-          if (node.closest?.('[data-message-author-role], [data-testid^="conversation-turn-"]')) return true;
-          if (node.querySelector?.('[data-message-author-role], [data-testid^="conversation-turn-"]')) return true;
-          return false;
-        });
-      });
-
-      if (conversationChanged || turnMutation) {
+      if (authMayHaveChanged || turnMutation) {
         scheduleAutoAuditCheck(AUTO_OBSERVER_DEBOUNCE_MS);
       }
     });
@@ -16491,21 +24463,38 @@ async function recoverArmedStartSend(options = {}) {
     releaseAutoLease(autoBoundConversationKey);
   }
 
-  function setAutoAuditEnabled(enabled) {
+  function setAutoAuditEnabled(enabled, options = {}) {
     bindAutoRuntimeToCurrentConversation({ claim: false });
 
     const next = Boolean(enabled);
+    const operatorAction = Boolean(options.operator);
+    const source = String(options.source || (operatorAction ? 'operator' : 'internal'));
     if (!autoRuntime) autoRuntime = emptyAutoRuntime({ enabled: next });
 
     const previous = autoRuntime.enabled;
+    const previousStage = String(autoRuntime.stage || '');
     autoRuntime.enabled = next;
     autoRuntime.conversationKey = autoBoundConversationKey || currentConversationKey();
 
     if (next) {
+      // Arming is always a decision to OWN the chat again, so it retires any
+      // recorded operator stop: a human who turns A3 back on has said so.
+      autoRuntime.a3OperatorExplicitOff = false;
+      autoRuntime.a3OperatorExplicitOffAt = 0;
+      autoRuntime.a3DisabledSource = '';
+      autoRuntime.a3DisabledReason = '';
       writeA3Intent(true, autoRuntime.conversationKey, {
         startTransaction: Boolean(startHandoffOwnsA3Intent(readStartAuditHandoff()))
       });
     } else {
+      // SRC-098: this is the ONLY place a disarm is ever recorded, and an
+      // operator stop exists only when a human actually touched the control.
+      // Every internal caller leaves the flag false, so managed recovery can
+      // still repair a runtime that went dark on its own.
+      autoRuntime.a3OperatorExplicitOff = operatorAction;
+      autoRuntime.a3OperatorExplicitOffAt = operatorAction ? Date.now() : 0;
+      autoRuntime.a3DisabledSource = source;
+      autoRuntime.a3DisabledReason = String(options.reason || '');
       clearA3Intent();
       clearStartAuditHandoff();
     }
@@ -16518,10 +24507,35 @@ async function recoverArmedStartSend(options = {}) {
       return;
     }
 
+    if (previous && !next) {
+      appendBridgeDiagnostic('a3_disarmed', {
+        severity: 'info',
+        message: `A3 disabled in ${autoRuntime.conversationKey} by ${source}`,
+        facts: {
+          conversation_key: String(autoRuntime.conversationKey || ''),
+          dispatch_id: String(browserWorkerLease?.dispatch_id || ''),
+          campaign_run_id: String(autoRuntime.runId || browserWorkerLease?.campaign_run_id || ''),
+          worker_id: String(browserWorkerLease?.worker_id || ''),
+          previous_stage: previousStage,
+          new_stage: String(autoRuntime.stage || ''),
+          reason: String(options.reason || ''),
+          source_function: 'setAutoAuditEnabled',
+          explicit_operator_action: operatorAction,
+          run_id: String(autoRuntime.runId || '')
+        }
+      });
+    }
+
     if (!next) {
       clearAutoComposerHold();
       clearAutoTimers();
       releaseAutoLease(autoBoundConversationKey);
+      // Milestone B: an explicit operator OFF on a managed lane is an
+      // end-to-end decision, not a local one. Internal disarms fall straight
+      // through -- only a human may retire a managed run.
+      if (operatorAction) {
+        managedA3OperatorStop({ reason: source || 'a3-checkbox' }).catch(() => { });
+      }
       ensureAutoAuditObserver();
       setStatus('Auto 3 waves disabled for this chat only. Saved progress is preserved; other and future conversations are unaffected.', 'success');
       renderAutoAuditState();
@@ -17028,11 +25042,11 @@ async function recoverArmedStartSend(options = {}) {
     panel.querySelector('#acb-super-progress').addEventListener('keydown', handleAuditStepActivation);
 
     panel.querySelector('#acb-auto-enabled').addEventListener('change', event => {
-      setAutoAuditEnabled(event.target.checked);
+      setAutoAuditEnabled(event.target.checked, { operator: true, source: 'a3-checkbox' });
     });
 
     panel.querySelector('#acb-super-enabled').addEventListener('change', event => {
-      setAutoAuditEnabled(event.target.checked);
+      setAutoAuditEnabled(event.target.checked, { operator: true, source: 'a3-checkbox' });
     });
 
     const toggleAuditProfile = () => {
@@ -17057,11 +25071,138 @@ async function recoverArmedStartSend(options = {}) {
 
     panel.querySelector('#acb-save-now').addEventListener('click', () => {
       syncSaveCurrentChatStateNow().catch(error => {
-        manualAuditSyncInFlight = false;
+        // The operation's own finally block owns the foreground release
+        // (generation-fenced). Clearing the flag here would let a rejected old
+        // attempt unlock a newer one's SAVE... state.
         setStatus(`SYNC/SAVE failed: ${error?.message || 'unexpected persistence error'}. Cached audits and runtime state were not intentionally discarded.`, 'error');
         renderAutoAuditState();
       });
     });
+
+    const autoZipButton = panel.querySelector('#acb-auto-zip');
+    if (autoZipButton) {
+      autoZipButton.addEventListener('click', () => {
+        attachProjectArchiveForCurrentChat().then(result => {
+          if (result?.ok) {
+            setStatus(result.reused ? 'AUTO ZIP: canonical archive already attached.' : `AUTO ZIP: attached ${result.filename}.`, 'success');
+          } else if (result?.errorCode) {
+            setStatus(`AUTO ZIP failed: ${result.message || result.errorCode}. The previous archive was kept.`, 'error');
+          }
+          renderAutoAuditState();
+        }).catch(error => {
+          archiveRefreshInFlight = false;
+          archiveRefreshState = 'error';
+          archiveRefreshDetail = String(error?.message || 'unexpected AUTO ZIP error');
+          setStatus(`AUTO ZIP failed: ${archiveRefreshDetail}. The previous archive was kept.`, 'error');
+          renderAutoAuditState();
+        });
+      });
+    }
+
+    // P1 TARGET G: the general manual ZIP control lives in the titlebar,
+    // independent of Auto Audit. Unbound -> project picker (project selection
+    // is explicit consent for the transaction); bound -> one whole transaction:
+    // VERIFY CANONICAL ARCHIVE -> ATTACH IF REQUIRED -> WAIT FOR READY TILE ->
+    // SEND CURRENT COMPOSER -> VERIFY SEND. Shift-click opens the picker, where
+    // "Attach only" is the documented attach-without-send escape hatch.
+    const manualZipButton = panel.querySelector('#acb-manual-zip-btn');
+    if (manualZipButton) {
+      manualZipButton.addEventListener('click', event => {
+        const menu = panel.querySelector('#acb-manual-zip-menu');
+        if (event.shiftKey || !manualArchiveBindingFor()) {
+          if (menu && !menu.hidden) {
+            closeManualArchivePicker();
+          } else {
+            openManualArchivePicker();
+          }
+          renderAutoAuditState();
+          return;
+        }
+        if (menu && !menu.hidden) {
+          closeManualArchivePicker();
+          renderAutoAuditState();
+          return;
+        }
+        manualArchiveZipAction().then(result => {
+          if (result?.ok) {
+            setStatus(manualArchiveResultStatusText(result), result.code === 'ALREADY_SENT' ? 'info' : 'success');
+          } else if (result?.code === 'UNBOUND') {
+            openManualArchivePicker();
+          } else if (result?.code) {
+            setStatus(`ZIP failed: ${result.message || result.code}. The previous archive was kept.`, 'error');
+          }
+          renderAutoAuditState();
+        }).catch(error => {
+          setStatus(`ZIP failed: ${error?.message || 'unexpected archive error'}. The previous archive was kept.`, 'error');
+          renderAutoAuditState();
+        });
+      });
+
+      manualZipButton.addEventListener('contextmenu', event => {
+        event.preventDefault();
+        const menu = panel.querySelector('#acb-manual-zip-menu');
+        if (menu && menu.hidden) {
+          openManualArchivePicker();
+        } else {
+          closeManualArchivePicker();
+        }
+        renderAutoAuditState();
+      });
+    }
+
+    document.addEventListener('pointerdown', event => {
+      const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+      if (!menu || menu.hidden) return;
+      const wrap = panel.querySelector('#acb-manual-zip');
+      if (wrap && !wrap.contains(event.target)) {
+        closeManualArchivePicker();
+        renderAutoAuditState();
+      }
+    }, true);
+
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
+        if (menu && !menu.hidden) {
+          closeManualArchivePicker();
+          renderAutoAuditState();
+        }
+      }
+    }, true);
+
+    const manualZipRefresh = panel.querySelector('#acb-manual-zip-refresh');
+    if (manualZipRefresh) {
+      manualZipRefresh.addEventListener('click', () => {
+        // TARGET E/F: an explicit refresh asks for a NEW registry generation and
+        // coalesces onto whatever request is already live.
+        manualArchiveRefreshProjects().catch(() => { });
+      });
+    }
+    const manualZipAttachOnly = panel.querySelector('#acb-manual-zip-attach-only');
+    if (manualZipAttachOnly) {
+      manualZipAttachOnly.addEventListener('click', event => {
+        // TARGET T: never the default. Selecting it inside the picker is
+        // explicit operator consent for one attach-without-send transaction.
+        setManualArchiveAttachOnly(!manualArchiveAttachOnlyRequested());
+        renderManualArchiveMenu();
+        renderManualArchiveControl();
+        setStatus(manualArchiveAttachOnlyRequested()
+          ? 'ZIP: attach-only armed for the next selection; the composer will not be sent.'
+          : 'ZIP: attach-only cleared; the next selection attaches and sends.', 'info');
+      });
+      manualZipAttachOnly.setAttribute('role', 'switch');
+    }
+    const manualZipClear = panel.querySelector('#acb-manual-zip-clear');
+    if (manualZipClear) {
+      manualZipClear.addEventListener('click', () => {
+        const existed = clearManualArchiveBinding();
+        closeManualArchivePicker();
+        setStatus(existed
+          ? 'ZIP: conversation binding cleared. Project files were not touched.'
+          : 'ZIP: no project was bound to this chat.', existed ? 'success' : 'info');
+        renderAutoAuditState();
+      });
+    }
 
     panel.querySelector('#acb-super-state').addEventListener('click', event => {
       const action = String(event.currentTarget?.dataset?.action || 'none');
@@ -17078,7 +25219,6 @@ async function recoverArmedStartSend(options = {}) {
 
       if (action === 'sync-save') {
         syncSaveCurrentChatStateNow().catch(error => {
-          manualAuditSyncInFlight = false;
           setStatus(`SYNC/SAVE failed: ${error?.message || 'unexpected persistence error'}. Cached audits and runtime state were not intentionally discarded.`, 'error');
           renderAutoAuditState();
         });
@@ -17156,6 +25296,33 @@ async function recoverArmedStartSend(options = {}) {
         conversationTitleGuardStartedAt = 0;
         conversationTitleGuardRunStartedAt = 0;
       }
+    });
+
+    panel.querySelector('#acb-handoff-auto')?.addEventListener('change', event => {
+      const next = Boolean(event.target.checked);
+      if (!commitStateMutation(
+        () => { state.handoffAutoCapture = next; },
+        'SAIHANDOFF auto-save could not be persisted; the previous value was restored.'
+      )) return;
+      setStatus(next ? 'SAIHANDOFF blocks in new replies are saved automatically.' : 'SAIHANDOFF auto-save is off; use the block capture button.', 'info');
+    });
+
+    panel.querySelector('#acb-audit-auto')?.addEventListener('change', event => {
+      const next = Boolean(event.target.checked);
+      if (!commitStateMutation(
+        () => { state.auditAutoCapture = next; },
+        'Audit auto-capture could not be persisted; the previous value was restored.'
+      )) return;
+      setStatus(next ? 'Replies to a project archive go to the INAUDIT Inbox automatically, pinned to that project.' : 'Audit auto-capture is off; use the IA button.', 'info');
+    });
+
+    panel.querySelector('#acb-audit-assign')?.addEventListener('change', event => {
+      const next = Boolean(event.target.checked);
+      if (!commitStateMutation(
+        () => { state.auditAutoAssign = next; },
+        'Audit auto-assign could not be persisted; the previous value was restored.'
+      )) return;
+      setStatus(next ? 'Captured audit replies are assigned to their project audit inbox at once.' : 'Captured audit replies wait in the INAUDIT Inbox for Assign.', 'info');
     });
 
     panel.querySelector('#acb-bridge-enabled').addEventListener('change', event => {
@@ -17257,6 +25424,20 @@ async function recoverArmedStartSend(options = {}) {
           : 'Bridge diagnostics log was already empty.',
         cleared > 0 ? 'success' : 'info'
       );
+    });
+
+    panel.querySelector('#acb-bridge-probe-get')?.addEventListener('click', event => {
+      const button = event.currentTarget;
+      if (button) button.disabled = true;
+      setStatus('Probing GET transport (Tampermonkey vs native fetch)...', 'info');
+      archiveTransportProbe().then(result => {
+        renderBridgeState();
+        setStatus(result.line || result.error || 'Transport probe finished without a result.', result.ok ? 'success' : 'error');
+      }).catch(error => {
+        setStatus(`Transport probe failed: ${error?.message || 'unexpected error'}`, 'error');
+      }).finally(() => {
+        if (button) button.disabled = false;
+      });
     });
 
     panel.querySelector('#acb-bridge-state')?.addEventListener('click', () => {
@@ -17580,18 +25761,40 @@ async function recoverArmedStartSend(options = {}) {
     }
   }
 
+  //: PERF-003 (audit/9.md): one canonical re-anchor point for every observer
+  //: bound to the ChatGPT chat root. Both ensure functions keep their own
+  //: idempotent same-root check, so calling this repeatedly can never multiply
+  //: observers -- and neither owner can be forgotten when <main> is replaced.
+  function ensureChatRootObservers() {
+    ensureAutoAuditObserver();
+    ensureInauditCaptureObserver();
+  }
+
   function installWidgetGuardian() {
     if (typeof MutationObserver !== 'function') return;
 
     if (!widgetGuardianObserver) {
       widgetGuardianObserver = new MutationObserver(() => {
         const bodyChanged = widgetGuardianBody !== document.body;
+        const liveChatRoot = document.querySelector?.('main') || null;
         const auditRootDetached = Boolean(autoAuditObserverRoot && !autoAuditObserverRoot.isConnected);
+        const inauditRootDetached = Boolean(inauditCaptureObserverRoot && !inauditCaptureObserverRoot.isConnected);
+        // A replacement root can appear while the old one is still attached
+        // (SPA route/hydration swap), so detachment alone is not the trigger.
+        const chatRootReplaced = Boolean(liveChatRoot && (
+          (autoAuditObserverRoot && autoAuditObserverRoot !== liveChatRoot) ||
+          (inauditCaptureObserverRoot && inauditCaptureObserverRoot !== liveChatRoot)
+        ));
+        const chatRootChanged = auditRootDetached || inauditRootDetached || chatRootReplaced;
         if (bodyChanged) installWidgetGuardian();
         if (!panel?.isConnected) ensureWidgetConnected();
-        if (auditRootDetached) {
-          ensureAutoAuditObserver();
-          if (autoRuntime?.enabled) scheduleAutoAuditCheck(80);
+        if (chatRootChanged) {
+          const autoNeededReanchor = auditRootDetached ||
+            Boolean(autoAuditObserverRoot && liveChatRoot && autoAuditObserverRoot !== liveChatRoot);
+          // Re-observe the new root's parent so the next replacement is seen too.
+          if (!bodyChanged) installWidgetGuardian();
+          ensureChatRootObservers();
+          if (autoNeededReanchor && autoRuntime?.enabled) scheduleAutoAuditCheck(80);
         }
       });
     }
@@ -17667,10 +25870,23 @@ async function recoverArmedStartSend(options = {}) {
     panel.id = 'acb-popup';
     panel.setAttribute('role', 'complementary');
     panel.setAttribute('aria-label', 'AUDAPACK Widget');
-    setHTML(panel, `
+      setHTML(panel, `
       <div id="acb-titlebar">
         <div id="acb-title">AUDAPACK Widget</div>
         <div id="acb-site" title="Current site">${escapeHTML(site.label)}</div>
+
+        <div id="acb-manual-zip">
+          <button id="acb-manual-zip-btn" type="button" data-state="unbound" title="Attach a registered AUDAPACK project archive to this chat and automatically Send it once ChatGPT has registered the attachment. Hold Shift (or use &quot;Attach only&quot; in the picker) to attach without sending.">ZIP ▾</button>
+          <div id="acb-manual-zip-menu" hidden>
+            <div id="acb-manual-zip-menu-title">Attach project archive</div>
+            <div id="acb-manual-zip-menu-list"></div>
+            <div id="acb-manual-zip-menu-actions">
+              <button id="acb-manual-zip-refresh" type="button" title="Reload the registered project list from the Bridge. Bounded: this never waits forever.">Refresh list</button>
+              <button id="acb-manual-zip-attach-only" type="button" data-selected="false" aria-pressed="false" title="Attach the selected project archive WITHOUT sending it. The normal ZIP action attaches and then automatically Sends.">Attach only</button>
+              <button id="acb-manual-zip-clear" type="button" title="Forget the project bound to THIS chat. Project files are never touched.">Clear</button>
+            </div>
+          </div>
+        </div>
 
         <div id="acb-super-controls" aria-label="Super compact campaign monitor">
           <span id="acb-super-brand" title="No audit project detected in this chat.">CHAT</span>
@@ -17708,6 +25924,8 @@ async function recoverArmedStartSend(options = {}) {
             <div id="acb-auto-progress" aria-label="Audit chain progress"></div>
             <div id="acb-auto-state-row">
               <div id="acb-auto-state" data-kind="info">Auto campaign disabled.</div>
+              <div id="acb-saihandoff-state" data-state="idle" title="Implementation handoff (M1 archive/send automation). This is NOT the Auto3 audit chain status.">Implementation handoff: IDLE</div>
+              <button id="acb-auto-zip" type="button" data-state="idle" title="Ensure the registered AUDAPACK project archive is fresh and attach it here. Does not send the chat.">↻ ZIP</button>
               <button id="acb-save-now" type="button" data-state="idle" title="SYNC/SAVE current chat: persist runtime, rescan COMPLETE waves, force-confirm disk output, and refresh campaign files when possible.">SAVE</button>
             </div>
             <div id="acb-audit-copy-hint">Attach project + START = arm Auto campaign automatically · normal chat stays inert · every COMPLETE is saved.</div>
@@ -17878,6 +26096,18 @@ async function recoverArmedStartSend(options = {}) {
                 <input id="acb-bridge-enabled" type="checkbox" />
                 <span>Use AUDAPACK Bridge (recommended)</span>
               </label>
+              <label class="acb-check-row acb-bridge-wide" for="acb-handoff-auto" title="When a reply finishes with a SAIHANDOFF block, the Bridge saves it as a ready .md file and its path is copied to the clipboard.">
+                <input id="acb-handoff-auto" type="checkbox" />
+                <span>Auto-save SAIHANDOFF blocks (copy file path)</span>
+              </label>
+              <label class="acb-check-row acb-bridge-wide" for="acb-audit-auto" title="When a reply to a message carrying a project ZIP finishes, it is saved to the AUDAPACK INAUDIT Inbox and pinned to that project.">
+                <input id="acb-audit-auto" type="checkbox" />
+                <span>Auto-capture audit replies to INAUDIT</span>
+              </label>
+              <label class="acb-check-row acb-bridge-wide" for="acb-audit-assign" title="A captured audit reply pinned to its project by the archive name is assigned at once: it lands in that project's audit inbox (SAIPEN: audit enqueue) without the Assign click.">
+                <input id="acb-audit-assign" type="checkbox" />
+                <span>...and assign it to the project audit inbox</span>
+              </label>
 
               <div class="acb-field acb-bridge-wide">
                 <label class="acb-label" for="acb-bridge-url">Bridge URL</label>
@@ -17900,6 +26130,7 @@ async function recoverArmedStartSend(options = {}) {
                 <span class="acb-label">Bridge diagnostics (token excluded)</span>
                 <button id="acb-bridge-copy-log" type="button" title="Copy connection state, queue job causes, and recent Bridge events for troubleshooting.">Copy log</button>
                 <button id="acb-bridge-clear-log" type="button" title="Clear the recorded Bridge diagnostics log so a fresh problem can be captured from a clean slate.">Clear log</button>
+                <button id="acb-bridge-probe-get" type="button" title="Time a content-free archive-sized download through Tampermonkey and through native fetch (twice each). The result is written to the diagnostics log and mirrored to the Bridge.">Probe GET</button>
               </div>
               <pre id="acb-bridge-log" tabindex="0">No Bridge diagnostics recorded yet.</pre>
             </div>
@@ -17942,6 +26173,7 @@ async function recoverArmedStartSend(options = {}) {
     clampPanelPosition({ report: true });
     updateLockState();
     installBridgeQueueListener();
+    retireLegacyMaterializeFailures();
     installAuditResultListener();
 
     if (site.key === 'chatgpt') {
@@ -18019,6 +26251,17 @@ async function recoverArmedStartSend(options = {}) {
         const root = chatGPTComposerRoot();
         if (!root || !root.contains(input)) return;
         rememberChatGPTComposerFiles(input);
+        if (acbInternalFileChangeEvents.has(event)) {
+          acbInternalFileChangeEvents.delete(event);
+          return;
+        }
+        const internal = input._acbInternalFileListChange;
+        input._acbInternalFileListChange = null;
+        if (internal && internal.signature === nativeFileListSignature(input.files)) return;
+        if (Array.from(input.files || []).length) {
+          handleSaihandoffM1DropOrSelection(Array.from(input.files || []), { eventType: 'change' });
+          setTimeout(() => { try { stepSaihandoffM1(); } catch (_) { } }, 0);
+        }
         setTimeout(() => renderAutoAuditState(), 0);
       }, true);
     }
@@ -18028,6 +26271,7 @@ async function recoverArmedStartSend(options = {}) {
         preservePreparedStartBeforeManualSend(event?.target);
       }, true);
     }
+    installComposerArchiveDropSanitizer();
     if (!managedWorkerHousekeepingInstalled && browserWorkerManagedIdentity()?.slot) {
       managedWorkerHousekeepingInstalled = true;
       // Housekeeping must not depend on the worker poll loop being healthy:
@@ -18048,6 +26292,10 @@ async function recoverArmedStartSend(options = {}) {
   let browserWorkerPollInFlight = false;
   let browserWorkerStopRequested = false;
   let browserWorkerLease = null;
+  // SRC-098: the last dispatch state the Bridge reported for the lease this
+  // window holds. The Bridge owns that truth; the widget only remembers it so
+  // a render between polls can still tell a live campaign from a finished one.
+  let browserWorkerDispatchState = '';
   let browserWorkerCompletionTimer = 0;
   let browserWorkerConsecutivePollFailures = 0;
   const BROWSER_WORKER_LEASE_SESSION_KEY = 'audapack_browser_worker_lease_v1';
@@ -18086,6 +26334,13 @@ async function recoverArmedStartSend(options = {}) {
   // the soft reason was. Nothing irreversible can be lost past this point: a
   // live lease, a prepared START and an actual generation are still respected.
   const BROWSER_WORKER_DIRTY_WATCHDOG_MS = 180000;
+  // Worker polls are short, never held open by the Bridge. The userscript
+  // manager runs every window's GM_xmlhttpRequest through one queue, so six
+  // workers each holding a ~6 s long poll put up to ~37 s in front of the
+  // operator's own ZIP ensure and GET (measured: GET headers 37.57 s against a
+  // 3 ms Bridge prep). The idle gap is spent in a local timer instead, where
+  // it blocks nobody; a claimable job still waits at most this long.
+  const BROWSER_WORKER_IDLE_POLL_MS = 2000;
   let browserWorkerDirtySince = 0;
   let browserWorkerReportedBlockReason = '';
 
@@ -18222,7 +26477,27 @@ let browserWorkerBraveConfirmed = false;
     return browserWorkerBrowserName;
   }
 
+  // T-248: the live composer shape, reported to the Bridge on every heartbeat
+  // so a build that moved its file input is readable evidence instead of a
+  // guess. Cached, because the worker status path is hot and a DOM scan per
+  // heartbeat is not free. Structure only: ids, testids, flags, ownership.
+  let browserWorkerUploadTopologyCache = { at: 0, value: '' };
+
+  function browserWorkerUploadTopology(now = Date.now()) {
+    const cached = browserWorkerUploadTopologyCache;
+    if (cached.value && now - cached.at < 5000) return cached.value;
+    let value = '';
+    try {
+      value = chatGPTUploadTopologyLine(chatGPTUploadTopology());
+    } catch (_) {
+      value = '';
+    }
+    browserWorkerUploadTopologyCache = { at: now, value };
+    return value;
+  }
+
   function browserWorkerSnapshot() {
+    const siteKey = detectSite().key;
     const input = rawChatGPTComposerInput();
     const draft = input ? composerPlainText(input) : '';
     const attachment = chatGPTReadyAttachmentSummary();
@@ -18257,11 +26532,12 @@ let browserWorkerBraveConfirmed = false;
       widget_protocol: BROWSER_WORKER_PROTOCOL_VERSION,
       widget_build_version: widgetBuildVersion(),
       bridge_api_version: String(BRIDGE_API_VERSION || 3),
-      site: detectSite().key,
+      site: siteKey,
       conversation_key: String(autoBoundConversationKey || currentConversationKey() || ''),
-      conversation_id: String(getTurnId?.(latestChatGPTUserTurn?.()) || ''),
+      conversation_id: String(getTurnId?.(latestChatGPTUserTurn?.(turns)) || ''),
       url_path: String(location.pathname || ''),
       browser_name: browserWorkerBrowserName || browserName,
+      upload_topology: siteKey === 'chatgpt' ? browserWorkerUploadTopology() : '',
       is_brave: isBrave,
       is_chromium: isChromium,
       brave_confirmed: browserWorkerBraveConfirmed,
@@ -18285,13 +26561,10 @@ let browserWorkerBraveConfirmed = false;
     };
   }
 
-  function browserWorkerClaimBlockReason() {
-    // Named reasons only: a job handed back with `worker-not-claimable` and
-    // nothing else is exactly as undiagnosable as the silent drop it replaced.
-    const snap = browserWorkerSnapshot();
+  function browserWorkerClaimBlockReason(snap = browserWorkerSnapshot()) {
     if (!snap.is_chromium) return 'worker-not-chromium';
-    if (!snap.page_eligible) return 'worker-not-on-root-chat';
     if (snap.work_surface) return 'worker-in-work-mode';
+    if (!snap.page_eligible) return 'worker-not-on-root-chat';
     if (detectSite().key !== 'chatgpt') return 'worker-not-on-chatgpt';
     if (snap.generating) return 'worker-generating';
     if (snap.has_conversation_turns) return 'worker-has-conversation';
@@ -18305,8 +26578,7 @@ let browserWorkerBraveConfirmed = false;
     return 'worker-not-claimable';
   }
 
-  function browserWorkerCanClaim() {
-    const snap = browserWorkerSnapshot();
+  function browserWorkerCanClaim(snap = browserWorkerSnapshot()) {
     return snap.is_chromium && snap.page_eligible && !snap.work_surface &&
       detectSite().key === 'chatgpt' &&
       !snap.generating && !snap.has_manual_draft && !snap.has_attachments &&
@@ -18445,6 +26717,34 @@ let browserWorkerBraveConfirmed = false;
     return transition('RETRYABLE', { error: reason });
   }
 
+  // T-248: pre-START delivery failed with an exact reason. A structural DOM
+  // contract miss blocks once with the shape of the current ChatGPT composer
+  // attached, so the operator sees WHY instead of six identical
+  // `pre-start retries exhausted` rows. A remount or a refused assignment
+  // stays RETRYABLE and keeps its own code.
+  function browserWorkerInjectionFailure(transition, code, detail) {
+    const reason = String(code || 'upload-input-unavailable');
+    const topology = chatGPTUploadTopology();
+    const summary = `${reason}${detail ? `: ${detail}` : ''} | ${chatGPTUploadTopologyLine(topology)}`;
+    if (chatGPTUploadCodeIsStructural(reason)) {
+      showBrowserWorkerBlocked(reason, { detail: summary });
+      return transition('BLOCKED', { error: reason, detail: summary });
+    }
+    return transition('RETRYABLE', { error: reason, detail: summary });
+  }
+
+  // The single injection step every pre-START path shares.
+  async function browserWorkerInjectArtifact(artifact, transition, inject) {
+    const outcome = await inject(artifact.file);
+    if (outcome.ok) return true;
+    const acknowledged = await browserWorkerInjectionFailure(transition, outcome.reason, outcome.detail);
+    if (acknowledged.ok) {
+      browserWorkerLease = null;
+      persistBrowserWorkerLease();
+    }
+    return false;
+  }
+
   function browserWorkerStandDown(reason = 'lease-revoked') {
     // The Bridge refused this window's START. That means another window owns
     // the dispatch now, or the lease is gone. Keeping the prepared Core armed
@@ -18475,14 +26775,34 @@ let browserWorkerBraveConfirmed = false;
 
   function browserWorkerRecoverIdleEngine() {
     // The Bridge says this window owns a live post-start run, and the engine
-    // that has to harvest it is sitting at stage idle. That happens when the
-    // Core was sent before the engine was armed, or when route hydration
-    // dropped the runtime as the draft became /c/<id>. The chat already holds
-    // the machine-authored audit turn, so the engine can be put back on it.
-    const stage = String(autoRuntime?.stage || 'idle');
-    if (stage !== 'idle' && stage !== 'complete') return false;
+    // that has to harvest it is not on. That happens when the Core was sent
+    // before the engine was armed, or when route hydration dropped the runtime
+    // as the draft became /c/<id>. The chat already holds the machine-authored
+    // audit turn, so the engine can be put back on it.
+    //
+    // SRC-098: the old gate was `stage idle|complete` only, which is exactly
+    // backwards for the live defect. A runtime parked at wait-core -- Core sent,
+    // answer not finished -- is the MOST managed state there is, and it was the
+    // one state that could never be re-armed: every other recovery predicate
+    // wanted either a blank runtime or a START handoff that had already been
+    // cleared when the Core turn was adopted. Ownership, not stage, decides.
     const now = Date.now();
     if (now - browserWorkerEngineRecoveredAt < 60000) return false;
+
+    // A disabled engine under a live managed dispatch is the split brain, and
+    // only the canonical recovery may clear it. It deliberately does NOT fall
+    // through to the arming below: that would re-enable A3 in a window the
+    // Bridge never matched to this worker.
+    if (!autoRuntime?.enabled) {
+      const recovered = recoverManagedA3Ownership({ source: 'managed-worker-poll' });
+      if (recovered) {
+        browserWorkerEngineRecoveredAt = now;
+        return true;
+      }
+    }
+
+    const stage = String(autoRuntime?.stage || 'idle');
+    if (stage !== 'idle' && stage !== 'complete') return false;
     browserWorkerEngineRecoveredAt = now;
     let repaired = false;
     try {
@@ -18503,9 +26823,23 @@ let browserWorkerBraveConfirmed = false;
     } catch (_) {
       repaired = false;
     }
+    // T-261: this is the one event that fires while a dispatched run is live and
+    // the engine is not harvesting -- exactly when the operator can see the page
+    // and the Bridge cannot. The verdict rides along so the next failure names
+    // its own layer, with no CDP and no operator copying a tooltip. NONE is the
+    // healthy case and stays out of the log; guarded, because diagnostics must
+    // never be the thing that breaks a worker.
+    let lineage = '';
+    try {
+      const snapshot = liveAuditLineageSnapshot();
+      const verdict = classifyLiveAuditLineage(snapshot);
+      if (verdict && verdict.failure && verdict.failure !== 'NONE') {
+        lineage = ` | ${liveAuditLineageDiagnosticLine(snapshot)}`;
+      }
+    } catch (_) { }
     appendBridgeDiagnostic('worker_engine_recovered', {
       severity: 'info',
-      message: `owned run is live but the audit engine was ${stage}; ${repaired ? 'resumed from the visible audit turn' : 'armed, no machine turn to adopt yet'}`
+      message: `owned run is live but the audit engine was ${stage}; ${repaired ? 'resumed from the visible audit turn' : 'armed, no machine turn to adopt yet'}${lineage}`
     });
     return repaired;
   }
@@ -18549,14 +26883,50 @@ let browserWorkerBraveConfirmed = false;
     return applied;
   }
 
+  // APP-PERF-001 TARGET P: one bounded worker-delivery trace per consume. The
+  // dependency seams below ARE the stage boundaries the delivery crosses
+  // (artifact fetch, injection, attachment registration, send/accept, Bridge
+  // transition ACKs), so each wrapped seam marks its own phase on ONE shared
+  // timings object -- the same one the manual path uses, never a competing
+  // system. Durations and ids only, never prompt text or tokens.
+  let browserWorkerLastDeliveryTiming = null;
+  let browserWorkerPendingPollWaitMs = 0;
+
+  function browserWorkerTimingBegin(job) {
+    const timings = manualArchiveTimingBegin();
+    timings.path = 'worker';
+    timings.dispatch_id = String(job?.dispatch_id || '').slice(0, 64);
+    timings.poll_wait_ms = Math.max(0, Number(browserWorkerPendingPollWaitMs) || 0);
+    browserWorkerPendingPollWaitMs = 0;
+    browserWorkerLastDeliveryTiming = timings;
+    return timings;
+  }
+
+  function browserWorkerTimingMark(key, startedAt) {
+    const timings = browserWorkerLastDeliveryTiming;
+    if (!timings) return;
+    // Accumulates: one consume calls transition() several times and every ACK
+    // belongs to the delivery's Bridge-ack budget.
+    timings[key] = Math.round(((Number(timings[key]) || 0) + Math.max(0, manualArchiveNow() - Number(startedAt || 0))) * 1000) / 1000;
+  }
+
   async function browserWorkerConsume(job, dependencies = null) {
-    const transition = dependencies?.transition || browserWorkerTransition;
-    const fetchArtifact = dependencies?.fetchArtifact || browserWorkerFetchArtifact;
+    browserWorkerTimingBegin(job);
+    const seam = (fn, key) => async (...args) => {
+      const startedAt = manualArchiveNow();
+      try {
+        return await fn(...args);
+      } finally {
+        browserWorkerTimingMark(key, startedAt);
+      }
+    };
+    const transition = seam(dependencies?.transition || browserWorkerTransition, 'transition_ack_ms');
+    const fetchArtifact = seam(dependencies?.fetchArtifact || browserWorkerFetchArtifact, 'artifact_fetch_ms');
     const uploadInput = dependencies?.uploadInput || chatGPTUploadInput;
     const composerRoot = dependencies?.composerRoot || chatGPTComposerRoot;
-    const injectFiles = dependencies?.injectFiles || setNativeFileList;
-    const waitForAttachment = dependencies?.waitForAttachment || waitForExactProjectAttachmentWithRetry;
-    const startAudit = dependencies?.startAudit || startAuditCoreFromReadyAttachment;
+    const injectFiles = seam(dependencies?.injectFiles || setNativeFileList, 'injection_ms');
+    const waitForAttachment = seam(dependencies?.waitForAttachment || waitForExactProjectAttachmentWithRetry, 'attachment_ready_ms');
+    const startAudit = seam(dependencies?.startAudit || startAuditCoreFromReadyAttachment, 'send_accept_ms');
     const releaseJob = dependencies?.releaseJob || browserWorkerReleaseUnclaimableJob;
     const expectedFilename = String(job.archive_filename || '');
     // /v1/browser/poll already moved this job QUEUED -> LEASED before it
@@ -18594,6 +26964,23 @@ let browserWorkerBraveConfirmed = false;
     // W3: state-aware resume. The persisted Bridge state decides the resume
     // entry point -- never "start from zero" for every state.
     const resumeState = String(job.state || 'LEASED').toUpperCase();
+    // T-248: production has no seams, so the shared upload engine owns
+    // discovery, composer-ownership proof and the remount-safe retry. A test
+    // that injects the legacy triple still gets exact reason codes instead of
+    // the old single `file-injection-rejected`.
+    const injectPreStart = dependencies?.uploadInput
+      ? async file => {
+        const root = composerRoot();
+        if (!root) return { ok: false, reason: 'composer-root-unavailable' };
+        const input = uploadInput();
+        if (!input) return { ok: false, reason: 'upload-input-unavailable' };
+        if (!root.contains(input)) return { ok: false, reason: 'upload-input-detached' };
+        // `injectFiles` is the timing seam and therefore async: awaiting it is
+        // what makes a refused assignment observable at all.
+        if (!(await injectFiles(input, [file]))) return { ok: false, reason: 'file-injection-rejected' };
+        return { ok: true, reason: 'injected' };
+      }
+      : file => injectComposerArchiveFile(file);
     let artifact = null;
     let injected = false;
     let ready = null;
@@ -18614,16 +27001,7 @@ let browserWorkerBraveConfirmed = false;
           }
           return false;
         }
-        const input = uploadInput();
-        const root = composerRoot();
-        if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
-          const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
-          if (acknowledged.ok) {
-            browserWorkerLease = null;
-            persistBrowserWorkerLease();
-          }
-          return false;
-        }
+        if (!(await browserWorkerInjectArtifact(artifact, transition, injectPreStart))) return false;
         injected = true;
       }
     } else if (resumeState === 'ARTIFACT_FETCHED') {
@@ -18638,16 +27016,7 @@ let browserWorkerBraveConfirmed = false;
         }
         return false;
       }
-      const input = uploadInput();
-      const root = composerRoot();
-      if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
-        const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
-        if (acknowledged.ok) {
-          browserWorkerLease = null;
-          persistBrowserWorkerLease();
-        }
-        return false;
-      }
+      if (!(await browserWorkerInjectArtifact(artifact, transition, injectPreStart))) return false;
       injected = true;
     } else {
       // LEASED (or fresh claim): full pipeline.
@@ -18663,16 +27032,7 @@ let browserWorkerBraveConfirmed = false;
         return false;
       }
       if (!(await transition('ARTIFACT_FETCHED')).ok) return false;
-      const input = uploadInput();
-      const root = composerRoot();
-      if (!input || !root || !root.contains(input) || !injectFiles(input, [artifact.file])) {
-        const acknowledged = await transition('RETRYABLE', { error: 'file-injection-rejected' });
-        if (acknowledged.ok) {
-          browserWorkerLease = null;
-          persistBrowserWorkerLease();
-        }
-        return false;
-      }
+      if (!(await browserWorkerInjectArtifact(artifact, transition, injectPreStart))) return false;
       injected = true;
     }
     if (!ready) {
@@ -18752,7 +27112,14 @@ let browserWorkerBraveConfirmed = false;
       }
     });
     const preserved = readStartAuditHandoff();
-    if (!started) {
+    // Milestone H: START reports sent/adopted separately. A legacy injected
+    // seam that answers a bare `true` is normalized to "sent, adoption unknown"
+    // -- never to "adopted".
+    const startOutcome = started && typeof started === 'object'
+      ? started
+      : { sent: Boolean(started), adopted: false, state: started ? 'sent-unproven' : 'failed' };
+    const startedOk = Boolean(startOutcome.sent);
+    if (!startedOk) {
       if (preserved && (startHandoffIsPrepared(preserved) || startHandoffIsCommitted(preserved))) {
         return false;
       }
@@ -18772,7 +27139,14 @@ let browserWorkerBraveConfirmed = false;
       return false;
     }
     if (!(await transition('STARTED', { campaign_run_id: String(autoRuntime?.runId || ''), conversation_id: String(autoRuntime?.conversationKey || '') })).ok) return false;
-    if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
+    // Milestone G: AUDITING is a claim that the local runtime owns a concrete
+    // current audit wave. STARTED means "the Core left the composer";
+    // AUDITING means "this window is harvesting a wave it has adopted". The
+    // STARTED -> AUDITING edge below is re-asserted by the poll loop as soon as
+    // adoption lands, so staying here is pending registration, not a stuck lane.
+    if (startOutcome.adopted || runtimeOwnsCurrentAuditWave()) {
+      if (!(await transition('AUDITING', { campaign_run_id: String(autoRuntime?.runId || '') })).ok) return false;
+    }
     return true;
   }
 
@@ -18846,7 +27220,7 @@ let browserWorkerBraveConfirmed = false;
     if (browserWorkerLease?.dispatch_id) return false;
     if (autoRuntime?.runId) return false;
     if (startHandoffIsPrepared(readStartAuditHandoff())) return false;
-    if (chatGPTIsGenerating()) return false;
+    if (chatGPTIsGenerating() || chatGPTGenerationUnresolved()) return false;
 
     const input = getChatGPTInput();
     if (!input) return false;
@@ -19038,7 +27412,7 @@ let browserWorkerBraveConfirmed = false;
     if (ownedJob?.dispatch_id) return false;
     if (autoRuntime?.runId) return false;
     if (auditStartIsLive() || auditActionIsLive()) return false;
-    if (chatGPTIsGenerating()) return false;
+    if (chatGPTIsGenerating() || chatGPTGenerationUnresolved()) return false;
     const handoff = readStartAuditHandoff();
     if (!startHandoffIsPrepared(handoff)) return false;
     if (!startHandoffComposerStillPrepared(handoff)) return false;
@@ -19057,7 +27431,7 @@ let browserWorkerBraveConfirmed = false;
     // reloading. An owned job, a lease, or a generation in flight still wins.
     if (browserWorkerLease?.dispatch_id) return false;
     if (ownedJob && ownedJob.dispatch_id) return false;
-    try { if (chatGPTIsGenerating()) return false; } catch (_) { return false; }
+    try { if (chatGPTIsGenerating() || chatGPTGenerationUnresolved()) return false; } catch (_) { return false; }
     if (!ownedJob && autoRuntime?.runId && String(autoRuntime?.stage || '') === 'running') return false;
     // A reload only re-runs the script the userscript manager already holds.
     // If it has nothing newer to hand us, coming back stale is the answer, not
@@ -19091,6 +27465,11 @@ let browserWorkerBraveConfirmed = false;
 
   async function browserWorkerPollOnce() {
     if (browserWorkerPollInFlight || browserWorkerStopRequested || !state?.bridgeEnabled) return false;
+    // Milestone E: a stop recorded before a reload resumes here. Idempotent on
+    // the Bridge side and bounded locally, so this can never become a loop.
+    if (autoRuntime?.a3OperatorStopPending && autoRuntime?.a3OperatorExplicitOff) {
+      await managedA3OperatorStop({ reason: 'a3-checkbox' });
+    }
     browserWorkerPollInFlight = true;
     try {
       if (browserWorkerLease && String(autoRuntime?.stage || '') === 'complete') {
@@ -19099,15 +27478,24 @@ let browserWorkerBraveConfirmed = false;
         // non-terminal FINALIZING state until the disk commit acknowledges it.
         await browserWorkerTransition('FINALIZING', { campaign_run_id: String(autoRuntime?.runId || '') });
       }
-      const snapshot = browserWorkerSnapshot();
+      const snapshot = { ...browserWorkerSnapshot(), wait_seconds: 0 };
+      const pollStarted = manualArchiveNow();
       const result = await bridgeRequest('POST', '/v1/browser/poll', snapshot, { timeout: 25000 });
+      // TARGET V evidence: how long this worker actually slept inside the long
+      // poll before the Bridge answered (claim or healthy empty).
+      browserWorkerPendingPollWaitMs = Math.max(0, manualArchiveNow() - pollStarted);
       if (!result.ok) {
         browserWorkerConsecutivePollFailures += 1;
         return false;
       }
       browserWorkerConsecutivePollFailures = 0;
+      // SRC-098: remember what the Bridge says this dispatch is, so a render
+      // between polls can still tell a live campaign from a retired one.
+      if (result.data?.owned_job?.dispatch_id) {
+        browserWorkerDispatchState = String(result.data.owned_job.state || '').toUpperCase();
+      }
       if (browserWorkerLease && result.data?.owned_job?.dispatch_id === browserWorkerLease.dispatch_id &&
-          ['COMPLETE', 'FAILED'].includes(String(result.data?.owned_job?.state || ''))) {
+          ['COMPLETE', 'FAILED', 'CANCELLED'].includes(String(result.data?.owned_job?.state || ''))) {
         // Positive terminal acknowledgement from Bridge is the only point at
         // which local recovery identity may be destroyed. FAILED counts too:
         // a lane the Bridge gave up on is just as finished as one it closed,
@@ -19151,13 +27539,38 @@ let browserWorkerBraveConfirmed = false;
         await browserWorkerTransition('STARTED');
       }
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
-          String(owned.state || '') === 'STARTED') {
+          String(owned.state || '') === 'STARTED' && runtimeOwnsCurrentAuditWave()) {
         // No campaign_run_id on purpose. The Bridge already owns the run id
         // from START_PREPARED, and re-sending a runtime value that route
         // hydration may have re-derived turns a harmless progress marker into
         // a run_id_conflict rejection. STARTED is written only after the Core
-        // was actually sent, so this window really is auditing.
-        await browserWorkerTransition('AUDITING');
+        // was actually sent, and this edge is crossed only once the runtime
+        // owns a concrete wave -- T-261: a STARTED lane whose window never
+        // adopted its own Core must stay STARTED, or the desktop shows an
+        // auditing project that is auditing nothing.
+        //
+        // T-261: this re-assert is also where the job gets PROMOTED off the key
+        // STARTED pinned at send time. That write happened while the route was
+        // still `draft:...`; ChatGPT then hydrated /c/<id>, and nothing ever
+        // sent the live key again, so the job spent its whole life naming a
+        // conversation that no longer existed -- observed live on
+        // dsp-6e79f5c354f54b56, whose worker sat on /c/6ac17c95-... for the
+        // entire life of a job that still claimed the draft. The Bridge
+        // overwrites conversation_id on every transition, including the
+        // idempotent same-state ACK, so re-reporting the live key here is the
+        // promotion, and repeating it every poll is free.
+        //
+        // The LIVE route wins over autoBoundConversationKey on purpose: bind()
+        // is what re-points the bound key after hydration, so a poll that wins
+        // the race re-sends the draft and the promotion stalls. Only a stable
+        // `c:` route is reported -- a quarantined root yields `auth:<tab>`, and
+        // writing that onto the job would trade a dead key for a meaningless one.
+        const liveKey = currentConversationKey();
+        await browserWorkerTransition('AUDITING', {
+          conversation_id: String(liveKey && liveKey.startsWith('c:')
+            ? liveKey
+            : (autoBoundConversationKey || liveKey || ''))
+        });
       }
       if (owned && browserWorkerLease && owned.dispatch_id === browserWorkerLease.dispatch_id &&
           !autoRuntime?.runId) {
@@ -19199,13 +27612,20 @@ let browserWorkerBraveConfirmed = false;
           // Same-tab reload before START: resume the leased attachment path,
           // never ask the broker for a second job.
           await browserWorkerConsume(owned);
+          manualArchivePublishTiming(browserWorkerLastDeliveryTiming);
         }
       }
       if (result.data?.job) {
-        if (browserWorkerCanClaim()) {
+        // APP-PERF-002 (audit/12.md): ONE post-response snapshot drives both
+        // the claim test and the block reason. Each helper used to build its
+        // own, so a single unclaimable job cost three snapshots -- three full
+        // conversation scans -- per poll cycle.
+        const postPoll = browserWorkerSnapshot();
+        if (browserWorkerCanClaim(postPoll)) {
           await browserWorkerConsume(result.data.job);
+          manualArchivePublishTiming(browserWorkerLastDeliveryTiming);
         } else {
-          await browserWorkerReleaseUnclaimableJob(result.data.job, browserWorkerClaimBlockReason());
+          await browserWorkerReleaseUnclaimableJob(result.data.job, browserWorkerClaimBlockReason(postPoll));
         }
       } else {
         browserWorkerDropStaleLease(result.data?.owned_job);
@@ -19224,7 +27644,7 @@ let browserWorkerBraveConfirmed = false;
   function browserWorkerPollBackoff() {
     // W7: persistent immediate poll errors must never become a 300ms tight loop.
     const failures = Math.max(0, Number(browserWorkerConsecutivePollFailures || 0));
-    if (failures <= 0) return 300;
+    if (failures <= 0) return BROWSER_WORKER_IDLE_POLL_MS;
     const table = [1000, 2000, 5000, 15000, 30000];
     return table[Math.min(failures - 1, table.length - 1)] || 30000;
   }
@@ -19350,14 +27770,44 @@ let browserWorkerBraveConfirmed = false;
         get autoRuntime() { return autoRuntime; },
         set autoRuntime(val) { autoRuntime = val; },
         get autoAuditObserver() { return autoAuditObserver; },
+        autoAuditObserverConfig,
+        mutationMayChangeAuthState,
+        mutationTouchesConversationTurn,
+        get autoObserverLastPathname() { return autoObserverLastPathname; },
         get state() { return state; },
         set state(val) { state = val; },
-        get browserWorkerLease() { return browserWorkerLease; },
-        set browserWorkerLease(val) { browserWorkerLease = val; },
+         get browserWorkerLease() { return browserWorkerLease; },
+         set browserWorkerLease(val) { browserWorkerLease = val; },
+         get browserWorkerDispatchState() { return browserWorkerDispatchState; },
+         set browserWorkerDispatchState(val) { browserWorkerDispatchState = String(val || '').toUpperCase(); },
         get autoBoundConversationKey() { return autoBoundConversationKey; },
         get autoInstanceId() { return autoInstanceId; },
         classifyAuditMessage,
         classifyAuditTurn,
+        manualArchiveTimingBegin,
+        manualArchiveTimingSet,
+        manualArchiveTimingMark,
+        manualArchiveTimingLine,
+        manualArchiveTimingDominant,
+        manualArchivePublishTiming,
+        manualArchiveGetSplitLine,
+        manualArchiveTimingDiagnostic,
+        manualArchiveTimingsFromTransport,
+        gmBinaryGet,
+        nativeFetchBinaryProbe,
+        archiveTransportProbe,
+        transportProbeTiming,
+        parseArchiveServerTiming,
+        fetchProjectArchive,
+        canonicalArchiveBytesFlight,
+        setManualArchiveUiState,
+        get manualArchiveElapsedTimerActive() { return manualArchiveElapsedTimer > 0; },
+        constants_MANUAL_ARCHIVE_ELAPSED_SHOW_MS: MANUAL_ARCHIVE_ELAPSED_SHOW_MS,
+        waitForExactProjectAttachment,
+        waitForChatGPTSendReady,
+        browserWorkerPollBackoff,
+        get manualArchiveLastTimings() { return manualArchiveLastTimings; },
+        get browserWorkerLastDeliveryTiming() { return browserWorkerLastDeliveryTiming; },
         auditTurnIsContinuation,
         knownAuditReceiptKind,
         trivialStartComposerNoise,
@@ -19406,16 +27856,29 @@ let browserWorkerBraveConfirmed = false;
         scheduleInauditActionAttach,
         get inauditDirtyTurns() { return inauditDirtyTurns; },
         ensureInauditCaptureObserver,
+        get inauditCaptureObserver() { return inauditCaptureObserver; },
+        get inauditCaptureObserverRoot() { return inauditCaptureObserverRoot; },
         putInauditSpool,
         listInauditSpool,
         flushInauditCaptureSpool,
         scheduleInauditCaptureFlush,
+        inauditCaptureFlushTimerState,
         inauditCaptureRetryDelay,
         inauditCaptureFailureRetriable,
         setInauditSpoolBackendForTest,
         setInauditBridgeRequestForTest,
-        bridgeQueueStats,
-        enqueueBridgeAuditRecord,
+        looksLikeSaihandoff,
+        handoffCandidateStrength,
+        offerHandoffCandidate,
+        handoffBlockText,
+        noteHandoffTurnSighting,
+        maybeAutoCaptureHandoffs,
+        maybeAutoCaptureAuditReply,
+        archiveNameInUserTurn,
+        handoffTurnSighting: turn => handoffTurnSightings.get(handoffTurnKey(turn)) || '',
+         bridgeQueueStats,
+         renderBridgeState,
+         enqueueBridgeAuditRecord,
          bridgeJobRequest,
          readBridgeJob,
          saveBridgeJob,
@@ -19447,8 +27910,21 @@ let browserWorkerBraveConfirmed = false;
          browserWorkerRecycleWatchdog,
          browserWorkerClearAbandonedDraft,
          chatGPTWorkSurfaceActive,
+         chatGPTSurfaceMode,
+         chatGPTSurfaceSnapshot,
+         chatGPTSendReadiness,
+         chatGPTWorkQuotaExhaustedVisible,
          chatGPTEnsureChatMode,
          chatGPTWorkModeControlNames,
+         openNewChatFromWidget,
+         readNewChatRequiresChatIntent,
+         writeNewChatRequiresChatIntent,
+         clearNewChatRequiresChatIntent,
+         fulfillNewChatRequiresChatIntentIfNeeded,
+         newChatDiagnostics,
+         chatGPTNewChatControl,
+         get currentStartPhase() { return currentStartPhase; },
+         startPhaseHistory: () => startPhaseHistory.slice(),
          auditProfileIds,
          browserWorkerUnusableReason,
          chatGPTSignedOut,
@@ -19459,7 +27935,6 @@ let browserWorkerBraveConfirmed = false;
          profileShortLabel,
          nextAuditProfileId,
          chatGPTWorkModeSwitchControl,
-         chatGPTNewChatControl,
          browserWorkerEnsureChatModeHousekeeping,
          composerStateOwnedBySameWrite,
          setBrowserWorkerDirtySinceForTest: value => { browserWorkerDirtySince = Number(value || 0); },
@@ -19471,6 +27946,12 @@ let browserWorkerBraveConfirmed = false;
          browserWorkerIsManagedProfile,
          enforceStartReceiptA3Ownership,
          reassertA3FromMachineReceipt,
+         managedA3OwnershipSnapshot,
+         recoverManagedA3Ownership,
+         interruptedAuditResponseSnapshot,
+        managedA3OperatorStop,
+        managedA3OperatorStopNeedsBridge,
+        normalizeManagedA3OperatorStopPending,
          machineAuthoredAuditTurn,
          visibleCampaignAlreadyFinished,
          setAuditStartInFlightForTest: (value, since) => {
@@ -19506,13 +27987,47 @@ let browserWorkerBraveConfirmed = false;
         renewBridgeFlushLease,
         flushBridgeQueueManualReliable,
         createBridgeMaterializeReceipt,
-        createBridgeMaterializeBatchId,
+        materializeAuditRecordsNow,
+        materializeRequestSignature,
+        manualSaveDeadlineExceeded,
+         bridgeJobIsHistoricalFailure,
+         retireLegacyMaterializeFailures,
+         bridgeJobRetryIsFutile,
+         classifyBridgeJobRecovery,
+         verifyMaterializeRecoveryCandidates,
+          constants_BRIDGE_FILE_VERIFY_FRESH_MS: BRIDGE_FILE_VERIFY_FRESH_MS,
+          constants_VERIFIED_MATERIALIZE_RUNS_MAX_ITEMS: VERIFIED_MATERIALIZE_RUNS_MAX_ITEMS,
+          get verifiedMaterializeRunsSize() { return verifiedMaterializeRuns.size; },
+          clearVerifiedMaterializeRunsForTest() { verifiedMaterializeRuns.clear(); },
+         setBridgeConnectEpochForTest: value => { bridgeConnectEpoch = Number(value) || 0; },
+         get bridgeConnectEpoch() { return bridgeConnectEpoch; },
+         advanceBridgeClockForTest: ms => { bridgeClockSkewMs += Math.max(0, Number(ms) || 0); },
+         bridgeVerificationIsFresh,
+         recordRunVerification,
+         invalidateRunVerification,
+         verifyDurableAuditFilesNow,
+         get inFlightRunVerificationCount() { return inFlightRunVerifications.size; },
+         inFlightRunVerificationKeys: () => Array.from(inFlightRunVerifications.keys()),
+        currentBridgeSaveState,
+        currentAuditSaveAttention,
+        get manualAuditSyncInFlight() { return manualAuditSyncInFlight; },
+        get manualAuditSyncGeneration() { return manualAuditSyncGeneration; },
+        get manualAuditSyncOwnerGeneration() { return manualAuditSyncOwnerGeneration; },
+        get manualAuditSyncFeedback() { return manualAuditSyncFeedback; },
+        get manualAuditSyncLastOutcome() { return manualAuditSyncLastOutcome; },
+        constants_MANUAL_SAVE_DEADLINE_MS: MANUAL_SAVE_DEADLINE_MS,
         setManualAuditSyncFeedback,
         saveCurrentChatAuditsNow,
         syncSaveCurrentChatStateNow,
         setAuditAutoSaveEnabled,
         autoProgressSnapshot,
         superCompactAutoLabel,
+        liveAuditLineageSnapshot,
+        classifyLiveAuditLineage,
+        liveAuditLineageDiagnosticLine,
+        autoStageSummary,
+        compactWaveToken,
+        liveAuditActivitySnapshot,
         userTurnTextCandidates,
         latestChatGPTAssistantTurn,
         latestRecognizableAuditUserTurn,
@@ -19547,11 +28062,27 @@ let browserWorkerBraveConfirmed = false;
         getChatGPTSend,
         isChatGPTSend,
         chatGPTSendNearComposer,
+        chatGPTUploadInput,
+        chatGPTUploadSurface,
+        chatGPTUploadTopology,
+        chatGPTUploadBoundOwner,
+        chatGPTUploadCodeIsStructural,
+        chatGPTUploadInputIsMediaOnly,
+        chatGPTComposerAttachControl,
+        prepareChatGPTUploadSurface,
+        injectComposerArchiveFile,
         chatGPTComposerReceiptState,
         chatGPTComposerStillContainsReceipt,
         chatGPTSendAccepted,
+        chatGPTSendOutcome,
+        startAuditCoreTransactionTurn,
+        autoSendTransactionBoundaryTurn,
+        runtimeOwnsCurrentAuditWave,
+        mergeStartHandoffRuntime,
+        captureStartHandoffPreSendBaseline,
         clickChatGPTSendVerified,
         chatGPTComposerAttachmentTiles,
+        chatGPTAttachmentTileName,
         waitForChatGPTSendReady,
         chatGPTProjectComposerAttachments,
         chatGPTReadyComposerAttachments,
@@ -19559,6 +28090,124 @@ let browserWorkerBraveConfirmed = false;
         archiveTimestampFromFilename,
         composerArchiveFreshness,
         currentAuditArchiveFreshness,
+        isAudapackProjectArchiveName,
+        isAudapackProjectArchiveFile,
+        handleComposerArchiveDrop,
+        installComposerArchiveDropSanitizer,
+        resolveRegisteredProjectForArchive,
+        matchRegisteredProject,
+        listRegisteredProjects,
+        canonicalArchiveProofForTile,
+        canonicalArchiveProofMatches,
+        composerAttachedProjectIdentities,
+        classifyComposerDropFile,
+        handleSaihandoffM1DropOrSelection,
+        setNativeFileList,
+        stepSaihandoffM1,
+        getSaihandoffM1Generation,
+        setSaihandoffM1Generation,
+        clearSaihandoffM1Generation,
+        isSaihandoffM1GateOpen,
+        setSaihandoffM1GateOpen,
+        get saihandoffM1CurrentGen() { return saihandoffM1CurrentGen; },
+        set saihandoffM1CurrentGen(val) { saihandoffM1CurrentGen = val; },
+        get saihandoffM1GenerationCounter() { return saihandoffM1GenerationCounter; },
+        set saihandoffM1GenerationCounter(val) { saihandoffM1GenerationCounter = val; },
+        ensureProjectArchive,
+        fetchProjectArchive,
+        sha256Hex,
+        attachProjectArchiveForCurrentChat,
+        attachCanonicalProjectArchive,
+        canonicalArchiveFlightKey,
+        manualArchiveBindingFor,
+        setManualArchiveBinding,
+        clearManualArchiveBinding,
+        migrateManualArchiveBinding,
+        manualArchiveKeyTabId,
+        readManualArchiveBindings: () => manualArchiveBindingsStore().bindings,
+        listManualArchiveProjects,
+        openManualArchivePicker,
+        closeManualArchivePicker,
+        renderManualArchiveControl,
+        renderManualArchiveMenu,
+        selectManualArchiveProject,
+        manualArchiveZipAction,
+        manualArchiveControlLabel,
+        manualArchivePhaseIsBusy,
+        manualArchiveResultStatusText,
+        manualArchiveTransaction,
+        manualArchiveRefreshProjects,
+        readManualArchiveRegistry,
+        manualArchiveSentStore,
+        manualArchiveRecordSent,
+        manualArchiveSentEntry,
+        manualArchiveSentEntries,
+        manualArchivePayloadIdentity,
+        manualArchiveAttachmentIdentity,
+        manualArchiveAttachmentsStronglyIdentified,
+        manualArchiveSnapshotStaleReason,
+        captureManualArchiveComposerSnapshot,
+        manualArchiveIsAlreadySent,
+        manualArchiveDetachSentArchive,
+        manualArchiveSendComposer,
+        setManualArchiveAttachOnly,
+        manualArchiveAttachOnlyRequested,
+        get manualArchiveAttachOnlyArmed() { return manualArchiveAttachOnly; },
+        get manualArchiveRegistryGeneration() { return manualArchiveRegistryGeneration; },
+        get manualArchiveDeliveredGeneration() { return manualArchiveDeliveredGeneration; },
+        get manualArchiveRegistryDeadlineActive() { return manualArchiveRegistryTimer > 0; },
+        get manualArchiveRegistryInFlight() { return manualArchiveRegistryFlight !== null; },
+        get manualArchiveFlightKey() { return manualArchiveFlight ? manualArchiveFlight.key : ''; },
+        get manualArchiveTransactionGeneration() { return manualArchiveTransactionGeneration; },
+        manualArchiveLogSnapshot: () => manualArchiveLog.slice(),
+        get manualArchiveDebug() { return manualArchiveDebug; },
+        constants_MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS: MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS,
+        constants_MANUAL_ARCHIVE_PICKER_DEADLINE_MS: MANUAL_ARCHIVE_PICKER_DEADLINE_MS,
+        constants_MANUAL_ARCHIVE_SENT_MAX: MANUAL_ARCHIVE_SENT_MAX,
+        constants_MANUAL_ARCHIVE_SENT_SUPPRESS_MS: MANUAL_ARCHIVE_SENT_SUPPRESS_MS,
+        constants_MANUAL_ARCHIVE_LOG_MAX: MANUAL_ARCHIVE_LOG_MAX,
+        constants_MANUAL_ARCHIVE_SENT_KEY: MANUAL_ARCHIVE_SENT_KEY,
+        manualArchiveShortKey,
+        get manualArchiveAcceptTrace() { return manualArchiveAcceptTrace; },
+        manualArchiveOfflineMessage,
+        dispatchManualArchiveRegistryRequest,
+        disambiguateProjectName,
+        positionManualArchiveMenu,
+        applyDisplayState,
+        currentPanelGeometry,
+        canonicalAttachedArchiveMatch,
+        bridgeOfflineResult,
+        get manualArchiveUiState() { return manualArchiveUiState; },
+        set manualArchiveUiState(value) { manualArchiveUiState = value; },
+        get manualArchiveMenuState() { return manualArchiveMenuState; },
+        get canonicalArchiveFlightCount() { return canonicalArchiveFlights.size; },
+        clearManualArchiveProjectsCache() { manualArchiveProjectsCache = { projects: [], fetchedAt: 0, revision: '' }; },
+        get manualArchiveProjectsCache() { return manualArchiveProjectsCache; },
+        manualArchiveProjectsCacheUsable,
+        get manualArchiveLastTimings() { return manualArchiveLastTimings; },
+        manualArchiveTimingBegin,
+        manualArchivePaintFrame,
+        manualArchiveCachedBytes,
+        manualArchiveByteCacheGet,
+        manualArchiveByteCachePut,
+        manualArchiveByteCacheClear,
+        manualArchiveByteCacheStats,
+        manualArchiveStaleMarker,
+        clearManualArchiveStaleMarker,
+        markManualArchiveBindingStale,
+        manualArchiveBindingIsStaleCode,
+        constants_MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS: MANUAL_ARCHIVE_TILE_READY_TIMEOUT_MS,
+        constants_MANUAL_ARCHIVE_PROJECTS_TTL_MS: MANUAL_ARCHIVE_PROJECTS_TTL_MS,
+        constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS: MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS,
+        constants_MANUAL_ARCHIVE_BYTE_CACHE_MAX_ITEMS: MANUAL_ARCHIVE_BYTE_CACHE_MAX_ITEMS,
+        constants_MANUAL_ARCHIVE_BYTE_CACHE_MAX_BYTES: MANUAL_ARCHIVE_BYTE_CACHE_MAX_BYTES,
+        removeComposerAttachmentTile,
+        rememberRuntimeProjectId,
+        get archiveRefreshInFlight() { return archiveRefreshInFlight; },
+        get archiveRefreshState() { return archiveRefreshState; },
+        get archiveRefreshDetail() { return archiveRefreshDetail; },
+        get archiveDropSanitizerInstalled() { return archiveDropSanitizerInstalled; },
+        get lastArchiveDropResult() { return lastArchiveDropResult; },
         composerAttachmentSignature,
         mutationTargetsOwnWidget,
         externalMutationRecords,
@@ -19587,6 +28236,12 @@ let browserWorkerBraveConfirmed = false;
         migrateStartHandoffRuntime,
         recoverSentStartCore,
         chatGPTIsGenerating,
+        chatGPTGenerationSnapshot,
+        chatGPTStopNearComposer,
+        generationStabilizeMs: AUTO_GENERATION_STABILIZE_MS,
+        setGenerationConflictSinceForTest: (value) => {
+          generationConflictSince = Number(value || 0);
+        },
         chatGPTAuthInterstitialVisible,
         chatGPTLoggedOutRootVisible,
         chatGPTRootIsQuarantined,
@@ -19600,7 +28255,18 @@ let browserWorkerBraveConfirmed = false;
         forceCommittedStartEnabledForKey,
         activeAuditNeedsRouteProtection,
         shouldPreservePreviousStableKey,
-        reconcileEnabledIdleAuditRuntime,
+         reconcileEnabledIdleAuditRuntime,
+         activeProfileWaveKind,
+         sendingStageWaveKind,
+         awaitStageWaveKind,
+         evaluateAutoAudit,
+         scheduleNextWave,
+         autoAwaitStageForKind,
+         recoverStalePauseFromConversation,
+         recoverPendingSendRegistration,
+         autoComposerHoldKind,
+         autoComposerHoldApplicable,
+         deferAutoSendForComposer,
         composerPlainText,
         previousAuditUserTurn,
         auditUserFlowAfter,
@@ -19638,6 +28304,8 @@ let browserWorkerBraveConfirmed = false;
         currentConversationKey,
         detectSite,
         ensureAutoAuditObserver,
+        ensureChatRootObservers,
+        get widgetGuardianObserver() { return widgetGuardianObserver; },
         autoAuditObserverConfig,
         ensureWidgetConnected,
         installWidgetGuardian,

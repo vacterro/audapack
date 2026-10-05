@@ -41,6 +41,10 @@ class TestForceShowNativeContract(unittest.TestCase):
         with patch("sys.platform", "win32"):
             self.assertFalse(_force_show_native(0))
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "the show-state contract is Win32; the test drives the real ctypes.windll.user32 seam",
+    )
     def test_windows_calls_showwindow_and_setwindowpos(self):
         from audapack.ui_qt.app import _force_show_native
 
@@ -81,6 +85,10 @@ class TestForceShowNativeContract(unittest.TestCase):
         # First arg is the hwnd.
         self.assertEqual(swp_calls[0][0][0], 0x1234)
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "the restore-first contract is Win32; the test drives the real ctypes.windll.user32 seam",
+    )
     def test_minimised_window_is_restored_first(self):
         """If Windows started the window minimised (IsIconic=True), force a
         SW_RESTORE before the SW_SHOWNORMAL so the user gets a normal window
@@ -112,7 +120,15 @@ class TestRunQtGuiInvokesForceShow(unittest.TestCase):
     """
 
     def test_run_qt_gui_calls_force_show_native(self):
+        from PySide6.QtWidgets import QApplication as _RealQApp
+
         from audapack.ui_qt import app as qt_app_mod
+
+        # run_qt_gui builds REAL QIcon/QFont objects around the mocked app,
+        # and QPixmap-backed work aborts the whole process unless a real
+        # (offscreen) QGuiApplication exists. The full suite hides this by
+        # test order; this test must be able to stand alone.
+        _RealQApp.instance() or _RealQApp(["-platform", "offscreen"])
 
         # Patch QApplication, MainWindow, and the force helper so the test
         # does not need a real Qt event loop.

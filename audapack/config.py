@@ -6,6 +6,7 @@ never leaving mutable tokens or state in the source repository.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import ipaddress
 import json
@@ -38,11 +39,45 @@ from audapack.models import Project
 
 CONFIG_FILE_NAME = "config.json"
 LEGACY_REPO_CONFIG_NAME = "audapack.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 
 #: Schema at which DEFAULT_EXCLUDES stopped owning media/font patterns. A
 #: config persisted below this is upgraded exactly once, on the next load.
 _MEDIA_EXCLUDE_UPGRADE_SCHEMA = 3
+
+#: Schema at which the historical generic ``*.bin`` default stopped being
+#: AUDAPACK-owned.  The migration below is deliberately stricter than the
+#: media migration: a binary rule is removed only when the persisted exclude
+#: set is exactly the frozen former built-in default set plus ``*.bin``.
+_BINARY_EXCLUDE_UPGRADE_SCHEMA = 4
+
+#: Schema at which the FreeBuff-specific single-instance default was removed.
+#: Below this, AUDAPACK shipped ``freebuff.max_instances = 1`` as a product-owned
+#: cap even though FreeBuff now supports multiple concurrent instances. A config
+#: persisted below this schema is upgraded exactly once on the next load: a
+#: FreeBuff capacity of exactly 1 -- the old forced default, indistinguishable
+#: from a manual 1 in the old serializer -- becomes 0 (unlimited). Every other
+#: persisted value is preserved, other launcher ids are never touched, and an
+#: explicit 1 set at schema 5 or above survives every future load.
+_FREEBUFF_MULTI_INSTANCE_SCHEMA = 5
+
+#: SRC-081 / APP-CLI-001 TARGET G: schema at which the multi-agent CLI
+#: launchers (claude1/claude2/antigravity/zcode) became shipped built-ins.
+#: A config persisted below this schema gains exactly those four identities,
+#: once: existing entries (including a custom launcher already using one of
+#: those ids) are never overwritten, order is preserved, and a schema-6+
+#: config is never re-filled after the operator deliberately removes one.
+_MULTI_CLI_LAUNCHER_SCHEMA = 6
+
+#: Schema at which every built-in agent console gained its YOLO flag. The
+#: persisted ``resolved_*`` cache of a CLI launcher still holds the pre-YOLO
+#: command, and a live probe keeps revalidating it forever, so a config below
+#: this schema drops that cache once. ``command_template`` (operator intent)
+#: is never touched.
+_YOLO_CLI_SCHEMA = 7
+
+#: The four multi-agent CLI launcher ids added by schema 6 (TARGET A).
+_MULTI_CLI_LAUNCHER_IDS: tuple[str, ...] = ("claude1", "claude2", "antigravity", "zcode")
 
 DEFAULT_AUDIT_ROOT = r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\__TO_AUDIT\AUDITING_IMPLEMENTATION"
 
@@ -60,6 +95,13 @@ MANDATORY_EXCLUDES = [
     "*.token",
     "*.pid",
     "secrets",
+    # Private keys (T-239): SSH identities and PuTTY keys are credentials
+    # wherever they sit; public halves (*.pub) are deliberately not matched.
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "*.ppk",
     "_AUDAPACK_MANIFEST.json",
 ]
 
@@ -109,7 +151,6 @@ DEFAULT_EXCLUDES = [
     "*.dylib",
     "*.pyd",
     "*.msi",
-    "*.bin",
     "*.wasm",
     "*.obj",
     "*.lib",
@@ -149,6 +190,57 @@ LEGACY_MEDIA_DEFAULT_EXCLUDES = frozenset({
     "*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm",
     "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
 })
+
+#: Exact provenance signatures for the old built-in heavyweight block.  The
+#: first signature is the snapshot-default list after the media migration has
+#: already run; the second is the untouched pre-schema-3 list that still has
+#: the historical media block.  Any operator addition, removal, or curation
+#: fails closed and leaves ``*.bin`` alone.
+_HISTORICAL_DEFAULT_EXCLUDES_WITHOUT_BIN = frozenset({
+    ".claude", ".codenomad", ".freebuff", ".saiwork", "node_modules",
+    "dist", "build", "target", ".cargo", "__pycache__", ".pytest_cache",
+    ".ruff_cache", "*.egg-info", ".venv", ".build-venv", "logs", "*.log",
+    "*.sqlite", "*.sqlite3", "*.db", "*.db-shm", "*.db-wal", "*.zip",
+    "*.part", "*.tmp", "token.txt", "*.token", "*.pid", "secrets",
+    "*.pre-redact", "*.secret", "*.secrets", "*.exe", "*.dll", "*.so",
+    "*.dylib", "*.pyd", "*.msi", "*.wasm", "*.obj", "*.lib", "*.class",
+    "*.jar", "*.tar", "*.tgz", "*.gz", "*.bz2", "*.xz", "*.7z", "*.rar",
+    "*.iso", "*.bak", "*.old", "*.zst", ".codebase-memory", ".next*",
+    ".git/objects",
+})
+LEGACY_BINARY_DEFAULT_EXCLUDES = frozenset({
+    *_HISTORICAL_DEFAULT_EXCLUDES_WITHOUT_BIN,
+    "*.bin",
+})
+LEGACY_BINARY_DEFAULT_SIGNATURES = (
+    LEGACY_BINARY_DEFAULT_EXCLUDES,
+    frozenset({
+        *LEGACY_BINARY_DEFAULT_EXCLUDES,
+        *LEGACY_MEDIA_DEFAULT_EXCLUDES,
+    }),
+)
+
+
+def strip_legacy_binary_default(excludes: list[str]) -> tuple[list[str], list[str]]:
+    """Remove only the provably untouched historical ``*.bin`` default.
+
+    The old default was a complete built-in exclude list.  Requiring exact set
+    equality is conservative provenance evidence: a user-owned list that merely
+    contains ``*.bin`` (or a list they curated by adding/removing a rule) is not
+    rewritten.  The operation is idempotent because the post-migration list no
+    longer matches this signature.
+    """
+    normalized = {str(pattern).strip().lower() for pattern in excludes}
+    if len(excludes) != len(normalized) or normalized not in LEGACY_BINARY_DEFAULT_SIGNATURES:
+        return list(excludes), []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for pattern in excludes:
+        if str(pattern).strip().lower() == "*.bin":
+            dropped.append(pattern)
+        else:
+            kept.append(pattern)
+    return kept, dropped
 
 
 def strip_legacy_media_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
@@ -546,6 +638,17 @@ class PackingConfig:
     #: (mandatory secret exclusions always win).
     always_include: list[str] = field(default_factory=list)
     always_exclude: list[str] = field(default_factory=list)
+    #: T-167 (SRC-039): automatic PACK ALL. Hourly by default, configurable,
+    #: and on by default -- the operator asked for exactly that. The interval is
+    #: normalized to 5..1440 minutes at load: a persisted 0 or negative must
+    #: never become a zero-delay timer, and anything beyond a day is nonsense.
+    auto_pack_all_enabled: bool = True
+    auto_pack_all_interval_minutes: int = 60
+    #: T-188: clicking a real project row in Project Room packs that project in
+    #: the background. On by default for fresh configs; a legacy config missing
+    #: the field loads as True so existing installs gain the behaviour. Covered
+    #: by its own field so the periodic AUTO PACK ALL meaning is never overloaded.
+    auto_pack_on_project_click_enabled: bool = True
 
 
 @dataclass
@@ -607,6 +710,20 @@ def _normalized_fidelity_profile(value: Any) -> str:
     return normalize_fidelity_profile(value)
 
 
+def _normalized_auto_pack_interval(value: Any) -> int:
+    """Keep the automatic PACK ALL interval a safe positive minute count.
+
+    T-167 (SRC-039): the feature defaults to hourly. A corrupt or nonsensical
+    persisted value must not produce a zero-delay timer or an overflow/busy
+    loop, so anything outside 5..1440 minutes is clamped (or defaulted when it
+    is not a number at all).
+    """
+    minutes = _as_int(value, 60)
+    if minutes <= 0:
+        minutes = 60
+    return max(5, min(1440, minutes))
+
+
 def _normalized_audit_profile(value: Any) -> str:
     """Keep the persisted profile inside the canonical registry.
 
@@ -658,6 +775,9 @@ class BridgeConfig:
     autostart: bool = True
     max_request_bytes: int = 10 * 1024 * 1024
     history_retention_days: int = 30
+    #: Where captured SAIHANDOFF blocks are written as ready-to-hand-over
+    #: `.md` files. Empty means `<temp>/audapack_handoffs`.
+    handoff_dir: str = ""
 
     def to_safe_dict(self) -> dict[str, Any]:
         """Serializable view for portable config: never contains the production token.
@@ -671,6 +791,7 @@ class BridgeConfig:
             "autostart": self.autostart,
             "max_request_bytes": self.max_request_bytes,
             "history_retention_days": self.history_retention_days,
+            "handoff_dir": self.handoff_dir,
         }
 
 
@@ -682,7 +803,18 @@ class LauncherConfig:
     command_template: str = ""
     agent_type: str = "powershell"  # "powershell", "cmd", "executable", "custom"
     enabled: bool = True
-    max_instances: int = 0  # 0 = unlimited; FreeBuff defaults to one global window
+    max_instances: int = 0  # 0 = unlimited; no launcher gets an implicit cap
+    #: SRC-081 APP-CLI-001 TARGET B: first stable resolved invocation for a
+    #: built-in CLI launcher, persisted so a click never rescans the machine.
+    #: ``command_template`` stays the operator's authoritative override; these
+    #: fields are discovery output only and never carry credentials.
+    resolved_command: str = ""
+    resolved_probe: str = ""
+    resolved_profile: str = ""
+    resolved_stage: str = ""
+    resolved_is_cli: bool = True
+    console_background_color: str = ""
+    console_foreground_color: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -693,16 +825,22 @@ class LauncherConfig:
             "agent_type": self.agent_type,
             "enabled": self.enabled,
             "max_instances": self.max_instances,
+            "resolved_command": self.resolved_command,
+            "resolved_probe": self.resolved_probe,
+            "resolved_profile": self.resolved_profile,
+            "resolved_stage": self.resolved_stage,
+            "resolved_is_cli": self.resolved_is_cli,
+            "console_background_color": self.console_background_color,
+            "console_foreground_color": self.console_foreground_color,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LauncherConfig:
         launcher_id = str(data.get("id", "")).strip()
-        default_limit = 1 if launcher_id == "freebuff" else 0
         try:
-            max_instances = max(0, int(data.get("max_instances", default_limit)))
+            max_instances = max(0, int(data.get("max_instances", 0)))
         except (TypeError, ValueError):
-            max_instances = default_limit
+            max_instances = 0
         return cls(
             id=launcher_id,
             name=str(data.get("name", "")).strip(),
@@ -711,21 +849,158 @@ class LauncherConfig:
             agent_type=str(data.get("agent_type", "powershell")).strip(),
             enabled=bool(data.get("enabled", True)),
             max_instances=max_instances,
+            resolved_command=str(data.get("resolved_command", "")).strip(),
+            resolved_probe=str(data.get("resolved_probe", "")).strip(),
+            resolved_profile=str(data.get("resolved_profile", "")).strip(),
+            resolved_stage=str(data.get("resolved_stage", "")).strip(),
+            resolved_is_cli=bool(data.get("resolved_is_cli", True)),
+            console_background_color=str(data.get("console_background_color", "") or "").strip(),
+            console_foreground_color=str(data.get("console_foreground_color", "") or "").strip(),
         )
 
 
+#: SRC-081 / APP-CLI-001 TARGET I: ONE authoritative short-label table. Every
+#: label surface (paint, settings, migration) reads this or the launcher's own
+#: ``short_label``; never a second hard-coded id map. ``C1``/``C2`` stay
+#: Codex 1/2, so the Claude pair uses ``A1``/``A2`` and stays unambiguous.
+DEFAULT_SHORT_LABELS: dict[str, str] = {
+    "opencode": "OC",
+    "freebuff": "FB",
+    "cline": "CL",
+    "main_codex": "C1",
+    "main_codex2": "C2",
+    "main_codex3_free": "CF",
+    "claude1": "A1",
+    "claude2": "A2",
+    "antigravity": "AG",
+    "zcode": "ZC",
+}
+
+#: Shipped launcher identities in button/shortcut order. The multi-agent CLI
+#: launchers (TARGET A) sit after the historical six so every existing
+#: operator's first-six shortcut muscle memory survives the schema-6 upgrade.
+DEFAULT_LAUNCHER_SPECS: tuple[tuple[str, str], ...] = (
+    ("opencode", "OpenCode"),
+    ("freebuff", "FreeBuff"),
+    ("cline", "Cline"),
+    ("main_codex", "Codex 1"),
+    ("main_codex2", "Codex 2"),
+    ("main_codex3_free", "Codex Free"),
+    ("claude1", "Claude 1"),
+    ("claude2", "Claude 2"),
+    ("antigravity", "Antigravity"),
+    ("zcode", "ZCode"),
+)
+
+DEFAULT_LAUNCHER_CONSOLE_COLORS: dict[str, tuple[str, str]] = {
+    "opencode": ("Black", "White"),
+    "cline": ("Black", "White"),
+}
+
 DEFAULT_LAUNCHERS: list[LauncherConfig] = [
-    LauncherConfig(id="opencode", name="OpenCode", short_label="OC", command_template="", agent_type="powershell", enabled=True),
-    LauncherConfig(id="freebuff", name="FreeBuff", short_label="FB", command_template="", agent_type="powershell", enabled=True, max_instances=1),
-    LauncherConfig(id="cline", name="Cline", short_label="CL", command_template="", agent_type="powershell", enabled=True),
-    LauncherConfig(id="main_codex", name="Codex 1", short_label="C1", command_template="", agent_type="powershell", enabled=True),
-    LauncherConfig(id="main_codex2", name="Codex 2", short_label="C2", command_template="", agent_type="powershell", enabled=True),
-    LauncherConfig(id="main_codex3_free", name="Codex Free", short_label="CF", command_template="", agent_type="powershell", enabled=True),
+    LauncherConfig(
+        id=launcher_id,
+        name=name,
+        short_label=DEFAULT_SHORT_LABELS[launcher_id],
+        command_template="",
+        agent_type="powershell",
+        enabled=True,
+        console_background_color=DEFAULT_LAUNCHER_CONSOLE_COLORS.get(launcher_id, ("", ""))[0],
+        console_foreground_color=DEFAULT_LAUNCHER_CONSOLE_COLORS.get(launcher_id, ("", ""))[1],
+    )
+    for launcher_id, name in DEFAULT_LAUNCHER_SPECS
 ]
 
 
 def create_default_launchers() -> list[LauncherConfig]:
     return [LauncherConfig.from_dict(launcher.to_dict()) for launcher in DEFAULT_LAUNCHERS]
+
+
+#: CORE-003 (audit/12.md): launcher ownership is split. These fields are
+#: DISCOVERY OUTPUT the runtime persists so a click never rescans the machine
+#: (`scoped_config_write` in ui_qt/main_window.py); an operator editing the
+#: launcher list has no authority over them and must never roll them back.
+LAUNCHER_RUNTIME_FIELDS = (
+    "resolved_command",
+    "resolved_probe",
+    "resolved_profile",
+    "resolved_stage",
+    "resolved_is_cli",
+)
+
+#: What each runtime field reads when the answer no longer applies.
+_LAUNCHER_RUNTIME_DEFAULTS = {
+    spec.name: spec.default
+    for spec in dataclasses.fields(LauncherConfig)
+    if spec.name in LAUNCHER_RUNTIME_FIELDS
+}
+
+#: Operator-owned launcher fields: everything the runtime does not own.
+LAUNCHER_OPERATOR_FIELDS = tuple(
+    spec.name
+    for spec in dataclasses.fields(LauncherConfig)
+    if spec.name not in LAUNCHER_RUNTIME_FIELDS
+)
+
+#: The invocation a `resolved_*` answer describes. Change either and the stored
+#: answer describes a DIFFERENT invocation, so it must be re-resolved.
+_LAUNCHER_INVOCATION_FIELDS = ("command_template", "agent_type")
+
+
+def _launcher_invocation(launcher: LauncherConfig) -> tuple:
+    return tuple(str(getattr(launcher, field, "") or "") for field in _LAUNCHER_INVOCATION_FIELDS)
+
+
+def merge_launcher_edits(
+    latest: list[LauncherConfig],
+    edited: list[LauncherConfig],
+    baseline: list[LauncherConfig],
+) -> list[LauncherConfig]:
+    """Merge an operator's launcher edits into the LATEST on-disk launchers.
+
+    CORE-003: `_persist_settings` used to assign its build-time snapshot over
+    the freshly loaded list wholesale, so ANY Settings autosave rolled back
+    launcher resolution written after the dialog opened -- an unrelated checkbox
+    erased the runtime's verified CLI invocation.
+
+    Ownership, in one place:
+      * operator: order, id/name/short_label, command_template, agent_type,
+        enabled, max_instances, console colours, plus add and remove;
+      * runtime: the ``resolved_*`` discovery output, preserved unless the
+        operator changed the invocation it answers.
+
+    ``baseline`` is the list the dialog was BUILT with, which is what separates
+    "the operator removed this" from "this appeared externally while the dialog
+    was open" -- the latter is never silently deleted.
+    """
+    latest_by_id = {lc.id: lc for lc in latest}
+    baseline_by_id = {lc.id: lc for lc in baseline}
+    baseline_ids = set(baseline_by_id)
+    edited_ids = {lc.id for lc in edited}
+
+    merged: list[LauncherConfig] = []
+    for snapshot in edited:
+        current = latest_by_id.get(snapshot.id)
+        if current is None:
+            # An id the dialog did not start with: the operator added it.
+            merged.append(independent_copy(snapshot))
+            continue
+        result = independent_copy(current)
+        for name in LAUNCHER_OPERATOR_FIELDS:
+            if hasattr(result, name):
+                setattr(result, name, getattr(snapshot, name))
+        before = baseline_by_id.get(snapshot.id)
+        if before is not None and _launcher_invocation(before) != _launcher_invocation(snapshot):
+            # A different invocation: the stored answer is about another one.
+            for name in LAUNCHER_RUNTIME_FIELDS:
+                setattr(result, name, _LAUNCHER_RUNTIME_DEFAULTS[name])
+        merged.append(result)
+
+    # A launcher the dialog never saw is not the operator's to remove.
+    merged.extend(
+        independent_copy(lc) for lc in latest if lc.id not in edited_ids and lc.id not in baseline_ids
+    )
+    return merged
 
 
 DEFAULT_GG_TEMPLATE = "/saipen gg READ THIS FILE AND CONTINUE THE PROJECT AUDITING {path}"
@@ -775,6 +1050,36 @@ TOOLBAR_BUTTON_KEYS = (
 DEFAULT_HIDDEN_TOOLBAR_BUTTONS = ("GG", "IA", "IA+")
 
 
+#: T-209 P1: what a double-click on a POPULATED project row does. Stable
+#: persistence values -- never translated display labels. Group headers keep
+#: expand/collapse and empty slots keep Add Project, whatever this says.
+PROJECT_DOUBLE_CLICK_ACTIONS: tuple[str, ...] = (
+    "launcher",
+    "project_folder",
+    "inaudit",
+    "instances",
+    "terminal",
+    "archive_folder",
+    "audit_folder",
+    "none",
+)
+#: The newly requested behaviour: open/start the bound program.
+PROJECT_DOUBLE_CLICK_DEFAULT = "launcher"
+PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT = "opencode"
+
+
+def normalize_double_click_action(value: Any) -> str:
+    """Deterministic migration for the project-row double-click action.
+
+    An explicit, known value is preserved -- a config that stores ``inaudit``
+    keeps the historical INAUDIT behaviour. A missing key, an empty value or an
+    unknown/retired value becomes the requested default (``launcher``); there is
+    never a second interpretation of the stored string.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in PROJECT_DOUBLE_CLICK_ACTIONS else PROJECT_DOUBLE_CLICK_DEFAULT
+
+
 @dataclass
 class UIConfig:
     window_size: list[int] = field(default_factory=lambda: [760, 680])
@@ -813,6 +1118,13 @@ class UIConfig:
     #: it needs. A window the operator opened by hand with NEW is never closed,
     #: and neither is one still holding a run.
     close_idle_worker_windows: bool = True
+
+    #: T-209: what a double-click on a populated project row does. One of
+    #: PROJECT_DOUBLE_CLICK_ACTIONS; group/empty-slot behaviour is untouched.
+    project_double_click_action: str = PROJECT_DOUBLE_CLICK_DEFAULT
+    #: T-209: the launcher id used when the action is "launcher". Persisted by
+    #: ID, never by list index, so reordering launchers cannot change it.
+    project_double_click_launcher_id: str = PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
 
 
 @dataclass
@@ -1235,8 +1547,20 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                 )
 
     packing_raw = data.get("packing", {})
+    config_schema = int(data.get("schema_version") or 0)
     raw_excludes = list(packing_raw.get("excludes", data.get("excludes", DEFAULT_EXCLUDES)))
-    if int(data.get("schema_version") or 0) < _MEDIA_EXCLUDE_UPGRADE_SCHEMA:
+    if config_schema < _BINARY_EXCLUDE_UPGRADE_SCHEMA:
+        # Binary provenance is evaluated before the older media migration so an
+        # untouched pre-schema-3 default can still match its frozen signature.
+        raw_excludes, dropped_binary = strip_legacy_binary_default(raw_excludes)
+        if dropped_binary:
+            logging.getLogger(__name__).info(
+                "config upgrade to schema %d: removed AUDAPACK-owned historical "
+                "binary exclude (%s); add it to always_exclude to keep it out",
+                _BINARY_EXCLUDE_UPGRADE_SCHEMA,
+                ", ".join(dropped_binary),
+            )
+    if config_schema < _MEDIA_EXCLUDE_UPGRADE_SCHEMA:
         raw_excludes, dropped_media = strip_legacy_media_excludes(raw_excludes)
         if dropped_media:
             logging.getLogger(__name__).info(
@@ -1259,6 +1583,13 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         fidelity_media_bytes=_as_int(packing_raw.get("fidelity_media_bytes", 0), 0),
         always_include=list(packing_raw.get("always_include", []) or []),
         always_exclude=list(packing_raw.get("always_exclude", []) or []),
+        auto_pack_all_enabled=bool(packing_raw.get("auto_pack_all_enabled", True)),
+        auto_pack_all_interval_minutes=_normalized_auto_pack_interval(
+            packing_raw.get("auto_pack_all_interval_minutes", 60)
+        ),
+        auto_pack_on_project_click_enabled=bool(
+            packing_raw.get("auto_pack_on_project_click_enabled", True)
+        ),
     )
 
     audits_raw = data.get("audits", {})
@@ -1290,6 +1621,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         autostart=bool(bridge_raw.get("autostart", True)),
         max_request_bytes=int(bridge_raw.get("max_request_bytes", 10 * 1024 * 1024)),
         history_retention_days=int(bridge_raw.get("history_retention_days", 30)),
+        handoff_dir=str(bridge_raw.get("handoff_dir") or "").strip(),
     )
 
     ui_raw = data.get("ui", {})
@@ -1315,6 +1647,13 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         worker_window_monitor=_as_int(ui_raw.get("worker_window_monitor", -1), -1),
         worker_windows_minimized=bool(ui_raw.get("worker_windows_minimized", True)),
         close_idle_worker_windows=bool(ui_raw.get("close_idle_worker_windows", True)),
+        project_double_click_action=normalize_double_click_action(
+            ui_raw.get("project_double_click_action", PROJECT_DOUBLE_CLICK_DEFAULT)
+        ),
+        project_double_click_launcher_id=(
+            str(ui_raw.get("project_double_click_launcher_id", PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT)).strip()
+            or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
+        ),
     )
 
     launchers_raw = data.get("launchers")
@@ -1323,12 +1662,57 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
     else:
         launchers = create_default_launchers()
 
-    # Migrate numeric 1..6 short_labels to letters OC/FB/CL/C1/C2/CF when letters mode is on
-    if getattr(ui_cfg, "launcher_letters", True):
-        _letter_map = {"opencode": "OC", "freebuff": "FB", "cline": "CL", "main_codex": "C1", "main_codex2": "C2", "main_codex3_free": "CF"}
+    if config_schema < _MULTI_CLI_LAUNCHER_SCHEMA:
+        # SRC-081 / APP-CLI-001 TARGET G: one-time, additive, idempotent. An
+        # old config gains exactly the four multi-agent CLI launcher
+        # identities -- existing entries (settings, order, custom launchers,
+        # even a custom launcher already using one of these ids) are never
+        # overwritten, and a schema-6+ config never re-runs this, so nothing
+        # is resurrected after a deliberate removal and loading twice never
+        # appends duplicates.
+        _known_ids = {_lc.id for _lc in launchers}
+        _added: list[str] = []
+        for _builtin in DEFAULT_LAUNCHERS:
+            if _builtin.id in _MULTI_CLI_LAUNCHER_IDS and _builtin.id not in _known_ids:
+                launchers.append(LauncherConfig.from_dict(_builtin.to_dict()))
+                _added.append(_builtin.id)
+        if _added:
+            logging.getLogger(__name__).info(
+                "config upgrade to schema %d: added built-in CLI launcher(s) %s",
+                _MULTI_CLI_LAUNCHER_SCHEMA,
+                ", ".join(_added),
+            )
+
+    if config_schema < _YOLO_CLI_SCHEMA:
         for _lc in launchers:
-            if _lc.short_label in ("1", "2", "3", "4", "5", "6") and _lc.id in _letter_map:
-                _lc.short_label = _letter_map[_lc.id]
+            if _lc.id in _MULTI_CLI_LAUNCHER_IDS and _lc.resolved_command:
+                _lc.resolved_command = ""
+                _lc.resolved_probe = ""
+                _lc.resolved_profile = ""
+                _lc.resolved_stage = ""
+                _lc.resolved_is_cli = True
+
+    # Migrate numeric short_labels to canonical letters when letters mode is
+    # on. Label truth is DEFAULT_SHORT_LABELS (TARGET I) -- never a second map.
+    if getattr(ui_cfg, "launcher_letters", True):
+        for _lc in launchers:
+            if _lc.short_label.isdigit() and _lc.id in DEFAULT_SHORT_LABELS:
+                _lc.short_label = DEFAULT_SHORT_LABELS[_lc.id]
+
+    if config_schema < _FREEBUFF_MULTI_INSTANCE_SCHEMA:
+        # One-time removal of AUDAPACK's historical forced FreeBuff cap: the old
+        # serializer stored the product default and a manual 1 identically, so
+        # schema < 5 prioritizes retiring the forced policy. Version-gated and
+        # idempotent -- a schema-5 config never reaches this branch, so an
+        # operator who later sets FreeBuff back to 1 keeps it.
+        for _lc in launchers:
+            if _lc.id == "freebuff" and _lc.max_instances == 1:
+                _lc.max_instances = 0
+                logging.getLogger(__name__).info(
+                    "config upgrade to schema %d: FreeBuff max_instances 1 -> 0 "
+                    "(unlimited); multi-instance is now supported",
+                    _FREEBUFF_MULTI_INSTANCE_SCHEMA,
+                )
 
     return AppConfig(
         schema_version=SCHEMA_VERSION,
@@ -1394,7 +1778,7 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
         # A schema upgrade counts as a heal: the media/font excludes handed to
         # the fidelity profile must be written back once, or a config the
         # operator later edits by hand is re-stripped on every load.
-        healed_any = int(data.get("schema_version") or 0) < _MEDIA_EXCLUDE_UPGRADE_SCHEMA
+        healed_any = int(data.get("schema_version") or 0) < SCHEMA_VERSION
         for p in cfg.projects:
             healed = auto_heal_project_path(p.display_name, p.source_path)
             if healed and healed != p.source_path:
@@ -1462,7 +1846,10 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
                         healed_any = True
             if healed_any:
                 save_config(cfg, base_dir)
-        elif healed_any and not base_dir:
+        elif healed_any:
+            # Persist schema/default migrations for both the canonical runtime
+            # config and test/imported config roots. Otherwise a caller reloads
+            # the same legacy payload and the migration is re-derived forever.
             save_config(cfg, base_dir)
 
         if legacy_token_present:
@@ -1484,6 +1871,64 @@ def load_config(base_dir: Optional[Path] = None) -> AppConfig:
                     except Exception:
                         pass
         raise ValueError(f"Corrupted configuration file '{cfg_file}': {exc}") from exc
+
+
+def _staged_for_save(config: AppConfig) -> AppConfig:
+    """The serialisation view of *config*: normalized, and marked initialized.
+
+    CORE-002: these two mutations used to be applied to the caller's LIVE
+    object before the durable replacement, so a refused or failed write still
+    changed authoritative in-memory state. They are applied here instead, on an
+    independent copy, and the caller only observes them after the commit (see
+    `_commit_saved_state`). Normalization is idempotent, so applying it to the
+    caller afterwards yields exactly the values that were just persisted.
+    """
+    staged = independent_copy(config)
+    staged.normalize_paths()
+    staged.initialized = True
+    return staged
+
+
+def independent_copy(value):
+    """A copy that does NOT go through the pickle protocol.
+
+    CORE-002: `copy.deepcopy` reconstructs through `__reduce_ex__`/`__setstate__`.
+    Any member that forwards unknown attributes (`__getattr__` delegating to a
+    private field) makes reconstruction ask for `__setstate__` on a half-built
+    object, which forwards again -- unbounded recursion. `save_config` caught the
+    RecursionError and returned False with nothing written, which is the exact
+    silent-failure this work exists to remove. This walks containers and
+    dataclasses, which is every shape AppConfig holds.
+
+    ponytail: a non-dataclass member is shared with the caller rather than copied,
+    so a mutation reaching one would be visible on both. Replace with a real
+    copier if AppConfig ever gains a non-dataclass mutable field.
+    """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        kwargs: dict = {}
+        deferred: dict = {}
+        for spec in dataclasses.fields(value):
+            copied = independent_copy(getattr(value, spec.name))
+            (kwargs if spec.init else deferred)[spec.name] = copied
+        clone = dataclasses.replace(value, **kwargs)
+        for name, item in deferred.items():
+            object.__setattr__(clone, name, item)
+        return clone
+    if isinstance(value, list):
+        return [independent_copy(item) for item in value]
+    if isinstance(value, dict):
+        return {key: independent_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(independent_copy(item) for item in value)
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+def _commit_saved_state(config: AppConfig) -> None:
+    """The input may now observe the committed state."""
+    config.normalize_paths()
+    config.initialized = True
 
 
 def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> bool:
@@ -1538,17 +1983,19 @@ def save_config(config: AppConfig, base_dir: Optional[Path] = None) -> bool:
 
         # Normalize paths before persisting so the on-disk form always uses
         # native separators, independent of where the value originated
-        # (file dialog, manual paste, legacy migration).
-        config.normalize_paths()
-        config.initialized = True
+        # (file dialog, manual paste, legacy migration). Staged on a copy, so a
+        # failure below leaves the caller untouched (CORE-002).
+        staged = _staged_for_save(config)
 
-        data = config.to_dict()
+        data = staged.to_dict()
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         _replace_config_file_with_retry(tmp_file, cfg_file)
+        # Durable replacement succeeded: only now may the caller's object see it.
+        _commit_saved_state(config)
 
         # Update backup if current save has projects
         if base_dir is None and data.get("projects"):

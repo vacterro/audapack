@@ -81,13 +81,74 @@ def test_monitor_discovers_titles_and_uses_tracked_freebuff_project(tmp_path):
     )
 
 
-def test_freebuff_global_limit_blocks_every_project(tmp_path):
+def test_freebuff_default_is_unlimited_across_projects(tmp_path):
+    """T-230: FreeBuff no longer carries a product-owned single-instance cap.
+
+    Three live FreeBuff windows across three projects must not block each other
+    and must not produce a global-capacity refusal.
+    """
+    p1 = project("p1", "Project One", r"V:\code\one")
+    p2 = project("p2", "Project Two", r"V:\code\two", slot=2)
+    p3 = project("p3", "Project Three", r"V:\code\three", slot=3)
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(11, 44, r"Project One | FreeBuff | V:\code\one", "powershell.exe"),
+            NativeWindow(12, 45, r"Project Two | FreeBuff | V:\code\two", "powershell.exe"),
+            NativeWindow(13, 46, r"Project Three | FreeBuff | V:\code\three", "powershell.exe"),
+        ]
+    )
+    launchers = create_default_launchers()
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    monitor.refresh([p1, p2, p3], launchers)
+
+    freebuff = next(item for item in launchers if item.id == "freebuff")
+    assert freebuff.max_instances == 0
+    assert monitor.count_for_launcher("freebuff") == 3
+    assert monitor.block_reason(freebuff) == ""
+
+
+def test_same_project_force_new_freebuff_instances_stay_independent(tmp_path):
+    """T-230 TARGET G: force-new FreeBuff launches on one project never collapse."""
+    pa = project("pa", "Project A", r"V:\code\a")
+    backend = FakeWindowBackend()
+    for pid, token in ((44, 1), (55, 2), (66, 3)):
+        backend.alive[pid] = True
+        backend.tokens[pid] = token
+    record_path = tmp_path / "instances.json"
+    monitor = InstanceMonitor(backend=backend, record_path=record_path)
+    for pid in (44, 55, 66):
+        assert monitor.track_launch(pid, "freebuff", pa)
+    backend.windows = [
+        NativeWindow(11, 44, r"Project A | FreeBuff | V:\code\a", "powershell.exe"),
+        NativeWindow(22, 55, r"Project A | FreeBuff | V:\code\a", "powershell.exe"),
+        NativeWindow(33, 66, r"Project A | FreeBuff | V:\code\a", "powershell.exe"),
+    ]
+
+    instances = monitor.refresh([pa], create_default_launchers())
+
+    freebuff = [item for item in instances if item.launcher_id == "freebuff"]
+    assert len(freebuff) == 3
+    assert {(item.hwnd, item.pid, item.launch_pid) for item in freebuff} == {
+        (11, 44, 44),
+        (22, 55, 55),
+        (33, 66, 66),
+    }
+    assert all(item.project_id == "pa" and item.launcher_id == "freebuff" for item in freebuff)
+    assert monitor.count_for_launcher("freebuff") == 3
+
+
+def test_explicit_launcher_capacity_blocks_globally(tmp_path):
+    """T-230 TARGET H: the generic max_instances engine is untouched.
+
+    An explicit cap must still refuse a further launch, whoever owns the window.
+    """
     p1 = project("p1", "Project One", r"V:\code\one")
     p2 = project("p2", "Project Two", r"V:\code\two", slot=2)
     backend = FakeWindowBackend(
         [NativeWindow(11, 44, r"Project One | FreeBuff | V:\code\one", "powershell.exe")]
     )
     launchers = create_default_launchers()
+    next(item for item in launchers if item.id == "freebuff").max_instances = 1
     monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
     monitor.refresh([p1, p2], launchers)
 
@@ -98,12 +159,36 @@ def test_freebuff_global_limit_blocks_every_project(tmp_path):
     assert "Project One" in reason
 
 
+def test_explicit_capacity_two_allows_two_and_blocks_the_third(tmp_path):
+    p1 = project("p1", "Project One", r"V:\code\one")
+    p2 = project("p2", "Project Two", r"V:\code\two", slot=2)
+    p3 = project("p3", "Project Three", r"V:\code\three", slot=3)
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(11, 44, r"Project One | FreeBuff | V:\code\one", "powershell.exe"),
+            NativeWindow(12, 45, r"Project Two | FreeBuff | V:\code\two", "powershell.exe"),
+            NativeWindow(13, 46, r"Project Three | FreeBuff | V:\code\three", "powershell.exe"),
+        ]
+    )
+    launchers = create_default_launchers()
+    next(item for item in launchers if item.id == "freebuff").max_instances = 2
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    monitor.refresh([p1, p2, p3], launchers)
+
+    freebuff = next(item for item in launchers if item.id == "freebuff")
+    assert monitor.count_for_launcher("freebuff") == 3
+    assert "limit 2" in monitor.block_reason(freebuff)
+
+
+
 def test_pending_launch_blocks_before_window_appears(tmp_path):
     p1 = project("p1", "Project One", r"V:\code\one")
     backend = FakeWindowBackend()
     backend.alive[77] = True
     backend.tokens[77] = 1234
     launchers = create_default_launchers()
+    # T-230: pin the block with an explicit cap; FreeBuff ships unlimited now.
+    next(lc for lc in launchers if lc.id == "freebuff").max_instances = 1
     monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
     monitor.track_launch(77, "freebuff", p1)
 
@@ -167,6 +252,121 @@ def test_monitors_reload_shared_launch_records_across_gui_processes(tmp_path):
     backend.alive[77] = False
     writer.refresh([p1], create_default_launchers())
     assert reader.refresh([p1], create_default_launchers()) == []
+
+
+def test_focus_candidate_breaks_a_same_tick_timestamp_tie_by_launch_order(tmp_path):
+    """Two launches inside one clock tick must still focus the NEWER window.
+
+    Windows resolves datetime.now() to roughly the system clock tick, so two
+    consoles started back to back share `started_at` exactly. With only that
+    key the sort was a tie and the stable lowest-PID pass decided, so clicking
+    a launcher brought the OLDER console to the front. The monotonic launch
+    sequence makes the order total.
+    """
+    p1 = project("p1", "Project One", r"V:\code\one")
+    backend = FakeWindowBackend()
+    for pid, token in ((44, 1), (55, 2)):
+        backend.alive[pid] = True
+        backend.tokens[pid] = token
+    record_path = tmp_path / "instances.json"
+    monitor = InstanceMonitor(backend=backend, record_path=record_path)
+
+    assert monitor.track_launch(44, "opencode", p1)
+    assert monitor.track_launch(55, "opencode", p1)
+
+    # Force the exact collision the real clock produces intermittently.
+    stamp = "2026-09-09T14:31:13.335000Z"
+    for pid in (44, 55):
+        monitor.records[pid].started_at = stamp
+    assert monitor.records[44].sequence < monitor.records[55].sequence
+
+    backend.windows = [
+        NativeWindow(11, 44, r"Project One | OpenCode | V:\code\one", "powershell.exe"),
+        NativeWindow(22, 55, r"Project One | OpenCode | V:\code\one", "powershell.exe"),
+    ]
+    monitor._save_records()
+    monitor.refresh([p1], create_default_launchers())
+    for pid in (44, 55):
+        monitor.records[pid].started_at = stamp
+
+    candidate = monitor.focus_candidate("p1", "opencode")
+    assert candidate is not None
+    assert candidate.pid == 55, "the most recently launched window wins the tie"
+    assert candidate.hwnd == 22
+
+    # And the order survives a reload by another GUI process.
+    reader = InstanceMonitor(backend=backend, record_path=record_path)
+    reader.refresh([p1], create_default_launchers())
+    assert reader.records[55].sequence > reader.records[44].sequence
+
+
+def test_correlated_visible_pids_keep_launch_recency_and_focus_newest(tmp_path):
+    """A conhost/TUI PID is presentation identity, not LaunchRecord identity."""
+    p1 = project("p1", "Project One", r"V:\code\one")
+    binding = {
+        "kind": "saipen-opencode-v1",
+        "project_root": r"V:\code\one",
+        "entrypoint": r"V:\saipen\tools\saipen.py",
+        "project_identity": r"v:\code\one",
+        "project_lineage": "lineage-1",
+        "actor": "buffy",
+    }
+    backend = FakeWindowBackend()
+    backend.alive.update({44: True, 55: True})
+    backend.tokens.update({44: 101, 55: 102})
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    monitor.track_launch(44, "opencode", p1, saipen_binding=binding, correlation_token="OC-one")
+    monitor.track_launch(55, "opencode", p1, saipen_binding=binding, correlation_token="OC-two")
+
+    backend.windows = [
+        NativeWindow(199, 99, "Project One | OpenCode YOLO | OC-one", "powershell.exe"),
+        NativeWindow(200, 100, "Project One | OpenCode YOLO | OC-two", "powershell.exe"),
+    ]
+    instances = monitor.refresh([p1], create_default_launchers())
+
+    compatible = [item for item in instances if item.tracked and item.saipen_binding == binding]
+    assert {(item.hwnd, item.pid, item.launch_pid) for item in compatible} == {
+        (199, 99, 44),
+        (200, 100, 55),
+    }
+    candidate = monitor.focus_candidate("p1", "opencode", saipen_binding=binding)
+    assert candidate is not None
+    assert (candidate.hwnd, candidate.pid, candidate.launch_pid) == (200, 100, 55)
+    assert monitor.focus(candidate)
+    assert backend.focused == [200]
+
+    repeated = monitor.focus_candidate("p1", "opencode", saipen_binding=binding)
+    assert repeated is not None
+    assert (repeated.hwnd, repeated.pid) == (200, 100)
+    assert monitor.focus(repeated)
+    assert backend.focused == [200, 200]
+
+
+def test_legacy_launch_records_without_a_sequence_still_load(tmp_path):
+    import json
+
+    p1 = project("p1", "Project One", r"V:\code\one")
+    backend = FakeWindowBackend()
+    backend.alive[77] = True
+    backend.tokens[77] = 5
+    record_path = tmp_path / "instances.json"
+    record_path.write_text(json.dumps([{
+        "pid": 77,
+        "launcher_id": "opencode",
+        "project_id": "p1",
+        "project_name": "Project One",
+        "project_path": r"V:\code\one",
+        "started_at": "2026-01-01T00:00:00Z",
+        "process_token": 5,
+    }]), encoding="utf-8")
+
+    monitor = InstanceMonitor(backend=backend, record_path=record_path)
+    assert monitor.records[77].sequence == 0
+    # A new launch must not reuse the legacy 0 slot.
+    backend.alive[88] = True
+    backend.tokens[88] = 6
+    assert monitor.track_launch(88, "opencode", p1)
+    assert monitor.records[88].sequence == 1
 
 
 def test_monitor_actions_only_forward_known_native_windows(tmp_path):
@@ -267,17 +467,32 @@ def test_monitor_reads_explicit_saipen_activity_without_claiming_terminal_output
     assert instance.last_action.endswith("RUN: inspect windows -> PASS")
 
 
-def test_launcher_config_migrates_freebuff_limit_and_roundtrips():
-    legacy = LauncherConfig.from_dict(
+def test_launcher_config_parses_capacity_generically_and_roundtrips():
+    """T-230: no launcher id gets an implicit capacity any more."""
+    legacy_freebuff = LauncherConfig.from_dict(
         {"id": "freebuff", "name": "FreeBuff", "short_label": "FB", "enabled": True}
+    )
+    legacy_opencode = LauncherConfig.from_dict(
+        {"id": "opencode", "name": "OpenCode", "short_label": "OC", "enabled": True}
+    )
+    explicit = LauncherConfig.from_dict(
+        {"id": "freebuff", "name": "FreeBuff", "short_label": "FB", "max_instances": 1}
     )
     custom = LauncherConfig.from_dict(
         {"id": "custom", "name": "Custom", "short_label": "CU", "max_instances": "3"}
     )
+    invalid = LauncherConfig.from_dict(
+        {"id": "freebuff", "name": "FreeBuff", "short_label": "FB", "max_instances": "garbage"}
+    )
 
-    assert legacy.max_instances == 1
+    assert legacy_freebuff.max_instances == 0, "FreeBuff no longer defaults to a cap"
+    assert legacy_opencode.max_instances == 0
+    assert explicit.max_instances == 1, "an explicit persisted cap is preserved"
     assert custom.max_instances == 3
+    assert invalid.max_instances == 0, "an unparseable value falls back to unlimited"
     assert LauncherConfig.from_dict(custom.to_dict()) == custom
+    assert LauncherConfig.from_dict(explicit.to_dict()) == explicit
+
 
 
 def test_instance_manager_lists_project_and_global_windows(tmp_path, qapp):
@@ -300,7 +515,7 @@ def test_instance_manager_lists_project_and_global_windows(tmp_path, qapp):
         assert dialog.scope_tabs.tabText(0) == "All (2)"
         assert dialog.scope_tabs.tabText(1) == "Project One (1)"
         assert "Windows 2" in dialog.capacity_label.text()
-        assert "FB 0/1" in dialog.capacity_label.text()
+        assert "FB 0/∞" in dialog.capacity_label.text()
         assert dialog._selected_instance().project_id == "p1"
         assert dialog.activity_label.text().startswith("Current: RUNNING")
         dialog.scope_tabs.setCurrentIndex(1)
@@ -316,12 +531,19 @@ def test_main_window_enforces_limit_and_project_click_opens_manager(tmp_path, qa
     p1 = project("p1", "Project One", r"V:\code\one")
     p2 = project("p2", "Project Two", r"V:\code\two", slot=2)
     service = ProjectService(AppConfig(projects=[p1, p2]), base_dir=tmp_path)
+    # T-230: FreeBuff no longer ships a cap; this pins the explicit generic
+    # capacity rule, so the click must be refused by the operator-set limit.
+    next(lc for lc in service.config.launchers if lc.id == "freebuff").max_instances = 1
     window = MainWindow(service)
     backend = FakeWindowBackend(
         [NativeWindow(11, 44, r"Project One | FreeBuff | V:\code\one", "powershell.exe")]
     )
     window._instance_monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
     window._instance_manager.monitor = window._instance_monitor
+    # T-216: the launcher click no longer scans native windows on the GUI
+    # thread; the harness installs the snapshot explicitly, exactly like every
+    # other capacity regression in this repository.
+    window._refresh_instance_snapshot()
     try:
         with (
             patch.object(window, "_on_open_with_freebuff") as launch,
@@ -335,6 +557,9 @@ def test_main_window_enforces_limit_and_project_click_opens_manager(tmp_path, qa
         index = window.model.index_for_project_id(p2.id)
         assert window.tabs.count() >= 2
         window.tabs.setCurrentIndex(0)
+        # T-209: the default double-click action is now "launcher"; this test
+        # pins the INAUDIT action path, which is one of the selectable values.
+        window._service.config.ui.project_double_click_action = "inaudit"
         window._on_tree_double_clicked(index)
         # T-143: a double-click on a project opens ITS audit inbox. Instances
         # answers a different question -- how many windows this project has --
@@ -478,3 +703,239 @@ def test_without_a_declared_workdir_the_old_path_matching_still_applies():
     saituls = project("saituls", "__SAITULS", r"V:\___VAC\__K\__CODE\__SAITULS")
     cmd = r'opencode.exe --project "V:\___VAC\__K\__CODE\__SAITULS"'
     assert InstanceMonitor._project_from_command_line(cmd, [saituls]) is saituls
+
+
+# --------------------------------------------------------------------------
+# T-179 defect 1: a browser tab is content, not an agent console
+# --------------------------------------------------------------------------
+
+def test_an_untracked_browser_titled_with_a_project_and_claude_is_rejected(tmp_path):
+    """chrome.exe "AUDAPACK | Claude Code" is a page, not a console.
+
+    The project name in the title resolved first, so the denylist -- consulted
+    only for project-less windows -- never ran and the tab was promoted.
+    """
+    p1 = project("audapack", "AUDAPACK", r"V:\code\AUDAPACK")
+    backend = FakeWindowBackend(
+        [NativeWindow(11, 44, "AUDAPACK | Claude Code", "chrome.exe")]
+    )
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.refresh([p1], create_default_launchers()) == []
+
+
+def test_untracked_browsers_naming_agents_and_projects_are_all_rejected(tmp_path):
+    p1 = project("pa", "Project A", r"V:\code\a")
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(1, 10, "Project A | ZCode", "brave.exe"),
+            NativeWindow(2, 20, "Project A | OpenCode", "msedge.exe"),
+            NativeWindow(3, 30, "Project A | Claude Code", "discord.exe"),
+            NativeWindow(4, 40, "Project A | Codex", "firefox.exe"),
+        ]
+    )
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.refresh([p1], create_default_launchers()) == []
+
+
+def test_a_terminal_agent_window_naming_a_project_and_claude_is_still_detected(tmp_path):
+    """The trust boundary is the PROCESS, not the words in the title."""
+    p1 = project("audapack", "AUDAPACK", r"V:\code\AUDAPACK")
+    backend = FakeWindowBackend(
+        [NativeWindow(11, 44, "AUDAPACK | Claude Code", "powershell.exe")]
+    )
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+
+    instances = monitor.refresh([p1], create_default_launchers())
+
+    assert [(item.launcher_id, item.project_id) for item in instances] == [("claude", "audapack")]
+
+
+def test_a_tracked_browser_launch_record_is_still_honoured(tmp_path):
+    """A launcher that deliberately starts a browser keeps its record."""
+    p1 = project("p1", "Project One", r"V:\code\one")
+    backend = FakeWindowBackend([NativeWindow(11, 44, "Project One | OpenCode", "chrome.exe")])
+    backend.alive[44] = True
+    backend.tokens[44] = 7
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(44, "opencode", p1)
+
+    instances = monitor.refresh([p1], create_default_launchers())
+
+    assert [(item.launcher_id, item.project_id, item.tracked) for item in instances] == [
+        ("opencode", "p1", True)
+    ]
+
+
+# --------------------------------------------------------------------------
+# T-179 defect 2: configured launcher identity outranks built-in tokens
+# --------------------------------------------------------------------------
+
+def test_a_configured_launcher_beats_a_generic_builtin_token():
+    my_open = LauncherConfig(id="my_open", name="OpenCode Special", short_label="MO")
+    launchers = [my_open] + create_default_launchers()
+
+    assert InstanceMonitor._launcher_from_title("Project | OpenCode Special", launchers) == "my_open"
+
+
+def test_configured_claude_and_zcode_names_keep_their_own_ids():
+    my_claude = LauncherConfig(id="my_claude", name="Claude Code Pro", short_label="MC")
+    my_zcode = LauncherConfig(id="my_zcode", name="ZCode Work", short_label="MZ")
+    launchers = [my_claude, my_zcode] + create_default_launchers()
+
+    assert InstanceMonitor._launcher_from_title("Project | Claude Code Pro", launchers) == "my_claude"
+    assert InstanceMonitor._launcher_from_title("Project | ZCode Work", launchers) == "my_zcode"
+
+
+def test_the_default_configured_launchers_still_resolve_to_their_own_ids():
+    launchers = create_default_launchers()
+
+    assert InstanceMonitor._launcher_from_title("Project | OpenCode", launchers) == "opencode"
+    assert InstanceMonitor._launcher_from_title("Project | Codex (main_codex)", launchers) == "main_codex"
+    assert InstanceMonitor._launcher_from_title("Project | Codex (main_codex2)", launchers) == "main_codex2"
+    assert (
+        InstanceMonitor._launcher_from_title("Project | Codex (main_codex3_free)", launchers)
+        == "main_codex3_free"
+    )
+
+
+def test_unconfigured_claude_and_zcode_fall_back_to_their_fallback_ids():
+    launchers = create_default_launchers()
+
+    assert InstanceMonitor._launcher_from_title("Project | Claude Code", launchers) == "claude"
+    assert InstanceMonitor._launcher_from_title("Project | ZCode", launchers) == "zcode"
+
+
+# --------------------------------------------------------------------------
+# T-179 project attribution matrix
+# --------------------------------------------------------------------------
+
+def test_attribution_matrix_maps_each_launcher_to_its_real_project(tmp_path):
+    pa = project("pa", "Project A", r"V:\code\a")
+    pb = project("pb", "Project B", r"V:\code\b", slot=2)
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(1, 10, r"Project A | OpenCode | V:\code\a", "powershell.exe"),
+            NativeWindow(2, 20, r"Project B | ZCode | V:\code\b", "powershell.exe"),
+            NativeWindow(3, 30, r"Project A | Claude Code | V:\code\a", "powershell.exe"),
+        ]
+    )
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+
+    instances = monitor.refresh([pa, pb], create_default_launchers())
+
+    assert {(item.launcher_id, item.project_id) for item in instances} == {
+        ("opencode", "pa"),
+        ("zcode", "pb"),
+        ("claude", "pa"),
+    }
+
+
+def test_a_tracked_audapack_record_wins_over_a_conflicting_title(tmp_path):
+    pa = project("pa", "Project A", r"V:\code\a")
+    pb = project("pb", "Project B", r"V:\code\b", slot=2)
+    backend = FakeWindowBackend([NativeWindow(1, 10, "Project A | OpenCode", "powershell.exe")])
+    backend.alive[10] = True
+    backend.tokens[10] = 5
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(10, "opencode", pb)
+
+    instances = monitor.refresh([pa, pb], create_default_launchers())
+
+    assert [(item.launcher_id, item.project_id, item.tracked) for item in instances] == [
+        ("opencode", "pb", True)
+    ]
+
+
+def test_an_explicit_title_identity_wins_over_an_ambiguous_pending_adoption(tmp_path):
+    """A window that names Project A is not adopted into Project B's pending launch."""
+    pa = project("pa", "Project A", r"V:\code\a")
+    pb = project("pb", "Project B", r"V:\code\b", slot=2)
+    backend = FakeWindowBackend(
+        [NativeWindow(1, 10, r"Project A | OpenCode | V:\code\a", "powershell.exe")]
+    )
+    backend.alive[20] = True
+    backend.tokens[20] = 9
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(20, "opencode", pb)
+
+    instances = monitor.refresh([pa, pb], create_default_launchers())
+
+    assert {(item.project_id, item.tracked, item.state) for item in instances} == {
+        ("pa", False, "running"),
+        ("pb", True, "starting"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SRC-081 / APP-CLI-001 TARGET L: fallback window recognition stays truthful
+# ---------------------------------------------------------------------------
+
+
+def test_generic_external_claude_stays_generic_not_claude1_or_claude2(tmp_path):
+    """A generic 'Claude Code' window is fallback `claude`, never a guess of
+    Claude 1 / Claude 2; a managed Claude 1 console keeps its exact id."""
+    pa = project("pa", "Project A", r"V:\code\a")
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(11, 41, r"Project A | Claude Code | V:\code\a", "claude.exe"),
+            NativeWindow(12, 42, r"Project A | Claude 1 | V:\code\a | tok42", "powershell.exe"),
+        ]
+    )
+    backend.alive[41] = True
+    backend.alive[42] = True
+    backend.tokens[42] = 1
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(42, "claude1", pa, correlation_token="tok42")
+
+    instances = monitor.refresh([pa], create_default_launchers())
+
+    generic = next(item for item in instances if item.pid == 41)
+    managed = next(item for item in instances if item.pid == 42)
+    assert generic.launcher_id == "claude"  # generic fallback identity
+    assert generic.launcher_id not in ("claude1", "claude2")
+    assert generic.tracked is False
+    assert managed.launcher_id == "claude1"  # exact registered identity
+    assert managed.tracked is True
+
+
+def test_generic_zcode_fallback_and_configured_zcode_share_one_identity(tmp_path):
+    """External ZCode windows and AUDAPACK-launched ones are ONE identity --
+    the fallback detector never mints a duplicate/conflicting id (TARGET E/L)."""
+    pa = project("pa", "Project A", r"V:\code\a")
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(21, 51, "ZCode — Project A", "ZCode.exe"),
+            NativeWindow(22, 52, r"Project A | ZCode | V:\code\a | tok52", "powershell.exe"),
+        ]
+    )
+    backend.alive[51] = True
+    backend.alive[52] = True
+    backend.tokens[52] = 1
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+    assert monitor.track_launch(52, "zcode", pa, correlation_token="tok52")
+
+    instances = monitor.refresh([pa], create_default_launchers())
+
+    generic = next(item for item in instances if item.pid == 51)
+    managed = next(item for item in instances if item.pid == 52)
+    assert generic.launcher_id == managed.launcher_id == "zcode"
+    ids = {item.launcher_id for item in instances}
+    assert ids == {"zcode"}  # no "ZCode"/"zcode-desktop"/fallback twin identities
+
+
+def test_browser_windows_with_provider_names_are_never_agent_consoles(tmp_path):
+    """Claude 1 / Antigravity / ZCode words in a browser title are content."""
+    pa = project("pa", "Project A", r"V:\code\a")
+    backend = FakeWindowBackend(
+        [
+            NativeWindow(31, 61, "Claude 1 — Project A — ChatGPT", "chrome.exe"),
+            NativeWindow(32, 62, "Antigravity docs — Project A", "brave.exe"),
+            NativeWindow(33, 63, "ZCode pricing — Project A", "msedge.exe"),
+            NativeWindow(34, 64, "Antigravity — Project A", "firefox.exe"),
+        ]
+    )
+    monitor = InstanceMonitor(backend=backend, record_path=tmp_path / "instances.json")
+
+    instances = monitor.refresh([pa], create_default_launchers())
+
+    assert instances == []

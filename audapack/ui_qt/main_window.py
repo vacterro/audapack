@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -38,38 +41,76 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from audapack.bridge.state import get_generation_file_path, get_generation_info
+from audapack.bridge.state import (
+    GenerationStateCorruptionError,
+    get_generation_file_path,
+    get_generation_info,
+)
 from audapack.campaign import get_profile, profile_choices
+from audapack.cli_launchers import (
+    BUILTIN_CLI_LAUNCHERS,
+    LAUNCHER_SHORTCUT_KEYS,
+    codex_console_command,
+    managed_console_title,
+    persist_resolution,
+    ps_quote,
+    resolve_cli_launcher,
+)
 from audapack.components.manager import ComponentManager
-from audapack.config import app_dir, save_config, scoped_config_write
+from audapack.config import (
+    app_dir,
+    normalize_double_click_action,
+    save_config,
+    scoped_config_write,
+)
+from audapack.console_style import apply_console_style
 from audapack.inaudit import (
     get_active_inaudit_path,
     get_inaudit_selected,
+    has_pending_inaudit,
     list_inaudit_layers,
     validate_inaudit_path,
 )
 from audapack.ingest import ingest_audit_text
 from audapack.instances import InstanceMonitor
+from audapack.launch_authority import (
+    LaunchPolicyError,
+    LaunchTarget,
+    create_agent_process,
+    register_agent_process,
+    resolve_launch_target,
+)
 from audapack.models import Project
+from audapack.opencode_launch import (
+    LaunchAdmissionError,
+    OpenCodeAdmission,
+    OpenCodeLaunchPolicy,  # noqa: F401 - compatibility patch seam for UI tests
+    admit_with_fallback,
+    is_managed,
+    new_correlation_token,
+)
 from audapack.packing import find_archive_for_project, human_mb, resolve_output_dir
 from audapack.services.audit_run_service import AuditRunCoordinator, AuditRunSnapshot
 from audapack.services.audit_service import AuditService
 from audapack.services.bridge_service import BridgeService, browser_worker_launch_need
 from audapack.services.packing_service import PackingService
 from audapack.services.project_service import ProjectService
+from audapack.title_guardian import TitleGuardian
 from audapack.ui_qt.dialogs.audit_runs_widget import AuditRunsWidget
 from audapack.ui_qt.dialogs.inaudit_widget import InauditWidget
 from audapack.ui_qt.dialogs.instance_manager import InstanceManagerWidget
+from audapack.ui_qt.dialogs.limits_prepared_widget import LimitsPreparedWidget
 from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
 from audapack.ui_qt.even_layout import EvenTabBar, fit_toolbar
 from audapack.ui_qt.models.project_delegate import (
-    FULL_ROW_MIN_WIDTH,
     ProjectItemDelegate,
     compute_info_button_rect,
     compute_layer_button_rects,
     compute_row_button_rects,
+    full_row_min_width,
 )
 from audapack.ui_qt.models.project_room_model import MIME_TYPE_PROJECT, ProjectRoomModel
+from audapack.ui_qt.pack_batch import PackBatchRunner
 from audapack.ui_qt.task_runner import TaskRunner
 from audapack.ui_qt.theme.golden_default import PALETTE, GoldenDefault
 
@@ -94,9 +135,16 @@ class ProjectTreeView(QTreeView):
         # letting the hand wander used to reorder projects behind the operator's
         # back; startDrag now refuses unless this was armed by such a press.
         self._drag_armed = False
+        # T-188: distinguishes a genuine row click (press+release on the same
+        # row, no drag) from a programmatic selection or a drag gesture. Only a
+        # clean click arms auto-pack-on-click; a drag clears it.
+        self._click_press_index = None
+        self._drag_started = False
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self._click_press_index = None
+        self._drag_started = False
         idx = self.indexAt(pos)
         # Group header — collapsable bar
         if idx.isValid() and idx.internalId() == 0:
@@ -118,8 +166,15 @@ class ProjectTreeView(QTreeView):
             # Same cramped-row rule as the delegate paints with: below the
             # threshold the buttons are simply not there, so a click must fall
             # through to the row instead of hitting invisible controls.
-            if proj and not idx.data(self.model().ROLES["is_empty_slot"]) and rect.width() >= FULL_ROW_MIN_WIDTH:
-                launchers = getattr(main_win._service.config, "launchers", None) if hasattr(main_win, "_service") else None
+            launchers = (
+                getattr(main_win._service.config, "launchers", None)
+                if hasattr(main_win, "_service")
+                else None
+            )
+            # SRC-081 TARGET H: the cramped-row threshold derives from the
+            # SAME configured launchers the painter uses, so a control can
+            # never be clickable where it is not painted.
+            if proj and not idx.data(self.model().ROLES["is_empty_slot"]) and rect.width() >= full_row_min_width(launchers):
                 launcher_buttons, gg_rect = compute_row_button_rects(rect, launchers)
                 info_rect = compute_info_button_rect(rect, launcher_buttons, gg_rect)
                 plus_rect, edit_rect = compute_layer_button_rects(rect, info_rect)
@@ -131,6 +186,20 @@ class ProjectTreeView(QTreeView):
                     button_hit = True
                 elif info_rect.contains(pos):
                     hover_info = idx.data(self.model().ROLES["hover_info"])
+                    # T-179: agent liveness is monitor state, not model state.
+                    # Enrich here, where the window (and its monitor) is in hand.
+                    if hover_info is not None and hasattr(main_win, "_instance_monitor"):
+                        hover_info = dict(hover_info)
+                        hover_info["launcher_instances"] = [
+                            {
+                                "launcher_id": item.launcher_id,
+                                "launcher_name": item.launcher_name,
+                                "state": "running" if item.selectable else "starting",
+                                "pid": item.pid,
+                                "tracked": item.tracked,
+                            }
+                            for item in main_win._instance_monitor.for_project(proj.id)
+                        ]
                     if hasattr(main_win, "_show_project_info"):
                         main_win._show_project_info(hover_info or {"project": proj, "group": group, "slot": slot}, anchor_pos=pos)
                     else:
@@ -141,13 +210,18 @@ class ProjectTreeView(QTreeView):
                     button_hit = True
 
             # Check launcher buttons [1]..[N] — same cramped-row guard.
-            if not button_hit and proj and rect.width() >= FULL_ROW_MIN_WIDTH and hasattr(main_win, "_on_open_with_launcher"):
-                launchers = getattr(main_win._service.config, "launchers", None)
+            if not button_hit and proj and rect.width() >= full_row_min_width(launchers) and hasattr(main_win, "_on_open_with_launcher"):
                 if launchers:
                     launcher_buttons, _gg = compute_row_button_rects(rect, launchers)
+                    # T-179: the modifier travels with the click, not with a
+                    # button's painted state. Shift means "another instance";
+                    # a plain click focuses the one that already exists.
+                    force_new = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
                     for launcher_cfg, btn_rect in launcher_buttons:
                         if btn_rect.contains(pos):
-                            main_win._on_open_with_launcher(proj, launcher_cfg.id)
+                            main_win._on_open_with_launcher(
+                                proj, launcher_cfg.id, force_new=force_new
+                            )
                             button_hit = True
                             break
 
@@ -186,13 +260,40 @@ class ProjectTreeView(QTreeView):
 
         # No button hit — call super() so Qt initializes internal drag state.
         # Without this, mouseMoveEvent cannot trigger startDrag.
+        # Arm a candidate pack-on-click only for a real project row (skip empty
+        # slots and group headers); the release handler decides if it was a click.
+        self._click_press_index = idx if (idx.isValid() and idx.internalId() != 0) else None
         self._press_pos = pos
         self._drag_armed = True
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        press_idx = self._click_press_index
+        self._click_press_index = None
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        # A genuine row click (T-188): release on the same row with no drag in
+        # between. Qt holds DraggingState during the drag, and a started drag sets
+        # _drag_started, so neither a drag nor a release after one packs.
+        if (
+            press_idx is not None
+            and press_idx.isValid()
+            and press_idx.internalId() != 0
+            and self.state() != QAbstractItemView.State.DraggingState
+            and not self._drag_started
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            rel_idx = self.indexAt(pos)
+            if rel_idx.isValid() and rel_idx == press_idx:
+                is_empty = rel_idx.data(self.model().ROLES["is_empty_slot"])
+                group = rel_idx.data(self.model().ROLES["group"])
+                slot = rel_idx.data(self.model().ROLES["slot"])
+                if not is_empty and group and slot is not None:
+                    main_win = self.window()
+                    if hasattr(main_win, "_on_project_row_clicked"):
+                        main_win._on_project_row_clicked(group, slot)
         self._press_pos = None
         self._drag_armed = False
+        self._drag_started = False
         super().mouseReleaseEvent(event)
 
     def _deferred_manual_start_drag(self):
@@ -295,6 +396,8 @@ class ProjectTreeView(QTreeView):
         # on a row button never arms it, so no button can drag a project.
         if not getattr(self, "_drag_armed", False):
             return
+        self._drag_started = True
+        self._click_press_index = None
         indexes = self.selectedIndexes()
         # Fallback: ensure at least the current index is included
         cur = self.currentIndex()
@@ -317,8 +420,11 @@ class ProjectTreeView(QTreeView):
         drag = QDrag(self)
         drag.setMimeData(mime_data)
 
-        # Generate a clean Win95 drag preview badge
-        proj_name = mime_data.text() or "Project"
+        # Generate a clean Win95 drag preview badge. The name comes from the
+        # model role, never from the transferred MIME: T-176 removed text/plain
+        # from the drag payload (external composers inserted it into the
+        # operator's text), so the preview cannot read mime_data.text().
+        proj_name = valid_indexes[0].data(self.model().ROLES["display_name"]) or "Project"
         badge_w = 200 if has_archive else 180
         pixmap = QPixmap(badge_w, 24)
         pixmap.fill(QColor(PALETTE["surfaceRaised"]))
@@ -340,7 +446,7 @@ class ProjectTreeView(QTreeView):
         drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction, Qt.DropAction.MoveAction)
 
     def mouseMoveEvent(self, event):
-        """No hover tooltip — info is on the [ⓘ] button. Keep only drag fallback."""
+        """Show account limits only over a launcher button; keep drag fallback."""
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
         if (event.buttons() & Qt.MouseButton.LeftButton) and not self._drag_armed:
             # Holding a row button and moving. Qt's own mouseMoveEvent would
@@ -358,9 +464,31 @@ class ProjectTreeView(QTreeView):
                 QTimer.singleShot(0, self._deferred_manual_start_drag)
             super().mouseMoveEvent(event)
             return
+        main_win = self.window()
+        hovered = ""
+        idx = self.indexAt(pos)
+        if idx.isValid() and idx.internalId() != 0 and hasattr(main_win, "_limit_snapshot_by_launcher"):
+            config = getattr(getattr(main_win, "_service", None), "config", None)
+            launchers = getattr(config, "launchers", [])
+            rect = self.visualRect(idx)
+            if rect.width() >= full_row_min_width(launchers):
+                buttons, _ = compute_row_button_rects(rect, launchers)
+                for launcher, button in buttons:
+                    if button.contains(pos) and launcher.id in main_win._limit_snapshot_by_launcher:
+                        hovered = launcher.id
+                        break
+        if hovered != getattr(self, "_hovered_limit_launcher", ""):
+            self._hovered_limit_launcher = hovered
+            if hovered:
+                QToolTip.showText(self.viewport().mapToGlobal(pos),
+                                  main_win._limit_snapshot_by_launcher[hovered][2], self.viewport())
+            else:
+                QToolTip.hideText()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
+        self._hovered_limit_launcher = ""
+        QToolTip.hideText()
         super().leaveEvent(event)
 
     def dragEnterEvent(self, event):
@@ -526,6 +654,39 @@ def bridge_status_warning(browser: dict[str, Any]) -> str:
     return ""
 
 
+def pack_failure_detail(result) -> str:
+    """ONE canonical failure line: ``[STATUS][CODE] message (path)``.
+
+    Both pack entry points (single and parallel batch) and every surface that
+    shows a failure -- the status bar, the Project row's Pack state and the ⓘ
+    detail popup -- must render the same line, or the operator sees two
+    different stories for one refusal. ``status`` is the phase bucket and
+    ``error_code`` the exact rule inside it (the failing stage's own code), so a reserved
+    archive-control conflict reads as
+    ``[FAILED_INVENTORY][TRACKED_RESERVED_ARCHIVE_NAME_CONFLICT] ...`` and is
+    never mistaken for the generic hard-safety denial it used to alias.
+
+    The project name stays with the caller: the status bar prepends
+    ``PACK FAILED (<project>)`` and the detail popup already titles the row
+    with it, so neither has to duplicate it here.
+    """
+    status = str(getattr(result, "status", "") or "")
+    code = str(getattr(result, "error_code", "") or "")
+    message = str(getattr(result, "error_message", "") or "")
+    # The inventory stage leads its own message with "[CODE] " -- that string is
+    # the frozen evidence the log line and the CLI print, so it stays as it is;
+    # here the token is lifted out instead, and the line carries it exactly once,
+    # directly beside its status bucket.
+    if code and message.startswith(f"[{code}]"):
+        message = message[len(code) + 2:].lstrip()
+    prefix = "".join(f"[{token}]" for token in (status, code) if token)
+    detail = f"{prefix} {message}" if prefix else message
+    first_path = str(getattr(result, "first_error_path", "") or "")
+    if first_path and first_path not in detail:
+        detail = f"{detail} ({first_path})"
+    return detail
+
+
 class MainWindow(QMainWindow):
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None):
         super().__init__()
@@ -544,14 +705,45 @@ class MainWindow(QMainWindow):
         self._active_project: Optional[Project] = None
         record_path = Path(service.base_dir) / "instances.json" if service.base_dir is not None else None
         self._instance_monitor = InstanceMonitor(record_path=record_path)
+        self._limit_snapshot_by_launcher: dict[str, tuple[Any, Any, str]] = {}
         self._instance_manager: Optional[InstanceManagerWidget] = None
-        self._instance_monitor.refresh(service.list_projects(), service.config.launchers)
+        # T-216 TARGET R: NO native desktop/process scan before the event loop
+        # can paint. The initial instance picture is discovered on the
+        # background lane shortly after startup; Project Room renders launcher
+        # state as unknown/starting for that moment, which is preferable to a
+        # startup freeze.
+        # T-205: AUDAPACK owns the canonical console title of each managed
+        # launch for the instance lifetime. The one-shot [Console]::Title in
+        # the wrapper is best-effort; this guardian restores drift without
+        # locating windows by their (already drifted) title.
+        self._title_guardian = TitleGuardian()
+        self._title_guardian_timer: Optional[QTimer] = None
+        # T-216 TARGET H/I: monotonic identity for one managed-launch request,
+        # so a stale Fleet preflight can never launch after the operator
+        # changed or deleted the project.
+        self._launch_request_seq = 0
 
         self._move_generation: int = 0
         self._last_audit_generation: int = 0
         self._last_dispatch_generation: int = 0
-        self._active_pack_queue = False
+        self._last_audit_epoch: str = ""
+        self._last_dispatch_epoch: str = ""
+        # T-191: the dedicated parallel pack batch executor (PACK ALL /
+        # AUTO PACK ALL / PACK [group] share this one runner).
+        self._pack_batch_runner = PackBatchRunner(parent=self)
+        self._pack_batch_runner.job_started.connect(self._on_batch_job_started)
+        self._pack_batch_runner.job_finished.connect(self._on_batch_job_finished)
+        self._pack_batch_runner.batch_finished.connect(self._on_batch_finished)
         self._notified_terminal: dict[str, str] = {}
+        # CORE-004 (E1/E2): Project Room move persistence is ONE ordered lane.
+        # Rapid drops used to submit independent TaskRunner keys
+        # (registry:move:{gen}) that ran concurrently on the global pool, so
+        # worker COMPLETION order -- not user gesture order -- decided the
+        # persisted registry. Now every drop appends a move intent to an
+        # explicit FIFO drained by a single serialized worker.
+        self._move_lane_lock = threading.Lock()
+        self._move_lane: list[dict] = []  # FIFO of move intents
+        self._move_lane_worker_active = False
         self._init_tray_icon()
 
         # Background Task Runner for async I/O
@@ -566,8 +758,15 @@ class MainWindow(QMainWindow):
         self.AUDIT_DISPATCH_KEY = "dispatch"
         self.AUDIT_DISPATCH_DEBOUNCE_MS = 450
         self._audit_start_pending: list[str] = []
+        # W2-002: set once, first thing in closeEvent(). Read by the worker that
+        # is running a START AUDIT batch.
+        self._closing = False
+        self._audit_start_aborted = lambda: self._closing
         self._audit_start_labels: list[str] = []
         self._audit_start_inflight: set[str] = set()
+        # How many projects the last group press skipped for a pending INAUDIT
+        # layer. Carried into the batch report so a skip is never a silent hole.
+        self._audit_start_skipped: int = 0
         self._audit_start_debounce = QTimer(self)
         self._audit_start_debounce.setSingleShot(True)
         self._audit_start_debounce.setInterval(self.AUDIT_DISPATCH_DEBOUNCE_MS)
@@ -589,10 +788,16 @@ class MainWindow(QMainWindow):
         if getattr(ui_cfg, "window_maximized", False):
             self.showMaximized()
 
-        # Set main orange app icon
-        icon_path = app_dir() / "resources" / "app_icon.png"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        # T-176: one canonical icon owner. run_qt_gui() installs the
+        # multi-size application icon on QApplication; the window inherits it.
+        # Replacing it here with the single 256px PNG re-opened the
+        # single-size-scaling defect the canonical builder exists to prevent.
+        # (Fall back to the PNG only when no QApplication icon exists, e.g.
+        # MainWindow used standalone in tests.)
+        if self.windowIcon().isNull():
+            icon_path = app_dir() / "resources" / "app_icon.png"
+            if icon_path.exists():
+                self.setWindowIcon(QIcon(str(icon_path)))
 
         # Presentation model
         self.model = ProjectRoomModel(service, audit_service=self._audit_service, parent=self)
@@ -680,6 +885,7 @@ class MainWindow(QMainWindow):
         p_layout.setContentsMargins(4, 4, 4, 4)
 
         self.tree = ProjectTreeView(projects_tab)
+        self.tree.setMouseTracking(True)
         self.tree.setModel(self.model)
         self.delegate = ProjectItemDelegate(self.tree, config=service.config)
         self.tree.setItemDelegate(self.delegate)
@@ -719,6 +925,8 @@ class MainWindow(QMainWindow):
             self._service,
             self._active_project,
             parent=self.tabs,
+            request_refresh=self.request_instance_refresh,
+            limit_snapshots=lambda: self._limit_snapshot_by_launcher,
         )
 
         # Tab 2: INAUDIT — project-local audit layers (audit/1.md ...)
@@ -735,11 +943,14 @@ class MainWindow(QMainWindow):
 
         # Tab 3: Settings
         self.settings_widget = SettingsWidget(service.config, self, on_saved=self._on_settings_saved)
+        self.limits_prepared_widget = LimitsPreparedWidget(service.config, self.task_runner, self.tabs)
+        self.limits_prepared_widget.snapshots_changed.connect(self._on_limit_snapshots_changed)
 
         self.tabs.addTab(projects_tab, "Project Room")
         self.tabs.addTab(self.audit_runs_widget, "Audit Runs")
         self.tabs.addTab(self.inaudit_widget, "INAUDIT")
         self.tabs.addTab(self._instance_manager, "Instances")
+        self.tabs.addTab(self.limits_prepared_widget, "Limits · Prepared")
         self.tabs.addTab(self.settings_widget, "Settings")
         self.tabs.setCurrentIndex(0)
 
@@ -781,6 +992,7 @@ QToolTip QLabel {
         # the buttons before this point measured unstyled widgets and every
         # label rendered clipped as "P...K".
         _fit_toolbar_to_text(self._action_toolbar)
+        self._bridge_status_text = ""
         self.statusBar().showMessage("AUDAPACK Ready")
 
         # Comprehensive Shortcuts
@@ -814,13 +1026,24 @@ QToolTip QLabel {
         self.quit_shortcut = QShortcut(QKeySequence("Ctrl+Q"), self)
         self.quit_shortcut.activated.connect(self.close)
 
-        # Ctrl 1-6: Open with launcher 1-6 (ordered enabled agents)
+        # Ctrl+1..9 / Ctrl+0: focus/open with launcher position 1..10 (ordered
+        # enabled agents). SRC-081 TARGET J: the digit row is the keyboard
+        # model's ceiling -- never a hidden six-launcher limit. No conflict:
+        # this window binds Ctrl+letter only (R/C/V/T/O/P/A/D/Q), never a digit.
+        # T-179: Ctrl+Shift+digit is the keyboard twin of Shift+click --
+        # explicitly another instance. Plain Ctrl+digit focuses the one that
+        # already exists. Reordering the launchers redefines positions.
         self._launcher_shortcuts = []
-        for _idx in range(6):
-            sc = QShortcut(QKeySequence(f"Ctrl+{_idx+1}"), self)
+        for _idx, _key in enumerate(LAUNCHER_SHORTCUT_KEYS):
+            sc = QShortcut(QKeySequence(f"Ctrl+{_key}"), self)
             # capture idx via default arg
             sc.activated.connect(lambda _checked=False, _i=_idx: self._on_open_with_launcher_index(_i))
             self._launcher_shortcuts.append(sc)
+            sc_new = QShortcut(QKeySequence(f"Ctrl+Shift+{_key}"), self)
+            sc_new.activated.connect(
+                lambda _checked=False, _i=_idx: self._on_open_with_launcher_index(_i, force_new=True)
+            )
+            self._launcher_shortcuts.append(sc_new)
 
         self.refresh_shortcut = QShortcut(QKeySequence("F5"), self)
         self.refresh_shortcut.activated.connect(self._on_refresh_all)
@@ -833,6 +1056,9 @@ QToolTip QLabel {
         self.temp_timer.setInterval(60000)
         self.temp_timer.timeout.connect(self._on_temperature_tick)
         self.temp_timer.start()
+
+        # T-167 (SRC-039): one periodic timer owns automatic PACK ALL.
+        self._configure_auto_pack_timer()
 
         # Bridge generation watcher with slow polling fallback.
         self._generation_path = get_generation_file_path()
@@ -852,23 +1078,39 @@ QToolTip QLabel {
         self.BRIDGE_POLL_IDLE_MS = 30000
         self.bridge_timer = QTimer(self)
         self.bridge_timer.setInterval(self.BRIDGE_POLL_IDLE_MS)
-        self.bridge_timer.timeout.connect(self._on_check_bridge_generation)
-        self.bridge_timer.timeout.connect(self._refresh_audit_runs_async)
+        # PERF-004 (audit/9.md): the timer has exactly ONE owner. It used to be
+        # connected to both the generation check and the composite refresh, and
+        # the generation check calls that refresh itself -- so a tick that saw a
+        # generation advance submitted `audit-runs:refresh` twice and
+        # TaskRunner's dirty-rerun turned the second submission into a whole
+        # extra runtime_status() + browser_jobs() + journal aggregation pass.
+        self.bridge_timer.timeout.connect(self._on_bridge_poll_tick)
         self.bridge_timer.start()
 
         # Pack progress flush timer: 250ms. Worker threads write to
         # ``_pack_progress_buffer``; the GUI thread consumes and pushes into the
         # model. This is the single chokepoint that guarantees the Qt model is
         # only ever touched from the GUI thread.
+        #
+        # PERF-005 (audit/10.md): the timer lifecycle must match the pack
+        # lifecycle. It used to be started unconditionally here and never
+        # stopped, so an idle Project Room scheduled four empty wakeups per
+        # second forever (~14,400/hour). It now starts on the first active pack
+        # and stops after the last one settles, tracked by the outstanding-run
+        # key set. Worker threads never touch the QTimer: enter/exit are GUI
+        # thread calls only.
         self._pack_progress_buffer: dict[str, tuple[int, int, int, str]] = {}
         self._pack_progress_lock = threading.Lock()
+        self._active_pack_runs: set[str] = set()
         self.pack_progress_timer = QTimer(self)
         self.pack_progress_timer.setInterval(250)
         self.pack_progress_timer.timeout.connect(self._flush_pack_progress)
-        self.pack_progress_timer.start()
 
         # Async initial enrichment (time-to-interactive optimization)
         QTimer.singleShot(50, self._async_initial_enrichment)
+        # T-216 TARGET R: the initial instance picture is discovered on the
+        # coalesced background lane, never before the event loop can paint.
+        QTimer.singleShot(0, lambda: self.request_instance_refresh("startup"))
 
     # ---------------------------------------------------------------- Startup Flow
 
@@ -885,10 +1127,45 @@ QToolTip QLabel {
         the dispatch provisions real browser windows, so a stray fire opens one
         with no owner left to close it. RESET ALL already establishes that an
         undispatched press is droppable.
+
+        W2-002 (audit/12.md): dropping the queue is not enough. Once
+        `_pump_audit_start_queue()` had moved a batch into `_audit_start_inflight`
+        and submitted `_prepare`, `closeEvent()` could not revoke it, so
+        `start_batch()` still packed, provisioned capacity and dispatched an audit
+        against a window the operator had already closed. The token below is set
+        FIRST -- before any of the teardown that itself takes time -- and is
+        checked by `start_batch()` immediately before each irreversible step.
         """
+        self._closing = True
         try:
             self._audit_start_debounce.stop()
             self._audit_start_pending.clear()
+        except Exception:
+            pass
+        try:
+            # Refuse new work and wait out what already began, so no task can
+            # call back into a window that is being destroyed.
+            self.task_runner.close()
+        except Exception:
+            pass
+        try:
+            # T-191: refuse further pack dispatch and clear queued runnables.
+            # In-flight workers finish harmlessly; their queued result signals
+            # are dropped, so no Qt model method can run after destruction.
+            self._pack_batch_runner.shutdown()
+        except Exception:
+            pass
+        try:
+            # PERF-005: an active pack-progress timer must not outlive the
+            # window it belongs to.
+            self.pack_progress_timer.stop()
+            self._active_pack_runs.clear()
+        except Exception:
+            pass
+        try:
+            # T-205: release the WinEvent hook/watchers; no stale callback may
+            # outlive this GUI and rename a window it no longer owns.
+            self._title_guardian.shutdown()
         except Exception:
             pass
         try:
@@ -921,15 +1198,12 @@ QToolTip QLabel {
 
         self.task_runner.submit("audit:initial_enrichment", _scan_all, on_success=_on_scanned)
 
-        def _check_bridge():
-            return self._bridge.status()
-
-        def _on_bridge_done(st):
-            healthy = st.get("healthy", False)
-            status_txt = "Bridge CONNECTED" if healthy else "Bridge OFFLINE"
-            self.statusBar().showMessage(f"AUDAPACK Ready · {status_txt}")
-
-        self.task_runner.submit("bridge:initial_check", _check_bridge, on_success=_on_bridge_done)
+        # The Bridge read and the ambient line belong to the one poll below: it
+        # asks runtime_status() itself. A separate startup probe wrote its own
+        # "AUDAPACK Ready · Bridge CONNECTED" beside the poll's "BRIDGE ✗ | not
+        # answering", so the first poll after startup always read as a change and
+        # overwrote whatever the operator had just been told -- and the probe's
+        # answer was thrown away regardless.
         self._refresh_audit_runs_async()
 
     def _refresh_dispatch_status_async(self):
@@ -985,7 +1259,7 @@ QToolTip QLabel {
             self._maybe_close_idle_worker_windows(browser)
             # Written on every pass, answer or not: skipping the write is what
             # let the startup verdict outlive the truth.
-            self.statusBar().showMessage(bridge_status_text(browser))
+            self._write_bridge_status(bridge_status_text(browser))
 
         self.task_runner.submit_coalesced("audit-runs:refresh", _load, on_success=_apply)
 
@@ -1003,6 +1277,29 @@ QToolTip QLabel {
                         self.tree.setCurrentIndex(slot_idx)
                         self._active_project = p
                         return
+
+    def _on_project_row_clicked(self, group: str, slot: int) -> None:
+        """T-188: a genuine operator click on a real project row.
+
+        Never reached by startup auto-selection, programmatic setCurrentIndex,
+        group headers, empty slots, row buttons or drags -- those paths are
+        filtered in the view before this is called. Packs the row's project when
+        the setting is on and the project is eligible; silently does nothing
+        otherwise (no dialogs, no focus stealing).
+        """
+        packing = getattr(getattr(self._service, "config", None), "packing", None)
+        if not bool(getattr(packing, "auto_pack_on_project_click_enabled", True)):
+            return
+        proj = self.model.project_at(group, slot)
+        if proj is None:
+            return
+        if not getattr(proj, "enabled", False):
+            return
+        if not getattr(proj, "source_path", ""):
+            return
+        if getattr(proj, "ignore_archive", False):
+            return
+        self._start_project_pack(proj)
 
     def _on_current_changed(self, current: QModelIndex, _previous: QModelIndex):
         if not current.isValid():
@@ -1072,10 +1369,103 @@ QToolTip QLabel {
 
     # ---------------------------------------------------------------- Agent Instances
 
-    def _refresh_instance_snapshot(self) -> None:
-        self._instance_monitor.refresh(self._service.list_projects(), self._service.config.launchers)
+    def request_instance_refresh(self, reason: str = "unspecified") -> int:
+        """Enqueue ONE coalesced background native scan (T-216 TARGET E/F).
+
+        THE Qt GUI THREAD MAY NEVER PERFORM UNBOUNDED OR EXTERNAL NATIVE
+        DISCOVERY. Every source -- startup, launcher click, post-launch,
+        startup grace, heartbeat authority request, process exit, instance
+        manager refresh -- funnels here; ``TaskRunner.submit_coalesced`` keeps
+        at most one scan running and one dirty follow-up, so N windows can
+        never start N concurrent full scans. The native work runs on the worker;
+        the completed immutable snapshot is installed on the GUI thread.
+        """
+        self._last_instance_refresh_reason = str(reason or "")
+        return self.task_runner.submit_coalesced(
+            "instances:refresh",
+            self._scan_instance_snapshot,
+            on_success=self._apply_instance_snapshot,
+        )
+
+    def _scan_instance_snapshot(self):
+        """Worker stage: every native/disk operation, no Qt access."""
+        started = time.monotonic()
+        snapshot = self._instance_monitor.scan(
+            self._service.list_projects(), self._service.config.launchers,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return snapshot, elapsed_ms
+
+    def _apply_instance_snapshot(self, payload) -> None:
+        """GUI stage: atomically install the snapshot and repaint (TARGET G)."""
+        snapshot, elapsed_ms = payload
+        self._instance_monitor.apply_snapshot(snapshot)
+        # T-209 TARGET D: hand the INSTANCE MONITOR's proven association
+        # (durable launch pid + exact hwnd + correlation token) to the title
+        # guardian. The visible console belongs to conhost.exe, so its window
+        # PID is not the launch PID; InstanceMonitor already proves the link and
+        # the guardian must not have to rediscover the console -- and must
+        # never identify the instance from its (already corrupted) title.
+        self._bind_title_guardian_hwnds()
+        self._sync_title_guardian_timer()
         if hasattr(self, "tree"):
             self.tree.viewport().update()
+        if self._instance_manager is not None:
+            # Render-only: refresh_instances() would REQUEST another scan and
+            # turn the completed scan into an endless coalesced refresh loop.
+            self._instance_manager.render_latest()
+        self._note_instance_scan(elapsed_ms)
+
+    def _note_instance_scan(self, elapsed_ms: int) -> None:
+        """TARGET S: bounded timing diagnostic, never a secret dump."""
+        self.last_instance_scan_ms = int(elapsed_ms)
+        if elapsed_ms > 250:
+            logger.warning(
+                "instance scan took %d ms (reason=%s)",
+                elapsed_ms,
+                getattr(self, "_last_instance_refresh_reason", ""),
+            )
+
+    def _refresh_instance_snapshot(self) -> None:
+        """SYNCHRONOUS scan+install. Tests and non-GUI callers only.
+
+        T-216: production code paths MUST use :meth:`request_instance_refresh`.
+        This remains because the repository's own harness drives the model
+        deterministically with it; it performs blocking native work and so is
+        never called from the Qt event loop.
+        """
+        snapshot = self._instance_monitor.scan(
+            self._service.list_projects(), self._service.config.launchers,
+        )
+        self._instance_monitor.apply_snapshot(snapshot)
+        self._bind_title_guardian_hwnds()
+        self._sync_title_guardian_timer()
+        if hasattr(self, "tree"):
+            self.tree.viewport().update()
+
+    def _bind_title_guardian_hwnds(self) -> None:
+        """Feed every proven launch\u2194window association into the guardian."""
+        guardian = getattr(self, "_title_guardian", None)
+        if guardian is None:
+            return
+        instances = list(getattr(self._instance_monitor, "instances", None) or [])
+        for instance in instances:
+            launch_pid = int(getattr(instance, "launch_pid", 0) or 0)
+            hwnd = int(getattr(instance, "hwnd", 0) or 0)
+            if launch_pid <= 0 or hwnd <= 0:
+                continue
+            # Only a registered launch carries a canonical title to restore.
+            try:
+                if guardian.registration(launch_pid) is None:
+                    continue
+                guardian.bind_hwnd(
+                    launch_pid,
+                    hwnd,
+                    correlation_token=str(getattr(instance, "correlation_token", "") or ""),
+                    native_pid=int(getattr(instance, "pid", 0) or 0),
+                )
+            except Exception:
+                continue
 
     def _launcher_config(self, launcher_id: str):
         return next(
@@ -1087,15 +1477,113 @@ QToolTip QLabel {
         launcher = self._launcher_config(launcher_id)
         return self._instance_monitor.block_reason(launcher) if launcher is not None else ""
 
-    def _register_agent_launch(self, process: Any, launcher_id: str, project: Project) -> None:
-        if self._instance_monitor.track_launch(getattr(process, "pid", 0), launcher_id, project):
-            self._refresh_instance_snapshot()
+    def _register_agent_launch(
+        self, process: Any, launcher_id: str, project: Project,
+        *, saipen_binding: dict[str, str] | None = None,
+        correlation_token: str = "",
+        managed_title: str = "",
+    ) -> None:
+        launcher = self._launcher_config(launcher_id)
+        if launcher is None:
+            return
+        target = LaunchTarget(project, launcher, Path(project.source_path).resolve())
+        if register_agent_process(
+            self._instance_monitor, process, target, saipen_binding=saipen_binding,
+            correlation_token=correlation_token,
+        ):
+            if managed_title and correlation_token:
+                self._title_guardian.register(
+                    getattr(process, "pid", 0),
+                    managed_title,
+                    correlation_token=correlation_token,
+                    launcher_id=launcher_id,
+                    project_id=getattr(project, "id", ""),
+                )
+                self._sync_title_guardian_timer()
+            self.request_instance_refresh("launch-registered")
             QTimer.singleShot(600, self._refresh_instances_after_launch)
 
+    def _sync_title_guardian_timer(self) -> None:
+        """Arm the title-integrity heartbeat ONLY while work exists.
+
+        T-209: the heartbeat is the correctness mechanism, so it runs while at
+        least one managed titled instance exists -- 1000 ms with the WinEvent
+        hook, the bounded legacy interval when the hook could not be installed.
+        With zero managed instances the timer does not exist at all, so an idle
+        AUDAPACK has zero title-guardian wakeups. The old permanent 250 ms busy
+        loop is NOT reintroduced.
+        """
+        guardian = self._title_guardian
+        interval = 0
+        if guardian.active_count > 0:
+            interval = int(
+                guardian.heartbeat_interval_ms
+                if guardian.event_driven
+                else guardian.fallback_interval_ms
+            )
+        if interval <= 0:
+            if self._title_guardian_timer is not None:
+                self._title_guardian_timer.stop()
+                self._title_guardian_timer.deleteLater()
+                self._title_guardian_timer = None
+            return
+        if self._title_guardian_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(interval)
+            timer.timeout.connect(self._on_title_heartbeat)
+            self._title_guardian_timer = timer
+            timer.start()
+        elif self._title_guardian_timer.interval() != interval:
+            self._title_guardian_timer.setInterval(interval)
+
+    def _on_title_heartbeat(self) -> None:
+        """Enqueue a title-integrity pass; return to Qt immediately (TARGET K).
+
+        T-216: the GUI timer itself performs NO native work and NO discovery.
+        It coalesces the heartbeat onto the shared background lane, so a slow
+        ``GetWindowText``/``SetWindowText``/process-identity check can never
+        execute on the Qt GUI thread. The steady state stays a cheap O(bound
+        HWNDs) read owned by the guardian (TARGET B); an authority request
+        enqueues exactly one coalesced background instance scan (TARGET F).
+        """
+        self.task_runner.submit_coalesced(
+            "title:heartbeat", self._run_title_heartbeat, on_success=self._on_title_heartbeat_done,
+        )
+
+    def _run_title_heartbeat(self):
+        """Worker stage: title verification/restore only, no discovery."""
+        started = time.monotonic()
+        try:
+            restored = self._title_guardian.heartbeat()
+        except Exception:
+            restored = 0
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return restored, elapsed_ms
+
+    def _on_title_heartbeat_done(self, payload) -> None:
+        restored, elapsed_ms = payload
+        self.last_title_heartbeat_ms = int(elapsed_ms)
+        if elapsed_ms > 250:
+            logger.warning("title heartbeat took %d ms", elapsed_ms)
+        self._sync_title_guardian_timer()
+        # T-216 TARGET F: an authority request is coalesced -- one background
+        # scan, never one per 1000 ms heartbeat.
+        if self._title_guardian.take_hwnd_authority_request() or self._title_guardian.needs_hwnd_authority:
+            self.request_instance_refresh("title-authority")
+
     def _refresh_instances_after_launch(self) -> None:
-        self._refresh_instance_snapshot()
-        if self._instance_manager is not None:
-            self._instance_manager.refresh_instances()
+        # T-216 TARGET J: never scan the desktop synchronously after a spawn.
+        # The 600 ms follow-up is only a scheduling HINT for the coalesced
+        # background lane; the launch is already rendered as STARTING from its
+        # LaunchRecord.
+        self.request_instance_refresh("post-launch")
+
+    def _on_limit_snapshots_changed(self, by_launcher: dict) -> None:
+        if by_launcher == self._limit_snapshot_by_launcher:
+            return
+        self._limit_snapshot_by_launcher = by_launcher
+        # One paint of visible rows; no model reset and no provider I/O here.
+        self.tree.viewport().update()
 
     def _show_instance_manager(self, project: Optional[Project] = None) -> None:
         target = project if isinstance(project, Project) else self._selected_project()
@@ -1172,56 +1660,73 @@ QToolTip QLabel {
             self.tree.setCurrentIndex(new_idx)
         self.statusBar().showMessage(f"Moved {proj.display_name} -> [{target_group} #{target_slot}]")
 
-        # 2. Async persistence with generation tracking & rollback protection
+        # 2. Serialized persistence through the move lane (CORE-004).
         self._move_generation += 1
-        gen = self._move_generation
+        with self._move_lane_lock:
+            self._move_lane.append(
+                {
+                    "seq": self._move_generation,
+                    "project_id": project_id,
+                    "target_group": target_group,
+                    "target_slot": target_slot,
+                }
+            )
+            start_worker = not self._move_lane_worker_active
+            if start_worker:
+                self._move_lane_worker_active = True
 
-        def _persist():
-            return self._service.move_project(project_id, target_group, target_slot)
+        if start_worker:
+            # ONE stable task family key: a later drop is appended to the same
+            # lane, it never spawns an independent competing worker.
+            self.task_runner.submit("registry:move", self._drain_move_lane)
 
-        def _on_success(res):
-            if not res.ok and gen == self._move_generation:
-                # Rollback on failed persistence
-                self.model.apply_project_move(
-                    target_group,
-                    target_slot,
-                    src_group,
-                    src_slot,
-                    proj,
-                    swapped_project=swap_proj,
+    def _drain_move_lane(self):
+        """Background worker: drain move intents strictly in gesture order.
+
+        Runs on the thread pool. Each intent persists its own move; failures
+        are collected and the model is reconciled from the authoritative
+        registry snapshot when the lane reaches a stable point. A newer
+        gesture can never be overwritten by an older worker because there is
+        exactly one worker per lane and it drains FIFO.
+        """
+        failures: list[str] = []
+        processed: list[dict] = []
+        while True:
+            with self._move_lane_lock:
+                if not self._move_lane:
+                    self._move_lane_worker_active = False
+                    break
+                intent = self._move_lane.pop(0)
+            processed.append(intent)
+            try:
+                res = self._service.move_project(
+                    intent["project_id"], intent["target_group"], intent["target_slot"]
                 )
-                # Select reverted position
-                revert_idx = self.model.index_for_slot(src_group, src_slot)
-                if revert_idx.isValid():
-                    self.tree.setCurrentIndex(revert_idx)
-                self.tree.viewport().update()
-                self.statusBar().showMessage(f"Move failed: reverting {proj.display_name}")
-            elif res.ok and gen == self._move_generation:
-                # Confirm: re-read the updated project from disk and emit targeted updates.
-                updated = self._service.get_project(project_id)
-                if updated:
-                    self.model.update_project_metadata(updated)
-                idx = self.model.index_for_project_id(project_id)
-                if idx.isValid():
-                    self.tree.setCurrentIndex(idx)
+                if not res or not res.ok:
+                    failures.append(f"{intent['project_id']}: move persisted as failed")
+            except Exception as exc:  # noqa: BLE001 -- failure reconciled at lane end
+                failures.append(f"{intent['project_id']}: {exc}")
 
-        def _on_error(err):
-            if gen == self._move_generation:
-                # Rollback on exception
-                self.model.apply_project_move(
-                    target_group,
-                    target_slot,
-                    src_group,
-                    src_slot,
-                    proj,
-                    swapped_project=swap_proj,
+        def _on_lane_finished():
+            # CORE-004 E4/E5: never roll back to an old src snapshot when newer
+            # gestures happened; reconcile from the authoritative registry.
+            self.model.reconcile_arrangement()
+            if failures:
+                self.statusBar().showMessage(
+                    f"Move persistence issue: {failures[-1]} — order kept from registry"
                 )
-                revert_idx = self.model.index_for_slot(src_group, src_slot)
-                if revert_idx.isValid():
-                    self.tree.setCurrentIndex(revert_idx)
-                self.statusBar().showMessage(f"Move error: {err}")
 
-        self.task_runner.submit(f"registry:move:{gen}", _persist, on_success=_on_success, on_error=_on_error)
+        def _on_lane_error(_err):
+            self.model.reconcile_arrangement()
+
+        # The reconcile callback runs on the GUI thread (TaskRunner invokes
+        # on_success there); the worker fn is trivial so the hop is safe.
+        self.task_runner.submit(
+            "registry:move:done",
+            lambda: None,
+            on_success=lambda _res: _on_lane_finished(),
+            on_error=_on_lane_error,
+        )
 
     # ---------------------------------------------------------------- Direct Project Actions (0 Popups)
 
@@ -1397,6 +1902,21 @@ QToolTip QLabel {
 
     # ---------------------------------------------------------------- Async Actions
 
+    def _write_bridge_status(self, text: str) -> None:
+        """The ambient bridge line has exactly one owner, the startup probe and
+        the routine poll included.
+
+        Written on every changed answer, answer or not: skipping the write is
+        what let the startup verdict outlive the truth. An UNCHANGED answer
+        yields instead, because a verdict the operator has not read yet must
+        survive the next 4s poll -- a BOUND_RECOVERY_REQUIRED_SAFE launch is
+        deliberately silent (no modal), so this bar is its only channel for the
+        reason code and the canonical next command.
+        """
+        if text != self._bridge_status_text or self.statusBar().currentMessage() == self._bridge_status_text:
+            self.statusBar().showMessage(text)
+            self._bridge_status_text = text
+
     def _flash_status(self, msg: str, color: str = "#4A7A20", duration_ms: int = 0):
         """Visual feedback flash on the status bar after button press.
 
@@ -1411,6 +1931,7 @@ QToolTip QLabel {
             self._flash_timer.setSingleShot(True)
             self._flash_timer.timeout.connect(self._flash_clear_stale)
         self.statusBar().showMessage(msg)
+        self._flash_msg = msg
         self.statusBar().setStyleSheet(f"color: {color}; font-weight: bold; font-size: 11px;")
         if duration_ms <= 0:
             duration_ms = getattr(self._service.config.ui, "flash_duration_ms", 800)
@@ -1422,6 +1943,13 @@ QToolTip QLabel {
         if hasattr(self, "_flash_timer"):
             self._flash_timer.stop()
         self.statusBar().setStyleSheet("")
+        # A flash is transient, so it hands the ambient line back -- but only
+        # when it is still the message on screen. Anything written since (a
+        # launch verdict, a pack result) is a durable statement, not a flash,
+        # and the bridge poll now yields to it for the same reason.
+        bridge_text = getattr(self, "_bridge_status_text", "")
+        if bridge_text and self.statusBar().currentMessage() == getattr(self, "_flash_msg", None):
+            self.statusBar().showMessage(bridge_text)
 
     def _init_tray_icon(self) -> None:
         """W8: optional native tray notification. Best-effort only -- a headless
@@ -1430,8 +1958,18 @@ QToolTip QLabel {
             if not QSystemTrayIcon.isSystemTrayAvailable():
                 self._tray_icon = None
                 return
-            icon_path = app_dir() / "resources" / "app_icon.png"
-            icon = QIcon(str(icon_path)) if icon_path.exists() else self.windowIcon()
+            # T-176: same canonical artwork as window/taskbar. The window
+            # inherits the QApplication icon (set by run_qt_gui before this
+            # constructor runs), so windowIcon() is the canonical source; the
+            # PNG is only a fallback when neither carries an icon.
+            icon = self.windowIcon()
+            if icon.isNull():
+                qapp = QApplication.instance()
+                if qapp is not None:
+                    icon = qapp.windowIcon()
+            if icon.isNull():
+                icon_path = app_dir() / "resources" / "app_icon.png"
+                icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
             self._tray_icon = QSystemTrayIcon(icon, self)
             self._tray_icon.setToolTip("AUDAPACK — Project Room")
             self._tray_icon.show()
@@ -1660,10 +2198,18 @@ QToolTip QLabel {
         creates the next numbered layer and puts the caret in it; [edit]
         selects the operator's LAST user-created layer, never one the AUDAPACK
         widget delivered (T-161).
+
+        T-174 I5: if the widget cannot bind to THIS project (a dirty draft
+        belongs to another one), the action MUST NOT run against the
+        previously bound project. Canonical project id only, never display
+        names.
         """
         if project is None:
             return
-        self._show_project_inbox(project)
+        if not self._show_project_inbox(project):
+            return
+        if self.inaudit_widget._project is None or self.inaudit_widget._project.id != project.id:
+            return
         if focus_last:
             self.inaudit_widget.focus_last_user_layer()
         else:
@@ -1760,14 +2306,28 @@ QToolTip QLabel {
         group = proj.priority_group.upper()
         # The whole group, not the first six: the rest wait in the pool queue
         # and take windows as they come free, instead of being dropped here.
-        projects = [
-            item.id for item in self._service.list_projects()
+        members = [
+            item for item in self._service.list_projects()
             if item.enabled and item.source_path and item.priority_group.upper() == group
         ]
-        if not projects:
+        if not members:
             self._flash_status(f"AUDIT GROUP: no enabled projects in {group}", "#D66464")
             return
-        self._start_audit_projects(projects, group)
+        # GROUP-ONLY dedupe: a project whose canonical INAUDIT layer is still
+        # waiting already has the audit asked for, so queueing another one spends
+        # a browser window on the same work. A single-project START is the
+        # operator overriding this on purpose, so it is untouched.
+        eligible = [item for item in members if not has_pending_inaudit(item)]
+        skipped = len(members) - len(eligible)
+        self._audit_start_skipped = skipped
+        if not eligible:
+            self._flash_status(
+                f"AUDIT GROUP {group}: 0 queued, {skipped} skipped (INAUDIT pending)",
+                "#D4A840",
+                duration_ms=7000,
+            )
+            return
+        self._start_audit_projects([item.id for item in eligible], group)
 
     def _start_audit_projects(self, project_ids: list[str], label: str, profile_id: str = ""):
         """Enqueue projects for the single serialized START AUDIT lane.
@@ -1838,7 +2398,10 @@ QToolTip QLabel {
         self._publish_pending_dispatch_count()
 
         def _prepare():
-            return self._audit_runs.start_batch(batch, profile)
+            # W2-002 (audit/12.md): the batch carries the window's close token
+            # all the way to the two irreversible boundaries.
+            return self._audit_runs.start_batch(batch, profile,
+                                                should_abort=self._audit_start_aborted)
 
         def _finish():
             self._audit_start_inflight.clear()
@@ -1854,16 +2417,23 @@ QToolTip QLabel {
             failed = [result for result in results if not result.ok]
             queued = [result for result in results if result.ok and not result.duplicate]
             duplicates = [result for result in results if result.duplicate]
+            skipped = self._audit_start_skipped
+            self._audit_start_skipped = 0
+            skipped_clause = f", {skipped} skipped (INAUDIT pending)" if skipped else ""
             if failed:
                 detail = "; ".join(f"{item.project_id}: {item.message}" for item in failed[:2])
                 self._flash_status(
-                    f"START AUDIT: {len(queued)} queued, {len(failed)} failed · {detail}",
+                    f"START AUDIT: {len(queued)} queued{skipped_clause}, {len(failed)} failed · {detail}",
                     "#D66464",
                     duration_ms=7000,
                 )
             else:
                 suffix = f", {len(duplicates)} already active" if duplicates else ""
-                self._flash_status(f"START AUDIT: {len(queued)} queued{suffix}", "#D4A840", duration_ms=4000)
+                self._flash_status(
+                    f"START AUDIT: {len(queued)} queued{skipped_clause}{suffix}",
+                    "#D4A840",
+                    duration_ms=4000,
+                )
             _finish()
 
         def _error(error):
@@ -2012,14 +2582,24 @@ QToolTip QLabel {
         self.task_runner.submit(key, _work, on_success=_done, on_error=_error)
 
     def _on_abandon_audit_dispatch_id(self, dispatch_id: str):
-        """Force a stuck BLOCKED run terminal after explicit operator confirmation."""
+        """Stop a live audit, or force a stuck BLOCKED run terminal, on confirmation.
+
+        Both make the same irreversible promise -- a Core prompt may already be
+        sitting in the browser -- so both ask first and both end FAILED. Only the
+        wording differs: STOP for live post-START work, FORCE UNBLOCK for a run
+        that is already dead.
+        """
         did = str(dispatch_id or "")
         if not did:
             return
+        selected = self.audit_runs_widget.selected_run()
+        blocking = not (selected and selected.dispatch_id == did and "STOP" in set(selected.actions))
         confirm = QMessageBox(self)
-        confirm.setWindowTitle("Force unblock audit run")
+        confirm.setWindowTitle("Force unblock audit run" if blocking else "Stop active audit run")
         confirm.setIcon(QMessageBox.Icon.Warning)
-        confirm.setText("Mark this BLOCKED run as terminally FAILED?")
+        confirm.setText(
+            "Mark this BLOCKED run as terminally FAILED?" if blocking else "Stop this running audit?"
+        )
         confirm.setInformativeText(
             "This frees the project so START AUDIT works again.\n\n"
             "A Core prompt may already have been sent in the browser, so AUDAPACK will NOT "
@@ -2031,15 +2611,25 @@ QToolTip QLabel {
         if confirm.exec() != QMessageBox.StandardButton.Yes:
             return
 
-        self._flash_status("Force unblocking audit run...", "#D4A840")
+        self._flash_status("Force unblocking audit run..." if blocking else "Stopping audit run...", "#D4A840")
         key = f"dispatch-abandon:{did}"
 
         def _abandon():
-            return self._audit_runs.abandon(did, "operator forced unblock from Audit Runs panel")
+            return self._audit_runs.abandon(
+                did,
+                "operator forced unblock from Audit Runs panel"
+                if blocking
+                else "operator stopped active audit from Audit Runs panel",
+            )
 
         def _done(result):
             if result.ok:
-                self._flash_status("Run marked FAILED; project is free for a new START AUDIT", "#D4A840", duration_ms=6000)
+                # STOP can lose the race to a real finish. Say what actually
+                # happened rather than claiming to have stopped something.
+                if result.state == "FAILED":
+                    self._flash_status("Run marked FAILED; project is free for a new START AUDIT", "#D4A840", duration_ms=6000)
+                else:
+                    self._flash_status(result.message or f"Run already reached {result.state}", "#D4A840", duration_ms=6000)
                 self._refresh_audit_runs_async()
             else:
                 self._flash_status(f"Force unblock refused: {result.message}", "#D66464", duration_ms=7000)
@@ -2063,20 +2653,40 @@ QToolTip QLabel {
         QApplication.clipboard().setText(self._audit_runs.diagnostics(snapshot))
         self._flash_status("Redacted audit diagnostics copied", "#D4A840")
 
-    def _on_pack(self):
-        """Async background packing — GUI thread remains 100% interactive."""
-        proj = self._selected_project()
-        if not proj:
-            return
+    def _start_project_pack(self, proj: Optional[Project], *, flash: bool = False) -> bool:
+        """The ONE individual-project pack dispatch (T-188 refactor).
 
+        Shared by manual PACK (toolbar/shortcut), the context-menu pack, and
+        auto-pack-on-row-click. Coalesces on a running ``pack:<id>`` and refuses
+        while the same project is owned by an active PACK ALL queue, so rapid
+        clicks can never spawn a duplicate packing job. ``flash`` keeps the
+        legacy manual-PACK gold flash; quiet callers stay on the status bar.
+        """
+        if not proj:
+            return False
+        busy = f"Packing already in progress for {proj.display_name}"
         if self.task_runner.is_running(f"pack:{proj.id}"):
-            self._flash_status(f"Packing already in progress for {proj.display_name}", "#D66464")
-            return
+            if flash:
+                self._flash_status(busy, "#D66464")
+            else:
+                self.statusBar().showMessage(busy)
+            return False
+        if self._pack_batch_runner.owns(proj.id):
+            # The parallel pack batch owns this project right now (queued or packing).
+            if flash:
+                self._flash_status(busy, "#D66464")
+            else:
+                self.statusBar().showMessage(busy)
+            return False
 
         self.model.update_pack_state(proj.id, "PACKING")
-        self._flash_status(f"\u25B6 PACK: {proj.display_name}", "#D4A840")
+        if flash:
+            self._flash_status(f"\u25B6 PACK: {proj.display_name}", "#D4A840")
+        else:
+            self.statusBar().showMessage(f"Packing {proj.display_name} in background...")
         run_id = self.model.get_current_pack_run_id(proj.id)
-
+        run_key = f"pack:{proj.id}"
+        self._pack_progress_run_active(run_key)
 
         def _do_pack():
             return self._packing.pack_project(
@@ -2085,76 +2695,199 @@ QToolTip QLabel {
             )
 
         def _on_pack_done(res):
+            # PERF-005: the final buffered snapshot must reach the model BEFORE
+            # the terminal state, because a terminal update stops accepting
+            # progress for this run (model contract). Flush, then settle.
+            self._flush_pack_progress()
             if res.success:
                 out_name = res.output_path.name if res.output_path else "archive.zip"
                 self.model.update_pack_state(proj.id, "COMPLETE", out_name)
-                self.statusBar().showMessage(f"✓ Packed {proj.display_name} -> {out_name}")
+                # T-190: compact terminal state + Git inventory summary.
+                git_part = f" ({res.git_summary})" if getattr(res, "git_summary", "") else ""
+                self.statusBar().showMessage(f"✓ Packed {proj.display_name} -> {out_name}{git_part}")
             else:
-                self.model.update_pack_state(proj.id, "FAILED", res.error_message)
-                self.statusBar().showMessage(f"PACK FAILED ({proj.display_name}): {res.error_message}")
+                detail = pack_failure_detail(res)
+                self.model.update_pack_state(proj.id, "FAILED", detail)
+                self.statusBar().showMessage(f"PACK FAILED ({proj.display_name}): {detail}")
+            self._pack_progress_run_settled(run_key)
 
         def _on_pack_error(err):
+            self._flush_pack_progress()
             self.model.update_pack_state(proj.id, "FAILED", str(err))
             self.statusBar().showMessage(f"PACK ERROR ({proj.display_name}): {err}")
+            self._pack_progress_run_settled(run_key)
 
-        self.task_runner.submit(f"pack:{proj.id}", _do_pack, on_success=_on_pack_done, on_error=_on_pack_error)
-
-    def _start_sequential_pack_queue(self, projects: list[Project], queue_label: str = "PACK ALL"):
-        """Executes a sequential top-to-bottom packing queue."""
-        if self._active_pack_queue:
-            self.statusBar().showMessage(f"{queue_label}: another packing queue is already running")
-            return False
-        self._active_pack_queue = True
-        total_count = len(projects)
-        for p in projects:
-            self.model.update_pack_state(p.id, "QUEUED")
-
-        queue = list(projects)
-        packed_count = [0]
-
-        def _step_next():
-            if not queue:
-                self._active_pack_queue = False
-                self.statusBar().showMessage(f"✓ {queue_label} COMPLETE: Packed {packed_count[0]}/{total_count} projects")
-                return
-
-            current_proj = queue.pop(0)
-            p_id = current_proj.id
-            p_name = current_proj.display_name
-            curr_num = total_count - len(queue)
-
-            self.model.update_pack_state(p_id, "PACKING")
-            self.statusBar().showMessage(f"{queue_label} ({curr_num}/{total_count}): Packing {p_name}...")
-            run_id = self.model.get_current_pack_run_id(p_id)
-
-            def _do_pack():
-                return self._packing.pack_project(
-                    p_id,
-                    progress_callback=self._make_pack_progress_callback(p_id, run_id),
-                )
-
-            def _on_pack_done(res):
-                if res.success:
-                    out_name = res.output_path.name if res.output_path else "archive.zip"
-                    self.model.update_pack_state(p_id, "COMPLETE", out_name)
-                    packed_count[0] += 1
-                else:
-                    self.model.update_pack_state(p_id, "FAILED", res.error_message)
-                    self.statusBar().showMessage(f"PACK FAILED ({p_name}): {res.error_message}")
-                QTimer.singleShot(10, _step_next)
-
-            def _on_pack_error(err):
-                self.model.update_pack_state(p_id, "FAILED", str(err))
-                self.statusBar().showMessage(f"PACK ERROR ({p_name}): {err}")
-                QTimer.singleShot(10, _step_next)
-
-            self.task_runner.submit(f"pack:{p_id}", _do_pack, on_success=_on_pack_done, on_error=_on_pack_error)
-
-        _step_next()
+        self.task_runner.submit(run_key, _do_pack, on_success=_on_pack_done, on_error=_on_pack_error)
         return True
 
-    def _on_pack_all(self):
-        """Sequential background packing queue of all projects from top to bottom."""
+    def _on_pack(self):
+        """Async background packing — GUI thread remains 100% interactive."""
+        proj = self._selected_project()
+        if not proj:
+            return
+        self._start_project_pack(proj, flash=True)
+
+    def _start_parallel_pack_batch(self, projects: list[Project], batch_label: str = "PACK ALL") -> bool:
+        """The ONE canonical parallel batch entry point (T-191).
+
+        Manual PACK ALL, periodic AUTO PACK ALL and PACK [group] all dispatch
+        through here. Every eligible project is SUBMITTED immediately -- no
+        completion is ever required to start the next job -- over a dedicated
+        pack-only pool so the shared TaskRunner's background work is never
+        starved. Batch state is explicit: the batch finalizes only when every
+        owned project reached a terminal state, and one failure never cancels
+        siblings.
+
+        Concurrency ownership: a project already packed individually (a live
+        ``pack:<id>`` TaskRunner job) is COALESCED OUT -- it keeps its running
+        individual pack and is reported as skipped; the rest of the batch still
+        starts. AUTO PACK ALL never reaches this split: its periodic contract
+        skips the whole occurrence while any packing is in flight.
+
+        Run generations: each project's pack run id is allocated on the GUI
+        thread BEFORE any worker exists, carried immutable inside the job, and
+        preserved across this run's QUEUED -> PACKING transition -- so live
+        progress callbacks can never be rejected as a stale generation.
+        """
+        if self._pack_batch_runner.busy():
+            self.statusBar().showMessage(f"{batch_label}: a pack batch is already running")
+            return False
+
+        skipped_packing = [
+            p for p in projects if self.task_runner.is_running(f"pack:{p.id}")
+        ]
+        batch_projects = [
+            p for p in projects if not self.task_runner.is_running(f"pack:{p.id}")
+        ]
+        skipped_note = ""
+        if skipped_packing:
+            names = ", ".join(p.display_name for p in skipped_packing)
+            skipped_note = f", {len(skipped_packing)} skipped (already packing: {names})"
+        if not batch_projects:
+            self.statusBar().showMessage(
+                f"{batch_label}: 0 projects submitted{skipped_note}"
+            )
+            return False
+
+        # Allocate one generation per project on the GUI thread, before the
+        # worker exists: QUEUED enters the active set here (new run id), and
+        # the worker never reads mutable model lifecycle state.
+        run_ids: dict[str, int] = {}
+        for p in batch_projects:
+            self.model.update_pack_state(p.id, "QUEUED")
+            run_ids[p.id] = self.model.get_current_pack_run_id(p.id)
+            self._pack_progress_run_active(f"pack:{p.id}")
+
+        def _job(project_id: str):
+            return self._packing.pack_project(
+                project_id,
+                progress_callback=self._make_pack_progress_callback(
+                    project_id, run_ids[project_id]
+                ),
+            )
+
+        def _on_batch_done(batch):
+            # GUI thread: aggregate report distinguishes honest failure from success.
+            self.statusBar().showMessage(
+                f"✓ {batch.label} COMPLETE: {batch.summary()}"
+            )
+
+        batch = self._pack_batch_runner.start_batch(
+            batch_projects,
+            batch_label,
+            job_fn=_job,
+            on_batch_done=_on_batch_done,
+            on_job_done=self._apply_batch_job_result,
+        )
+        if batch is None:
+            # Only reachable while shutting down; no worker will ever run.
+            return False
+        total = len(batch_projects)
+        self.statusBar().showMessage(
+            f"{batch_label}: {total} projects submitted concurrently{skipped_note}"
+        )
+        return True
+
+    def _on_batch_job_started(self, project_id: str):
+        """A pool worker picked the job up: QUEUED -> PACKING (GUI thread)."""
+        state, _ = self.model._pack_states.get(project_id, ("IDLE", ""))
+        if state in ("QUEUED", "PACKING"):
+            self.model.update_pack_state(project_id, "PACKING")
+        # PERF-005: a batched project also owns one outstanding progress run
+        # until its terminal result is applied. Arming here covers a batch job
+        # whose QUEUED entry predated the batch (or was coalesced in); arming
+        # twice on the same key is idempotent.
+        self._pack_progress_run_active(f"pack:{project_id}")
+
+    def _apply_batch_job_result(self, result):
+        """Apply one project's terminal state (GUI thread, queued signal)."""
+        # PERF-005: flush the final buffered snapshot before the terminal state
+        # for this run, so the last progress is never lost to the terminal
+        # progress rejection.
+        self._flush_pack_progress()
+        if result.success:
+            res = result.payload
+            out_name = "archive.zip"
+            git_part = ""
+            if res is not None:
+                out_name = res.output_path.name if res.output_path else out_name
+                git_part = f" ({res.git_summary})" if getattr(res, "git_summary", "") else ""
+                self.model.update_pack_state(result.project_id, "COMPLETE", out_name)
+            else:
+                self.model.update_pack_state(result.project_id, "COMPLETE", out_name)
+            proj = self.model.project_by_id(result.project_id)
+            name = proj.display_name if proj else result.project_id
+            self.statusBar().showMessage(f"✓ Packed {name} -> {out_name}{git_part}")
+        else:
+            message = result.error_message or "pack failed"
+            res = result.payload
+            if res is not None:
+                message = pack_failure_detail(res)
+            self.model.update_pack_state(result.project_id, "FAILED", message)
+            proj = self.model.project_by_id(result.project_id)
+            name = proj.display_name if proj else result.project_id
+            self.statusBar().showMessage(f"PACK FAILED ({name}): {message}")
+        self._pack_progress_run_settled(f"pack:{result.project_id}")
+
+    def _on_batch_job_finished(self, result):
+        # Kept as the signal slot; the callback already applied the result.
+        pass
+
+    def _on_batch_finished(self, batch_id: int, label: str, summary: str):
+        # Aggregate final state is reported by the runner callback; this slot
+        # exists so tests and future consumers can observe batch completion.
+        pass
+
+    def _configure_auto_pack_timer(self):
+        """Apply the automatic PACK ALL config to the one periodic timer.
+
+        T-167 (SRC-039): exactly one QTimer, owned by the window. Enabled ->
+        it runs at the configured interval; disabled -> it stops. Changing the
+        interval through Settings restarts the countdown from the new value.
+        The timer never fires immediately: a fresh start waits a full interval
+        before the first automatic pack.
+        """
+        packing = getattr(getattr(self._service, "config", None), "packing", None)
+        enabled = bool(getattr(packing, "auto_pack_all_enabled", True))
+        minutes = int(getattr(packing, "auto_pack_all_interval_minutes", 60) or 60)
+        minutes = max(5, min(1440, minutes))
+        timer = getattr(self, "auto_pack_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.timeout.connect(self._on_auto_pack_tick)
+            self.auto_pack_timer = timer
+        timer.stop()
+        if enabled:
+            timer.setInterval(minutes * 60 * 1000)
+            timer.start()
+
+    def _pack_all_eligible_projects(self) -> tuple[list[Project], int]:
+        """The projects manual PACK ALL packs, in Project Room order.
+
+        The one eligibility contract for both the manual button and the
+        automatic tick (T-167): registered in the current room, enabled, with a
+        source path, and not flagged ignore_archive.
+        """
         ordered_projects = []
         skipped_arch = 0
         for group in self.model._groups:
@@ -2165,6 +2898,34 @@ QToolTip QLabel {
                         skipped_arch += 1
                         continue
                     ordered_projects.append(p)
+        return ordered_projects, skipped_arch
+
+    def _auto_pack_is_busy(self) -> bool:
+        """True while any packing work is in flight (T-167 concurrency rule)."""
+        if self._pack_batch_runner.busy():
+            return True
+        projects, _skipped = self._pack_all_eligible_projects()
+        return any(self.task_runner.is_running(f"pack:{p.id}") for p in projects)
+
+    def _on_auto_pack_tick(self):
+        """Periodic automatic PACK ALL; skip the occurrence while packing is busy.
+
+        A busy tick neither starts a second batch nor accumulates a backlog:
+        the next regular interval is the retry. No dialogs, no focus stealing,
+        no windows, no audits -- this packs archives only. Busy ownership is
+        the active parallel batch (T-191), not a sequential queue.
+        """
+        if self._auto_pack_is_busy():
+            self.statusBar().showMessage("AUTO PACK ALL skipped: packing is already running")
+            return
+        projects, _skipped = self._pack_all_eligible_projects()
+        if not projects:
+            return
+        self._start_parallel_pack_batch(projects, batch_label="AUTO PACK ALL")
+
+    def _on_pack_all(self):
+        """Parallel background pack batch of all eligible projects (T-191)."""
+        ordered_projects, skipped_arch = self._pack_all_eligible_projects()
 
         if not ordered_projects:
             if skipped_arch:
@@ -2174,41 +2935,13 @@ QToolTip QLabel {
             return
 
         suffix = f" (+{skipped_arch} ignored to archive skipped)" if skipped_arch else ""
-        self._flash_status(f"\u25B6 PACK ALL: {len(ordered_projects)} projects queued{suffix}", "#D4A840")
-        self._start_sequential_pack_queue(ordered_projects, queue_label="PACK ALL")
+        self._flash_status(f"\u25B6 PACK ALL: {len(ordered_projects)} projects submitted concurrently{suffix}", "#D4A840")
+        self._start_parallel_pack_batch(ordered_projects, batch_label="PACK ALL")
 
     def _on_pack_specific(self, proj: Project):
         if not proj:
             return
-        if self.task_runner.is_running(f"pack:{proj.id}"):
-            self.statusBar().showMessage(f"Packing already in progress for {proj.display_name}")
-            return
-
-        self.model.update_pack_state(proj.id, "PACKING")
-        self.statusBar().showMessage(f"Packing {proj.display_name} in background...")
-        run_id = self.model.get_current_pack_run_id(proj.id)
-
-
-        def _do_pack():
-            return self._packing.pack_project(
-                proj.id,
-                progress_callback=self._make_pack_progress_callback(proj.id, run_id),
-            )
-
-        def _on_pack_done(res):
-            if res.success:
-                out_name = res.output_path.name if res.output_path else "archive.zip"
-                self.model.update_pack_state(proj.id, "COMPLETE", out_name)
-                self.statusBar().showMessage(f"✓ Packed {proj.display_name} -> {out_name}")
-            else:
-                self.model.update_pack_state(proj.id, "FAILED", res.error_message)
-                self.statusBar().showMessage(f"PACK FAILED ({proj.display_name}): {res.error_message}")
-
-        def _on_pack_error(err):
-            self.model.update_pack_state(proj.id, "FAILED", str(err))
-            self.statusBar().showMessage(f"PACK ERROR ({proj.display_name}): {err}")
-
-        self.task_runner.submit(f"pack:{proj.id}", _do_pack, on_success=_on_pack_done, on_error=_on_pack_error)
+        self._start_project_pack(proj)
 
     def _on_copy_audit(self):
         """Copies verified audit to clipboard for selected project."""
@@ -2428,7 +3161,9 @@ QToolTip QLabel {
         target = proj if isinstance(proj, Project) else self._selected_project()
         if not target:
             return
-        root_dir = Path(self._service.config.audits.root_dir)
+        # T-209: AuditsConfig stores ``root``; ``root_dir`` never existed, so
+        # this canonical handler raised AttributeError for every caller.
+        root_dir = Path(self._service.config.audits.root)
         target_dir = root_dir / target.priority_group.upper() / (target.audit_project_name or target.id)
         if target_dir.exists():
             os.startfile(str(target_dir))
@@ -2439,15 +3174,115 @@ QToolTip QLabel {
         else:
             self.statusBar().showMessage(f"Audit folder does not exist: {target_dir}")
 
-    def _on_open_with_launcher(self, proj: Optional[Any] = None, launcher_id: str = ""):
-        """Generic launcher dispatch — routes launcher_id to the matching handler."""
+    def _on_open_with_launcher(
+        self,
+        proj: Optional[Any] = None,
+        launcher_id: str = "",
+        *,
+        force_new: bool = False,
+    ):
+        """Generic launcher dispatch — routes launcher_id to the matching handler.
+
+        T-179: a NORMAL click means "put that agent in front of me". It focuses
+        the existing instance of exactly this launcher for exactly this project
+        and launches only when there is none. Every repeated click used to spawn
+        another console. ``force_new`` (Shift+click) skips reuse and asks for
+        another instance -- it does NOT skip ``enabled``, ``max_instances``, the
+        source-path check or the command-template policy.
+
+        T-216 TARGET H: a managed OpenCode click must NOT run the Fleet
+        preflight (a subprocess with ``timeout=30``) on the Qt GUI thread. The
+        click shows CHECK, enqueues the bound preflight, keeps the GUI
+        responsive, and continues only from the result callback.
+        """
         target = proj if isinstance(proj, Project) else self._selected_project()
         if not target:
             return
 
-        # Capacity is global per launcher, not per row/project. Refresh before
-        # every launch so a stale painted button can never bypass the real gate.
-        self._refresh_instance_snapshot()
+        cfg = self._launcher_config(launcher_id)
+        # T-216 TARGET H: ONLY a genuinely managed project pays the Fleet
+        # preflight, and that preflight (a bounded 30 s subprocess) must never
+        # run on the Qt GUI thread. ``is_managed`` is a cheap directory probe;
+        # a legacy/non-managed project keeps the synchronous, subprocess-free
+        # legacy admission.
+        if launcher_id == "opencode" and target.source_path and is_managed(target.source_path):
+            self._begin_managed_opencode_click(target, launcher_id, force_new)
+            return
+
+        admission: OpenCodeAdmission | None = None
+        if launcher_id == "opencode" and target.source_path:
+            try:
+                admission = admit_with_fallback(
+                    target.source_path,
+                    custom_template=getattr(cfg, "command_template", None),
+                    known_display_name=target.display_name,
+                )
+            except LaunchAdmissionError as exc:
+                self._report_opencode_launch_block(str(exc))
+                return
+        self._continue_launcher_dispatch(target, launcher_id, force_new, admission)
+
+    def _begin_managed_opencode_click(
+        self, target: Project, launcher_id: str, force_new: bool
+    ) -> None:
+        """Enqueue the Fleet preflight off the GUI thread (TARGET H/I).
+
+        Single-flight on ``project_id + launcher_id``: repeated clicks while
+        CHECK runs coalesce into a status message, never a second preflight and
+        never a duplicate console. A monotonic request id plus a project
+        existence check fences a stale preflight so it cannot launch after the
+        operator deleted or changed the project.
+        """
+        cfg = self._launcher_config(launcher_id)
+        key = f"opencode:preflight:{target.id}:{launcher_id}"
+        if self.task_runner.is_running(key):
+            self.statusBar().showMessage(
+                f"CHECK… already checking SAIPEN for {target.display_name}"
+            )
+            return
+        self._launch_request_seq += 1
+        request_id = self._launch_request_seq
+        self.statusBar().showMessage(
+            f"CHECK… checking SAIPEN binding for {target.display_name}"
+        )
+        template = getattr(cfg, "command_template", None)
+        source_path = target.source_path
+
+        def _preflight():
+            return admit_with_fallback(source_path, custom_template=template, known_display_name=target.display_name)
+
+        def _done(admission):
+            if request_id != self._launch_request_seq:
+                return
+            if self._service.get_project(target.id) is None:
+                return
+            self._continue_launcher_dispatch(target, launcher_id, force_new, admission)
+
+        def _error(exc):
+            if request_id != self._launch_request_seq:
+                return
+            self._report_opencode_launch_block(str(exc))
+
+        self.task_runner.submit(key, _preflight, on_success=_done, on_error=_error)
+
+    def _continue_launcher_dispatch(
+        self,
+        target: Project,
+        launcher_id: str,
+        force_new: bool,
+        admission: OpenCodeAdmission | None,
+    ) -> None:
+        # Capacity is global per launcher, not per row/project. The decision
+        # reads the last installed snapshot (pure in-memory) and a fresh scan is
+        # requested for the next paint; the GUI thread never runs it here.
+        self.request_instance_refresh("launcher-click")
+
+        if not force_new and self._focus_existing_launcher_instance(
+            target, launcher_id,
+            saipen_binding=admission.binding if admission and admission.managed else None,
+        ):
+            return
+
         block_reason = self._launcher_block_reason(launcher_id)
         if block_reason:
             self.statusBar().showMessage(f"Launch blocked: {block_reason}")
@@ -2485,6 +3320,25 @@ QToolTip QLabel {
         # Cline button hardcodes --auto-approve true and the OpenCode one --auto,
         # and without this there was no way to launch either without its
         # confirmation gate disabled.
+        if admission and admission.managed and not admission.degraded:
+            self._launch_bound_opencode(target, admission)
+            return
+        if admission and admission.degraded:
+            self._launch_degraded_opencode(target, admission)
+            return
+        if admission and admission.managed:
+            self._launch_bound_opencode(target, admission)
+            return
+
+        # SRC-081 / APP-CLI-001: the multi-agent CLI launchers share ONE
+        # dispatch path (cli_launchers). resolve_cli_launcher honours a
+        # non-empty command_template FIRST (TARGET F), so an operator wrapper
+        # always wins over built-in discovery -- and the launch still gets the
+        # managed title and exact registration (TARGET K).
+        if launcher_id in BUILTIN_CLI_LAUNCHERS:
+            self._launch_cli_launcher(target, launcher_id)
+            return
+
         cfg = next((lc for lc in getattr(self._service.config, "launchers", []) if lc.id == launcher_id), None)
         if cfg and cfg.command_template:
             self._launch_custom(cfg, target)
@@ -2497,26 +3351,178 @@ QToolTip QLabel {
 
         self.statusBar().showMessage(f"Unknown launcher: {launcher_id}")
 
+    def _focus_existing_launcher_instance(
+        self, target: Project, launcher_id: str,
+        *, saipen_binding: dict[str, str] | None = None,
+    ) -> bool:
+        """True when the click was answered by an existing window, not a launch.
+
+        Exact project id AND exact launcher id -- never the Codex family -- so
+        C2 can never focus C1 and Project A's OpenCode can never answer for
+        Project B. A live instance that refuses to focus is reported; it is
+        never quietly replaced by a duplicate console.
+        """
+        launcher = self._launcher_config(launcher_id)
+        launcher_label = str(getattr(launcher, "name", "") or launcher_id)
+
+        existing = self._instance_monitor.focus_candidate(
+            target.id, launcher_id, saipen_binding=saipen_binding
+        )
+        if existing is not None:
+            if self._instance_monitor.focus(existing):
+                self.statusBar().showMessage(
+                    f"✔ Focused {launcher_label} for {target.display_name} "
+                    f"(PID {existing.pid}) · Shift+click for a new instance"
+                )
+                return True
+            # Focus failed: the window may have died between the scan and the
+            # call, or it is genuinely refusing foreground. A bounded O(1)
+            # liveness probe decides; the GUI thread does NOT run a native
+            # desktop scan here. A dead instance releases the click to the
+            # launch path; a live-but-unfocusable one is reported, never
+            # silently duplicated.
+            if self._instance_monitor.instance_alive(existing):
+                self.statusBar().showMessage(
+                    f"{launcher_label} for {target.display_name} is running (PID {existing.pid}) "
+                    "but would not come to the front — see Instances"
+                )
+                self._show_instance_manager(target)
+                return True
+            self.request_instance_refresh("focus-retry")
+
+        starting = self._instance_monitor.starting_for_project_launcher(
+            target.id, launcher_id, saipen_binding=saipen_binding
+        )
+        if starting:
+            self.statusBar().showMessage(
+                f"{launcher_label} is already starting for {target.display_name}"
+            )
+            return True
+        return False
+
     def _launch_custom(self, cfg, proj: Project):
         """Launches a custom command_template launcher in a new console."""
         import subprocess
         target = proj if isinstance(proj, Project) else self._selected_project()
         if not target or not target.source_path:
             return
-        target_path = str(Path(target.source_path).resolve())
+        try:
+            launch_target = resolve_launch_target(self._service.config, target.id, cfg.id)
+        except LaunchPolicyError as exc:
+            self.statusBar().showMessage(f"Launch blocked: {exc}")
+            return
+        target_path = str(launch_target.cwd)
         create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
         tpl = (cfg.command_template or "").strip()
         tpl = tpl.replace("{workdir}", target_path).replace("{path}", target_path)
         tpl = tpl.replace("{project}", target.display_name)
-        process = subprocess.Popen(
-            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", tpl],
+        cmd = apply_console_style(tpl, cfg)
+        process = create_agent_process(
+            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            launch_target,
             creationflags=create_console,
         )
         self._register_agent_launch(process, cfg.id, target)
         self.statusBar().showMessage(f"✓ Launched {cfg.name} for {target.display_name}")
 
-    def _on_open_with_launcher_index(self, idx: int):
-        """Ctrl 1-6 — open selected project with ordered enabled launcher idx."""
+    def _launch_cli_launcher(self, target: Project, launcher_id: str) -> None:
+        """One shared launch path for the multi-agent CLI launchers (SRC-081).
+
+        TARGET B/M: CLI-first resolution with a launcher-specific diagnostic
+        when resolution fails -- never a crash, never a modal, never a row-wide
+        block. The console starts in the canonical project root, the managed
+        title carries project + launcher + root + correlation token and no
+        secret (TARGET K), and the launch registers under the exact launcher
+        id so Claude 1 can never satisfy Claude 2 (TARGET A/K).
+        """
+        cfg = self._launcher_config(launcher_id)
+        if cfg is None:
+            self.statusBar().showMessage(
+                f"Launcher unavailable: {launcher_id} is not in the configured launcher list"
+            )
+            return
+        if not target.source_path:
+            return
+        try:
+            launch_target = resolve_launch_target(self._service.config, target.id, launcher_id)
+        except LaunchPolicyError as exc:
+            self.statusBar().showMessage(f"Launch blocked: {exc}")
+            return
+        target_path = str(launch_target.cwd)
+        resolution = resolve_cli_launcher(
+            cfg, project_root=target_path, project_name=target.display_name
+        )
+        if not resolution.ok:
+            self._report_cli_launch_unavailable(cfg, target, resolution)
+            return
+        if persist_resolution(cfg, resolution):
+            # TARGET B: persist the stable answer once; later clicks reuse it
+            # instead of rescanning the machine.
+            def _persist(latest):
+                for lc in getattr(latest, "launchers", []):
+                    if lc.id == cfg.id:
+                        lc.resolved_command = cfg.resolved_command
+                        lc.resolved_probe = cfg.resolved_probe
+                        lc.resolved_profile = cfg.resolved_profile
+                        lc.resolved_stage = cfg.resolved_stage
+                        lc.resolved_is_cli = cfg.resolved_is_cli
+                        break
+
+            if not scoped_config_write(_persist):
+                logger.warning("could not persist launcher resolution for %s", launcher_id)
+
+        token = new_correlation_token()
+        title = managed_console_title(target.display_name, cfg.name, target_path, token)
+        script = apply_console_style(
+            f"[Console]::Title = {ps_quote(title)}; {resolution.console_command}",
+            cfg,
+        )
+        create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        try:
+            process = create_agent_process(
+                ["powershell.exe", "-NoExit", "-Command", script],
+                launch_target,
+                creationflags=create_console,
+            )
+        except OSError as exc:
+            self.statusBar().showMessage(
+                f"{cfg.name} unavailable for {target.display_name} | stage={resolution.stage} | "
+                f"missing: powershell console ({self._sanitize_diagnostic(str(exc), 120)})"
+            )
+            return
+        self._register_agent_launch(
+            process, cfg.id, target, correlation_token=token, managed_title=title,
+        )
+        note = f"[{resolution.stage}]"
+        if not resolution.is_cli:
+            note += " GUI fallback — no CLI entrypoint"
+        self.statusBar().showMessage(
+            f"✓ Launched {cfg.name} for {target.display_name} {note}"
+        )
+
+    def _report_cli_launch_unavailable(
+        self, cfg: Any, target: Project, resolution: Any
+    ) -> None:
+        """TARGET M: launcher-specific, non-blocking diagnostic.
+
+        One unresolved provider launcher never becomes a modal and never
+        disables the row: the report names launcher, project, resolution
+        stage, the missing command/profile/wrapper and the next useful
+        operator action. Fail-open: every other launcher stays usable.
+        """
+        message = resolution.diagnostic(getattr(cfg, "name", ""), target.display_name)
+        logger.warning("launcher diagnostic: %s", message)
+        self.statusBar().showMessage(message)
+
+    def _on_open_with_launcher_index(self, idx: int, force_new: bool = False):
+        """Ctrl+1..9 / Ctrl+0 — open selected project with launcher position idx.
+
+        T-179: the keyboard path uses the same semantic helper as the button, so
+        Ctrl+digit focuses and Ctrl+Shift+digit asks for another instance.
+        SRC-081 TARGET J: positions 1..10 map to the digit row
+        (LAUNCHER_SHORTCUT_KEYS), and launcher reordering redefines the
+        positional order.
+        """
         proj = self._selected_project()
         if not proj:
             self._flash_status("Open with: No project selected", "#D66464")
@@ -2525,13 +3531,34 @@ QToolTip QLabel {
         if idx < 0 or idx >= len(enabled):
             self.statusBar().showMessage(f"No launcher at position {idx+1}")
             return
-        self._on_open_with_launcher(proj, enabled[idx].id)
+        self._on_open_with_launcher(proj, enabled[idx].id, force_new=bool(force_new))
 
     def _on_open_with_opencode(self, proj: Optional[Any] = None):
-        """Launches OpenCode YOLO for this project."""
+        """Launches OpenCode YOLO for this project.
+
+        T-216 TARGET H: a managed project's Fleet preflight is enqueued on the
+        background lane; only the subprocess-free legacy path stays synchronous.
+        """
         import subprocess
         target = proj if isinstance(proj, Project) else self._selected_project()
         if not target or not target.source_path:
+            return
+        if is_managed(target.source_path):
+            self._begin_managed_opencode_click(target, "opencode", False)
+            return
+        try:
+            admission = admit_with_fallback(
+                target.source_path, custom_template=None,
+                known_display_name=target.display_name,
+            )
+        except LaunchAdmissionError as exc:
+            self._report_opencode_launch_block(str(exc))
+            return
+        if admission.managed and not admission.degraded:
+            self._launch_bound_opencode(target, admission)
+            return
+        if admission.degraded:
+            self._launch_degraded_opencode(target, admission)
             return
         target_path = str(Path(target.source_path).resolve())
         create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
@@ -2542,12 +3569,300 @@ QToolTip QLabel {
                 "-File", str(launcher_ps1), "-Agent", "OpenCode", "-WorkDir", target_path
             ], creationflags=create_console)
         else:
+            cfg = self._launcher_config("opencode") or "opencode"
+            cmd = apply_console_style(
+                f'Set-Location -LiteralPath "{target_path}"; opencode.cmd . --auto',
+                cfg,
+            )
             process = subprocess.Popen([
-                "powershell.exe", "-NoExit", "-Command",
-                f'Set-Location -LiteralPath "{target_path}"; opencode.cmd . --auto'
+                "powershell.exe", "-NoExit", "-Command", cmd
             ], creationflags=create_console)
         self._register_agent_launch(process, "opencode", target)
         self.statusBar().showMessage(f"✓ Launched OpenCode for {target.display_name}")
+
+    def _launch_degraded_opencode(self, target: Project, admission: OpenCodeAdmission) -> None:
+        import subprocess
+
+        assert admission.command is not None
+        root = admission.cwd
+        token = new_correlation_token()
+        title = f"{target.display_name} | OpenCode | {root} | {token} | DEGRADED"
+        command = " ".join("'" + str(p).replace("'", "''") + "'" for p in admission.command)
+        create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        script = (
+            "$env:OPENCODE_DISABLE_TERMINAL_TITLE = 'true'; "
+            "[Console]::Title = '" + title.replace("'", "''") + "'; "
+            "& " + command + "; exit $LASTEXITCODE"
+        )
+        cfg = self._launcher_config("opencode") or "opencode"
+        script = apply_console_style(script, cfg)
+        try:
+            process = subprocess.Popen(
+                ["powershell.exe", "-NoExit", "-NoLogo", "-NoProfile", "-Command", script],
+                cwd=str(root), creationflags=create_console,
+            )
+        except OSError as exc:
+            self._report_opencode_launch_block(f"degraded OpenCode console failed: {exc}")
+            return
+        self._register_agent_launch(
+            process, "opencode", target,
+            saipen_binding=admission.binding, correlation_token=token, managed_title=title,
+        )
+        reason = (admission.recovery_diagnostic or {}).get("reason", admission.degraded_reason)
+        self.statusBar().showMessage(
+            f"OpenCode launched in degraded mode for {target.display_name} — "
+            f"SAIPEN binding invalid: {reason[:160]}"
+        )
+
+    def _report_opencode_launch_block(self, detail: str) -> None:
+        message = f"Launch blocked: {detail}"
+        self.statusBar().showMessage(message)
+        QMessageBox.warning(self, "OpenCode launch blocked", message)
+
+    @staticmethod
+    def _sanitize_diagnostic(detail: str, max_length: int = 250) -> str:
+        if not detail:
+            return ""
+        import re
+        text = str(detail).strip()
+        text = re.sub(
+            r"(?i)(bearer|token|secret|password|key|auth|credential)[=:\s]+[A-Za-z0-9_\-\.]{8,}",
+            r"\1=[REDACTED]",
+            text,
+        )
+        text = re.sub(r"(?i)(set\s+[A-Za-z0-9_]+=[^\r\n]+)", r"[ENV_REDACTED]", text)
+        text = re.sub(r"\s+", " ", text)
+        if len(text) > max_length:
+            text = text[: max_length - 3] + "..."
+        return text
+
+    def _report_opencode_launch_failure(
+        self, exit_code: int, stage: str, detail: str
+    ) -> None:
+        bounded_detail = self._sanitize_diagnostic(detail)
+        status_msg = f"OpenCode launch failed (exit={exit_code}, stage={stage})"
+        if bounded_detail:
+            status_msg += f": {bounded_detail}"
+        if len(status_msg) > 120:
+            status_msg = status_msg[:117] + "..."
+        self.statusBar().showMessage(status_msg)
+
+        modal_text = (
+            f"OpenCode launch failed\n"
+            f"exit={exit_code}\n"
+            f"stage={stage}\n"
+            f"detail={bounded_detail}"
+        )
+        QMessageBox.warning(self, "OpenCode launch failed", modal_text)
+
+    def _handle_opencode_exit(
+        self,
+        exit_code: int,
+        admission: OpenCodeAdmission,
+        diag_file: Path,
+        err_file: Path,
+        target_pid: int = 0,
+    ) -> None:
+        if target_pid > 0:
+            self._instance_monitor.untrack_launch(target_pid)
+            self._title_guardian.unregister(target_pid)
+            self._sync_title_guardian_timer()
+            self.request_instance_refresh("opencode-exit")
+
+        stage = "powershell"
+        detail = ""
+        if diag_file.is_file():
+            try:
+                diag_data = json.loads(diag_file.read_text(encoding="utf-8"))
+                stage = diag_data.get("stage", stage)
+            except Exception:
+                pass
+        if err_file.is_file():
+            try:
+                detail = err_file.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                pass
+        if not detail and stage == "saipen" and exit_code != 0:
+            try:
+                if len(admission.command) > 5 and admission.command[2] == "--agent":
+                    cmd = [
+                        str(admission.command[0]),
+                        str(admission.command[1]),
+                        "--agent",
+                        str(admission.command[3]),
+                        "--project-root",
+                        str(admission.command[5]),
+                        "runtime",
+                        "--prelaunch",
+                        "--adapter",
+                        "opencode",
+                        "--json",
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                    if res.stdout:
+                        info = json.loads(res.stdout)
+                        detail = info.get("detail", "") or info.get("code", "")
+            except Exception:
+                pass
+        if not detail:
+            if exit_code == 0:
+                stage = "opencode"
+                detail = "process exited immediately with code 0 without a live OpenCode instance"
+            else:
+                detail = f"command exited with code {exit_code}"
+
+        try:
+            diag_file.unlink(missing_ok=True)
+            err_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        self._report_opencode_launch_failure(exit_code, stage, detail)
+
+    def _start_opencode_startup_observation(
+        self,
+        process: Any,
+        target: Project,
+        admission: OpenCodeAdmission,
+        token: str,
+        diag_file: Path,
+        err_file: Path,
+    ) -> None:
+        grace_period = getattr(self, "_opencode_startup_grace_sec", 1.5)
+        deadline = time.monotonic() + grace_period
+
+        if not hasattr(self, "_opencode_startup_watchers"):
+            self._opencode_startup_watchers = []
+
+        timer = QTimer(self)
+        timer.setInterval(50)
+
+        def _check_startup():
+            rc = process.poll()
+            if isinstance(rc, int):
+                timer.stop()
+                if timer in self._opencode_startup_watchers:
+                    self._opencode_startup_watchers.remove(timer)
+                timer.deleteLater()
+                self._handle_opencode_exit(
+                    rc, admission, diag_file, err_file, target_pid=getattr(process, "pid", 0)
+                )
+                return
+
+            now = time.monotonic()
+            if now >= deadline:
+                timer.stop()
+                if timer in self._opencode_startup_watchers:
+                    self._opencode_startup_watchers.remove(timer)
+                timer.deleteLater()
+                self.request_instance_refresh("startup-grace")
+                try:
+                    diag_file.unlink(missing_ok=True)
+                    err_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        timer.timeout.connect(_check_startup)
+        self._opencode_startup_watchers.append(timer)
+        timer.start()
+
+    def _launch_bound_opencode(self, target: Project, admission: OpenCodeAdmission) -> None:
+        """Own the console/title; bound SAIPEN CLI owns actor, root and lineage."""
+        import subprocess
+
+        assert admission.command is not None and admission.binding is not None
+        token = new_correlation_token()
+
+        def quote(value: str | Path) -> str:
+            return "'" + str(value).replace("'", "''") + "'"
+
+        title = f"{target.display_name} | OpenCode YOLO | {admission.cwd} | {token}"
+        command = " ".join(quote(part) for part in admission.command)
+        create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+
+        err_file = Path(tempfile.gettempdir()) / f"audapack-opencode-err-{token}.log"
+        diag_file = Path(tempfile.gettempdir()) / f"audapack-opencode-diag-{token}.json"
+
+        # TARGET B & D & E:
+        # - Pass OPENCODE_DISABLE_TERMINAL_TITLE=true so OpenCode does not overwrite console title.
+        # - Set [Console]::Title once; remove periodic timer and event registration.
+        # - Clean interactive TTY: do NOT redirect child stderr with 2> $errPath.
+        script = (
+            f"$managedTitle = {quote(title)}; "
+            f"$diagPath = {quote(diag_file)}; "
+            f"$errPath = {quote(err_file)}; "
+            "$env:OPENCODE_DISABLE_TERMINAL_TITLE = 'true'; "
+            "$stage = 'powershell'; "
+            "try { "
+            "[Console]::Title = $managedTitle; "
+            "} catch {}; "
+            "$stage = 'saipen'; "
+            "try { "
+            f"& {command}; "
+            "$childExit = $LASTEXITCODE; "
+            "} catch { "
+            "$childExit = 1; "
+            "$stage = 'powershell'; "
+            "try { [System.IO.File]::WriteAllText($errPath, $_.Exception.Message) } catch {}; "
+            "}; "
+            "try { "
+            "$diag = @{ "
+            "exit = if ($null -ne $childExit) { [int]$childExit } else { 0 }; "
+            "stage = $stage; "
+            "}; "
+            "[System.IO.File]::WriteAllText($diagPath, ($diag | ConvertTo-Json -Compress)); "
+            "} catch {}; "
+            "exit $childExit"
+        )
+        cfg = self._launcher_config("opencode") or "opencode"
+        script = apply_console_style(script, cfg)
+        popen_env = dict(os.environ)
+        popen_env["OPENCODE_DISABLE_TERMINAL_TITLE"] = "true"
+        try:
+            process = subprocess.Popen(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", script],
+                cwd=str(admission.cwd), creationflags=create_console,
+                env=popen_env,
+            )
+        except OSError as exc:
+            self._report_opencode_launch_block(f"canonical SAIPEN console failed: {exc}")
+            return
+
+        # Immediate exit check (e.g. process could not be launched or mock test)
+        poll_res = process.poll()
+        if isinstance(poll_res, int):
+            self._handle_opencode_exit(
+                poll_res, admission, diag_file, err_file, target_pid=getattr(process, "pid", 0)
+            )
+            return
+
+        # Register launch immediately so tracking and starting state are active
+        self._register_agent_launch(
+            process, "opencode", target, saipen_binding=admission.binding,
+            correlation_token=token, managed_title=title,
+        )
+        if admission.recovery_diagnostic:
+            rd = admission.recovery_diagnostic
+            reason_code = rd.get("reason_code", "UNSPECIFIED")
+            next_cmd = rd.get("canonical_next_command", "") or "no next command"
+            self.statusBar().showMessage(
+                f"✓ Launched SAIPEN-bound OpenCode for {target.display_name} "
+                f"(Recovery: {reason_code} | {next_cmd})"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"✓ Launched SAIPEN-bound OpenCode for {target.display_name}"
+            )
+
+        # TARGET C: Asynchronous non-blocking startup observation
+        self._start_opencode_startup_observation(
+            process=process,
+            target=target,
+            admission=admission,
+            token=token,
+            diag_file=diag_file,
+            err_file=err_file,
+        )
 
     def _on_open_with_cline(self, proj: Optional[Any] = None):
         """Launches Cline YOLO for this project."""
@@ -2564,9 +3879,13 @@ QToolTip QLabel {
                 "-File", str(launcher_ps1), "-Agent", "Cline", "-WorkDir", target_path
             ], creationflags=create_console)
         else:
+            cfg = self._launcher_config("cline") or "cline"
+            cmd = apply_console_style(
+                f'Set-Location -LiteralPath "{target_path}"; cline.cmd --cwd "{target_path}" --auto-approve true --tui',
+                cfg,
+            )
             process = subprocess.Popen([
-                "powershell.exe", "-NoExit", "-Command",
-                f'Set-Location -LiteralPath "{target_path}"; cline.cmd --cwd "{target_path}" --auto-approve true --tui'
+                "powershell.exe", "-NoExit", "-Command", cmd
             ], creationflags=create_console)
         self._register_agent_launch(process, "cline", target)
         self.statusBar().showMessage(f"✓ Launched Cline for {target.display_name}")
@@ -2582,52 +3901,65 @@ QToolTip QLabel {
         fb_exe = Path(r"C:\Users\vac34\freebuff.exe")
         exe_str = str(fb_exe) if fb_exe.exists() else "freebuff"
 
-        process = subprocess.Popen([
-            "powershell.exe", "-NoExit", "-Command",
+        cfg = self._launcher_config("freebuff") or "freebuff"
+        cmd = apply_console_style(
             f'[Console]::Title = "{target.display_name} | FreeBuff | {target_path}"; '
             f'Set-Location -LiteralPath "{target_path}"; '
-            f'& "{exe_str}" --cwd "{target_path}"'
+            f'& "{exe_str}" --cwd "{target_path}"',
+            cfg,
+        )
+        process = subprocess.Popen([
+            "powershell.exe", "-NoExit", "-Command", cmd
         ], creationflags=create_console)
         self._register_agent_launch(process, "freebuff", target)
         self.statusBar().showMessage(f"✓ Launched FreeBuff for {target.display_name}")
 
-    def _on_open_with_codex(self, proj: Optional[Any] = None, account: str = "main_codex"):
-        """Launches Codex for this project with specific account profile."""
+    def _on_open_with_codex(self, proj: Optional[Any] = None, account: str = "main_codex",
+                            model: str = ""):
+        """Launches Codex (YOLO) for this project on one isolated account.
+
+        Self-contained: the account is chosen by CODEX_HOME inside the new
+        console (see cli_launchers.codex_console_command); no external
+        per-account launcher script has to exist on this machine.
+        """
         import subprocess
         target = proj if isinstance(proj, Project) else self._selected_project()
         if not target or not target.source_path:
             return
-        target_path = str(Path(target.source_path).resolve())
-        create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
-        if account == "main_codex2":
-            script = Path(r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\main_codex2\Start-Codex-Account2.ps1")
-        elif account == "main_codex3_free":
-            script = Path(r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\main_codex3_free\Start-Codex-Account3-Free.ps1")
-        else:
-            script = Path(r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\main_codex\Start-Codex-Main.ps1")
-
-        if script.exists():
-            process = subprocess.Popen([
-                "powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass",
-                "-Command",
-                f'[Console]::Title = "{target.display_name} | Codex ({account}) | {target_path}"; '
-                f'& "{script}" -WorkDir "{target_path}"'
-            ], creationflags=create_console)
-        elif account in {"main_codex2", "main_codex3_free"}:
-            self.statusBar().showMessage(f"Codex launcher script does not exist: {script}")
+        try:
+            launch_target = resolve_launch_target(self._service.config, target.id, account)
+        except LaunchPolicyError as exc:
+            self.statusBar().showMessage(f"Launch blocked: {exc}")
             return
-        else:
-            process = subprocess.Popen([
-                "powershell.exe", "-NoExit", "-Command",
-                f'[Console]::Title = "{target.display_name} | Codex | {target_path}"; '
-                f'Set-Location -LiteralPath "{target_path}"; codex'
-            ], creationflags=create_console)
+        target_path = str(launch_target.cwd)
+        create_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        model_label = f" | {model}" if model else ""
+        title = f"{target.display_name} | Codex ({account}){model_label} YOLO | {target_path}"
+        cfg = self._launcher_config(account) or account
+        process = create_agent_process([
+            "powershell.exe", "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", codex_console_command(account, target_path, title, model=model, launcher=cfg),
+        ], launch_target, creationflags=create_console)
         self._register_agent_launch(process, account, target)
-        self.statusBar().showMessage(f"✓ Launched Codex ({account}) for {target.display_name}")
+        model_status = f" [{model}]" if model else ""
+        self.statusBar().showMessage(
+            f"✓ Launched Codex ({account}){model_status} for {target.display_name}"
+        )
+
+    def _on_open_with_codex_luna(self, proj: Optional[Any] = None) -> None:
+        """Launch GPT-6 Luna. Codex controls Luna Reserve automatically.
+
+        There is no direct reserve-pool selector: Codex applies Luna Reserve on
+        its own when the normal allocation is exhausted/eligible, so the action
+        is named for what it truthfully does (launch Luna), not for a Reserve
+        route AUDAPACK cannot select. SRC-088 stays BLOCKED until a verified
+        direct reserve selector exists.
+        """
+        self._on_open_with_codex(proj, "main_codex", model="gpt-6-luna")
 
     def _on_open_audits_root(self):
         """Reveals root audits folder in Windows Explorer."""
-        root_dir = Path(self._service.config.audits.root_dir)
+        root_dir = Path(self._service.config.audits.root)
         if root_dir.exists():
             os.startfile(str(root_dir))
         else:
@@ -2688,7 +4020,7 @@ QToolTip QLabel {
         self.statusBar().showMessage(f"✓ {st} project {proj.display_name}")
 
     def _on_pack_group(self, group: str):
-        """Sequential background packing queue of projects in a group."""
+        """Parallel background pack batch of every packable project in a group (T-191)."""
         ordered_projects = []
         skipped_arch = 0
         for slot in range(1, 7):
@@ -2706,7 +4038,7 @@ QToolTip QLabel {
                 self.statusBar().showMessage(f"No enabled projects in group {group}")
             return
 
-        self._start_sequential_pack_queue(ordered_projects, queue_label=f"PACK [{group}]")
+        self._start_parallel_pack_batch(ordered_projects, batch_label=f"PACK [{group}]")
 
     def _on_refresh_single_project(self, proj: Project):
         """Refreshes audit status for a single project without full tree reload."""
@@ -2721,7 +4053,12 @@ QToolTip QLabel {
         )
 
     def _on_tree_double_clicked(self, index: QModelIndex):
-        """Double click handler: open INAUDIT on project row, add folder on empty slot, toggle on group."""
+        """Double click: group toggles, empty slot adds, project row follows the setting.
+
+        T-209 P1: only the POPULATED PROJECT ROW behaviour is configurable --
+        group headers still expand/collapse and empty slots still open Add
+        Project, whatever ``project_double_click_action`` says.
+        """
         if not index.isValid():
             return
         node_type = self.model.data(index, self.model.ROLES["node_type"])
@@ -2737,22 +4074,76 @@ QToolTip QLabel {
         proj = self.model.project_at(group, slot)
         if proj:
             self._active_project = proj
-            self._show_project_inbox(proj)
+            self._on_project_row_activated(proj)
         else:
             self._on_add_project(default_group=group, default_slot=slot)
 
-    def _show_project_inbox(self, proj: Project):
+    #: Settings value -> the canonical handler that already owns that action.
+    #: No filesystem/launcher logic is duplicated here.
+    def _project_double_click_handlers(self) -> dict[str, Any]:
+        return {
+            "project_folder": self._on_open_project_folder,
+            "inaudit": self._show_project_inbox,
+            "instances": self._show_instance_manager,
+            "terminal": self._on_open_terminal,
+            "archive_folder": self._on_open_archive_folder,
+            "audit_folder": self._on_open_audit_folder,
+        }
+
+    def _on_project_row_activated(self, proj: Project) -> None:
+        """Run the configured double-click action on a populated project row."""
+        ui_cfg = self._service.config.ui
+        action = normalize_double_click_action(
+            getattr(ui_cfg, "project_double_click_action", "")
+        )
+        if action == "none":
+            self.statusBar().showMessage(
+                f"Double-click action is 'Nothing' — {proj.display_name} left unchanged"
+            )
+            return
+        if action == "launcher":
+            self._activate_double_click_launcher(proj)
+            return
+        handler = self._project_double_click_handlers().get(action)
+        if handler is None:
+            self._show_project_inbox(proj)
+            return
+        handler(proj)
+
+    def _activate_double_click_launcher(self, proj: Project) -> None:
+        """Delegate to the ONE launch path; never spawn a duplicate.
+
+        The selected launcher is persisted by ID. If it was removed, disabled
+        or is otherwise unavailable, say so and leave the project alone -- a
+        missing launcher must never silently start a different agent.
+        """
+        launcher_id = str(
+            getattr(self._service.config.ui, "project_double_click_launcher_id", "")
+            or "opencode"
+        ).strip()
+        launcher = self._launcher_config(launcher_id)
+        if launcher is None or not getattr(launcher, "enabled", True):
+            self.statusBar().showMessage(f"Double-click launcher unavailable: {launcher_id}")
+            return
+        self._on_open_with_launcher(proj, launcher_id)
+
+    def _show_project_inbox(self, proj: Project) -> bool:
         """Open the INAUDIT view bound to this project (T-143).
 
         Double-click used to open the Instances tab, which answers a different
         question -- how many windows this project has -- while the thing an
         operator wants to see on a project is its audit inbox. Instances is still
         one right-click away, and the toolbar still has it.
+
+        T-174 I5: returns whether the widget is now actually bound to ``proj``.
+        A refused bind (dirty draft on another project) is visible to callers.
         """
-        self.inaudit_widget.set_project(proj)
+        bound = self.inaudit_widget.set_project(proj)
         self.tabs.setCurrentWidget(self.inaudit_widget)
         self.inaudit_widget.mode_tabs.setCurrentWidget(self.inaudit_widget.layers_page)
         self.inaudit_widget.setFocus()
+        return bool(bound and self.inaudit_widget._project is not None
+                    and self.inaudit_widget._project.id == proj.id)
 
     def _on_tree_context_menu(self, pos):
         """Rich Win95 context menu on right-click."""
@@ -2898,6 +4289,16 @@ QToolTip QLabel {
                     _act = menu_open_with.addAction(f"[{_lc.short_label}] {_lc.name}")
                     _lid = _lc.id
                     _act.triggered.connect(lambda _checked=False, _p=proj, _id=_lid: self._on_open_with_launcher(_p, _id))
+            menu_open_with.addSeparator()
+            reserve_action = menu_open_with.addAction("[LR] Luna / Reserve fallback")
+            reserve_action.setToolTip(
+                "Launches GPT-6 Luna. Codex controls Luna Reserve automatically "
+                "when the normal allocation is exhausted/eligible; AUDAPACK "
+                "cannot directly select the Reserve pool."
+            )
+            reserve_action.triggered.connect(
+                lambda _checked=False, _p=proj: self._on_open_with_codex_luna(_p)
+            )
             menu.addSeparator()
 
             # Actions group 4: Project Management & Slot Reordering
@@ -2995,18 +4396,83 @@ QToolTip QLabel {
         self._generation_watch_paths()
         self._generation_debounce.start()
 
+    def _on_bridge_poll_tick(self):
+        """Sole owner of ``bridge_timer.timeout`` (PERF-004, audit/9.md).
+
+        One emission performs one generation check, its targeted project
+        refresh, and EXACTLY ONE composite audit/runtime refresh -- whether or
+        not a generation advanced. The unconditional refresh is required by the
+        polling contract: browser liveness changes without touching any
+        generation file.
+        """
+        self._consume_bridge_generations()
+        self._refresh_audit_runs_async()
+
     def _on_check_bridge_generation(self):
+        """Event-driven generation handling (watcher + 100 ms debounce).
+
+        Refreshes the composite view only when a generation actually advanced,
+        so a filesystem event storm does not become a request storm.
+        """
+        if self._consume_bridge_generations():
+            self._refresh_audit_runs_async()
+
+    def _consume_bridge_generations(self) -> bool:
         """Consume audit-file and dispatch generation signals.
 
         QFileSystemWatcher is primary; the 30-second timer is only a fallback.
         Generation files are replaced atomically, so watcher paths are restored
         after every event before the next read.
+
+        Returns True when a generation advanced, i.e. when the composite refresh
+        is warranted. It does NOT perform that refresh: PERF-004 (audit/9.md)
+        separates "did the generation change" from "who owns the refresh", so a
+        timer tick and a watcher event cannot both schedule the same expensive
+        pass for one cause.
         """
         try:
             refresh_runs = False
-            info = get_generation_info()
+            try:
+                info = get_generation_info()
+            except GenerationStateCorruptionError:
+                # W2-003: an unreadable generation file is an explicit reset.
+                # Resync once and adopt the sentinel baseline instead of
+                # stalling the view forever.
+                info = {"generation": 0, "epoch": "__corrupt__"}
             gen = info.get("generation", 0)
-            if gen > self._last_audit_generation:
+            epoch = str(info.get("epoch", ""))
+            audit_reset = epoch != getattr(self, "_last_audit_epoch", "")
+            if audit_reset or gen > self._last_audit_generation:
+                # CORE-002: an external Bridge change may have registered a new
+                # project on disk. Refresh the shared registry snapshot before
+                # resolving it so the new id is visible without a restart.
+                # Structural change (add/remove/move/swap) requires a real model
+                # reload; an unchanged structure stays on the targeted snapshot
+                # path so we do not force unnecessary full resets.
+                structure_changed = False
+                refresh_with_delta = getattr(getattr(self, "_service", None), "refresh_projects_with_delta", None)
+                if callable(refresh_with_delta):
+                    try:
+                        _, structure_changed = refresh_with_delta()
+                    except Exception:
+                        structure_changed = False
+                else:
+                    refresh_projects = getattr(getattr(self, "_service", None), "refresh_projects", None)
+                    if callable(refresh_projects):
+                        try:
+                            res = refresh_projects()
+                        except Exception:
+                            structure_changed = False
+                        else:
+                            if isinstance(res, (tuple, list)) and len(res) == 2:
+                                _, structure_changed = res
+                            elif res:
+                                structure_changed = True
+                if structure_changed:
+                    try:
+                        self.model.reload()
+                    except Exception:
+                        pass
                 project_id = info.get("project_id")
                 if not project_id and info.get("last_project"):
                     p = self._service.registry.get_project_by_name(info["last_project"])
@@ -3018,23 +4484,28 @@ QToolTip QLabel {
                         lambda: self._audit_service.refresh_project(project_id),
                         on_success=lambda snap: self.model.update_audit_snapshot(project_id, snap),
                     )
-                    self._last_audit_generation = gen
-                else:
-                    self._last_audit_generation = gen
+                self._last_audit_generation = gen
+                self._last_audit_epoch = epoch
                 refresh_runs = True
             try:
-                dispatch_info = json.loads(self._dispatch_generation_path.read_text(encoding="utf-8"))
-                dispatch_gen = int(dispatch_info.get("generation", 0) or 0)
+                if self._dispatch_generation_path.exists():
+                    dispatch_info = json.loads(self._dispatch_generation_path.read_text(encoding="utf-8"))
+                    dispatch_gen = int(dispatch_info.get("generation", 0) or 0)
+                    dispatch_epoch = str(dispatch_info.get("epoch") or "")
+                else:
+                    dispatch_gen = 0
+                    dispatch_epoch = ""
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                dispatch_gen = self._last_dispatch_generation
-            if dispatch_gen > self._last_dispatch_generation:
+                dispatch_gen = 0
+                dispatch_epoch = "__corrupt__"
+            if dispatch_epoch != getattr(self, "_last_dispatch_epoch", "") or dispatch_gen > self._last_dispatch_generation:
                 self._last_dispatch_generation = dispatch_gen
+                self._last_dispatch_epoch = dispatch_epoch
                 refresh_runs = True
-            if refresh_runs:
-                self._refresh_audit_runs_async()
             self._generation_watch_paths()
+            return refresh_runs
         except Exception:
-            pass
+            return False
 
     def _on_temperature_tick(self):
         """In-memory temperature tick, then the freshness recompute off-thread.
@@ -3086,6 +4557,30 @@ QToolTip QLabel {
                 pass
         return _cb
 
+    def _pack_progress_run_active(self, key: str) -> None:
+        """GUI thread: register an outstanding pack run and arm the flush timer.
+
+        PERF-005: the 250 ms flush is meaningful only while a pack can emit
+        progress, so the first live run starts the timer and the timer is left
+        running while any run remains outstanding.
+        """
+        self._active_pack_runs.add(str(key))
+        if not self.pack_progress_timer.isActive():
+            self.pack_progress_timer.start()
+
+    def _pack_progress_run_settled(self, key: str) -> None:
+        """GUI thread: one pack run reached terminal; stop the timer when idle.
+
+        The caller flushes the final buffered snapshot BEFORE applying the
+        terminal model state (a terminal update drops that run's progress), so
+        nothing is left to drain here. When the last outstanding run settles,
+        the idle Project Room returns to zero periodic wakeups.
+        """
+        self._active_pack_runs.discard(str(key))
+        if self._active_pack_runs:
+            return
+        self.pack_progress_timer.stop()
+
     def _flush_pack_progress(self) -> None:
         """Drains the worker-thread progress buffer into the model on the GUI thread."""
         snapshot: list[tuple[str, int, int, int, str]] = []
@@ -3120,6 +4615,9 @@ QToolTip QLabel {
         self.statusBar().showMessage("✓ Settings saved successfully")
         self.tree.scheduleDelayedItemsLayout()
         self.tree.viewport().update()
+        # T-167: the auto-pack timer must follow its config even when nothing
+        # audit-relevant moved -- the early return below would skip it.
+        self._configure_auto_pack_timer()
         try:
             from audapack.config import load_config
             persisted = load_config()
@@ -3182,6 +4680,14 @@ QToolTip QLabel {
     def _on_refresh_all(self):
         """Explicit Refresh All action."""
         self._flash_status("\u25B6 REFRESH: Scanning all audits...", "#D4A840")
+        # CORE-002: an explicit structural refresh must first pull canonical
+        # registry state (external Bridge mutations) and rebuild the room, then
+        # refresh audit snapshots against the same project collection.
+        try:
+            self._service.refresh_projects()
+            self.model.reload()
+        except Exception:
+            pass
         self.task_runner.submit_coalesced(
             "audit:refresh_all",
             self._audit_service.refresh_all,

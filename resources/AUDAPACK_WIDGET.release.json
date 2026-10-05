@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "script": "AUDAPACK_WIDGET.user.js",
+  "sha256": "fc23fc674b734098966d68592c9ac2c2b3edacccfa07129d6c23b4cc5b1cbe12",
+  "version": "0.0.98"
+}

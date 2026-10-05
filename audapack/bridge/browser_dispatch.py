@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from audapack.bridge.state import GenerationStateCorruptionError
 from audapack.campaign import STATUS_CAMPAIGN_COMPLETE
 from audapack.config import cross_process_lock, get_state_dir
 
@@ -80,6 +81,12 @@ TERMINAL_ACK_WINDOW_SECONDS = 300.0
 PROFILE_AFFINITY_GRACE_SECONDS = 60.0
 QUEUE_BOUND = 200
 HISTORY_BOUND = 100
+#: PERF-003 (audit/10.md): the reload-dedup map is keyed by worker session, and
+#: worker sessions churn (every close/reopen/reload mints a new id). Retirement
+#: clears the matching entry, so this is a belt-and-braces ceiling: even if a
+#: future path forgot to retire, the map can never grow without bound. Ordered
+#: oldest-first, evicted on insert past the bound.
+RELOAD_ASK_BOUND = 512
 PRE_START_MAX_RETRIES = 5
 PRE_START_RETRY_BACKOFF_SECONDS = 5
 PRE_START_RETRY_BACKOFF_MAX = 120
@@ -260,6 +267,13 @@ class DispatchJob:
     conversation_id: str = ""
     start_receipt: str = ""
     error: str = ""
+    #: A worker-reported reason the run needs a human but is NOT over: the
+    #: assistant stopped mid-answer, the Core is still on screen, the campaign
+    #: is intact. `error` means the lane failed; this means it is held. It is
+    #: bounded, cleared by the next healthy report, and never drives a state
+    #: transition -- it is what the Project Room shows, so an interrupted wave
+    #: is visible in the lane instead of only inside one browser tab.
+    attention: str = ""
     result: str = ""
     final_handoff_path: str = ""
     final_handoff_sha256: str = ""
@@ -361,6 +375,10 @@ class BrowserDispatcher:
         self.jobs_file = self.state_dir / "jobs.json"
         self.generation_file = self.state_dir / "browser_dispatch_generation.json"
         self._generation = 0
+        #: W2-003: the recovery identity of the current notification stream.
+        #: Changing it tells consumers to resync and adopt the recovered
+        #: baseline even when the numeric counter is lower than what they saw.
+        self._generation_epoch = ""
         self._generation_context: dict[str, Any] = {}
         self._lock = threading.RLock()
         self._work_available = threading.Condition(self._lock)
@@ -388,16 +406,52 @@ class BrowserDispatcher:
         # `dispatch_gen > _last_dispatch_generation`, so a UI that had seen 2
         # ignored the recovery and every state change after it. Monotonic, per
         # restart, always.
-        self._generation = self._read_persisted_generation()
+        try:
+            self._generation, self._generation_epoch = self._read_persisted_generation_document()
+        except GenerationStateCorruptionError:
+            # W2-003: corrupt durable bytes are not a fresh counter. The first
+            # write quarantines them and starts a new epoch; construction must
+            # not fail on a recoverable notification-file defect.
+            self._generation = 0
+            self._generation_epoch = ""
         self._load_jobs()
         self._committed_jobs = self._job_state_snapshot()
 
-    def _read_persisted_generation(self) -> int:
+    def _read_persisted_generation_document(self) -> tuple[int, str]:
+        """Read (generation, epoch), distinguishing MISSING from CORRUPT.
+
+        W2-003/CORE-001: an existing-but-unreadable generation file raises
+        :class:`GenerationStateCorruptionError` rather than returning 0. The
+        caller either defers publication or performs an explicit epoch reset.
+        """
+        if not self.generation_file.exists():
+            return 0, ""
         try:
-            value = json.loads(self.generation_file.read_text(encoding="utf-8")).get("generation", 0)
-            return max(0, int(value))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return 0
+            raw = json.loads(self.generation_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise GenerationStateCorruptionError(
+                f"dispatch generation file {self.generation_file} is corrupt or unreadable: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise GenerationStateCorruptionError(
+                f"dispatch generation file {self.generation_file} is not a JSON object"
+            )
+        value = raw.get("generation")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise GenerationStateCorruptionError(
+                f"dispatch generation file {self.generation_file} has no valid non-negative generation"
+            )
+        return max(0, int(value)), str(raw.get("epoch") or "")
+
+    def _quarantine_generation_file(self) -> None:
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        target = self.generation_file.with_name(
+            f"{self.generation_file.name}.corrupt-{stamp}.json"
+        )
+        try:
+            self.generation_file.replace(target)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ #
     # persistence
@@ -519,10 +573,22 @@ class BrowserDispatcher:
             # W2-005: another process may have advanced the counter while this
             # one held its own value. Under the same lock the jobs write takes,
             # so a concurrent Bridge cannot regress it either.
-            self._generation = max(self._generation, self._read_persisted_generation()) + 1
+            # W2-003: an unreadable durable file cannot authorize a lower
+            # counter. Quarantine it and start a new epoch so the consumer
+            # resyncs. The authoritative jobs document already committed above.
+            try:
+                persisted, persisted_epoch = self._read_persisted_generation_document()
+                self._generation = max(self._generation, persisted) + 1
+                if not self._generation_epoch:
+                    self._generation_epoch = persisted_epoch or uuid.uuid4().hex
+            except GenerationStateCorruptionError:
+                self._quarantine_generation_file()
+                self._generation = 1
+                self._generation_epoch = uuid.uuid4().hex
             try:
                 _atomic_write_json(self.generation_file, {
                     "generation": self._generation,
+                    "epoch": self._generation_epoch,
                     **self._generation_context,
                     "updated_at": _now(),
                 })
@@ -557,9 +623,25 @@ class BrowserDispatcher:
             if now - w.last_seen_at > WORKER_TTL_SECONDS
         ]
         for wid in expired:
-            self._workers.pop(wid, None)
+            self._retire_worker(wid)
         self._expired_worker_count += len(expired)
         self._retire_duplicate_slots()
+
+    def _retire_worker(self, worker_id: str) -> None:
+        """The ONE authoritative worker-retirement helper (PERF-003).
+
+        Before this, every removal path popped ``_workers`` only, so the
+        auxiliary ``worker:<id>`` reload-dedup entry outlived the worker it
+        described. Worker ids identify browser sessions, so normal
+        close/reopen churn accumulated one immortal key per stale session ever
+        observed -- 5,000 unique sessions left 5,000 entries after every live
+        worker expired (audit/10.md PERF-003). Removal of the worker and its
+        reload-dedup state must be one atomic act; every retirement path
+        (expiry, offline, duplicate slot, capacity eviction, stale cleanup,
+        replacement, explicit retirement) routes through here.
+        """
+        self._workers.pop(worker_id, None)
+        self._widget_reload_asked.pop(f"worker:{worker_id}", None)
 
     def _retire_duplicate_slots(self) -> None:
         """One slot, one lane -- enforced continuously, not only on arrival.
@@ -593,7 +675,7 @@ class BrowserDispatcher:
                     continue
                 if other.campaign_run_id or self._worker_owns_live_job(other):
                     continue
-                self._workers.pop(other.worker_id, None)
+                self._retire_worker(other.worker_id)
 
     @staticmethod
     def _incoming_managed_slot(payload: dict[str, Any]) -> int:
@@ -640,7 +722,7 @@ class BrowserDispatcher:
                 # Old Widget builds ran inside ChatGPT's matching sentinel
                 # iframe. Purge any prior record before rejecting the poll so
                 # embedded documents can never consume a real tab slot.
-                self._workers.pop(wid, None)
+                self._retire_worker(wid)
                 raise DispatchError(
                     "ineligible_worker_context",
                     "embedded ChatGPT frames cannot register as browser workers",
@@ -658,7 +740,7 @@ class BrowserDispatcher:
                     and not other.campaign_run_id
                     and not self._worker_owns_live_job(other)
                 ]:
-                    self._workers.pop(stale.worker_id, None)
+                    self._retire_worker(stale.worker_id)
                 if len(self._live_managed_slots()) >= MAX_ACTIVE_WORKERS:
                     # Every lane is spoken for by a managed window. An idle
                     # personal tab already holding one is evicted here, not
@@ -673,7 +755,7 @@ class BrowserDispatcher:
                         and not self._worker_owns_live_job(other)
                         and other.state in {WORKER_FREE, WORKER_RESERVED}
                     ]:
-                        self._workers.pop(tab.worker_id, None)
+                        self._retire_worker(tab.worker_id)
             elif (
                 wid not in self._workers
                 and len(self._live_managed_slots()) >= MAX_ACTIVE_WORKERS
@@ -699,7 +781,7 @@ class BrowserDispatcher:
                 spare = [w for w in self._workers.values() if not self.worker_consumes_lane(w)]
                 if spare:
                     stalest = min(spare, key=lambda item: (item.last_seen_at, item.worker_id))
-                    self._workers.pop(stalest.worker_id, None)
+                    self._retire_worker(stalest.worker_id)
             if wid not in self._workers and len(lane_workers) >= MAX_ACTIVE_WORKERS:
                 incoming_supported = (
                     str(payload.get("widget_version") or "") == SUPPORTED_BROWSER_WIDGET_VERSION
@@ -724,7 +806,7 @@ class BrowserDispatcher:
                     ]
                     if yielding:
                         stalest = min(yielding, key=lambda item: (item.last_seen_at, item.worker_id))
-                        self._workers.pop(stalest.worker_id, None)
+                        self._retire_worker(stalest.worker_id)
                         lane_workers = [w for w in self._workers.values() if self.worker_consumes_lane(w)]
             if wid not in self._workers and len(lane_workers) >= MAX_ACTIVE_WORKERS:
                 replaceable = [
@@ -737,7 +819,7 @@ class BrowserDispatcher:
                 ]
                 if incoming_supported and replaceable:
                     oldest = min(replaceable, key=lambda item: (item.last_seen_at, item.worker_id))
-                    self._workers.pop(oldest.worker_id, None)
+                    self._retire_worker(oldest.worker_id)
                 else:
                     raise DispatchError(
                         "worker_limit",
@@ -788,9 +870,15 @@ class BrowserDispatcher:
                 record.managed_profile = True
             if payload.get("browser_name"):
                 record.meta["browser_name"] = str(payload.get("browser_name"))[:80]
+            # T-248: the widget reports the live ChatGPT composer shape on every
+            # heartbeat. It is the evidence the 2026-09-27 six-lane reproduction
+            # lacked: a build that moved its file input is now readable from the
+            # Bridge instead of guessed at from a screenshot. Structure only.
+            if payload.get("upload_topology"):
+                record.meta["upload_topology"] = str(payload.get("upload_topology"))[:400]
             record.last_seen_at = _now()
             if reported_state == WORKER_OFFLINE:
-                self._workers.pop(wid, None)
+                self._retire_worker(wid)
                 return record
             self._workers[wid] = record
 
@@ -801,6 +889,19 @@ class BrowserDispatcher:
                 if not (dispatch_id and lease_id):
                     raise DispatchError("invalid_lease", "dispatch_id and lease_id must be reported together")
                 job = self._jobs.get(dispatch_id)
+                if job is not None and job.state in TERMINAL_STATES:
+                    # The Bridge retired this dispatch, so the window's claim on
+                    # it is over -- but the widget never sees that: `owned_job`
+                    # stops naming a terminal job, so its only signal is the
+                    # lease it still reports, and it keeps answering RESERVED.
+                    # Live: dsp-c6763cc27a1242a9 was abandoned FAILED and
+                    # audapack-managed-1-1-944af8d3bphb1o stayed RESERVED with
+                    # page_eligible=false forever, with no honest way back
+                    # except killing the browser. BLOCKED is deliberately not
+                    # here: a blocked post-START run still has to reconcile
+                    # against this very lease.
+                    record.state = WORKER_FREE
+                    record.meta["reports_lease"] = False
                 try:
                     if job and self._is_recovery_block(job):
                         self.reconcile_job(dispatch_id, wid, lease_id, payload)
@@ -940,6 +1041,11 @@ class BrowserDispatcher:
             if self._widget_reload_asked.get(key) == required:
                 return False
             self._widget_reload_asked[key] = required
+            # PERF-003: immortals are what this map used to accumulate. Every
+            # retirement path clears its own key; this bound is the guard that
+            # no missed path can turn the dedup map into an unbounded leak.
+            while len(self._widget_reload_asked) > RELOAD_ASK_BOUND:
+                self._widget_reload_asked.pop(next(iter(self._widget_reload_asked)))
             return True
 
     def stale_widget_workers(self) -> int:
@@ -1374,9 +1480,19 @@ class BrowserDispatcher:
         W2-004 (audit/3.md): the fields were copied whenever present, which makes
         them a claim rather than proof. A path is only proof if the file is there,
         and a digest is only proof if the bytes produce it.
+
+        T-156 (audit/2.md): a readable artifact with NO declared digest is not
+        proof. Bytes nobody committed to can be truncated, foreign, or swapped
+        after the fact -- "the file exists" was the whole claim. The durable
+        campaign probe and the Bridge's own finalize path (which set the digest
+        themselves) are the paths that close a run; an unproven ACK still lands
+        on FINALIZING with the lane held.
         """
         raw_path = str(payload.get("final_handoff_path") or "").strip()
         if not raw_path:
+            return False
+        declared = str(payload.get("final_handoff_sha256") or "").strip().lower()
+        if not declared:
             return False
         candidate = Path(raw_path)
         try:
@@ -1385,11 +1501,6 @@ class BrowserDispatcher:
             data = candidate.read_bytes()
         except OSError:
             return False
-        declared = str(payload.get("final_handoff_sha256") or "").strip().lower()
-        if not declared:
-            # A real file with no digest is weak proof, but it is still a file
-            # the Bridge can read and reconcile against; the lane may close.
-            return True
         return hashlib.sha256(data).hexdigest() == declared
 
     def _require_owner(
@@ -1421,6 +1532,11 @@ class BrowserDispatcher:
             if job.start_receipt and job.start_receipt != start_receipt:
                 raise DispatchError("start_receipt_conflict", "START receipt cannot change within a dispatch")
             job.start_receipt = start_receipt
+        # An explicit empty string is the worker saying "I am healthy again",
+        # which is how a resolved interruption clears. An absent key means the
+        # worker said nothing and the current reason stands.
+        if "attention" in payload:
+            job.attention = str(payload.get("attention") or "").strip()[:120]
 
     def transition_job(
         self,
@@ -1449,6 +1565,24 @@ class BrowserDispatcher:
                 job.updated_at = now
                 self._persist_jobs()
                 return job
+
+            # Re-asserting the SAME START_PREPARED receipt once the fence is
+            # already crossed is a lost-response retry, not a backwards move.
+            # The widget asks for this durable ack immediately before its one
+            # irreversible Send click; a poll that had already advanced the
+            # dispatch to STARTED made the Bridge answer "cannot move STARTED
+            # -> START_PREPARED", and the widget read ok:false as "the fence
+            # refused" -- it stood down and the lane stayed pinned in STARTED
+            # with the Core never sent (dsp-731c7e06fc82469a, after a 409s
+            # bounded Send wait). BLOCKED is excluded on purpose: that lane is
+            # held for operator recovery, not for a click.
+            if to_state == JOB_START_PREPARED and job.state in (JOB_STARTED, JOB_AUDITING, JOB_FINALIZING):
+                if str((payload or {}).get("start_receipt") or "") == job.start_receipt:
+                    self._apply_transition_metadata(job, payload or {})
+                    job.updated_at = now
+                    job.lease_expires_at = now + LEASE_SECONDS
+                    self._persist_jobs()
+                    return job
 
             # Lease expiry before START_PREPARED may return to QUEUED (spec
             # section 11). After the boundary exactly-once forbids reassignment.
@@ -1567,13 +1701,23 @@ class BrowserDispatcher:
                 worker = self._workers.get(worker_id)
                 if worker:
                     worker.state = WORKER_BLOCKED
-                job.error = str(payload.get("error") or job.error)
+                # T-248: a structural pre-START refusal (an unsupported upload
+                # surface, ambiguous composer ownership) blocks ONCE with its
+                # exact reason. `error` keeps the short machine code and `detail`
+                # carries the bounded observation, so `last_error_code` stays
+                # comparable instead of holding a whole diagnostic blob.
+                code = str(payload.get("error") or job.last_error_code or job.error)
+                detail = str(payload.get("detail") or "").strip()
+                job.last_error_code = code
+                job.error = f"{code} | {detail}" if detail else code
             elif to_state == JOB_RETRYABLE:
                 worker = self._workers.get(worker_id)
                 if worker:
                     worker.state = WORKER_FREE
-                job.error = str(payload.get("error") or job.error)
-                job.last_error_code = str(payload.get("error") or job.error)
+                code = str(payload.get("error") or job.error)
+                detail = str(payload.get("detail") or "").strip()
+                job.error = f"{code} | {detail}" if detail else code
+                job.last_error_code = code
                 if job.retry_count >= PRE_START_MAX_RETRIES:
                     job.state = JOB_BLOCKED
                     job.retry_count += 1
@@ -1782,6 +1926,16 @@ class BrowserDispatcher:
         Reproduced: project_id=alpha/name=beta closing against a live job with
         project_id=beta returned 2. A canonical id now matches ids only; the
         name is a fallback for a legacy record that carries no id at all.
+
+        T-160 closed the caller-has-id direction but left the `else
+        job_id == wanted_name` branch in place, so a caller holding NO id still
+        compared a job's canonical ID against its own NAME -- the same defect
+        the W2-003 note describes, on the other side of the comparison. Two
+        production paths reach it: reconcile_finished_campaigns passes
+        job.project_id, empty for legacy records, and server.py passes the
+        resolved id only when the submitted name resolves in the live
+        registry. Reproduced: a name-only close of project "beta" against a
+        live job id=beta closed 2. Neither domain now borrows the other.
         """
         wanted_id = str(project_id or "").strip().lower()
         wanted_name = str(project_name or "").strip().lower()
@@ -1791,9 +1945,15 @@ class BrowserDispatcher:
         def _is_target(job: DispatchJob) -> bool:
             job_id = str(job.project_id or "").strip().lower()
             if job_id:
-                # Both sides have a canonical id: that is the whole comparison.
-                # Without an id on our side, the name is all there is to go on.
-                return job_id == wanted_id if wanted_id else job_id == wanted_name
+                # A canonical id is only ever compared against a canonical id.
+                # Falling back to our display NAME here is the cross-domain
+                # collision W2-003 closed on the id side and left open on the
+                # no-id side (saitest TEST-001): a caller holding no id must
+                # not reach a job whose id merely happens to equal our name.
+                return bool(wanted_id) and job_id == wanted_id
+            # A legacy record carries no id at all, so the name is the only
+            # thing there is to go on -- and it stays name against name,
+            # one identity domain.
             return bool(wanted_name) and str(job.project_name or "").strip().lower() == wanted_name
 
         with self._lock:
@@ -2061,10 +2221,19 @@ class BrowserDispatcher:
                     "pre-start BLOCKED dispatch can be cancelled safely; abandon is for post-start recovery",
                 )
             note = str(reason or "operator abandoned a stuck blocked run").strip()[:300]
+            released = self._workers.get(job.assigned_worker_id or "")
             job.state = JOB_FAILED
             job.assigned_worker_id = ""
             job.lease_id = ""
             job.lease_expires_at = 0.0
+            if released:
+                # The run is over, so the window's reservation is over with it.
+                # Leaving it RESERVED kept the only clean worker off the fleet
+                # forever: dsp-731c7e06fc82469a reached FAILED while
+                # audapack-managed-1-1-38cc4539nicy9c stayed RESERVED with
+                # page_eligible=false, and START AUDIT had nothing to claim.
+                released.state = WORKER_FREE
+                released.campaign_run_id = ""
             job.last_error_code = "operator_abandoned"
             job.error = (
                 f"{note} (was BLOCKED: {job.error})" if job.error else note

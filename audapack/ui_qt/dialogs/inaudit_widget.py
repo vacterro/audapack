@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 import webbrowser
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from audapack.config import load_config
 from audapack.inaudit import (
+    TRACKING_REPAIR_UNPERSISTED,
     delete_inaudit_layer,
     ensure_next_layer,
     get_active_inaudit_path,
@@ -33,16 +35,27 @@ from audapack.inaudit import (
     inaudit_dir,
     last_user_layer,
     list_inaudit_layers,
+    record_user_layer,
+    recover_inaudit_state,
     rename_inaudit_layer,
     reorder_inaudit_layers,
     set_inaudit_selected,
     validate_inaudit_path,
 )
 from audapack.inaudit_capture import InauditCaptureError, InauditCaptureStore
+from audapack.inaudit_commit import (
+    CHANGED_EXTERNALLY,
+    COMMITTED,
+    MISSING_OR_CONSUMED,
+    commit_existing_layer,
+    recover_inaudit_dir_commits,
+)
 from audapack.models import Project
 from audapack.saipen_transport import is_managed
 from audapack.ui_qt.task_runner import TaskRunner
 from audapack.ui_qt.theme.golden_default import GoldenDefault
+
+logger = logging.getLogger(__name__)
 
 
 class _InauditLayerList(QListWidget):
@@ -111,6 +124,17 @@ class InauditWidget(QWidget):
         self._dirty = False
         self._editor_path: Path | None = None
         self._editor_bytes: bytes | None = None
+        #: Why the last editor load could not read a real layer. A failure here
+        #: is NOT the same fact as "this project has no layer yet": Save must
+        #: refuse in the first case instead of inventing a new target.
+        self._layer_read_error: str = ""
+        # T-174: first-class managed-draft state. A managed draft is NOT a
+        # fake audit/N.md: SAIPEN owns layer allocation, so the draft exists
+        # only as editor text plus ONE stable capture UUID (the producer
+        # operation id T-158 idempotency relies on) until Save delivers it.
+        self.managed_draft_project_id: str | None = None
+        self.managed_draft_capture_id: str | None = None
+        self.managed_draft_delivery_pending = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
@@ -655,14 +679,142 @@ class InauditWidget(QWidget):
         self.btn_archive_capture.setEnabled(has and not archived)
         self.btn_delete_capture.setEnabled(has)
 
-    def set_project(self, project: Project | None):
+    def set_project(self, project: Project | None) -> bool:
+        """Bind the widget to ``project``. False when the binding was refused
+        (a dirty draft belongs to another project) -- callers MUST propagate
+        this, or a refused bind lets [+]/[edit] run against the previously
+        bound project (T-174 I5)."""
         if self._dirty and project != self._project:
             self.status.setText("Draft retained. Save or Reload before switching projects.")
-            return
+            return False
+        same = project == self._project
+        if not same:
+            # A real project switch drops the draft binding; re-binding the
+            # SAME project (e.g. the Project Room row [++] path) must never
+            # clear an in-flight managed draft (T-175 defect 5).
+            self._clear_managed_draft()
         self._project = project
+        if project is not None:
+            # CORE-001/CORE-002/CORE-003 bounded recovery boundary: resolve
+            # interrupted saves, pending reorder journals and tracker repair
+            # intents once per project bind, before the layer is exposed.
+            try:
+                recover_inaudit_state(project)
+            except Exception:
+                logger.warning("inaudit recovery at bind failed", exc_info=True)
         self._rewatch()
-        self.refresh()
+        if not same or not self.managed_draft_project_id:
+            self.refresh()
         self.refresh_inbox()
+        self._update_actions()
+        return True
+
+    def _clear_managed_draft(self):
+        self.managed_draft_project_id = None
+        self.managed_draft_capture_id = None
+        self.managed_draft_delivery_pending = False
+
+    def _managed_active(self) -> bool:
+        return self._project is not None and bool(
+            getattr(self._project, "source_path", None)
+        ) and is_managed(self._project.source_path)
+
+    def _update_managed_action_state(self):
+        """Advertise only operations the backend will actually perform (T-174 J).
+
+        Managed projects: SAIPEN owns layer numbers, so drag reorder is
+        disabled rather than advertised-then-refused. Unmanaged: unchanged.
+        """
+        managed = self._managed_active()
+        self.btn_plus.setToolTip(
+            "Create a manual audit draft; Save delivers it through SAIPEN"
+            if managed
+            else "Create next numbered layer"
+        )
+        if managed:
+            self.list.setDragEnabled(False)
+            self.list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+            self.list.setDefaultDropAction(Qt.DropAction.IgnoreAction)
+        else:
+            self.list.setDragEnabled(True)
+            self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+            self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def _action_state(self) -> str:
+        """The one deterministic derivation every layer control reads (T-175).
+
+        Every state of the widget is named here; _update_actions maps them onto
+        buttons instead of a dozen scattered setEnabled calls.
+        """
+        if self._project is None:
+            return "NO_PROJECT"
+        if self.managed_draft_delivery_pending or self._task_runner.is_running("inaudit:assign"):
+            return "ASSIGNMENT_PENDING"
+        if self.managed_draft_project_id:
+            return "MANAGED_DRAFT_DIRTY" if self._dirty else "MANAGED_DRAFT_IDLE"
+        if self._layer_read_error:
+            return "LAYER_UNREADABLE"
+        if self._active_path() is None:
+            # The bottom textbox IS the manual audit editor, so this state is a
+            # real one, not a dead end: Save here writes the FIRST canonical
+            # audit. It only has to be distinguishable from "a layer is open".
+            return "NO_LAYER"
+        return "EXISTING_LAYER_DIRTY" if self._dirty else "EXISTING_LAYER_CLEAN"
+
+    def _update_actions(self):
+        """Apply the derived action state to every control (T-175).
+
+        MANAGED_DRAFT_*: the draft has NO physical audit/N.md, so layer-bound
+        actions (Open / IA Copy / GG / CC / Rename / Delete / reorder) must be
+        disabled -- they would otherwise operate on a previously selected old
+        layer behind the draft. Save + Reload(discard) + editor stay live.
+        ASSIGNMENT_PENDING: the delivery snapshot is immutable -- editor
+        read-only, Save/Reload/[+] frozen until the worker finishes.
+        NO_LAYER: the editor is the first audit's text. Save stays live and
+        writes it; only the layer-bound actions drop, because there is nothing
+        to open, rename or delete yet.
+        LAYER_UNREADABLE: Save is dead here on purpose. The editor is showing a
+        layer we could NOT read, so committing would write to a target nobody
+        has verified.
+        """
+        state = self._action_state()
+        pending = state == "ASSIGNMENT_PENDING"
+        layer_bound = state in ("EXISTING_LAYER_CLEAN", "EXISTING_LAYER_DIRTY")
+        # editor
+        self.editor.setEnabled(self._project is not None)
+        self.editor.setReadOnly(pending)
+        # save / reload
+        self.btn_save.setEnabled(
+            state in (
+                "EXISTING_LAYER_CLEAN",
+                "EXISTING_LAYER_DIRTY",
+                "MANAGED_DRAFT_IDLE",
+                "MANAGED_DRAFT_DIRTY",
+                "NO_LAYER",
+            )
+        )
+        self.btn_reload.setEnabled(
+            state in ("EXISTING_LAYER_CLEAN", "EXISTING_LAYER_DIRTY", "MANAGED_DRAFT_IDLE", "MANAGED_DRAFT_DIRTY")
+        )
+        # layer-bound actions need a REAL physical active layer
+        physical = layer_bound and self._active_path() is not None
+        self.btn_open.setEnabled(physical)
+        self.btn_ia.setEnabled(physical)
+        self.btn_gg.setEnabled(physical)
+        self.btn_cc.setEnabled(physical)
+        self.btn_rename.setEnabled(physical and not self._managed_active())
+        self.btn_delete.setEnabled(physical)
+        # navigation / creation
+        self.btn_plus.setEnabled(
+            self._project is not None and not pending and not self.managed_draft_project_id
+        )
+        self.btn_refresh.setEnabled(True)
+        self.btn_rename.setToolTip(
+            "SAIPEN owns layer numbers; rename the capture title in Inbox"
+            if self._managed_active()
+            else "Move this layer to a different free number (never overwrites)"
+        )
+        self._update_managed_action_state()
 
     def _rewatch(self):
         try:
@@ -679,6 +831,12 @@ class InauditWidget(QWidget):
         if d is None:
             return
         self.header.setText(f"INAUDIT — {self._project.display_name} · {d}")
+        try:
+            # CORE-001: resolve any interrupted Save journal once at the
+            # project-layer boundary before the layer is exposed as healthy.
+            recover_inaudit_dir_commits(d)
+        except Exception:
+            pass
         try:
             self._watcher.addPath(str(Path(self._project.source_path).resolve()))
             if d.exists():
@@ -699,6 +857,21 @@ class InauditWidget(QWidget):
             self.list.clear()
             self.editor.clear()
             self._dirty = False
+            self._update_actions()
+            return
+        if self.managed_draft_project_id:
+            # A managed draft owns the editor; a filesystem refresh must not
+            # silently clear it. Re-render the list only.
+            layers = list_inaudit_layers(self._project)
+            self.list.blockSignals(True)
+            self.list.clear()
+            for lay in layers:
+                empty = "  EMPTY" if lay.size_bytes == 0 else ""
+                item = QListWidgetItem(f"[{lay.number}]  {lay.number}.md    {lay.size_str}{empty}")
+                item.setData(Qt.ItemDataRole.UserRole, lay.number)
+                self.list.addItem(item)
+            self.list.blockSignals(False)
+            self._rewatch()
             self._update_actions()
             return
         layers = list_inaudit_layers(self._project)
@@ -754,6 +927,24 @@ class InauditWidget(QWidget):
         item = self.list.item(row)
         if not item:
             return
+        if self._dirty:
+            # T-174 I3: a dirty editor must NEVER be silently replaced by
+            # selecting another row. Keep the text, the bound layer/draft and
+            # restore the visible selection to it.
+            keep = None
+            if self._editor_path is not None:
+                keep = self._editor_path.stem
+            if keep is None and self.managed_draft_project_id:
+                keep = None  # draft: restore nothing on disk, just the row
+            if keep is not None:
+                for r in range(self.list.count()):
+                    if str(self.list.item(r).data(Qt.ItemDataRole.UserRole)) == keep:
+                        self.list.blockSignals(True)
+                        self.list.setCurrentRow(r)
+                        self.list.blockSignals(False)
+                        break
+            self.status.setText("Unsaved edits — Save or Reload before switching layers")
+            return
         num = item.data(Qt.ItemDataRole.UserRole)
         set_inaudit_selected(self._project, int(num) if num else None)
         self._load_editor()
@@ -771,6 +962,7 @@ class InauditWidget(QWidget):
     def _load_editor(self):
         self._editor_path = None
         self._editor_bytes = None
+        self._layer_read_error = ""
         if self._project is None:
             self.editor.clear()
             self._dirty = False
@@ -788,8 +980,14 @@ class InauditWidget(QWidget):
             self._editor_bytes = p.read_bytes()
             text = self._editor_bytes.decode("utf-8")
             self._editor_path = p
-        except Exception:
+        except Exception as exc:
+            # A layer we could not read is not "no layer". Blanking the editor
+            # and carrying on is how a save lands on the wrong file, so the
+            # failure is kept and reported instead of swallowed.
             text = ""
+            self._editor_bytes = None
+            self._layer_read_error = f"{p.name} could not be read: {exc}"
+            self.status.setText(f"{self._layer_read_error} — Reload to try again")
         self.editor.blockSignals(True)
         self.editor.setPlainText(text)
         self.editor.blockSignals(False)
@@ -802,32 +1000,303 @@ class InauditWidget(QWidget):
 
     def _on_save(self):
         if self._project is None:
+            self.status.setText("Save refused: select a project first")
+            return
+        if self.managed_draft_project_id:
+            self._save_managed_draft()
             return
         p = self._editor_path
         if p is None:
+            # No layer is bound. That is a real state with a real meaning here:
+            # the operator is writing the FIRST canonical audit for this
+            # project. Returning silently is what made Save look broken.
+            self._save_as_first_layer()
             return
-        try:
-            # Open an existing file: a consume racing Save must never recreate it.
-            try:
-                stream = p.open("r+b")
-            except FileNotFoundError:
-                self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
-                return
-            with stream:
-                if stream.read() != self._editor_bytes:
-                    self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
-                    return
-                stream.seek(0)
-                stream.write(self.editor.toPlainText().encode("utf-8"))
-                stream.truncate()
+        new_bytes = self.editor.toPlainText().encode("utf-8")
+        # CORE-001: durability lives in the framework-neutral primitive, not
+        # here. It guarantees exact old-or-new canonical bytes after any
+        # failure and never recreates a consumed layer.
+        res = commit_existing_layer(p, self._editor_bytes or b"", new_bytes)
+        if res.outcome == COMMITTED:
+            self._editor_bytes = res.committed_bytes if res.committed_bytes is not None else new_bytes
             self._dirty = False
             self.lbl_dirty.setText(f"Saved {p.name}")
             self.status.setText(f"Saved {p.name}")
             self.refresh()
+            return
+        if res.outcome == MISSING_OR_CONSUMED:
+            self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
+            return
+        if res.outcome == CHANGED_EXTERNALLY:
+            self.status.setText("Save refused: layer changed or was consumed. Copy your draft, then Reload.")
+            return
+        # IO_FAILED / RECOVERY_REQUIRED: draft stays dirty and preserved.
+        self.status.setText(f"Save failed: {res.detail} — draft retained, try again")
+
+    def _save_as_first_layer(self):
+        """Save with no layer bound means: create this project's first audit.
+
+        Two paths, both canonical. A managed project gets a draft IDENTITY
+        adopted around the text that is already typed -- never a fresh blank
+        editor -- and then delivers through CaptureStore -> assign -> SAIPEN
+        enqueue, so SAIPEN still owns layer numbering and the T-175 stable
+        capture UUID survives every retry. An unmanaged project takes the next
+        legal number from the allocator and commits the exact bytes through the
+        same durable primitive an existing layer uses.
+
+        Refusals are visible: an unreadable layer is not "no layer", and an
+        empty editor is not an instruction to create an empty file.
+        """
+        if self._layer_read_error:
+            self.status.setText(
+                f"Save refused: {self._layer_read_error} — Reload to try again"
+            )
+            return
+        text = self.editor.toPlainText()
+        if not text.strip():
+            self.status.setText("Nothing to save")
+            return
+        if self._managed_active():
+            self._adopt_managed_draft()
+            self._save_managed_draft()
+            return
+        try:
+            created = ensure_next_layer(self._project)
         except Exception as exc:
-            self.status.setText(f"Save failed: {exc}")
+            self.status.setText(f"Save refused: could not create the first layer — {exc}")
+            return
+        new_bytes = text.encode("utf-8")
+        res = commit_existing_layer(created, b"", new_bytes)
+        if res.outcome == COMMITTED:
+            self._editor_path = created
+            self._editor_bytes = res.committed_bytes if res.committed_bytes is not None else new_bytes
+            self._dirty = False
+            self.lbl_dirty.setText(f"Saved {created.name}")
+            self.status.setText(f"Created and saved {created.name} as the first audit for this project")
+            self.refresh()
+            return
+        self.status.setText(f"Save failed: {res.detail} — text retained, try again")
+
+    # ------------------------------------------------- managed draft (T-174)
+
+    def _adopt_managed_draft(self) -> None:
+        """Give this editor a managed-draft identity, keeping the text in it.
+
+        Split from ``_start_managed_draft`` because [+] starts a draft around an
+        EMPTY editor, while Save-on-first-audit adopts one around text the
+        operator already wrote. Both allocate ONE stable capture UUID, reused
+        for every retry -- the producer operation id T-158 idempotency relies on.
+        """
+        self.managed_draft_project_id = self._project.id
+        self.managed_draft_capture_id = str(uuid.uuid4())
+        self.managed_draft_delivery_pending = False
+        self._editor_path = None
+        self._editor_bytes = None
+        self._layer_read_error = ""
+        self.mode_tabs.setCurrentWidget(self.layers_page)
+        self._update_actions()
+
+    def _start_managed_draft(self):
+        """Enter the managed-draft state: the editor becomes the draft surface.
+
+        No audit/N.md is created, no layer number chosen, no ensure_next_layer
+        call, no enqueue yet. ONE stable capture UUID is allocated here and
+        reused for every Save retry -- the producer operation id is part of
+        T-158 idempotency.
+        """
+        self._adopt_managed_draft()
+        self.editor.blockSignals(True)
+        self.editor.setPlainText("")
+        self.editor.blockSignals(False)
+        self._dirty = False
+        self.lbl_dirty.setText("New managed audit draft")
+        self.status.setText("New managed audit draft — type the audit, then Save")
+        self.mode_tabs.setCurrentWidget(self.layers_page)
+        # Derive the whole control surface from the new state: layer-bound
+        # actions must drop immediately so no old selected layer masquerades
+        # behind the draft (T-175 defect 3).
+        self._update_actions()
+        self.editor.setFocus()
+
+    def _save_managed_draft(self):
+        """Deliver the managed draft through the canonical store path (T-174 D/E/F).
+
+        Text is snapshotted on the GUI thread; capture + canonical SAIPEN
+        enqueue run on the TaskRunner. The draft capture UUID is stable, so
+        capture() stays idempotent and _assign_managed() resolves the SAME
+        SAIPEN operation on retry -- a failed delivery can never produce a
+        second layer. A failed delivery keeps the draft recoverable.
+
+        T-175: the shared ``inaudit:assign`` lane is exclusive at the
+        workflow boundary -- a managed Save refuses while ANY assignment is
+        active (Inbox or draft) instead of superseding the running TaskRunner
+        generation, and the editor becomes read-only for the delivery's
+        lifetime so the snapshot cannot drift under the worker.
+        """
+        if self._task_runner.is_running("inaudit:assign"):
+            self.status.setText("Audit delivery is already in progress")
+            return
+        if self.managed_draft_delivery_pending:
+            self.status.setText("Managed audit delivery in progress")
+            return
+        text = self.editor.toPlainText()
+        if not text.strip():
+            self.status.setText("Audit text is empty")
+            return
+        capture_id = self.managed_draft_capture_id
+        if not capture_id:
+            self.status.setText("Managed draft lost its operation id — press [+] to start a new draft")
+            return
+        project_id = self.managed_draft_project_id
+        project = next((p for p in self._projects() if p.id == project_id), None)
+        if project is None:
+            self.status.setText("Managed draft's project is no longer registered")
+            return
+        projects = self._projects()
+        self.managed_draft_delivery_pending = True
+        self.editor.setReadOnly(True)
+        self.status.setText("Delivering managed audit through SAIPEN...")
+
+        def _deliver():
+            self._capture_store.capture(
+                {
+                    "capture_id": capture_id,
+                    "text": text,
+                    "capture_kind": "audit",
+                    "source": "desktop",
+                    "source_title": "Desktop manual audit",
+                    "project_hints": [project_id],
+                },
+                projects,
+            )
+            return self._capture_store.assign(capture_id, project_id, projects)
+
+        def done(result):
+            self._managed_delivery_finished(result, project_id, text)
+
+        def failed(error):
+            self.managed_draft_delivery_pending = False
+            self.editor.setReadOnly(False)
+            self._update_actions()
+            self.status.setText(f"Managed delivery failed: {error}. Draft retained — press Save to retry.")
+
+        self._task_runner.submit("inaudit:assign", _deliver, on_success=done, on_error=failed)
+        self._update_actions()
+
+    def _managed_delivery_finished(self, result, project_id, text):
+        """Managed delivery completion (CORE-002 C5).
+
+        Once the durable SAIPEN assignment is proven (layer read back), the
+        draft is complete: bind the assigned path, mark the editor committed,
+        clear delivery pending, restore mutability and clear draft identity
+        BEFORE the secondary tracker attempt. A tracker failure must never
+        escape through TaskRunner on_success and leave the editor wedged
+        read-only with delivery pending, and must never re-enqueue.
+        """
+        try:
+            self._managed_delivery_finish_impl(result, project_id, text)
+        except Exception as exc:  # noqa: BLE001 -- never wedge the draft state
+            # Delivery itself already committed durably; only the callback
+            # state is at risk. Restore it, never re-enqueue.
+            self.managed_draft_delivery_pending = False
+            self.editor.setReadOnly(False)
+            self._clear_managed_draft()
+            self._update_actions()
+            self.status.setText(f"Delivery completed; callback error: {exc}")
+            logger.warning("managed delivery callback failed", exc_info=True)
+
+    def _managed_delivery_finish_impl(self, result, project_id, text):
+        # T-175 defect 6: the project may have been removed from the registry
+        # while the worker was running. Never dereference None, never retry a
+        # durable enqueue, never bind the layer to a different project: report
+        # completed-but-unregistered and clear the busy state safely.
+        project = next((p for p in self._projects() if p.id == project_id), None)
+        assigned = Path(str(result["assigned_path"]))
+        if project is None or not project.source_path:
+            self.managed_draft_delivery_pending = False
+            self.editor.setReadOnly(False)
+            self._clear_managed_draft()
+            self._update_actions()
+            self.status.setText(
+                f"Delivery completed, but project is no longer registered; assigned path: {assigned}"
+            )
+            return
+        # Validate the SAIPEN-returned path is a canonical numbered layer of
+        # this project's audit directory before ever treating it as ours.
+        audit_dir = Path(project.source_path) / "audit"
+        resolved = assigned.resolve()
+        number = None
+        if resolved.parent == audit_dir.resolve() and resolved.suffix == ".md" and resolved.stem.isdigit():
+            number = int(resolved.stem)
+        if number is None:
+            self.managed_draft_delivery_pending = False
+            self.editor.setReadOnly(False)
+            self._update_actions()
+            self.status.setText(
+                f"Managed delivery returned an unexpected path ({assigned.name}) — draft retained"
+            )
+            return
+        # Bind the editor to the REAL assigned layer before any state clears,
+        # so durability is proven before the draft state is dropped.
+        try:
+            self._editor_bytes = resolved.read_bytes()
+            delivered = self._editor_bytes.decode("utf-8")
+        except OSError as exc:
+            self.managed_draft_delivery_pending = False
+            self.editor.setReadOnly(False)
+            self._update_actions()
+            self.status.setText(f"Managed delivery could not be read back: {exc}. Draft retained")
+            return
+        self._editor_path = resolved
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(delivered)
+        self.editor.blockSignals(False)
+        self._dirty = False
+        self.lbl_dirty.setText(str(resolved.name))
+        # Delivery is DONE: clear pending, restore mutability, drop the draft
+        # identity BEFORE the secondary tracker attempt (CORE-002 C5).
+        self._clear_managed_draft()
+        self.managed_draft_delivery_pending = False
+        self.editor.setReadOnly(False)
+        self._update_actions()
+        # Only the explicit desktop managed-draft path marks the layer
+        # user-created; ordinary Inbox/widget assignments never do (T-174 G).
+        # Secondary: a failure here is a warning + repair intent, never a
+        # re-enqueue and never a wedge.
+        track_warning = record_user_layer(project, number)
+        if track_warning == TRACKING_REPAIR_UNPERSISTED:
+            self.status.setText(f"Created {resolved.name} via SAIPEN — WARNING: {track_warning}")
+        elif track_warning:
+            self.status.setText(f"Created {resolved.name} via SAIPEN — {track_warning}")
+        self.refresh()
+        for row in range(self.list.count()):
+            if self.list.item(row).data(Qt.ItemDataRole.UserRole) == number:
+                self.list.setCurrentRow(row)
+                break
+        if not track_warning:
+            self.status.setText(f"Created {resolved.name} via SAIPEN")
+        self.editor.setFocus()
+        try:
+            if self._on_changed_cb:
+                self._on_changed_cb(project)
+        except Exception:
+            pass
 
     def _on_reload(self):
+        if self.managed_draft_delivery_pending:
+            # T-175 defect 2: Reload during delivery would clear the draft
+            # UUID/state the async callback still owns. No mutation while the
+            # worker is live.
+            self.status.setText("Managed audit delivery is still in progress")
+            return
+        if self.managed_draft_project_id:
+            # Explicit draft reset: no filesystem mutation, the capture UUID
+            # and draft state are dropped and the editor returns to the
+            # project's (empty or existing) layer view.
+            self._clear_managed_draft()
+            self._load_editor()
+            self.status.setText("Managed draft discarded")
+            return
         self._load_editor()
         self.status.setText("Reloaded from disk")
 
@@ -891,16 +1360,46 @@ class InauditWidget(QWidget):
         The bottom textbox IS where a manual audit is written: one [+], one
         new layer, the caret already in the box. No popup asks for the text
         first -- the operator types straight into the editor and presses Save.
+
+        T-174: on a SAIPEN-managed project the backend guard stays (SAIPEN
+        owns layer allocation), so [+] starts a managed DRAFT instead: the
+        editor becomes the draft surface and Save delivers through the
+        canonical capture -> SAIPEN enqueue path.
         """
         if self._project is None:
             self.status.setText("Select a project first")
             return
+        if self._task_runner.is_running("inaudit:assign"):
+            # T-175 defect 5: a disabled local button is not an invariant --
+            # the Project Room row [+] reaches this method directly, and a new
+            # draft must never start while a canonical assignment owns the
+            # shared inaudit:assign lane.
+            self.status.setText("Audit delivery is already in progress")
+            return
+        if self._dirty:
+            # T-174 I1: refuse BEFORE any filesystem/capture mutation. The old
+            # behavior created an empty layer, then failed the switch on the
+            # dirty editor -- a physical file the operator never asked for.
+            self.status.setText("Unsaved edits — Save or Reload before creating another layer")
+            return
+        if self.managed_draft_delivery_pending:
+            self.status.setText("Managed audit delivery in progress")
+            return
         self.mode_tabs.setCurrentWidget(self.layers_page)
+        if self.managed_draft_project_id:
+            # A draft already exists: focus it rather than starting a second one.
+            self.editor.setFocus()
+            return
+        if self._managed_active():
+            self._start_managed_draft()
+            return
         try:
             p = ensure_next_layer(self._project)
         except Exception as exc:
             self.status.setText(f"Create failed: {exc}")
             return
+        # CORE-002: the layer physically exists; a tracker failure is only a
+        # repair-pending note, never a false "Create failed".
         self.status.setText(f"Created {p.name} — type the audit below, then Save")
         self.refresh()
         # focus new row
@@ -919,6 +1418,11 @@ class InauditWidget(QWidget):
         """
         if self._project is None:
             self.status.setText("Select a project first")
+            return
+        if self._dirty:
+            # T-174 I2: renaming moves the physical layer; with the editor
+            # still pointing at the old path the next Save would refuse.
+            self.status.setText("Unsaved edits — Save or Reload before renaming")
             return
         item = self.list.currentItem()
         if item is None:
@@ -977,7 +1481,11 @@ class InauditWidget(QWidget):
         number = rows.pop(source_row)
         target_row = max(0, min(target_row, len(rows)))
         rows.insert(target_row, number)
-        reason = reorder_inaudit_layers(self._project, rows)
+        # CORE-003 D7: ONE stable operation identity per drop gesture. The
+        # same id replays as already-committed success; a new drag gesture
+        # generates a new id and is a real new operation.
+        operation_id = str(uuid.uuid4())
+        reason = reorder_inaudit_layers(self._project, rows, operation_id=operation_id)
         if reason:
             self.status.setText(f"Reorder failed: {reason}")
             self.refresh()
@@ -997,6 +1505,11 @@ class InauditWidget(QWidget):
         operator has never made one, so the caller can say so instead of
         silently landing on a widget-delivered layer."""
         if self._project is None:
+            return False
+        if self._dirty:
+            # T-174 I4: refresh() would refuse on the dirty editor while the
+            # selection could still move; no layer switch while dirty.
+            self.status.setText("Unsaved edits — Save or Reload before switching layers")
             return False
         self.refresh()
         number = last_user_layer(self._project)
@@ -1054,15 +1567,3 @@ class InauditWidget(QWidget):
                     w.model.refresh_inaudit(self._project.id)
         except Exception:
             pass
-
-    def _update_actions(self):
-        has = self._active_path() is not None
-        for b in (self.btn_open, self.btn_ia, self.btn_gg, self.btn_cc, self.btn_save, self.btn_reload):
-            b.setEnabled(has if b not in (self.btn_plus, self.btn_refresh) else True)
-        self.btn_plus.setEnabled(self._project is not None and not self._task_runner.is_running("inaudit:assign"))
-        managed = self._project is not None and is_managed(self._project.source_path)
-        self.btn_rename.setEnabled(has and not managed)
-        self.btn_rename.setToolTip("SAIPEN owns layer numbers; rename the capture title in Inbox" if managed
-                                   else "Move this layer to a different free number (never overwrites)")
-        self.btn_delete.setEnabled(has)
-        self.editor.setEnabled(has or self._project is not None)

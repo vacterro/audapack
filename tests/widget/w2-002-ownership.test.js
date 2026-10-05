@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { setup, composerFixture, leaseFor } = require('./helpers');
+const { setup, composerFixture, installAcceptedSend, leaseFor } = require('./helpers');
 
 const KEY = 'c:abc123';
 
@@ -89,7 +89,7 @@ test('W2-002: lost lease invalidates the guard even with matching composer', asy
 
 test('W2-002: executePreset sends automatically when ownership holds', async () => {
   const { h, api } = setup();
-  composerFixture(h);
+  const fixture = installAcceptedSend(h, composerFixture(h));
   api.autoRuntime.enabled = true;
   await withToken(h, api, async token => {
     const guard = api.createAutoSendOwnershipGuard(token, api.chatGPTComposerStateSnapshot());
@@ -101,12 +101,18 @@ test('W2-002: executePreset sends automatically when ownership holds', async () 
     await h.settle();
     const result = await promise;
     assert.deepStrictEqual({ ok: result.ok, sent: result.sent }, { ok: true, sent: true });
+    assert.strictEqual(
+      fixture._submitted.includes('ACB_CHAIN_RECEIPT: r1'),
+      true,
+      'the submitted payload carried the machine receipt'
+    );
+    assert.strictEqual(fixture.send._clickCount, 1, 'exactly one Send click');
   });
 });
 
-test('W2-002: executePreset writes the receipt into the composer', async () => {
+test('W2-002: executePreset submits the receipt with the composed payload', async () => {
   const { h, api } = setup();
-  const { input } = composerFixture(h);
+  const fixture = installAcceptedSend(h, composerFixture(h));
   api.autoRuntime.enabled = true;
   await withToken(h, api, async token => {
     const guard = api.createAutoSendOwnershipGuard(token, api.chatGPTComposerStateSnapshot());
@@ -118,8 +124,11 @@ test('W2-002: executePreset writes the receipt into the composer', async () => {
     await h.settle();
     const result = await promise;
     assert.strictEqual(result.sent, true);
-    assert.ok(api.composerPlainText(input).includes('AUDIT SECOND WAVE'));
-    assert.ok(api.composerPlainText(input).includes('ACB_CHAIN_RECEIPT'));
+    // The accepted submission consumes the composer; what proves the receipt
+    // was written is the payload ChatGPT received, not what remains behind.
+    assert.ok(fixture._submitted.includes('AUDIT SECOND WAVE'));
+    assert.ok(fixture._submitted.includes('ACB_CHAIN_RECEIPT: r2'));
+    assert.strictEqual(api.composerPlainText(fixture.input), '', 'the accepted submission consumed the composer');
   });
 });
 
@@ -181,15 +190,39 @@ test('W2-002: triggerSend fence blocks the click without side effects', async ()
   assert.strictEqual(send._clicked, undefined);
 });
 
-test('W2-002: triggerSend without fence still clicks', async () => {
+test('W2-002: triggerSend succeeds when ChatGPT verifies the accepted Send', async () => {
   const { h, api } = setup();
-  const { send } = composerFixture(h);
+  const fixture = installAcceptedSend(h, composerFixture(h));
+  fixture.input.textContent = 'manual send payload';
+
   const site = api.detectSite();
   const input = site.getInput();
-  const result = await api.triggerSend(site, input, {});
+  assert.ok(input);
+
+  const promise = api.triggerSend(site, input, {});
+  await h.settle();
+  const result = await promise;
+
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.mode, 'button');
-  assert.strictEqual(send._clicked, true);
+  assert.strictEqual(fixture.send._clickCount, 1);
+  assert.strictEqual(fixture._submitted, 'manual send payload');
+});
+
+test('W2-002: triggerSend reports click-unverified when the Send click is not accepted', async () => {
+  const { h, api } = setup();
+  const { send, input } = composerFixture(h);
+  input.textContent = 'manual send payload';
+
+  const site = api.detectSite();
+  const promise = api.triggerSend(site, site.getInput(), {});
+  await h.settle();
+  const result = await promise;
+
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.mode, 'click-unverified');
+  assert.strictEqual(send._clickCount, 1);
+  assert.strictEqual(api.composerPlainText(input), 'manual send payload');
 });
 test('T79: the ownership guard survives ChatGPT relabelling our own attachment', () => {
   const { h, api } = setup();

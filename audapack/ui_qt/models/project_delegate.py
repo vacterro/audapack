@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from audapack.audits import format_age_str
 from audapack.campaign import get_profile, profile_short_label
+from audapack.freshness import ArchiveFreshness
 from audapack.models import AuditTemperature
 from audapack.ui_qt.theme.golden_default import PALETTE
 
@@ -32,6 +33,32 @@ TEMP_COLORS = {
     "STALE": "#8A8078",
     "NONE": "#7A7A7A",
 }
+
+
+def launcher_button_label(launcher: Any) -> str:
+    """The ONE display label for a launcher button (SRC-081 TARGET I).
+
+    The launcher's canonical ``short_label`` is the primary display source;
+    the name's first two characters are only a last-resort fallback for
+    entries without one. No per-surface id->label map exists anymore.
+    """
+    label = str(getattr(launcher, "short_label", "") or "").strip()
+    if label:
+        return label
+    name = str(getattr(launcher, "name", "") or "").strip()
+    return name[:2].upper() or "?"
+
+
+def launcher_button_width(label: str) -> int:
+    """Button width from the label string alone -- deterministic (TARGET I).
+
+    Two-character labels keep the historical 18px cell (T-173 geometry);
+    every extra character widens its own button instead of being clipped
+    silently. String-based on purpose: paint and hit-testing compute identical
+    pixels without sharing a font-metrics object.
+    """
+    chars = max(1, len(str(label or "").strip()))
+    return 18 if chars <= 2 else 18 + 7 * (chars - 2)
 
 
 def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = None) -> tuple[list[tuple[Any, QRect]], QRect]:
@@ -53,15 +80,19 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
     if not enabled_launchers:
         return [], gg_rect
 
-    btn_w = 18  # widened for 2-char labels OC/FB/CL/C1
     gap = 2
-    total_w = len(enabled_launchers) * btn_w + (len(enabled_launchers) - 1) * gap
+    # TARGET H/I: per-button width derives from the label actually painted
+    # (the launcher's canonical short_label) instead of a fixed 18px cell for
+    # an assumed six buttons. Paint and hit-testing share this helper, so the
+    # geometry can never disagree between what is drawn and what is clickable.
+    widths = [launcher_button_width(launcher_button_label(launcher)) for launcher in enabled_launchers]
+    total_w = sum(widths) + gap * max(0, len(enabled_launchers) - 1)
     # hug right edge with 2px margin (was 36 with GG)
     start_x = row_rect.right() - total_w - 2
 
     cur_x = start_x
     result_buttons: list[tuple[Any, QRect]] = []
-    for launcher in enabled_launchers:
+    for launcher, btn_w in zip(enabled_launchers, widths, strict=True):
         r = QRect(cur_x, row_rect.top() + 2, btn_w, 20)
         result_buttons.append((launcher, r))
         cur_x += btn_w + gap
@@ -69,39 +100,51 @@ def compute_row_button_rects(row_rect: QRect, launchers: Optional[list[Any]] = N
     return result_buttons, gg_rect
 
 
-#: Fixed width reserved on the right edge for the launcher/info/layer button
-#: block, so the state column left edge is identical on every row regardless of
-#: how many launcher buttons a row actually has. Max 6 buttons * 18px + 5 * 2px
-#: gap + 2px margin + 4px gap + 18px info + 2 * 18px layer buttons + 2 * 2px
-#: gaps = 184px; round to a safe 190px.
-FIXED_ACTIONS_WIDTH = 190
-
 #: Row narrower than this cannot fit checkboxes + name + state grid + the
-#: fixed right-edge button block without elements landing on top of each
-#: other. Below it the row degrades gracefully: no state grid, no buttons —
-#: only checkboxes, slot badge and an elided name. The click handler in
+#: right-edge button block without elements landing on top of each other.
+#: Below it the row degrades gracefully: no state grid, no buttons — only
+#: checkboxes, slot badge and an elided name. The click handler in
 #: main_window guards on the same constant, so paint and hit-testing agree.
 MIN_ROW_WIDTH = 340
+
+#: SRC-081 TARGET H: there is deliberately NO ``MAX_LAUNCHERS`` ceiling
+#: anymore. The action block derives from the actual configured enabled
+#: launchers (below), so ten shipped launchers -- or more, or fewer -- all lay
+#: out from one geometry authority. A cap existed only because the old UI
+#: assumed six buttons and six shortcuts.
+
+
+def actions_block_width(launchers: Optional[list[Any]] = None) -> int:
+    """Exact width of the right-edge button block for ``launchers``.
+
+    Derived from the SAME geometry helpers the painter and hit-tester use --
+    never a guessed constant and never a fixed six-launcher ceiling (TARGET
+    H). With no argument the shipped default set is measured, which is the
+    worst case a window must survive with defaults enabled.
+    """
+    if launchers is None:
+        from audapack.config import create_default_launchers
+
+        launchers = create_default_launchers()
+    probe = QRect(0, 0, 10000, 22)
+    enabled = [launcher for launcher in launchers if getattr(launcher, "enabled", True)]
+    launcher_buttons, gg_rect = compute_row_button_rects(probe, enabled)
+    info_rect = compute_info_button_rect(probe, launcher_buttons, gg_rect)
+    _plus_rect, edit_rect = compute_layer_button_rects(probe, info_rect)
+    return probe.right() + 1 - edit_rect.left()
+
 
 #: The exact width at which the full row layout (name + state grid + buttons)
 #: stops fitting. ONE threshold shared by the delegate's paint and
 #: main_window's hit-testing, so a control can never be clickable where it is
-#: not painted (or painted where it is not clickable).
-FULL_ROW_MIN_WIDTH = MIN_ROW_WIDTH + FIXED_ACTIONS_WIDTH
+#: not painted (or painted where it is not clickable). Computed below, after
+#: the geometry helpers it derives from.
+FULL_ROW_MIN_WIDTH = 0
 
-#: Compact-row state grid: one cell per field, in reading order, at offsets
-#: that do not depend on the value of any other field. Concatenating them into
-#: one string made every field start wherever the previous one happened to end,
-#: so nothing lined up down the list.
-#: "arc" is the archive's own age plus its freshness mark. Packing borrows the
-#: ZIP cell while it runs, and a COMPLETE pack badge sits there for good --
-#: which left compact rows showing "[OK]" forever and never a word about how
-#: old the archive under it actually is.
+#: Legacy fixed-cell vocabulary for the compact rail -- kept ONLY as the
+#: token order contract for compact_fit_tokens callers and the old
+#: compact_state_columns offsets. No paint path reads these widths anymore.
 COMPACT_STATE_CELL_WIDTHS = (("run", 50), ("waves", 30), ("age", 44), ("zip", 58), ("arc", 52))
-
-#: Width of the whole compact state grid. Derived, so a cell cannot be widened
-#: without the column growing to match and silently clipping the last field.
-COMPACT_STATE_WIDTH = sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS)
 
 #: Full-mode state grid: RUN | WAVES | AGE on line 0, ZIP | PACK on line 1.
 #: Both lines must stay inside FULL_STATE_WIDTH -- a cell beyond it lands on
@@ -111,12 +154,121 @@ COMPACT_STATE_WIDTH = sum(width for _name, width in COMPACT_STATE_CELL_WIDTHS)
 FULL_STATE_CELL_WIDTHS = (("run", 64), ("waves", 42), ("age", 62), ("zip", 100), ("pack", 60))
 FULL_STATE_WIDTH = 175
 
+#: Compact rows are a right-anchored TOKEN RAIL, not a fixed grid: every
+#: visible token takes its measured text width plus one small gap, absent
+#: values take zero width, and whatever the rail does not need flows back to
+#: the project name. The old fixed five-cell grid (RUN 50 | WAVES 30 | AGE 44
+#: | ZIP 58 | ARC 52 = 234px) reserved maximum-width cells on every row, so
+#: sparse rows painted large holes and every row elided its name while pixels
+#: sat unused.
+COMPACT_TOKEN_GAP = 6
+#: The gap between the last state token and the first action control.
+COMPACT_RAIL_GAP = 8
+#: The project name outranks low-value verbose state text (F6): if the rail
+#: would squeeze the name below this, tail tokens (ARC, ZIP, AGE, WAVES) are
+#: dropped one by one -- RUN always survives, and the cramped-row fallback
+#: still owns the truly narrow case.
+COMPACT_NAME_MIN = 44
+
 #: The slot badge must hold the widest value the Add/Edit dialog can produce:
 #: slots run 1..10, so "[10]" is the worst case. The width is derived from the
 #: font at paint time (see slot_badge_width) -- a hardcoded pixel width lies the
 #: moment the theme's NoAntialias strategy makes Verdana 9 render at 48px.
 SLOT_BADGE_WORST = "[10]"
 SLOT_BADGE_MIN = 24
+
+
+def compact_state_tokens(
+    wave_text: str,
+    waves_label: str,
+    age_cell: str,
+    zip_text: str,
+    packing: str,
+    arc_cell: str,
+) -> list[tuple[str, str]]:
+    """Ordered semantic compact tokens: RUN WAVES AGE ZIP ARC (F3).
+
+    Empty values are simply absent -- an absent field consumes zero width.
+    Packing owns the ZIP token exactly as it used to own the ZIP cell.
+    """
+    tokens: list[tuple[str, str]] = [("run", wave_text)]
+    if waves_label:
+        tokens.append(("waves", waves_label))
+    if age_cell:
+        tokens.append(("age", age_cell))
+    if (packing or zip_text).strip():
+        tokens.append(("zip", packing or zip_text))
+    if arc_cell:
+        tokens.append(("arc", arc_cell))
+    return tokens
+
+
+def compute_actions_left(row_rect: QRect, launchers: Optional[list[Any]] = None) -> int:
+    """Left edge of the REAL action block: [edit] [+] [i] [launchers...].
+
+    Derived from the same three helpers the painter and the hit-tester share,
+    so the content boundary can never disagree with the actual buttons. All
+    rows share one global launcher configuration, so this edge is identical
+    on every row and the columns still align.
+    """
+    launcher_buttons, gg_rect = compute_row_button_rects(row_rect, launchers)
+    info_rect = compute_info_button_rect(row_rect, launcher_buttons, gg_rect)
+    _plus_rect, edit_rect = compute_layer_button_rects(row_rect, info_rect)
+    return edit_rect.left()
+
+
+def compact_fit_tokens(
+    metrics,
+    tokens: list[tuple[str, str]],
+    actions_left: int,
+    name_left: int,
+    name_text: str = "",
+    name_extra: int = 0,
+) -> tuple[list[tuple[str, QRect]], int]:
+    """Fit the compact state rail right-anchored at the real action block.
+
+    ``tokens`` is the ordered (key, text) rail content; empty texts are the
+    caller's responsibility to omit. Every kept token takes its measured
+    horizontalAdvance -- never a reserved cell -- and one COMPACT_TOKEN_GAP
+    between neighbours. The rail sits COMPACT_RAIL_GAP left of ``actions_left``.
+
+    F6: the project name outranks low-value state text. While the FULL name
+    (plus ``name_extra``, e.g. the IA badge reservation) would not fit in the
+    box the rail leaves it, tail tokens are dropped lowest-priority-first
+    (ARC, ZIP, AGE, WAVES) until it fits; RUN always survives, and when even
+    RUN leaves too little the name elides inside what is left -- operational
+    status is never completely removed for an arbitrarily long name.
+    Returns (token_rects, name_right): the name rectangle ends at
+    ``name_right``.
+    """
+    kept = [(key, text) for key, text in tokens if text]
+    widths: dict[str, int] = {}
+
+    def _name_right() -> int:
+        total = sum(widths[key] for key, _text in kept) + COMPACT_TOKEN_GAP * max(0, len(kept) - 1)
+        return actions_left - COMPACT_RAIL_GAP - total - COMPACT_TOKEN_GAP
+
+    def _name_fits() -> bool:
+        if not name_text:
+            return True
+        need = metrics.horizontalAdvance(name_text) + name_extra
+        return _name_right() - name_left >= need
+
+    while True:
+        for key, text in kept:
+            widths[key] = metrics.horizontalAdvance(text)
+        if _name_fits() or len(kept) <= 1:
+            break
+        kept.pop()  # lowest-priority token (rightmost of RUN,WAVES,AGE,ZIP,ARC)
+    name_right = _name_right()
+    rects: list[tuple[str, QRect]] = []
+    x = actions_left - COMPACT_RAIL_GAP
+    for key, _text in reversed(kept):
+        x -= widths[key]
+        rects.append((key, QRect(x, 0, widths[key], 0)))
+        x -= COMPACT_TOKEN_GAP
+    rects.reverse()
+    return rects, name_right
 
 
 def slot_badge_width(metrics) -> int:
@@ -142,17 +294,29 @@ def compact_archive_cell(
     exists: bool,
     age_str: str,
     freshness_short: str,
-    source_older: Optional[bool],
+    archive_freshness: Optional[str],
 ) -> str:
     """Text of the compact ARC cell: how old the archive is, and its verdict.
 
     A bare "2d" cannot be read without knowing the thresholds, and a bare mark
     cannot tell one stale archive from another. Both, or nothing.
+
+    PERF-002 (audit/9.md): two different questions share this cell and must not
+    be confused. ``age_str``/``freshness_short`` answer HOW OLD the archive is;
+    ``archive_freshness`` is the canonical tri-state answer to WHETHER THE
+    SOURCE MOVED ON since the pack. STALE and UNKNOWN own the mark because they
+    are the actionable answers; only a proven-current archive falls through to
+    its age glyph. The predecessor was a boolean named ``source_older`` whose
+    True the producer set for "source is OLDER" and this consumer read as
+    "source changed since the pack".
     """
     if not exists:
         return "—"
-    if source_older is True:
+    state = str(archive_freshness or ArchiveFreshness.UNKNOWN.value).upper()
+    if state == ArchiveFreshness.STALE.value:
         mark = "▲"  # source moved on since the pack -- repack before auditing
+    elif state == ArchiveFreshness.UNKNOWN.value:
+        mark = "?"  # freshness could not be proven; never rendered as current
     else:
         mark = {"fresh": "✓", "stale": "·", "old": "!"}.get(freshness_short, "")
     age = age_str.replace(" ", "")
@@ -160,7 +324,12 @@ def compact_archive_cell(
 
 
 def compact_state_columns(col_x: int) -> dict[str, tuple[int, int]]:
-    """Return {field: (x, width)} for the compact state grid."""
+    """Legacy fixed-cell offsets, retained only for full-mode callers.
+
+    The compact rail no longer uses fixed cells -- it right-anchors measured
+    tokens at the real action block (compact_fit_tokens). This helper stays
+    for tests/importers that still speak the cell vocabulary.
+    """
     cells: dict[str, tuple[int, int]] = {}
     cursor = int(col_x)
     for name, width in COMPACT_STATE_CELL_WIDTHS:
@@ -201,6 +370,27 @@ def compute_layer_button_rects(row_rect: QRect, info_rect: QRect) -> tuple[QRect
     plus_rect = QRect(plus_x, row_rect.top() + 2, btn_w, 20)
     edit_rect = QRect(plus_x - gap - btn_w, row_rect.top() + 2, btn_w, 20)
     return plus_rect, edit_rect
+
+
+#: The exact width at which the full row layout (name + state grid + buttons)
+#: stops fitting. ONE threshold shared by the delegate's paint and
+#: main_window's hit-testing, so a control can never be clickable where it is
+#: not painted (or painted where it is not clickable). Derived from the real
+#: geometry helpers above, never a guessed constant.
+
+
+def full_row_min_width(launchers: Optional[list[Any]] = None) -> int:
+    """``MIN_ROW_WIDTH`` plus the real action block for ``launchers``.
+
+    Paint and hit-testing BOTH ask this helper with the same configured
+    launcher list (TARGET H), so the cramped-row threshold can never disagree
+    between what is painted and what is clickable. The no-argument value is
+    the shipped default set and stays the legacy ``FULL_ROW_MIN_WIDTH``.
+    """
+    return MIN_ROW_WIDTH + actions_block_width(launchers)
+
+
+FULL_ROW_MIN_WIDTH = full_row_min_width()
 
 
 class ProjectItemDelegate(QStyledItemDelegate):
@@ -369,14 +559,15 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # buttons a row actually has. This fixes the "rows crawling in different
         # directions" visual defect.
         compact_rows = bool(getattr(getattr(self._config, "ui", None), "compact_rows", False))
-        # Full mode gives the state column room for the aligned sub-columns
-        # (RUN | WAVES | AGE / ZIP | PACK); compact keeps its one wide line.
-        col_w = COMPACT_STATE_WIDTH if compact_rows else FULL_STATE_WIDTH
+        # Compact rows right-anchor a measured token rail at the REAL action
+        # block; full mode keeps its aligned fixed sub-column grid.
+        actions_left = compute_actions_left(rect, launchers)
+        col_w = FULL_STATE_WIDTH if not compact_rows else 0
         # A too-narrow row cannot hold name + state grid + button block side by
         # side: painting them anyway just stacks text on text. Skip the state
         # grid entirely and let the elided name own the whole middle.
-        cramped = rect.width() < FULL_ROW_MIN_WIDTH
-        col_x = rect.right() - FIXED_ACTIONS_WIDTH - 4 - col_w
+        cramped = rect.width() < full_row_min_width(launchers)
+        col_x = rect.right() - actions_block_width(launchers) - 4 - col_w
 
         # Data used by the column
         arc_data = index.data(Qt.ItemDataRole.UserRole + 18)
@@ -389,7 +580,7 @@ class ProjectItemDelegate(QStyledItemDelegate):
         pack_progress = index.data(Qt.ItemDataRole.UserRole + 26) or None
         pack_percent = index.data(Qt.ItemDataRole.UserRole + 27)
         archive_fresh_short = index.data(Qt.ItemDataRole.UserRole + 31) or "none"
-        source_older = index.data(Qt.ItemDataRole.UserRole + 30)
+        archive_freshness = str(index.data(Qt.ItemDataRole.UserRole + 30) or ArchiveFreshness.UNKNOWN.value)
         archive_age_str = index.data(Qt.ItemDataRole.UserRole + 44) or ""
 
         TC = TEMP_COLORS
@@ -515,17 +706,19 @@ class ProjectItemDelegate(QStyledItemDelegate):
         # column. Candidates used to be fitted against the WHOLE column (175px)
         # and then drawn into the 100px cell, so anything between 100 and 175px
         # wide ran straight into the PACK badge's pixels.
-        zip_fit_width = dict(FULL_STATE_CELL_WIDTHS)["zip"] if not compact_rows else COMPACT_STATE_CELL_WIDTHS[-2][1]
+        zip_fit_width = dict(FULL_STATE_CELL_WIDTHS)["zip"]
         if arc_exists:
             size_str = str(arc_size).replace(".", ",")  # 156.7 MB → 156,7 MB like screenshot
             arc_color = QColor(TC.get(arc_temp_val, PALETTE["textSecondary"]))
-            if sync_status == "OUTDATED" or source_older is True:
+            if sync_status == "OUTDATED" or archive_freshness == ArchiveFreshness.STALE.value:
                 arc_color = QColor(PALETTE["dangerText"])
             # Coarse freshness tag at end of ZIP line so the user can see at a glance
             # whether the archive is fresh, stale, or old — and a small [NEW] if
             # the source tree has changed since the last pack.
-            if source_older is True:
-                freshness_tag = "  [SRC\u25B2]"  # source is newer than archive
+            if archive_freshness == ArchiveFreshness.STALE.value:
+                freshness_tag = "  [SRC\u25B2]"  # an included source file is newer
+            elif archive_freshness == ArchiveFreshness.UNKNOWN.value:
+                freshness_tag = "  [SRC?]"  # not proven current
             elif archive_fresh_short == "fresh":
                 freshness_tag = "  [\u2713]"
             elif archive_fresh_short == "stale":
@@ -587,48 +780,66 @@ class ProjectItemDelegate(QStyledItemDelegate):
         if compact_rows:
             painter.setFont(self.font_small)
             single_y = y + (h - line_h) // 2
+            fm = painter.fontMetrics()
+            # The age token carries the audit age, or the copy counter when
+            # there is no age. Packing owns the ZIP token.
+            age_cell = (audit_display or "").strip() or (copy_display or "").strip()
+            packing = (pack_display or "").strip()
 
-            def _draw_cell(cell_x, cell_w, text, color):
+            # ── Ordered semantic tokens (F3), reading order RUN WAVES AGE ZIP ARC.
+            # Empty values are simply absent: zero width, no holes. Packing
+            # owns the ZIP token and a COMPLETE badge never leaves it, so the
+            # archive size yields to the pack badge exactly as before.
+            tokens = compact_state_tokens(
+                wave_text,
+                f"{completed_waves}/{total_waves}" if total_waves else "",
+                age_cell,
+                zip_text,
+                packing,
+                compact_archive_cell(
+                    arc_exists, archive_age_str, archive_fresh_short, archive_freshness,
+                ),
+            )
+
+            token_rects, name_right = compact_fit_tokens(
+                fm,
+                tokens,
+                actions_left,
+                x,
+                name_text=str(display_name),
+                # The IA badge rides inside the name's right boundary (F5/F7).
+                name_extra=painter.fontMetrics().horizontalAdvance(f" {inaudit_label}")
+                if inaudit_label
+                else 0,
+            )
+
+            def _draw_token(token_x: int, text: str, color) -> None:
                 if not text:
                     return
                 painter.setPen(color)
                 painter.drawText(
-                    QRect(cell_x, single_y, cell_w, line_h),
+                    QRect(token_x, single_y, fm.horizontalAdvance(text) + 2, line_h),
                     Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                    painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, cell_w),
+                    text,
                 )
 
-            cells = compact_state_columns(col_x)
-            run_cx, C_RUN = cells["run"]
-            wav_cx, C_WAV = cells["waves"]
-            age_cx, C_AGE = cells["age"]
-            zip_cx, C_ZIP = cells["zip"]
-
-            _draw_cell(run_cx, C_RUN, wave_text, wave_color)
+            run_color = wave_color
             wav_color = QColor(PALETTE["success"]) if all_ready else QColor(
                 PALETTE["warning"] if completed_waves > 0 else PALETTE["textMuted"]
             )
-            _draw_cell(wav_cx, C_WAV, f"{completed_waves}/{total_waves}" if total_waves else "", wav_color)
-            # The INAUDIT badge is already drawn beside the project name; the
-            # compact age cell keeps age, copy counter only. Painting the same
-            # IA token twice on one 22px row made the row read as doubled.
-            age_cell = (audit_display or "").strip() or (copy_display or "").strip()
-            age_color = audit_color if (audit_display or "").strip() else QColor(PALETTE["textMuted"])
-            _draw_cell(age_cx, C_AGE, age_cell, age_color)
-            # Packing owns the ZIP cell while it runs: the archive size it
-            # reports is about to be replaced anyway, and the progress badge
-            # reads "PACK 42% 3f 1.2MB" -- which never fit the 32px column it
-            # used to have, so that column was elided to nothing on every row
-            # and sat empty the rest of the time.
-            packing = (pack_display or "").strip()
-            if packing:
-                _draw_cell(zip_cx, C_ZIP, packing, pack_color)
-            else:
-                _draw_cell(zip_cx, C_ZIP, zip_text, arc_color)
-            arc_cx, C_ARC = cells["arc"]
-            _draw_cell(arc_cx, C_ARC, compact_archive_cell(
-                arc_exists, archive_age_str, archive_fresh_short, source_older,
-            ), arc_color)
+            colors = {
+                "run": run_color,
+                "waves": wav_color,
+                "age": audit_color if (audit_display or "").strip() else QColor(PALETTE["textMuted"]),
+                "zip": pack_color if packing else arc_color,
+                "arc": arc_color,
+            }
+            token_map = dict(tokens)
+            for key, token_rect in token_rects:
+                _draw_token(token_rect.left(), token_map[key], colors[key])
+            # The name rectangle ends at the rail's left edge; the IA badge
+            # reservation happens inside the name's own box below (F5/F7).
+            col_x = name_right
         else:
             # Full mode: each state field is a fixed-width column so every row
             # aligns vertically -- RUN | WAVES | AGE on line 0, ZIP | PACK on
@@ -704,10 +915,12 @@ class ProjectItemDelegate(QStyledItemDelegate):
         else:
             painter.setPen(QColor(PALETTE["textPrimary"]))
         name_x = x + prefix_width
+        # The name owns every pixel between its left edge and the state area
+        # (compact: the token rail's left edge; full: the fixed column), minus
+        # the IA badge's real measured width so the name elides before the two
+        # ever collide (F7). No artificial floor: a floor wider than the real
+        # gap is what used to run the name over the state column.
         name_available = col_x - name_x - 8
-        # Reserve room for the IA badge so the name elides before it collides.
-        # No artificial floor: a floor wider than the real gap is exactly what
-        # made the name run over the state column on narrow windows.
         ia_suffix_w = painter.fontMetrics().horizontalAdvance(f" {inaudit_label}") if inaudit_label else 0
         name_width = max(0, name_available - ia_suffix_w)
         elided_name = painter.fontMetrics().elidedText(str(display_name), Qt.TextElideMode.ElideRight, name_width)
@@ -725,30 +938,85 @@ class ProjectItemDelegate(QStyledItemDelegate):
                 f" {inaudit_label}",
             )
 
-        # 7. Draw launcher buttons — letters OC/FB/CL/C1/C2/CF or numbers 1-6
-        LETTER_MAP = {"opencode": "OC", "freebuff": "FB", "cline": "CL", "main_codex": "C1", "main_codex2": "C2", "main_codex3_free": "CF"}
-        use_letters = bool(getattr(getattr(self._config, "ui", None), "launcher_letters", True))
+        # 7. Draw launcher buttons — the launcher's canonical short_label
+        # (SRC-081 TARGET I): one label source, zero per-surface id maps.
+        # Numeric mode is the same source with Settings rewriting short_label
+        # to the positional number.
         painter.setFont(self.font_tiny)
-        for idx, (launcher, b_rect) in enumerate(launcher_buttons):
+        # T-179: which launcher is already live for THIS project. Pure in-memory
+        # read of the last instance scan (same source the row's instance prefix
+        # already uses), so the paint path stays free of native/filesystem work.
+        launcher_states = (
+            main_window._instance_monitor.launcher_states(project_id)
+            if main_window is not None and hasattr(main_window, "_instance_monitor")
+            else {}
+        )
+        for launcher, b_rect in launcher_buttons:
             block_reason = (
                 main_window._launcher_block_reason(launcher.id)
                 if main_window is not None and hasattr(main_window, "_launcher_block_reason")
                 else ""
             )
-            if use_letters:
-                lbl = LETTER_MAP.get(launcher.id, str(getattr(launcher, "short_label", "") or getattr(launcher, "name", "")[:2] or "?").upper()[:2])
-            else:
-                lbl = str(idx + 1)
-            painter.fillRect(b_rect, QColor(PALETTE["surfaceRaised"]))
+            run_state = launcher_states.get(launcher.id, "")
+            lbl = launcher_button_label(launcher)
+            # The RECT never changes -- a running agent must not move the
+            # buttons or steal a pixel from the project name (T-173). Only the
+            # surface, border and label colour carry the state.
+            surface = {
+                "running": PALETTE["accentTealDeep"],
+                "starting": PALETTE["warning"],
+            }.get(run_state, PALETTE["surfaceRaised"])
+            painter.fillRect(b_rect, QColor(surface))
             painter.setPen(QPen(QColor(PALETTE["bevelLight"]), 1))
             painter.drawLine(b_rect.left(), b_rect.top(), b_rect.right() - 1, b_rect.top())
             painter.drawLine(b_rect.left(), b_rect.top(), b_rect.left(), b_rect.bottom() - 1)
             painter.setPen(QPen(QColor(PALETTE["borderDark"]), 1))
             painter.drawLine(b_rect.left(), b_rect.bottom() - 1, b_rect.right() - 1, b_rect.bottom() - 1)
             painter.drawLine(b_rect.right() - 1, b_rect.top(), b_rect.right() - 1, b_rect.bottom() - 1)
+            if run_state == "running":
+                painter.setPen(QPen(QColor(PALETTE["success"]), 1))
+                painter.drawLine(
+                    b_rect.left() + 1, b_rect.bottom() - 2,
+                    b_rect.right() - 2, b_rect.bottom() - 2,
+                )
 
-            painter.setPen(QColor(PALETTE["textMuted"] if block_reason else PALETTE["borderGolden"]))
+            if block_reason:
+                label_color = PALETTE["textMuted"]
+            elif run_state == "running":
+                label_color = PALETTE["borderHighlight"]
+            elif run_state == "starting":
+                label_color = PALETTE["textPrimary"]
+            else:
+                label_color = PALETTE["borderGolden"]
+            painter.setPen(QColor(label_color))
             painter.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, lbl)
+            limit_entry = (
+                getattr(main_window, "_limit_snapshot_by_launcher", {}).get(launcher.id)
+                if main_window is not None else None
+            )
+            if limit_entry is not None:
+                snapshot = limit_entry[1]
+                state = snapshot.availability().value if snapshot is not None else "UNKNOWN"
+                windows = snapshot.relevant_windows() if snapshot is not None else ()
+                for line, kind in enumerate(("five_hour", "weekly")):
+                    meter = next((w for w in windows if w.kind == kind), None)
+                    ratio = meter.remaining_ratio if meter else None
+                    bar = QRect(b_rect.left() + 2, b_rect.bottom() - 4 + line,
+                                max(1, b_rect.width() - 4), 1)
+                    painter.fillRect(bar, QColor(PALETTE["borderMuted"]))
+                    if ratio is not None and state not in ("STALE", "ERROR"):
+                        color = ("danger" if ratio == 0 else "warning" if ratio <= 0.1
+                                 else "success" if ratio > 0.3 else "borderGolden")
+                        width = max(1, int(round(bar.width() * ratio))) if ratio > 0 else 0
+                        if width:
+                            painter.fillRect(QRect(bar.left(), bar.top(), width, 1), QColor(PALETTE[color]))
+                    elif state == "STALE":
+                        painter.setPen(QPen(QColor(PALETTE["textMuted"]), 1, Qt.PenStyle.DashLine))
+                        painter.drawLine(bar.left(), bar.top(), bar.right(), bar.top())
+                if state == "ERROR":
+                    painter.setPen(QColor(PALETTE["dangerText"]))
+                    painter.drawText(b_rect.adjusted(0, 0, -1, 0),
+                                     Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, "!")
             if block_reason:
                 painter.setFont(self.font_tiny)
                 painter.setPen(QColor(PALETTE["dangerText"]))
@@ -823,6 +1091,29 @@ class ProjectItemDelegate(QStyledItemDelegate):
         if flags:
             lines.append(f"<font color='#FF8866'>{' / '.join(flags)}</font>")
 
+        # T-179: which agents are live for THIS project, and what a click does.
+        # The Project column in the Instances tab still owns the full detail;
+        # this is the at-a-glance answer next to the buttons themselves.
+        agents = hover_info.get("launcher_instances") or []
+        if agents:
+            lines.append("")
+            lines.append("<b>Agents</b>")
+            for agent in agents:
+                name = str(agent.get("launcher_name") or agent.get("launcher_id") or "?")
+                state = str(agent.get("state") or "")
+                pid = agent.get("pid")
+                origin = "AUDAPACK" if agent.get("tracked") else "external"
+                colour = "#55FF55" if state == "running" else "#FFD700"
+                pid_txt = f" PID {pid}" if pid else ""
+                lines.append(
+                    f"  <font color='{colour}'>{name}: {state}</font>"
+                    f"{pid_txt} <font color='#999988'>({origin})</font>"
+                )
+            lines.append(
+                "  <font color='#999988'>Click a launcher button: focus this project's "
+                "instance · Shift+click: another instance (max_instances still applies)</font>"
+            )
+
         # Audit section — structured but compact
         if snap:
             prof = getattr(snap, "audit_profile_id", "quick3") or "quick3"
@@ -891,8 +1182,13 @@ class ProjectItemDelegate(QStyledItemDelegate):
             created_txt = f" created {arc_created}" if arc_created else ""
             fresh_short = hover_info.get("archive_freshness_short", "none")
             fresh_txt = {"fresh": "[✓ fresh]", "stale": "[· stale]", "old": "[! old]"}.get(fresh_short, "")
-            src_newer = hover_info.get("source_older_than_archive")
-            src_txt = '  <font color="#FFAA55">⏫ SOURCE CHANGED AFTER PACK</font>' if src_newer is True else ""
+            src_state = str(hover_info.get("archive_freshness") or ArchiveFreshness.UNKNOWN.value)
+            if src_state == ArchiveFreshness.STALE.value:
+                src_txt = '  <font color="#FFAA55">⏫ SOURCE CHANGED AFTER PACK</font>'
+            elif src_state == ArchiveFreshness.UNKNOWN.value:
+                src_txt = '  <font color="#999999">[? freshness unknown]</font>'
+            else:
+                src_txt = ""
             lines.append(f"<b>Archive</b>: {arc_size}{created_txt} <font color='{arc_tc}'>[{arc_temp_val}]</font>{fresh_txt}{sync_txt}{src_txt}")
             if arc_path:
                 ap = str(arc_path)

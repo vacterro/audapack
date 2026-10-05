@@ -248,6 +248,129 @@ def _warn_qt_missing(detail: str) -> None:
         pass
 
 
+def _fail_recovery(holder_pid: int, identity: str, error: str, action: str) -> None:
+    """Report a recovery that genuinely could not be completed.
+
+    This replaces the old informational "already running" box, and it is an
+    ERROR on purpose. That box described a routine, self-healing situation as
+    if it needed the operator: the real fix here is that a verified windowless
+    owner is now recovered automatically, so the only thing left to say out
+    loud is a recovery that did NOT happen -- which is rare, actionable, and
+    must never be mistaken for the normal case.
+    """
+    who = f"PID {holder_pid}" if holder_pid > 0 else "an unidentified process"
+    message = (
+        f"AUDAPACK could not recover from a broken GUI owner.\n\n"
+        f"Holder: {who}\n"
+        f"Identity check: {identity}\n"
+        f"Failure: {error}\n\n"
+        f"Next: {action}"
+    )
+    print(message, file=sys.stderr)
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND = 0x10, 0x0, 0x10000
+        ctypes.windll.user32.MessageBoxW(
+            None, message, f"{__app_name__} - launcher recovery failed", MB_OK | MB_ICONERROR | MB_SETFOREGROUND
+        )
+    except Exception:
+        # A missing message box must never be the reason the app does not open.
+        pass
+
+
+def _run_gui(args) -> int:
+    """Open the real GUI. Shared by a first launch and a post-recovery launch,
+    so a recovered app is bit-for-bit the app a normal launch produces."""
+    # Qt is the production default (Wave N cutover). Tkinter remains only as explicit fallback.
+    if args.ui == "tkinter":
+        from audapack.ui.main_window import run_gui
+
+        return run_gui()
+
+    try:
+        from audapack.ui_qt.app import run_qt_gui
+
+        return run_qt_gui()
+    except ImportError as exc:
+        _warn_qt_missing(str(exc))
+        from audapack.ui.main_window import run_gui
+
+        return run_gui()
+
+
+def _recover_windowless_owner(single, args) -> int:
+    """Case C/D: the guard is held, but the holder has no window after its grace.
+
+    That holder is a brick, not a reason to give up. One launcher verifies who
+    it is, ends it if -- and only if -- it is provably that exact process, takes
+    over the SAME primary guard, and opens the app. No Task Manager, no
+    "already running" box, no manual second click.
+
+    Returns a process exit code: 0 when a GUI exists afterwards (ours or the
+    healthy owner's), 1 only when recovery genuinely failed.
+    """
+    acquired, why = single.acquire_recovery_guard()
+    if not acquired:
+        # Another launcher is already recovering. Do NOT race it into a second
+        # recovery and do NOT kill anything: wait for the GUI it opens and
+        # bring it forward, which is all this click was ever asking for.
+        if single.wait_for_recovered_window() is None:
+            _fail_recovery(
+                single.owner_pid,
+                "not checked (another launcher holds recovery)",
+                "the recovering launcher never produced a window",
+                "wait a moment and start AUDAPACK again",
+            )
+            return 1
+        single.activate_existing_window("AUDAPACK")
+        return 0
+
+    try:
+        # Re-read the record HERE, under the recovery guard. What was on disk
+        # before another launcher had its turn is not evidence of anything now.
+        record = single.read_owner_record()
+        state, detail = single.terminate_verified_owner(record)
+        holder_pid = 0
+        try:
+            holder_pid = int(record.get("pid") or 0)
+        except (AttributeError, TypeError, ValueError):
+            holder_pid = 0
+
+        if state == "restored":
+            # Healthy but hidden. It is already on screen; a second GUI would
+            # be the bug, not the fix.
+            single.activate_existing_window("AUDAPACK")
+            return 0
+        if state in ("refused", "failed"):
+            # Unproven identity is never killed. Windows refuses to be lied to.
+            _fail_recovery(
+                holder_pid,
+                "verified" if state == "failed" else "NOT proven",
+                detail,
+                "end that process yourself, then start AUDAPACK again"
+                if state == "refused"
+                else "the single-instance namespace could not be re-entered; "
+                     "restart Windows if the holder cannot be ended",
+            )
+            return 1
+
+        ok, acquire_detail = single.acquire_primary_after_recovery()
+        if not ok:
+            _fail_recovery(holder_pid, "verified", acquire_detail,
+                           "restart AUDAPACK once the previous instance has fully exited")
+            return 1
+    finally:
+        # Recovery is over either way: the primary guard now does the
+        # serializing, and holding this second lock past the GUI would make
+        # every subsequent launch wait on a lock nobody needs.
+        single.release_recovery_guard()
+
+    return _run_gui(args)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"{__app_name__} — Windows cockpit for verified ZIP packaging and multi-wave AI audit handoff."
@@ -348,7 +471,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_bridge_server(config)
 
     # Launch GUI (enforce single instance)
-    from audapack.single_instance import GuardEstablishmentError, SingleInstance
+    from audapack.single_instance import (
+        OWNER_WINDOW_GRACE_SECONDS,
+        GuardEstablishmentError,
+        SingleInstance,
+    )
     single = SingleInstance("AUDAPACK_GUI")
     try:
         already_running = single.is_already_running()
@@ -356,45 +483,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"AUDAPACK: single-instance guard failed, refusing to start: {exc}", file=sys.stderr)
         return 1
     if already_running:
-        if single.activate_existing_window("AUDAPACK"):
+        # W2-002 (audit/11 E): kernel guard is the admission authority. A held
+        # named object means another launcher is already within the guard's
+        # namespace, so this one never starts a second GUI.
+        #
+        # T-25: it used to stop there. A windowless/hung holder therefore bricked
+        # the launcher for good -- every click answered "already running" and
+        # opened nothing, and the operator was told to end a process in Task
+        # Manager. Now a holder that survives its FULL startup grace with no
+        # window is recovered in place: verified, terminated if it must be, and
+        # replaced by a real AUDAPACK in this same click.
+        # Scope every window probe to the process that actually holds THIS
+        # guard. An unrelated AUDAPACK window on the desktop is not this
+        # launcher's owner, and treating it as one is how a windowless brick
+        # survives: the launcher "activates" somebody else's window and stands
+        # down against a holder it has never even looked at.
+        owner_pid = single.owner_pid or None
+        if single.activate_existing_window("AUDAPACK", pid=owner_pid):
             return 0
-        if single.owner_is_alive():
-            # W2-005 (audit/1.md): activation failing is not evidence the owner
-            # is dead. On POSIX it can NEVER succeed, so every genuine second
-            # instance took the branch below and opened a second GUI -- two
-            # config writers, which is the amplifier for the stale-registry
-            # writes in CORE-002. A live owner that has not shown its window yet
-            # gets a bounded wait, then this launcher stands down either way.
-            hwnd = single.wait_for_owner_window()
-            if hwnd is not None and single.activate_existing_window("AUDAPACK"):
-                return 0
+        # The full grace, not the old hardcoded 2s: an owner that is merely
+        # slow must be given the same chance a human would give it.
+        hwnd = single.wait_for_owner_window(timeout=OWNER_WINDOW_GRACE_SECONDS, pid=owner_pid)
+        if hwnd is not None and single.activate_existing_window("AUDAPACK", pid=owner_pid):
+            return 0
+        if sys.platform != "win32":
+            # No named-object or process-termination semantics to reason about
+            # here, so there is nothing safe to recover. Say so on stderr and
+            # stand down rather than kill a process on a guess.
             print(
-                "AUDAPACK: already running; its window is not answering yet, so this launcher is standing down.",
+                "AUDAPACK: another instance holds the single-instance guard and "
+                "automatic recovery is Windows-only; this launcher stood down.",
                 file=sys.stderr,
             )
             return 0
-        # Mutex reported held, the recorded owner is gone and no window was
-        # found -- a leftover lock. Do NOT silently no-op (that bricks the
-        # launcher). Open a new instance.
-        print(
-            "AUDAPACK: detected a leftover lock with no visible window; opening a new instance.",
-            file=sys.stderr,
-        )
+        return _recover_windowless_owner(single, args)
 
-    # Qt is the production default (Wave N cutover). Tkinter remains only as explicit fallback.
-    if args.ui == "tkinter":
-        from audapack.ui.main_window import run_gui
-        return run_gui()
-
-    try:
-        from audapack.ui_qt.app import run_qt_gui
-
-        return run_qt_gui()
-    except ImportError as exc:
-        _warn_qt_missing(str(exc))
-        from audapack.ui.main_window import run_gui
-
-        return run_gui()
+    return _run_gui(args)
 
 
 if __name__ == "__main__":

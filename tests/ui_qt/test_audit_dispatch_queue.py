@@ -29,7 +29,7 @@ def window(tmp_path, qapp):
 def test_rapid_presses_collapse_into_one_batch(window):
     """Six presses in a burst must dispatch as one batch of six."""
     batches: list[list[str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append(list(ids)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
 
     for index in range(1, 7):
@@ -43,7 +43,7 @@ def test_rapid_presses_collapse_into_one_batch(window):
 
 def test_a_press_while_a_batch_runs_is_queued_not_dropped(window):
     batches: list[list[str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append(list(ids)) or [])
     # Simulate a batch that is still in flight: the runner never calls back.
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
     window.task_runner.is_running = lambda key: bool(batches)
@@ -62,7 +62,7 @@ def test_a_press_while_a_batch_runs_is_queued_not_dropped(window):
 
 
 def test_the_same_project_is_never_queued_twice(window):
-    window._audit_runs.start_batch = lambda ids, profile: []
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: []
     window._start_audit_projects(["p1"], "Project 1")
     window._start_audit_projects(["p1"], "Project 1")
     assert [pid for pid, _profile in window._audit_start_pending] == ["p1"]
@@ -70,7 +70,7 @@ def test_the_same_project_is_never_queued_twice(window):
 
 def test_batch_is_capped_at_six_lanes(window):
     batches: list[list[str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append(list(ids)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
 
     window._start_audit_projects([f"p{i}" for i in range(1, 7)] + ["p1"], "MAIN0")
@@ -154,7 +154,7 @@ def test_reopen_surfaces_an_unreachable_bridge():
 def test_a_profile_button_only_switches_and_never_starts(window):
     """They read as mode indicators, so pressing one must not fire an audit."""
     batches: list[tuple[list[str], str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append((list(ids), profile)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
     window._selected_project = lambda: window._service.get_project("p1")
 
@@ -170,7 +170,7 @@ def test_a_profile_button_only_switches_and_never_starts(window):
 
 def test_start_then_uses_the_switched_profile(window):
     batches: list[tuple[list[str], str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append((list(ids), profile)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
     window._selected_project = lambda: window._service.get_project("p1")
 
@@ -185,7 +185,7 @@ def test_start_then_uses_the_switched_profile(window):
 def test_two_profiles_queued_together_never_share_one_batch(window):
     """start_batch applies ONE profile to everything it is handed."""
     batches: list[tuple[list[str], str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append((list(ids), profile)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append((list(ids), profile)) or [])
     window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: fn()
 
     window._start_audit_projects(["p1", "p2"], "pair", profile_id="quick3")
@@ -202,7 +202,7 @@ def test_two_profiles_queued_together_never_share_one_batch(window):
 
 def test_a_profile_button_without_a_selection_says_so(window):
     window._selected_project = lambda: None
-    window._audit_runs.start_batch = lambda ids, profile: []
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: []
     window._on_launch_audit_profile("super10")
     assert window._audit_start_pending == []
     # The choice still persists, so the next START AUDIT uses it.
@@ -218,7 +218,7 @@ def test_reset_all_drops_presses_that_have_not_dispatched_yet(window, monkeypatc
     from PySide6.QtWidgets import QMessageBox
 
     batches: list[list[str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append(list(ids)) or [])
     window._audit_runs.reset_all = lambda: {"cancelled": [], "unblocked": [], "failed": [], "total": 0}
     monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
 
@@ -294,7 +294,7 @@ def test_closing_the_window_drops_a_press_still_in_the_debounce(window):
     browser windows on the operator's desktop.
     """
     batches: list[list[str]] = []
-    window._audit_runs.start_batch = lambda ids, profile: (batches.append(list(ids)) or [])
+    window._audit_runs.start_batch = lambda ids, profile, should_abort=None: (batches.append(list(ids)) or [])
 
     window._start_audit_projects(["p1"], "Project 1")
     assert window._audit_start_debounce.isActive() is True
@@ -305,3 +305,39 @@ def test_closing_the_window_drops_a_press_still_in_the_debounce(window):
 
     window._pump_audit_start_queue()
     assert batches == [], "a press dropped at close must never dispatch"
+
+
+def test_closeEvent_revokes_a_batch_already_moved_into_inflight(window):
+    """W2-002 (audit/12.md): the batch is pumped into `_audit_start_inflight`
+    and `_prepare` is submitted; closing the window at that moment must still
+    stop it, because it provisions real browser windows and dispatches an audit.
+    """
+    seen = []
+
+    def _start_batch(ids, profile, should_abort=None):
+        seen.append(bool(should_abort and should_abort()))
+        return []
+
+    window._audit_runs.start_batch = _start_batch
+    queued: list = []
+    window.task_runner.submit = lambda key, fn, on_success=None, on_error=None: queued.append(fn) or 1
+
+    window._start_audit_projects(["p1"], "Project 1")
+    window._audit_start_debounce.stop()
+    window._pump_audit_start_queue()
+    assert window._audit_start_inflight, "the batch never reached inflight"
+    assert queued, "_prepare was never submitted"
+    assert seen == [], "the prepared task ran before the close"
+
+    window._closing = True  # what closeEvent() does first
+    queued[0]()
+    assert seen == [True], "a batch prepared before the close still dispatched"
+
+
+def test_closeEvent_closes_the_task_runner_before_the_window_goes_away(window):
+    window._start_audit_projects(["p1"], "Project 1")
+    assert window.task_runner.state == "OPEN"
+    window.close()
+    assert window._closing is True
+    assert window.task_runner.state in {"CLOSING", "CLOSED"}
+    assert window.task_runner.submit("after-close", lambda: 1) == 0

@@ -451,6 +451,27 @@ def read_inbox(root: Path | str, binding_rel: str = "") -> InboxState:
 
 _CACHE: dict[tuple[str, str], tuple[float, tuple, InboxState]] = {}
 _CACHE_TTL_SECONDS = 8.0
+#: PERF-004 (audit/10.md): the module cache used to grow forever. A project
+#: removed or moved left its root+binding key behind indefinitely. Bound it
+#: deterministically: insertion-ordered oldest-first eviction past this many
+#: distinct keys. Every entry can be rebuilt from the filesystem, so eviction
+#: is always safe.
+_CACHE_MAX_ENTRIES = 512
+
+#: PERF-004: the passive dashboard may reuse a settled verdict inside this
+#: budget instead of re-scanning the inbox on every repaint. The active
+#: dashboard cadence is ``MainWindow.BRIDGE_POLL_ACTIVE_MS = 4000`` and Qt
+#: timers fire at or AFTER their interval, so a budget equal to that interval
+#: expires on every active repaint and buys nothing. The budget must exceed the
+#: poll by a meaningful margin: at 8 seconds one normal 4-second repaint is
+#: served from zero-I/O passive state while a genuine inbox change is still
+#: noticed within the next budget window, and expiry still performs exactly one
+#: fresh physical probe. Do not set this to the caller's poll interval.
+_PASSIVE_FRESHNESS_SECONDS = 8.0
+#: Per-key state for the passive layer: (probe_stamp, state). No fingerprint:
+#: inside the budget nothing is read; on expiry a full physical probe runs, so
+#: there is no cheap-fingerprint middle path to justify.
+_PASSIVE_CACHE: dict[tuple[str, str], tuple[float, InboxState]] = {}
 
 
 def _inbox_fingerprint(root: Path | str, binding_rel: str = "") -> tuple:
@@ -479,6 +500,25 @@ def _inbox_fingerprint(root: Path | str, binding_rel: str = "") -> tuple:
     return tuple(entries)
 
 
+def _cache_store(cache: dict, key: tuple[str, str], value: object) -> None:
+    """Insert with deterministic oldest-first eviction past the bound."""
+    cache[key] = value
+    while len(cache) > _CACHE_MAX_ENTRIES:
+        cache.pop(next(iter(cache)))
+
+
+def invalidate_inbox_cache(root: Path | str, binding_rel: str = "") -> None:
+    """Drop the cached verdict for one project after a known inbox change.
+
+    Called by a producer that just wrote a layer or a binding, so the next
+    passive repaint forces a physical probe instead of reusing a verdict that
+    the change just made stale.
+    """
+    key = (str(root), str(binding_rel or ""))
+    _CACHE.pop(key, None)
+    _PASSIVE_CACHE.pop(key, None)
+
+
 def read_inbox_cached(root: Path | str, now: Optional[float] = None,
                       binding_rel: str = "") -> InboxState:
     """``read_inbox`` with a bounded cache for repeated dashboard refreshes.
@@ -487,6 +527,11 @@ def read_inbox_cached(root: Path | str, now: Optional[float] = None,
     hashes the delivered layers. The cheap fingerprint above decides; the TTL
     only bounds how long a stale answer can survive a filesystem that reports
     no change at all.
+
+    AUTHORITATIVE-ON-CHANGE: this fingerprints on EVERY call, so a same-instant
+    delivery is visible immediately (``test_the_cache_follows_the_inbox_rather_
+    than_a_clock``). Callers whose correctness depends on current truth use
+    this. The passive dashboard layer is ``read_inbox_passive``.
     """
     import time
 
@@ -499,5 +544,46 @@ def read_inbox_cached(root: Path | str, now: Optional[float] = None,
     if hit and hit[1] == fingerprint and stamp - hit[0] < _CACHE_TTL_SECONDS:
         return hit[2]
     state = read_inbox(key[0], binding_rel)
-    _CACHE[key] = (stamp, fingerprint, state)
+    _cache_store(_CACHE, key, (stamp, fingerprint, state))
+    return state
+
+
+def read_inbox_passive(root: Path | str, now: Optional[float] = None,
+                       binding_rel: str = "",
+                       freshness_seconds: float = _PASSIVE_FRESHNESS_SECONDS,
+                       force: bool = False) -> InboxState:
+    """Dashboard repaint path: reuse a settled verdict inside its freshness budget.
+
+    PERF-004: ``read_inbox_cached`` fingerprints the whole inbox on every call,
+    so a live dashboard polling every 4 seconds re-enumerates and stats every
+    settled project even though its advertised TTL is 8 seconds. Moving the TTL
+    ahead of the fingerprint would break the same-instant delivery contract, so
+    the passive layer is separate instead:
+
+    * a repaint INSIDE the freshness budget returns the last settled verdict
+      with ZERO filesystem work;
+    * the budget's expiry, ``force``, or a missing verdict runs one full
+      ``read_inbox`` and refreshes the passive record, so an invalidation or a
+      decision-critical read is never answered from a stale passive snapshot.
+
+    Callers that need authoritative current truth keep calling
+    ``read_inbox_cached``; operators force a probe before any action whose
+    correctness depends on the inbox verdict.
+
+    The freshness age is process-local elapsed time, so the default clock is
+    ``time.monotonic()``: a wall-clock correction must neither expire every
+    passive entry at once nor extend a stale verdict after a rollback. Tests
+    inject an explicit ``now`` and keep deterministic behaviour.
+    """
+    import time
+
+    if not str(root or ""):
+        return InboxState()
+    key = (str(root), str(binding_rel or ""))
+    stamp = float(now if now is not None else time.monotonic())
+    hit = _PASSIVE_CACHE.get(key)
+    if not force and hit is not None and stamp - hit[0] < max(0.0, float(freshness_seconds)):
+        return hit[1]
+    state = read_inbox(key[0], binding_rel)
+    _cache_store(_PASSIVE_CACHE, key, (stamp, state))
     return state

@@ -253,3 +253,41 @@ def test_an_unreadable_latest_config_fails_closed_and_writes_nothing(tmp_path, q
     assert saves == [], "a save was attempted with no knowledge of the current state"
     assert (tmp_path / "config.json").read_bytes() == before
     assert "FAILED" in w.lbl_save_status.text()
+
+
+def test_auto_pack_widgets_load_persisted_values_and_round_trip(tmp_path, qapp):
+    """T-167 (SRC-039): checkbox + interval spinbox persist through autosave."""
+    cfg = AppConfig()
+    cfg.packing.auto_pack_all_enabled = False
+    cfg.packing.auto_pack_all_interval_minutes = 120
+    assert save_config(cfg, tmp_path)
+
+    w, _cfg = widget(tmp_path, load_config(tmp_path))
+    assert not w.auto_pack_all.isChecked()
+    assert w.auto_pack_interval.value() == 120
+    assert not w.auto_pack_interval.isEnabled(), "interval control must be disabled while auto-pack is off"
+
+    w2, _cfg2 = widget(tmp_path)  # defaults: enabled, hourly
+    assert w2.auto_pack_all.isChecked()
+    assert w2.auto_pack_interval.value() == 60
+    assert w2.auto_pack_interval.isEnabled()
+
+
+def test_auto_pack_fields_persist_without_overwriting_unrelated_config(tmp_path, qapp):
+    """Only the touched auto-pack fields land; neighbours stay on disk."""
+    on_disk = AppConfig()
+    on_disk.packing.delete_old = False
+    on_disk.packing.auto_pack_all_interval_minutes = 240
+    assert save_config(on_disk, tmp_path)
+
+    w, _cfg = widget(tmp_path, AppConfig())
+    w.auto_pack_all.setChecked(False)
+    assert load_config(tmp_path).packing.delete_old is False, "an untouched packing field was overwritten"
+    assert load_config(tmp_path).packing.auto_pack_all_interval_minutes == 240, "untouched interval moved"
+
+    w.auto_pack_interval.setValue(30)
+    w._save()
+    loaded = load_config(tmp_path)
+    assert loaded.packing.auto_pack_all_enabled is False
+    assert loaded.packing.auto_pack_all_interval_minutes == 30
+    assert loaded.packing.delete_old is False

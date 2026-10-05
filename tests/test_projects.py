@@ -367,6 +367,52 @@ class TestRegistryTransactions(unittest.TestCase):
         final = load_config(self.base_dir)
         self.assertFalse(any(p.display_name == "GhostProject" for p in final.projects))
 
+    def test_first_write_alias_is_not_the_caller_live_config(self):
+        """CORE-002: the FIRST write seeded the staging object FROM the caller's
+        live config by reference, so the transaction object and the caller's
+        authoritative state were the same object and a failed save left a ghost
+        project behind with nothing on disk.
+        """
+        from unittest import mock
+
+        from audapack import projects as projects_mod
+
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        cfg = AppConfig()
+        cfg.projects = []
+        reg = ProjectRegistry(cfg, base_dir=empty, transactional=True)
+
+        with mock.patch.object(projects_mod, "save_config", return_value=False):
+            with self.assertRaises(projects_mod.RegistrySaveError):
+                reg.add_project("Ghost", r"C:\Code\Ghost", priority_group="MAIN0", slot=1)
+
+        self.assertEqual(cfg.projects, [], "failed first write must not touch live state")
+        self.assertFalse((empty / "config.json").exists())
+
+    def test_a_raising_editor_leaves_caller_config_untouched(self):
+        """The same invariant when the mutation itself raises before the save."""
+        from audapack import projects as projects_mod
+
+        cfg = self._fresh_registry().config
+        reg = ProjectRegistry(cfg, base_dir=self.base_dir, transactional=True)
+        before = [p.display_name for p in cfg.projects]
+
+        class _Boom(Exception):
+            pass
+
+        with self.assertRaises(_Boom):
+            with reg._mutate_latest() as tx:
+                tx.cfg.projects.append(Project(id="half", display_name="Half", source_path=r"C:\Half"))
+                raise _Boom("editor exploded")
+
+        self.assertEqual([p.display_name for p in cfg.projects], before)
+        self.assertEqual(
+            [p.display_name for p in load_config(self.base_dir).projects],
+            before,
+        )
+        self.assertTrue(hasattr(projects_mod, "RegistrySaveError"))
+
     def test_name_aliases_resolve_to_existing_without_registration(self):
         reg1 = self._fresh_registry()
         proj, created = reg1.resolve_or_register_project("Banana Tool")

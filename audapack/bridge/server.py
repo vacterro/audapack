@@ -16,9 +16,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from audapack import __version__
+from audapack import __version__, archive_receipt, handoff_drop
 from audapack.bridge.browser_dispatch import (
     SUPPORTED_BROWSER_WIDGET_VERSION,
     BrowserDispatcher,
@@ -27,7 +27,12 @@ from audapack.bridge.browser_dispatch import (
 from audapack.bridge.browser_dispatch import (
     DispatchError as BrowserDispatchError,
 )
-from audapack.bridge.lifecycle import INSTANCE_NONCE, remove_pid, write_pid
+from audapack.bridge.lifecycle import (
+    INSTANCE_NONCE,
+    SUPPORTED_API_VERSIONS,
+    remove_pid,
+    write_pid,
+)
 from audapack.bridge.state import (
     GenerationPersistenceError,
     RunStateCorruptionError,
@@ -39,10 +44,17 @@ from audapack.bridge.state import (
 from audapack.bridge.storage import (
     InvalidProjectPathError,
     atomic_write,
+    canonical_audit_bytes,
     capture_file_snapshots,
+    classify_canonical_file,
+    classify_canonical_file_by_sha,
+    expected_history_dir,
+    expected_wave_representation_paths,
     generate_canonical_campaign,
     parse_wave,
+    read_canonical_file,
     resolve_project_audit_dir,
+    resolve_project_audit_dir_readonly,
     restore_file_snapshots,
 )
 from audapack.campaign import (
@@ -59,22 +71,27 @@ from audapack.campaign import (
 from audapack.components.widget import get_bundled_widget_path
 from audapack.config import (
     AppConfig,
+    app_dir,
     get_token_file_path,
     get_user_runtime_dir,
     legacy_token_acceptance_revoked,
     load_config,
     normalize_bridge_host,
 )
-from audapack.inaudit_capture import InauditCaptureError, store_for_config
-from audapack.packing import find_archive_for_project, resolve_output_dir
+from audapack.inaudit_capture import InauditCaptureError, normalize_capture_text, store_for_config
+from audapack.packing import find_archive_for_project, project_for_archive_filename, resolve_output_dir
 from audapack.procutil import run_hidden
 from audapack.projects import ProjectRegistry, RegistrySaveError
 
 logger = logging.getLogger("audapack.bridge")
 
+#: W2-001: bounded extra grace the Bridge gives the prepared worker to reach
+#: quiescence before it refuses to close the socket or drop its PID file.
+PREPARED_QUIESCENCE_WAIT_SECONDS = 30.0
+
 # Canonical API contract version. Advertised in /health; supports v2 and v3.
+# SUPPORTED_API_VERSIONS is the single client+server set (W2-004).
 BRIDGE_API_VERSION = 3
-SUPPORTED_API_VERSIONS = (2, 3)
 
 # Canonical browser-worker protocol advertised in /health; sourced from browser_dispatch.
 BROWSER_WORKER_PROTOCOL_VERSION = SUPPORTED_BROWSER_WIDGET_VERSION
@@ -287,7 +304,18 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
     Raises on any write failure so the caller can roll back. History side is
     written before the canonical latest so a partial failure never leaves the
     authoritative file mutated without durable state agreeing.
+
+    T-185 B3: the exact physical bytes of every canonical latest representation
+    are recorded in ``state["final_artifact_digests"]`` so a future content-less
+    verify probe can classify ALL_3 against exact bytes instead of guessing
+    (the synthesizer embeds a generation timestamp, so re-synthesis can never
+    reproduce the original bytes).
     """
+    digests = dict(state.get("final_artifact_digests") or {})
+
+    def _record(path, content):
+        digests[str(path)] = hashlib.sha256(canonical_audit_bytes(content)).hexdigest()
+
     kind = prof.canonical_artifact_kind
     if kind == ARTIFACT_KIND_QUICK3_COMBINED:
         all3_content = synth_result.get("all3", "")
@@ -295,6 +323,7 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
         all3_hist = history_dir / f"{resolved_name}__00_AUDIT_ALL_3__{dt_str}.md"
         atomic_write(all3_hist, all3_content)
         atomic_write(all3_latest, all3_content)
+        _record(all3_latest, all3_content)
         state["all3_complete"] = True
         state["all3_path"] = str(all3_latest)
     elif kind == ARTIFACT_KIND_DIRECT_HANDOFF:
@@ -307,6 +336,7 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
         handoff_hist = history_dir / f"{resolved_name}{basename}__{dt_str}.md"
         atomic_write(handoff_hist, handoff_content)
         atomic_write(handoff_latest, handoff_content)
+        _record(handoff_latest, handoff_content)
         state["campaign_complete"] = True
         state["final_handoff_path"] = str(handoff_latest)
         state["canonical_campaign_path"] = str(handoff_latest)
@@ -326,9 +356,14 @@ def _write_final_artifacts(prof, synth_result, target_dir, history_dir, dt_str, 
         atomic_write(final_latest, super_final)
         atomic_write(index_hist, super_index)
         atomic_write(index_latest, super_index)
+        _record(all_latest, super_all)
+        _record(final_latest, super_final)
+        _record(index_latest, super_index)
         state["campaign_complete"] = True
         state["final_handoff_path"] = str(final_latest)
         state["canonical_campaign_path"] = str(all_latest)
+
+    state["final_artifact_digests"] = digests
 
 
 def _final_artifact_paths(prof, target_dir: Path, history_dir: Path, dt_str: str, resolved_name: str) -> list[Path]:
@@ -368,6 +403,153 @@ def _get_final_handoff_path(prof, state) -> Optional[Path]:
     if prof.canonical_artifact_kind == ARTIFACT_KIND_QUICK3_COMBINED:
         return Path(state["all3_path"]) if state.get("all3_path") else None
     return Path(state["final_handoff_path"]) if state.get("final_handoff_path") else None
+
+
+# T-185 P0-2: the required physical durability set. ONE derivation owner for
+# what "this campaign is durably represented on disk" means, shared by
+# verify_only, materialization (normal, partial and replay) and the duplicate
+# acknowledgement -- four slightly different lists is exactly the defect class
+# audit/10 CORE-001/W2-001 names.
+def _campaign_requires_final_artifacts(prof, state) -> bool:
+    """True when every profile-required wave is complete in the run state.
+
+    B1: an incomplete 1/3 or 2/3 run has NO required final artifact -- Core
+    still saves truthfully at 1/3 and Second at 2/3. B2: a campaign-complete
+    run must also prove its final handoff.
+    """
+    return all(
+        state.get("waves", {}).get(w.id, {}).get("complete")
+        for w in prof.waves if w.required
+    )
+
+
+def _expected_final_artifacts(prof, state, target_dir, resolved_name):
+    """The REQUIRED final-artifact durability set for a run (T-185 B2/B3).
+
+    One derivation owner shared by verify_only, receipt-replay preflight,
+    materialization postcondition and the duplicate acknowledgement. Each entry
+    is {"path", "digest"}: the canonical latest representation this profile's
+    finalization promises, and the exact physical-byte digest recorded when
+    those bytes were written (``state["final_artifact_digests"]``). A missing
+    digest means the bytes cannot be proven at all -- callers classify that
+    fail-closed (UNREADABLE), never durable. Returns [] for an incomplete
+    campaign (B1: no ALL_3 requirement before campaign readiness).
+    """
+    if not _campaign_requires_final_artifacts(prof, state):
+        return []
+    digests = state.get("final_artifact_digests") or {}
+    kind = prof.canonical_artifact_kind
+    entries: list[dict] = []
+    if kind == ARTIFACT_KIND_QUICK3_COMBINED:
+        latest = Path(state["all3_path"]) if state.get("all3_path") else (
+            target_dir / f"{resolved_name}__00_AUDIT_ALL_3.md"
+        )
+        entries.append({"path": latest, "digest": str(digests.get(str(latest), ""))})
+    elif kind == ARTIFACT_KIND_DIRECT_HANDOFF:
+        latest = Path(state["final_handoff_path"]) if state.get("final_handoff_path") else (
+            target_dir / f"{resolved_name}{prof.canonical_artifact_basename}.md"
+        )
+        entries.append({"path": latest, "digest": str(digests.get(str(latest), ""))})
+    else:
+        for key, suffix in (
+            ("canonical_campaign_path", "__00_SUPER_AUDIT_ALL.md"),
+            ("final_handoff_path", "__00_SUPER_AUDIT_FINAL.md"),
+            (None, "__00_SUPER_AUDIT_INDEX.json"),
+        ):
+            if key and state.get(key):
+                latest = Path(state[key])
+            else:
+                latest = target_dir / f"{resolved_name}{suffix}"
+            entries.append({"path": latest, "digest": str(digests.get(str(latest), ""))})
+    return entries
+
+
+def classify_required_artifacts(entries, target_dir) -> list[dict]:
+    """Classify every required final artifact like wave representations (B3).
+
+    Verdicts: INTACT / MISSING / CONTENT_MISMATCH / WRONG_TYPE / UNREADABLE.
+    A recorded path outside the campaign directory is OUTSIDE_CANONICAL (A3:
+    unsafe -- fail closed, never overwrite arbitrary filesystem objects). A
+    file whose bytes cannot be proven against any recorded digest is
+    UNREADABLE (the classify_canonical_file_by_sha convention: an unprovable
+    file is never durable).
+    """
+    classified = []
+    target_root = Path(target_dir).resolve()
+    for entry in entries:
+        path = Path(entry["path"])
+        digest = str(entry.get("digest") or "")
+        try:
+            contained = path.resolve().parent == target_root or target_root in path.resolve().parents
+        except OSError:
+            contained = False
+        if not contained:
+            classified.append({"path": str(path), "verdict": "OUTSIDE_CANONICAL", "digest": digest})
+            continue
+        data, verdict = read_canonical_file(path)
+        if verdict:
+            classified.append({"path": str(path), "verdict": verdict, "digest": digest})
+            continue
+        if not digest:
+            classified.append({"path": str(path), "verdict": "UNREADABLE", "digest": digest})
+            continue
+        intact = hashlib.sha256(data or b"").hexdigest() == digest.strip().lower()
+        classified.append({
+            "path": str(path),
+            "verdict": "INTACT" if intact else "CONTENT_MISMATCH",
+            "digest": digest,
+        })
+    return classified
+
+
+def detect_project_placement_drift(state, target_dir) -> list[dict]:
+    """W2-005: recorded canonical paths must belong to the CURRENT placement.
+
+    A run records absolute canonical paths (per-wave latest/history, the
+    history dir and the final artifacts) from the placement it was ingested
+    in. If the project has since been moved to another group/display name, or
+    the configured audit root changed, those recorded paths point at a STALE
+    placement while materialize would create campaign.json under the NEW one
+    -- one campaign physically split across two sources of truth.
+
+    Returns one entry per recorded canonical path that no longer lives under
+    ``target_dir`` (empty list = placement is coherent). The caller must fail
+    closed BEFORE any mkdir/write; a bounded migration is deliberately out of
+    scope. Entries carry placement-level context (the stale path's last two
+    components), never full absolute paths: enough to diagnose the move,
+    nothing that leaks unrelated filesystem layout.
+    """
+    target_root = Path(target_dir).resolve()
+    stale: list[dict] = []
+
+    def _drifts(kind: str, wave_id: str, raw) -> None:
+        if not raw:
+            return
+        path = Path(str(raw))
+        try:
+            resolved = path.resolve()
+            contained = resolved.parent == target_root or target_root in resolved.parents
+        except OSError:
+            contained = False
+        if contained:
+            return
+        parts = resolved.parts
+        stale.append({
+            "kind": kind,
+            "wave": wave_id,
+            "file": resolved.name,
+            "placement": "/".join(parts[-3:-1]) if len(parts) >= 3 else (parts[-2] if len(parts) >= 2 else ""),
+        })
+
+    _drifts("history_dir", "", state.get("history_dir"))
+    for wave_id, wave_state in (state.get("waves") or {}).items():
+        if not isinstance(wave_state, dict):
+            continue
+        _drifts("latest_path", str(wave_id), wave_state.get("latest_path"))
+        _drifts("history_path", str(wave_id), wave_state.get("history_path"))
+    for key in ("all3_path", "final_handoff_path", "canonical_campaign_path"):
+        _drifts("final_artifact", "", state.get(key))
+    return stale
 
 
 def _get_canonical_path(prof, state) -> Optional[Path]:
@@ -613,6 +795,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "widget_bundle_sha256": widget_bundle_sha256,
                 "browser_worker_protocol": BROWSER_WORKER_PROTOCOL_VERSION,
             })
+        elif parsed.path == "/v1/probe/bytes":
+            self._handle_transport_probe(parsed.query)
         elif parsed.path == "/widget.user.js":
             w_path = get_bundled_widget_path()
             if w_path.exists():
@@ -660,6 +844,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 "widget_bundle_version": widget_bundle_version,
                 "widget_bundle_sha256": widget_bundle_sha256,
                 "browser_worker_protocol": BROWSER_WORKER_PROTOCOL_VERSION,
+                "prepared_scheduler": getattr(getattr(self, "prepared_worker", None),
+                                              "status_snapshot", {"state": "UNAVAILABLE"}),
             })
         elif parsed.path in ["/v1/projects", "/v1/registry"]:
             if not self.check_auth():
@@ -669,7 +855,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             active_groups = registry.get_active_groups()
             self.send_json(200, {
                 "ok": True,
-                "revision": int(time.time()),
+                # P1 TARGET C: a CONTENT revision, not a wall clock. The old
+                # `int(time.time())` changed every second, so it could never
+                # support "the registry has not changed, keep the cached list".
+                "revision": self._registry_revision(live_cfg),
                 "groups": active_groups,
                 "projects": [
                     {
@@ -762,6 +951,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 # with its original worker present and heartbeating. Invisible,
                 # it looks like the recovery path simply never runs.
                 "last_reconcile_error": worker.meta.get("last_reconcile_error", ""),
+                # T-248: the live ChatGPT composer shape this window can really
+                # see, refreshed on every heartbeat. It answers "why did every
+                # lane block pre-START" with the current build's own file-input
+                # topology instead of a guess made from a screenshot.
+                "upload_topology": worker.meta.get("upload_topology", ""),
                 "managed_profile": worker.managed_profile,
                 "profile_allowed": self._dispatcher().worker_in_allowed_profile(worker),
                 "reports_lease": bool(worker.meta.get("reports_lease")),
@@ -815,6 +1009,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "next_retry_at": job.next_retry_at,
                     "last_error_code": job.last_error_code,
                     "recovery_state": job.recovery_state,
+                    # Held, not failed: the worker stopped mid-answer and is
+                    # waiting for a human. The Project Room shows this beside
+                    # the lane so an interrupted wave is not invisible.
+                    "attention": job.attention,
                     # The run id the saved campaign actually carries when the
                     # widget's runtime re-derived it. Without it in this payload
                     # the coordinator cannot prove campaign_match, and a
@@ -834,6 +1032,12 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             if not self.check_auth():
                 return
             self.send_json(200, {"ok": True, **self._browser_slots_status()})
+        elif self._project_archive_route(parsed.path) is not None:
+            project_id, action = self._project_archive_route(parsed.path)
+            if action:
+                self.send_json(404, {"ok": False, "error": "Endpoint not found"})
+                return
+            self.handle_project_archive_download(project_id)
         else:
             self.send_json(404, {"ok": False, "error": "Endpoint not found"})
 
@@ -875,6 +1079,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 self._handle_inaudit_restore(capture_id)
                 return
 
+        if parsed.path == "/v1/audits/materialize":
+            self.handle_audit_materialize()
+            return
+
         if parsed.path == "/v1/audits":
             self.handle_audit_submission()
             return
@@ -905,6 +1113,14 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/v1/browser/relaunch-slot":
             self._handle_relaunch_slot()
+            return
+
+        if self._project_archive_route(parsed.path) is not None:
+            project_id, action = self._project_archive_route(parsed.path)
+            if action == "ensure":
+                self.handle_project_archive_ensure(project_id)
+                return
+            self.send_json(404, {"ok": False, "error": "Endpoint not found"})
             return
 
         self.send_json(404, {"ok": False, "error": "Endpoint not found"})
@@ -996,9 +1212,28 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         data = self._read_json_body()
         if data is None:
             return
+        # SRC-083: a captured handoff is filed as a handoff and written as a
+        # ready-to-hand-over file, so the operator pastes a path instead of
+        # copying the block through a scratchpad first. The registry decides the
+        # project-addressed shape, so only a REGISTERED name counts.
+        live_cfg = self.get_live_config()
+        text = data.get("text") if isinstance(data, dict) else None
+        label = (
+            handoff_drop.detect_handoff(text, handoff_drop.project_names(live_cfg.projects))
+            if isinstance(text, str)
+            else None
+        )
+        # `handoff_only`: the widget's automatic path offers a block that merely
+        # LOOKS project-addressed. Anything the Bridge does not recognize as a
+        # handoff is dropped here -- never filed as an inbox capture.
+        if isinstance(data, dict) and data.get("handoff_only") is True and not label:
+            self.send_json(200, {"ok": True, "committed": False, "durable": False, "handoff": None, "skipped": "not_a_handoff"})
+            return
+        if label and str(data.get("capture_kind") or "response").lower() in ("response", "block", "clipboard"):
+            data = {**data, "capture_kind": "handoff"}
         store = self._inaudit_store()
         try:
-            result = store.capture(data, self.get_live_config().projects)
+            result = store.capture(data, live_cfg.projects)
         except InauditCaptureError as exc:
             self._send_inaudit_error(exc)
             return
@@ -1008,7 +1243,48 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": {"code": "capture_persistence_failed", "message": str(exc), "retriable": True}},
             )
             return
+        if label:
+            result = {**result, "handoff": self._materialize_handoff(normalize_capture_text(text), label, live_cfg)}
+        else:
+            result = self._pin_capture_to_archive_project(store, data, result, live_cfg.projects)
         self._send_inaudit_committed(store, result)
+
+    def _pin_capture_to_archive_project(self, store, data: dict, result: dict, projects) -> dict:
+        """Pin an audit reply to the project whose archive it answered.
+
+        The widget sends ``archive_filename`` when it captures a reply to a user
+        turn that carried a project archive. The archive name is an exact project
+        identity, stronger than any text classification, so the capture lands in
+        the Inbox already pinned. A name no single project owns, a capture that
+        is already pinned or assigned, or any pin failure leaves the capture as
+        it was -- the capture itself is already durable.
+        """
+        filename = data.get("archive_filename") if isinstance(data, dict) else None
+        if not isinstance(filename, str) or not filename.strip() or len(filename) > 260:
+            return result
+        record = result.get("record") or {}
+        if record.get("target_project_id") or record.get("assigned_project_id"):
+            return result
+        project = project_for_archive_filename(filename, projects)
+        if project is None:
+            return result
+        try:
+            pinned = store.set_target_project(str(record.get("capture_id") or ""), project.id, projects)
+        except (InauditCaptureError, OSError) as exc:
+            logger.warning("archive reply capture not pinned: %s", exc)
+            return result
+        return {**result, "record": pinned, "pinned_project": project.display_name}
+
+    def _materialize_handoff(self, text: str, label: str, live_cfg) -> dict:
+        """Write the handoff file; a failure here never undoes the capture."""
+        configured = getattr(getattr(live_cfg, "bridge", None), "handoff_dir", "") or ""
+        folder = handoff_drop.resolve_drop_dir(configured)
+        try:
+            path, reused = handoff_drop.materialize(text, label, folder)
+        except OSError as exc:
+            logger.warning("handoff file not written: %s", exc)
+            return {"ok": False, "label": label, "error": str(exc)[:240]}
+        return {"ok": True, "label": label, "path": str(path), "filename": path.name, "reused": reused}
 
     def _handle_inaudit_assign(self, capture_id: str) -> None:
         data = self._read_json_body()
@@ -1108,8 +1384,11 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return
 
         if was_created:
-            from audapack.bridge.state import increment_audit_generation
-            increment_audit_generation(proj.display_name, "registered", project_id=proj.id)
+            from audapack.bridge.state import GenerationPersistenceError, publish_audit_generation
+            try:
+                publish_audit_generation(proj.display_name, "registered", project_id=proj.id)
+            except GenerationPersistenceError as exc:
+                logger.warning("registered generation publish deferred: %s", exc)
             if _ON_AUDIT_WRITTEN:
                 try:
                     _ON_AUDIT_WRITTEN(proj.display_name, "registered")
@@ -1127,6 +1406,1519 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             "registry_revision": len(live_cfg.projects),
             "created": was_created,
         })
+
+    @staticmethod
+    def _project_archive_route(path: str) -> Optional[tuple[str, str]]:
+        """Parse /v1/projects/<id>/archive[/ensure] with no other shape.
+
+        Returns ``(project_id, action)`` where action is ``""`` for the download
+        route or ``"ensure"``. Any other path (including a trailing arbitrary
+        segment) is not an archive route.
+        """
+        parts = [part for part in str(path or "").split("/") if part]
+        if len(parts) not in (4, 5):
+            return None
+        if parts[0] != "v1" or parts[1] != "projects" or parts[3] != "archive":
+            return None
+        action = parts[4] if len(parts) == 5 else ""
+        if action not in ("", "ensure"):
+            return None
+        return unquote(parts[2]), action
+
+    @staticmethod
+    def _registry_revision(live_cfg) -> str:
+        """A content digest of the registered project identities (TARGET C).
+
+        The project picker caches its list; a cache may only be kept while the
+        thing it caches is unchanged. A clock cannot state that (the previous
+        `int(time.time())` revision changed every second regardless), so this is
+        a digest of exactly the fields the picker renders and the ZIP path
+        depends on: identity, names, group, slot, enabled. Two readbacks that
+        differ here genuinely differ; two that agree may safely share a list.
+        """
+        try:
+            payload = [
+                [
+                    str(getattr(p, "id", "")),
+                    str(getattr(p, "display_name", "")),
+                    str(getattr(p, "audit_project_name", "") or ""),
+                    str(getattr(p, "priority_group", "") or ""),
+                    int(getattr(p, "slot", 0) or 0),
+                    bool(getattr(p, "enabled", False)),
+                ]
+                for p in list(getattr(live_cfg, "projects", None) or [])
+            ]
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+        except Exception:  # noqa: BLE001 - an unreadable registry has no revision
+            return ""
+
+    def _registered_project(self, project_id: str):
+        """Read-only registered lookup. Never registers and never guesses."""
+        live_cfg = self.get_live_config()
+        registry = ProjectRegistry(live_cfg, base_dir=self.get_custom_base_dir(), transactional=True)
+        return live_cfg, registry.get_project_by_id(project_id)
+
+    def _canonical_archive_path(self, proj, live_cfg) -> Optional[Path]:
+        """The archive the packer would call canonical for ``proj``.
+
+        Server-side resolution only: the output directory comes from the live
+        configuration and the project identity, never from the request.
+        """
+        if not getattr(proj, "source_path", ""):
+            return None
+        output_dir = resolve_output_dir(
+            proj.source_path,
+            live_cfg.packing,
+            fallback=app_dir(),
+            group=proj.priority_group,
+            project=proj,
+        )
+        archive = find_archive_for_project(proj, output_dir)
+        if archive is None or not archive.is_file():
+            return None
+        return archive
+
+    def _archive_project_eligibility(self, project_id: str):
+        """Shared archive eligibility for ensure AND download.
+
+        Read-only, never registers. Returns ``(live_cfg, proj, error)`` where
+        ``error`` is None or a ``(status, code, message)`` triple. Keeping one
+        policy owner prevents ensure and download from drifting apart.
+        """
+        live_cfg, proj = self._registered_project(project_id)
+        if proj is None:
+            return live_cfg, None, (404, "unknown_project", "Project is not registered")
+        if not proj.enabled:
+            return live_cfg, None, (400, "project_disabled", "Project is disabled")
+        if not proj.source_path:
+            return live_cfg, None, (400, "project_source_missing", "Project has no source path")
+        try:
+            available = Path(proj.source_path).is_dir()
+        except OSError:
+            available = False
+        if not available:
+            return live_cfg, None, (400, "project_source_unavailable", "Project source directory is unavailable")
+        return live_cfg, proj, None
+
+    def handle_project_archive_ensure(self, project_id: str) -> None:
+        if not self.check_auth():
+            return
+        live_cfg, proj, error = self._archive_project_eligibility(project_id)
+        if error is not None:
+            status, code, message = error
+            self.send_json(status, {"ok": False, "error": {"code": code, "message": message, "retriable": False}})
+            return
+
+        from audapack.services.packing_service import PackingService
+
+        packer = PackingService(live_cfg, base_dir=self.get_custom_base_dir())
+        ensure_started = time.perf_counter()
+        try:
+            result = packer.ensure_fresh_archive(proj.id)
+        except Exception as exc:  # noqa: BLE001 - surface an exact, non-fatal error
+            self.send_json(503, {"ok": False, "error": {"code": "archive_pack_failed", "message": str(exc)[:240], "retriable": True}})
+            return
+        ensure_ms = (time.perf_counter() - ensure_started) * 1000.0
+        if not result.success or not result.output_path:
+            self.send_json(400, {"ok": False, "error": {"code": "archive_unavailable", "message": result.error_message or "Archive could not be produced", "retriable": False}})
+            return
+        archive = Path(result.output_path)
+        try:
+            stat = archive.stat()
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        # P1 TARGET D: ask the receipt store first. A reused archive whose
+        # identity (path + size + mtime_ns + ctime_ns + policy fingerprint) is
+        # unchanged returns its recorded SHA without rereading the whole ZIP;
+        # anything else hashes once and refreshes the receipt.
+        sha_started = time.perf_counter()
+        try:
+            digest, digest_from_receipt = archive_receipt.proven_digest(
+                archive,
+                policy_fingerprint=self._archive_policy_fingerprint(live_cfg),
+                compute=self._sha256_path,
+            )
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        sha_ms = (time.perf_counter() - sha_started) * 1000.0
+        timings = dict(getattr(result, "timings", None) or {})
+        timings.update({
+            "ensure_total_ms": round(ensure_ms, 3),
+            "server_archive_sha_ms": round(sha_ms, 3),
+            "sha_receipt_reused": bool(digest_from_receipt),
+        })
+        # P1 TARGET E: the freshness probe is measured inside the ensure decision
+        # and reported separately, so "is the walk or the pack the latency?" is
+        # answered by evidence instead of by a guess.
+        self.send_json(200, {
+            "ok": True,
+            "project_id": proj.id,
+            "display_name": proj.display_name,
+            "filename": archive.name,
+            "size": int(stat.st_size),
+            "mtime": int(stat.st_mtime),
+            "sha256": digest,
+            "sha_source": "receipt" if digest_from_receipt else "computed",
+            "reused": bool(getattr(result, "reused", False)),
+            "packed": bool(getattr(result, "packed", False)),
+            "timings": timings,
+            # T-190: compact terminal pack state + Git inventory summary.
+            "status": str(getattr(result, "status", "") or ("PACKED" if result.success else "")),
+            "git_summary": str(getattr(result, "git_summary", "") or ""),
+        })
+
+    @staticmethod
+    def _archive_policy_fingerprint(live_cfg) -> str:
+        """The packing policy identity the archive must prove it was built under.
+
+        Empty means "this process cannot state the policy", and an empty
+        fingerprint makes every receipt unusable by construction (see
+        `audapack.archive_receipt`), so an inability to compute it degrades to
+        "hash it" rather than to "trust a stale digest".
+        """
+        try:
+            from audapack.fidelity import policy_fingerprint_from_config
+
+            packing = live_cfg.packing
+            return policy_fingerprint_from_config(packing, set(getattr(packing, "excludes", None) or []))
+        except Exception:  # noqa: BLE001 - no policy identity means no receipt
+            return ""
+
+    def handle_project_archive_download(self, project_id: str) -> None:
+        # SRC-083 TARGET C: the pre-stream work is timed per step so a slow GET
+        # can be attributed to auth, project/archive resolution or the digest
+        # proof instead of to "the download". Durations only -- never a path.
+        entered = time.perf_counter()
+        if not self.check_auth():
+            return
+        auth_done = time.perf_counter()
+        live_cfg, proj, error = self._archive_project_eligibility(project_id)
+        if error is not None:
+            status, code, message = error
+            self.send_json(status, {"ok": False, "error": {"code": code, "message": message, "retriable": False}})
+            return
+        archive = self._canonical_archive_path(proj, live_cfg)
+        if archive is None:
+            self.send_json(404, {"ok": False, "error": {"code": "archive_missing", "message": "No canonical archive for this project", "retriable": False}})
+            return
+        try:
+            size = archive.stat().st_size
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        resolved = time.perf_counter()
+        # TARGET D on the download path too: this used to hash the entire archive
+        # BEFORE streaming it, so every GET paid two full reads of the same bytes.
+        try:
+            digest, _from_receipt = archive_receipt.proven_digest(
+                archive,
+                policy_fingerprint=self._archive_policy_fingerprint(live_cfg),
+                compute=self._sha256_path,
+            )
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        digested = time.perf_counter()
+        auth_ms = (auth_done - entered) * 1000.0
+        resolve_ms = (resolved - auth_done) * 1000.0
+        digest_ms = (digested - resolved) * 1000.0
+        prep_ms = (digested - entered) * 1000.0
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{archive.name}"')
+            self.send_header("X-AUDAPACK-Archive-SHA256", digest)
+            # Where the digest came from, so "did this GET reread the ZIP?" is
+            # answerable from the wire instead of inferred.
+            self.send_header("X-AUDAPACK-Archive-SHA256-Source", "receipt" if _from_receipt else "computed")
+            self.send_header("X-AUDAPACK-Archive-Prep-Ms", f"{prep_ms:.3f}")
+            self.send_header("X-AUDAPACK-Archive-Digest-Ms", f"{digest_ms:.3f}")
+            self.send_header(
+                "Server-Timing",
+                f"auth;dur={auth_ms:.3f}, resolve;dur={resolve_ms:.3f}, digest;dur={digest_ms:.3f}, prep;dur={prep_ms:.3f}",
+            )
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-ACB-Token, Authorization")
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "X-AUDAPACK-Archive-SHA256, X-AUDAPACK-Archive-SHA256-Source, X-AUDAPACK-Archive-Prep-Ms, "
+                "X-AUDAPACK-Archive-Digest-Ms, Server-Timing, Content-Disposition, Content-Length",
+            )
+            self.end_headers()
+            with archive.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (OSError, BrokenPipeError) as exc:
+            logger.warning("project archive stream interrupted: %s", exc)
+
+    #: SRC-083 TARGET F: upper bound of one transport probe body.
+    TRANSPORT_PROBE_MAX_BYTES = 8 * 1024 * 1024
+
+    def _handle_transport_probe(self, query: str) -> None:
+        """Stream N zero bytes so the widget can time a browser transport.
+
+        The widget compares GM_xmlhttpRequest with the page's native fetch on a
+        body the same size as the canonical archive. The body is content-free
+        zeros, so the endpoint needs no token: a native fetch is never handed
+        the Bridge credential just to be measured, and no project data can
+        leave through it. Size is clamped; loopback checks already ran.
+        """
+        try:
+            size = int((parse_qs(query).get("size") or ["0"])[0])
+        except (TypeError, ValueError):
+            size = 0
+        size = max(1, min(self.TRANSPORT_PROBE_MAX_BYTES, size or (1 << 20)))
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin())
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Expose-Headers", "Content-Length")
+            self.end_headers()
+            block = memoryview(bytes(1 << 20))
+            remaining = size
+            while remaining > 0:
+                step = min(remaining, len(block))
+                self.wfile.write(block[:step])
+                remaining -= step
+        except (OSError, BrokenPipeError) as exc:
+            logger.warning("transport probe stream interrupted: %s", exc)
+
+    def _completed_wave_duplicate_response(
+        self,
+        *,
+        prof,
+        run_id: str,
+        project: str,
+        project_id: str,
+        live_cfg,
+        state: dict,
+        wave_def,
+        wave_state: dict,
+        dt_str: str,
+        content: str = "",
+    ) -> tuple[int, dict]:
+        """Unified idempotent response for an already-committed wave (W2-002).
+
+        SRC-041:R005: the same-receipt retry and the different-receipt retry were
+        two copies of the same work -- only the receipt path repaired incomplete
+        finalization and flushed `generation_pending`, so a retry that reused the
+        wave content under a new receipt skipped both and could answer
+        `campaign_ready=False` forever while the generation marker stayed pending.
+        Both now run this one helper, so duplicate handling is identical.
+
+        Secondary work (generation publication, marker clear, finalization) never
+        drops the HTTP connection: a marker-clear `save_run_state` failure keeps
+        `generation_pending` durable and still returns valid JSON (SRC-041:R005).
+
+        T-185: a duplicate is durability proof only if every canonical expected
+        file still holds the exact committed bytes. Both call sites gate on
+        `wave_state["sha256"] == sha256(content)`, so the submitted bytes ARE the
+        canonical bytes and a MISSING/CONTENT_MISMATCH file can be repaired with
+        them transactionally. WRONG_TYPE / UNREADABLE fail closed -- a directory
+        or an unreadable file is never silently replaced. Legacy state without
+        recorded paths derives its expected paths instead of answering files=[].
+        """
+        from audapack.bridge.state import publish_audit_generation
+
+        try:
+            target_dir, resolved_name, _proj_dup, _created = resolve_project_audit_dir(
+                live_cfg, project, project_id or None, base_dir=self.get_custom_base_dir()
+            )
+        except InvalidProjectPathError as exc:
+            return 400, {
+                "ok": False,
+                "error": {"code": "invalid_project_path", "message": str(exc), "retriable": False},
+            }
+        except Exception as exc:
+            return 503, {
+                "ok": False,
+                "error": {"code": "duplicate_resolve_failed", "message": str(exc), "retriable": True},
+            }
+
+        completed_at = str(wave_state.get("completed_at") or dt_str)
+        history_dir = (
+            Path(state["history_dir"])
+            if state.get("history_dir")
+            else expected_history_dir(target_dir, completed_at, run_id)
+        )
+        latest_path, history_path = expected_wave_representation_paths(
+            wave_number=wave_def.number,
+            wave_slug=wave_def.slug,
+            resolved_name=resolved_name,
+            target_dir=target_dir,
+            history_dir=history_dir,
+            completed_at=completed_at,
+            latest_path=str(wave_state["latest_path"]) if wave_state.get("latest_path") else None,
+            history_path=str(wave_state["history_path"]) if wave_state.get("history_path") else None,
+        )
+
+        classification: dict[Path, str] = {}
+        for path in dict.fromkeys((latest_path, history_path)):
+            classification[path] = classify_canonical_file(path, content) if content else "UNREADABLE"
+
+        repairable = [p for p, verdict in classification.items() if verdict in ("MISSING", "CONTENT_MISMATCH")]
+        blocking = [p for p, verdict in classification.items() if verdict in ("WRONG_TYPE", "UNREADABLE")]
+        repaired_paths: list[str] = []
+        if repairable and content:
+            lock_root = target_dir
+            try:
+                with campaign_transaction_lock(lock_root):
+                    snapshots, snap_err = capture_file_snapshots(repairable)
+                    if snap_err:
+                        return 503, {
+                            "ok": False,
+                            "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True},
+                        }
+                    try:
+                        for path in repairable:
+                            atomic_write(path, content)
+                            repaired_paths.append(str(path))
+                    except Exception as exc:
+                        # Transactional: an unrepairable second write must return
+                        # the first file to its exact pre-request bytes.
+                        return 503, _rollback_error(snapshots, "atomic_write_failed", str(exc))
+                    # Re-verify AFTER repair: only physical canonical bytes count.
+                    # An injected no-op write leaves the file MISSING again.
+                    still_bad = [
+                        str(path) for path in repairable
+                        if classify_canonical_file(path, content) != "INTACT"
+                    ]
+                    if still_bad:
+                        return 503, {
+                            "ok": False,
+                            "error": {
+                                "code": "duplicate_files_missing",
+                                "message": (
+                                    "Wave content matches the canonical run but these canonical files "
+                                    "could not be restored and verified: " + "; ".join(still_bad)
+                                ),
+                                "retriable": True,
+                                "files_missing": still_bad,
+                            },
+                        }
+            except Exception as exc:
+                return 503, {
+                    "ok": False,
+                    "error": {
+                        "code": "atomic_write_failed",
+                        "message": f"Duplicate-path repair could not take the campaign lock: {exc}",
+                        "retriable": True,
+                    },
+                }
+
+        if blocking:
+            # Fail closed: no durability success while a canonical path is a
+            # directory / special file / unreadable. Retriable: filesystem
+            # conditions like this may be fixed by the operator.
+            details = "; ".join(f"{path}={classification[path]}" for path in blocking)
+            return 503, {
+                "ok": False,
+                "error": {
+                    "code": "duplicate_files_unverified",
+                    "message": (
+                        "Wave content matches the canonical run but these canonical paths are not "
+                        "verifiable regular files: " + details
+                    ),
+                    "retriable": True,
+                    "files_unverified": [str(path) for path in blocking],
+                },
+            }
+
+        completed_count = len([
+            w for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")
+        ])
+        is_ready = state.get("campaign_complete", False) or state.get("all3_complete", False)
+
+        if state.get("generation_pending", False):
+            try:
+                from audapack.bridge.state import publish_audit_generation
+                publish_audit_generation(
+                    project, wave_def.id, project_id=state.get("project_id") or None
+                )
+            except GenerationPersistenceError:
+                pass
+            else:
+                state["generation_pending"] = False
+                try:
+                    save_run_state(run_id, state)
+                except RunStatePersistenceError:
+                    # Generation published, durable marker-clear failed: keep
+                    # the marker pending (in memory and on disk) and answer
+                    # normally; a later retry repairs it.
+                    state["generation_pending"] = True
+
+        # Repair incomplete finalization for a completed campaign (CORE-002).
+        all_waves_complete = all(
+            w.id in state.get("waves", {}) and state["waves"][w.id].get("complete")
+            for w in prof.waves if w.required
+        )
+        if not is_ready and all_waves_complete:
+            try:
+                target_dir, resolved_name, proj, _created = resolve_project_audit_dir(
+                    live_cfg, project, project_id, base_dir=self.get_custom_base_dir()
+                )
+                target_dir.mkdir(parents=True, exist_ok=True)
+                parsed_dict = {
+                    w.id: state["waves"][w.id].get("meta", {})
+                    for w in prof.waves if w.id in state.get("waves", {})
+                }
+                # Reuse the finalizing wave's original completion stamp so a
+                # repair overwrites its existing history artifact instead of
+                # minting a second one (W2-002 G3: no new history artifact).
+                final_wave = prof.waves[-1] if prof.waves else None
+                final_wave_state = (
+                    state.get("waves", {}).get(final_wave.id, {}) if final_wave else {}
+                )
+                final_dt = str(final_wave_state.get("completed_at") or dt_str)
+                history_dir = Path(state["history_dir"]) if state.get("history_dir") else None
+                if history_dir is None or not history_dir.exists():
+                    history_dir = expected_history_dir(target_dir, final_dt, run_id)
+                    history_dir.mkdir(parents=True, exist_ok=True)
+                    state["history_dir"] = str(history_dir)
+                # CORE-004: route duplicate finalization repair through the same
+                # transactional commit gate as normal delivery. W2-001: same
+                # campaign-root lock as ingest and delivery.
+                with campaign_transaction_lock(target_dir):
+                    snap_targets = [target_dir / "campaign.json"]
+                    snap_targets.extend(
+                        _final_artifact_paths(prof, target_dir, history_dir, final_dt, resolved_name)
+                    )
+                    snapshots, snap_err = capture_file_snapshots(snap_targets)
+                    if snap_err:
+                        return 503, {
+                            "ok": False,
+                            "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True},
+                        }
+                    try:
+                        synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                        _write_final_artifacts(prof, synth_result, target_dir, history_dir,
+                                               final_dt, state, resolved_name)
+                        save_live_campaign_index(
+                            campaign_root=target_dir, profile=prof, run_id=run_id,
+                            project_name=resolved_name,
+                            parsed_waves={
+                                wid: {
+                                    "wave_id": wid,
+                                    "status": "COMPLETE",
+                                    "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                                    "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
+                                    "sha256": w_info.get("sha256", ""),
+                                    "completed_at": w_info.get("completed_at", final_dt),
+                                }
+                                for wid, w_info in state.get("waves", {}).items()
+                            },
+                            completed_waves=[w.id for w in prof.waves],
+                            active_wave_id=None,
+                            status=STATUS_CAMPAIGN_COMPLETE,
+                            final_handoff_path=_get_final_handoff_path(prof, state),
+                        )
+                    except Exception as exc:
+                        return 503, _rollback_error(snapshots, "campaign_index_failed", str(exc))
+                    try:
+                        save_run_state(run_id, state)
+                    except RunStatePersistenceError as exc:
+                        return 503, _rollback_error(snapshots, "campaign_index_failed", str(exc))
+                is_ready = True
+                try:
+                    from audapack.bridge.state import GenerationPersistenceError as _GPE2
+                    from audapack.bridge.state import publish_audit_generation as _pub2
+                    _pub2(resolved_name, wave_def.id, project_id=proj.id if proj else None)
+                except _GPE2 as exc:
+                    logger.warning("duplicate finalization generation deferred: %s", exc)
+                    state["generation_pending"] = True
+                    try:
+                        save_run_state(run_id, state)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                return 503, {
+                    "ok": False,
+                    "error": {"code": "finalization_failed", "message": str(exc), "retriable": True},
+                }
+
+        # T-185 P0-2 (B6): a duplicate of the final required wave must not
+        # answer campaign-durable while the required final artifact set is
+        # broken. The committed wave meta proves enough to rebuild finalization
+        # safely, so repair it transactionally -- or fail closed.
+        if is_ready and _campaign_requires_final_artifacts(prof, state):
+            try:
+                target_dir, resolved_name, _proj_b6, _created = resolve_project_audit_dir(
+                    live_cfg, project, project_id, base_dir=self.get_custom_base_dir()
+                )
+            except Exception as exc:
+                return 503, {
+                    "ok": False,
+                    "error": {"code": "duplicate_resolve_failed", "message": str(exc), "retriable": True},
+                }
+            final_bad = [
+                entry for entry in classify_required_artifacts(
+                    _expected_final_artifacts(prof, state, target_dir, resolved_name),
+                    target_dir,
+                )
+                if entry["verdict"] != "INTACT"
+            ]
+            if final_bad:
+                unsafe = [
+                    entry["path"] for entry in final_bad
+                    if entry["verdict"] in ("WRONG_TYPE", "UNREADABLE", "OUTSIDE_CANONICAL")
+                ]
+                if unsafe:
+                    return 503, {
+                        "ok": False,
+                        "error": {
+                            "code": "campaign_final_files_unverified",
+                            "message": (
+                                "Campaign final artifact(s) cannot be safely repaired: "
+                                + "; ".join(f"{e['path']}={e['verdict']}" for e in final_bad)
+                            ),
+                            "retriable": True,
+                            "files_unverified": unsafe,
+                        },
+                    }
+                # Missing / mismatched final bytes: rebuild through the same
+                # synthesizer, transactionally, exactly like a fresh
+                # finalization would.
+                final_wave = prof.waves[-1] if prof.waves else None
+                final_wave_state = (
+                    state.get("waves", {}).get(final_wave.id, {}) if final_wave else {}
+                )
+                final_dt = str(final_wave_state.get("completed_at") or dt_str)
+                history_dir = Path(state["history_dir"]) if state.get("history_dir") else None
+                if history_dir is None or not history_dir.exists():
+                    history_dir = expected_history_dir(target_dir, final_dt, run_id)
+                    history_dir.mkdir(parents=True, exist_ok=True)
+                    state["history_dir"] = str(history_dir)
+                parsed_dict = {
+                    w.id: state["waves"][w.id].get("meta", {})
+                    for w in prof.waves if w.id in state.get("waves", {})
+                }
+                with campaign_transaction_lock(target_dir):
+                    snap_targets = [target_dir / "campaign.json"]
+                    snap_targets.extend(
+                        _final_artifact_paths(prof, target_dir, history_dir, final_dt, resolved_name)
+                    )
+                    snapshots, snap_err = capture_file_snapshots(snap_targets)
+                    if snap_err:
+                        return 503, {
+                            "ok": False,
+                            "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True},
+                        }
+                    try:
+                        synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                        _write_final_artifacts(
+                            prof, synth_result, target_dir, history_dir,
+                            final_dt, state, resolved_name,
+                        )
+                        still_bad = [
+                            entry["path"] for entry in classify_required_artifacts(
+                                _expected_final_artifacts(prof, state, target_dir, resolved_name),
+                                target_dir,
+                            )
+                            if entry["verdict"] != "INTACT"
+                        ]
+                        if still_bad:
+                            return 503, _rollback_error(
+                                snapshots, "campaign_final_files_unverified",
+                                "campaign final artifact repair failed verification: "
+                                + ", ".join(still_bad),
+                            )
+                    except Exception as exc:
+                        return 503, _rollback_error(snapshots, "finalization_failed", str(exc))
+                    try:
+                        save_run_state(run_id, state)
+                    except RunStatePersistenceError as exc:
+                        return 503, _rollback_error(snapshots, "campaign_index_failed", str(exc))
+                repaired_paths.extend(
+                    str(entry["path"]) for entry in final_bad
+                )
+
+        return 200, {
+            "ok": True,
+            "duplicate": True,
+            "run_id": run_id,
+            "profile_id": prof.profile_id,
+            "project": project,
+            "wave": wave_def.id,
+            "wave_index": wave_def.ordinal,
+            "wave_count": prof.wave_count,
+            "completed_waves": completed_count,
+            "total_waves": prof.wave_count,
+            "campaign_ready": is_ready,
+            "all3_ready": is_ready if prof.profile_id == "quick3" else state.get("all3_complete", False),
+            "files": [str(latest_path), str(history_path)],
+            "repaired_files": repaired_paths,
+            "integrity": {
+                str(path): "INTACT" for path in dict.fromkeys((latest_path, history_path))
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Manual materialization (T-184)
+    #
+    # `/v1/audits` is INGEST: it commits a newly complete wave into the
+    # canonical campaign run, and a completed wave is immutable there. Manual
+    # SYNC/SAVE is a different operation -- it physically re-creates the files
+    # that already-canonical content is supposed to occupy. Routing it through
+    # ingest made an exact duplicate look like a failure and made a genuine
+    # content conflict (`completed_wave_immutable`) look like success. This
+    # endpoint owns representation recovery and nothing else: it never mints a
+    # run, never mutates a wave's receipt/sha/completion stamp, and fails
+    # closed the moment the requested bytes are not the canonical bytes.
+    # ------------------------------------------------------------------
+
+    MATERIALIZE_RECEIPTS_MAX = 50
+
+    @staticmethod
+    def _materialize_request_hash(
+        *,
+        run_id: str,
+        project_id: str,
+        project: str,
+        profile_id: str,
+        waves: list,
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "run_id": run_id,
+                "project_id": project_id,
+                "project": project,
+                "profile_id": profile_id,
+                "waves": sorted(
+                    [
+                        {
+                            "wave_id": str(w.get("wave_id") or w.get("wave") or "").strip().lower()
+                            if isinstance(w, dict) else "",
+                            "sha256": hashlib.sha256(
+                                str(w.get("content", "") if isinstance(w, dict) else "").encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for w in waves
+                    ],
+                    key=lambda item: (item["wave_id"], item["sha256"]),
+                ),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _record_materialization(state: dict, receipt: str, request_sha: str, response: dict) -> None:
+        ledger = state.get("materializations")
+        if not isinstance(ledger, dict):
+            ledger = {}
+        ledger[receipt] = {
+            "request_sha256": request_sha,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "response": response,
+        }
+        limit = AudapackBridgeHandler.MATERIALIZE_RECEIPTS_MAX
+        if len(ledger) > limit:
+            ordered = sorted(ledger.items(), key=lambda kv: str(kv[1].get("at", "")))
+            for stale_receipt, _stale in ordered[: len(ledger) - limit]:
+                ledger.pop(stale_receipt, None)
+        state["materializations"] = ledger
+
+    @staticmethod
+    def _record_replay_repair_failure(state: dict, receipt: str, failed_paths: list[str]) -> None:
+        """A4: a failed replay repair never rewrites the stored success.
+
+        The receipt stays the same logical operation with its original success
+        history intact; the current repair failure is recorded separately under
+        ``repair_failures`` so diagnostics keep both truths.
+        """
+        ledger = state.get("materializations")
+        if not isinstance(ledger, dict) or receipt not in ledger:
+            return
+        entry = ledger[receipt]
+        failures = entry.setdefault("repair_failures", [])
+        failures.append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "files": list(failed_paths),
+        })
+        state["materializations"] = ledger
+
+    def handle_audit_materialize(self):
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("application/json"):
+            self.send_json(415, {"ok": False, "error": {"code": "unsupported_media_type", "retriable": False}})
+            return
+
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        try:
+            client_api = int(data.get("api_version", 0))
+        except Exception:
+            client_api = 0
+        if client_api not in SUPPORTED_API_VERSIONS:
+            self.send_json(400, {
+                "ok": False,
+                "error": {
+                    "code": "unsupported_api_version",
+                    "message": f"Bridge speaks API versions {list(SUPPORTED_API_VERSIONS)}; payload declared v{client_api}",
+                    "retriable": False,
+                }
+            })
+            return
+
+        run_id = str(data.get("source_run_id") or data.get("run_id") or "").strip()
+        project = str(data.get("project") or data.get("project_name") or "").strip()
+        project_id = str(data.get("project_id", "")).strip()
+        receipt = str(data.get("receipt", "")).strip()
+        requested_profile = str(data.get("profile_id", "")).strip().lower()
+        # T-185: a verification asks "do the canonical files still exist?" and
+        # writes nothing. It needs no content and takes no receipt slot, so a
+        # background check can never mutate a campaign or burn idempotency.
+        verify_only = bool(data.get("verify_only"))
+        waves_raw = data.get("waves")
+        if not isinstance(waves_raw, list):
+            waves_raw = []
+
+        if not run_id or not waves_raw or (not receipt and not verify_only):
+            self.send_json(400, {
+                "ok": False,
+                "error": {
+                    "code": "missing_fields",
+                    "message": "source_run_id, receipt and a non-empty waves[] are required",
+                    "retriable": False,
+                }
+            })
+            return
+
+        live_cfg = self.get_live_config()
+        out_root = Path(live_cfg.audits.root).resolve()
+        if not out_root.exists():
+            self.send_json(503, {
+                "ok": False,
+                "error": {
+                    "code": "output_unavailable",
+                    "message": f"Audit root unavailable: {out_root}",
+                    "retriable": True,
+                }
+            })
+            return
+
+        live_registry = ProjectRegistry(live_cfg, base_dir=self.get_custom_base_dir(), transactional=True)
+        if project_id and live_registry.get_project_by_id(project_id) is None:
+            self.send_json(400, {
+                "ok": False,
+                "error": {
+                    "code": "invalid_project_id",
+                    "message": f"Unknown project_id: {project_id}",
+                    "retriable": False,
+                }
+            })
+            return
+
+        with run_transaction(run_id):
+            try:
+                state = get_run_state(run_id)
+            except RunStateCorruptionError as exc:
+                self.send_json(503, {
+                    "ok": False,
+                    "error": {"code": "run_state_corrupt", "message": str(exc), "retriable": True}
+                })
+                return
+
+            # A materialization never creates a campaign. get_run_state()
+            # answers a blank scaffold for an unknown id, and a scaffold has no
+            # waves -- exactly the "nothing canonical to re-materialize" case.
+            if not isinstance(state.get("waves"), dict) or not state.get("waves"):
+                self.send_json(404, {
+                    "ok": False,
+                    "error": {
+                        "code": "unknown_run",
+                        "message": f"No canonical campaign run state exists for run {run_id}",
+                        "retriable": False,
+                    }
+                })
+                return
+
+            bound_profile = str(state.get("profile_id") or "").strip().lower()
+            if requested_profile and bound_profile and requested_profile != bound_profile:
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "campaign_profile_conflict",
+                        "message": f"Run {run_id} is bound to profile '{bound_profile}', cannot materialize as '{requested_profile}'",
+                        "retriable": False,
+                    }
+                })
+                return
+            try:
+                prof = get_profile(bound_profile or requested_profile or "quick3")
+            except KeyError:
+                self.send_json(400, {
+                    "ok": False,
+                    "error": {
+                        "code": "unsupported_profile",
+                        "message": f"Unknown campaign profile: '{bound_profile or requested_profile}'",
+                        "retriable": False,
+                    }
+                })
+                return
+
+            bound_pid = str(state.get("project_id") or "")
+            bound_name = str(state.get("project") or "")
+            if project_id and bound_pid and project_id != bound_pid:
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "project_identity_conflict",
+                        "message": f"Run {run_id} is bound to project_id '{bound_pid}', cannot materialize for '{project_id}'",
+                        "retriable": False,
+                    }
+                })
+                return
+            if project:
+                named = live_registry.get_project_by_name(project)
+                if bound_pid and named is not None and named.id != bound_pid:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "project_identity_conflict",
+                            "message": f"Run {run_id} is bound to project_id '{bound_pid}' but '{project}' resolves to '{named.id}'",
+                            "retriable": False,
+                        }
+                    })
+                    return
+                if not bound_pid and bound_name and named is None and bound_name.strip().lower() != project.strip().lower():
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "project_identity_conflict",
+                            "message": f"Run {run_id} belongs to project '{bound_name}', cannot materialize for '{project}'",
+                            "retriable": False,
+                        }
+                    })
+                    return
+
+            request_sha = self._materialize_request_hash(
+                run_id=run_id,
+                project_id=bound_pid or project_id,
+                project=bound_name or project,
+                profile_id=prof.profile_id,
+                waves=waves_raw,
+            )
+            ledger = state.get("materializations")
+            prior = None if verify_only else (ledger.get(receipt) if isinstance(ledger, dict) else None)
+            replay_prior = None
+            if isinstance(prior, dict):
+                if str(prior.get("request_sha256", "")) != request_sha:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "receipt_conflict",
+                            "message": "Materialize receipt already used with a different request body",
+                            "retriable": False,
+                        }
+                    })
+                    return
+                # T-185 P0-1: a prior receipt is an operation IDENTITY, not a
+                # licence to replay a stored JSON response. The physical effect
+                # is re-proven below (A1 preflight) before any replay answer.
+                replay_prior = prior
+
+            # ---- validation pass: prove every requested wave BEFORE writing ----
+            planned: list = []
+            seen_waves: set = set()
+            for entry in waves_raw:
+                if not isinstance(entry, dict):
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {"code": "missing_fields", "message": "waves[] entries must be objects", "retriable": False}
+                    })
+                    return
+                wave_raw = str(entry.get("wave_id") or entry.get("wave") or "").strip().lower()
+                content = str(entry.get("content", ""))
+                declared_sha = str(entry.get("sha256", "")).strip().lower()
+                wave_def = prof.get_wave_by_id(wave_raw) or prof.get_wave_by_number(wave_raw)
+                if not wave_def:
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {
+                            "code": "unsupported_wave",
+                            "message": f"Wave '{wave_raw}' is not valid for profile '{prof.profile_id}'",
+                            "retriable": False,
+                        }
+                    })
+                    return
+                if wave_def.id in seen_waves:
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {
+                            "code": "duplicate_wave",
+                            "message": f"Wave '{wave_def.id}' appears twice in one materialize request",
+                            "retriable": False,
+                        }
+                    })
+                    return
+                seen_waves.add(wave_def.id)
+                if not content and not verify_only:
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {
+                            "code": "missing_fields",
+                            "message": f"Wave '{wave_def.id}' carries no content",
+                            "retriable": False,
+                        }
+                    })
+                    return
+
+                wave_state = state["waves"].get(wave_def.id) or {}
+                if not wave_state.get("complete"):
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "materialize_wave_not_complete",
+                            "message": f"Wave '{wave_def.id}' is not COMPLETE in run {run_id}; only canonical complete content can be materialized",
+                            "retriable": False,
+                        }
+                    })
+                    return
+
+                if verify_only and not content:
+                    planned.append({
+                        "wave_def": wave_def,
+                        "wave_state": wave_state,
+                        "content": "",
+                        "sha256": str(wave_state.get("sha256", "")),
+                        "meta": wave_state.get("meta", {}) or {},
+                    })
+                    continue
+
+                content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if declared_sha and declared_sha != content_hash:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "materialize_content_conflict",
+                            "message": f"Declared sha256 for wave '{wave_def.id}' does not hash the submitted content",
+                            "retriable": False,
+                        }
+                    })
+                    return
+                canonical_sha = str(wave_state.get("sha256", "")).lower()
+                if not canonical_sha or canonical_sha != content_hash:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "materialize_content_conflict",
+                            "message": (
+                                f"Wave '{wave_def.id}' canonical sha256 '{canonical_sha[:12]}' does not match "
+                                f"submitted content '{content_hash[:12]}'; nothing was written"
+                            ),
+                            "retriable": False,
+                        }
+                    })
+                    return
+
+                valid, wave_meta, parse_err = parse_wave(content, wave_def.id, prof)
+                if not valid:
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {"code": "invalid_wave_structure", "message": parse_err, "retriable": False}
+                    })
+                    return
+
+                planned.append({
+                    "wave_def": wave_def,
+                    "wave_state": wave_state,
+                    "content": content,
+                    "sha256": content_hash,
+                    "meta": wave_meta or {},
+                })
+
+            planned.sort(key=lambda item: item["wave_def"].ordinal)
+
+            # T-185 D2: a verification is read-only, so it may never resolve
+            # through registration. A legacy run that never stored project_id
+            # must not mint a registry entry just because someone asked whether
+            # its files still exist.
+            if verify_only:
+                resolved = resolve_project_audit_dir_readonly(
+                    live_cfg,
+                    bound_name or project,
+                    bound_pid or project_id or None,
+                    base_dir=self.get_custom_base_dir(),
+                )
+                if resolved is None:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "project_unresolvable_readonly",
+                            "message": (
+                                f"Cannot resolve project identity for run {run_id} without "
+                                "registering; verification never registers projects"
+                            ),
+                            "retriable": False,
+                        }
+                    })
+                    return
+                target_dir, resolved_name, _proj_ro = resolved
+            else:
+                try:
+                    target_dir, resolved_name, proj, _created = resolve_project_audit_dir(
+                        live_cfg,
+                        bound_name or project,
+                        bound_pid or project_id or None,
+                        base_dir=self.get_custom_base_dir(),
+                    )
+                except InvalidProjectPathError as exc:
+                    self.send_json(400, {
+                        "ok": False,
+                        "error": {"code": "invalid_project_path", "message": str(exc), "retriable": False}
+                    })
+                    return
+
+            # W2-005 (T-188): the placement gate. The current destination was
+            # resolved once above; every canonical path the run RECORDS must
+            # still belong to it before this operation touches anything. A
+            # recorded path under a stale placement (project moved between
+            # groups / display names, or the audit root itself changed) would
+            # otherwise let materialize write campaign.json HERE while wave
+            # writes still land in the OLD location -- split-brain campaign
+            # state. Fail closed with one stable code; no mkdir, no repair,
+            # no receipt, no run-state write. Receipt replay goes through this
+            # gate too, so a stale success can never be resurrected. Alias
+            # changes of the SAME project resolve to the same target_dir and
+            # pass: identity is registry-owned, drift is physical.
+            stale_placement = detect_project_placement_drift(state, target_dir)
+            if stale_placement:
+                current_placement = target_dir.resolve().relative_to(out_root).as_posix()
+                self.send_json(409, {
+                    "ok": False,
+                    "error": {
+                        "code": "project_placement_changed",
+                        "message": (
+                            f"Run {run_id} records canonical artifacts under a stale project placement "
+                            f"({len(stale_placement)} recorded path(s) outside the current placement "
+                            f"'{current_placement}'). The campaign must be migrated to one placement; "
+                            "nothing was written, created or repaired."
+                        ),
+                        "retriable": False,
+                        "current_placement": current_placement,
+                        "stale_paths": stale_placement,
+                    }
+                })
+                return
+
+            if not verify_only:
+                # Only the WRITE path may create the target directory, and only
+                # after the placement gate proved the run is not split-brained.
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+            final_dt = str(
+                planned[-1]["wave_state"].get("completed_at")
+                or datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+            )
+            if state.get("history_dir"):
+                history_dir = Path(state["history_dir"])
+            else:
+                history_dir = expected_history_dir(target_dir, final_dt, run_id)
+            # T-185 D1: a verification changes nothing on disk -- not even a
+            # directory. Only the materialization path creates the history dir.
+            if not verify_only:
+                history_dir.mkdir(parents=True, exist_ok=True)
+
+            # A materialization re-uses the canonical paths the original commit
+            # recorded. Only a legacy record that never stored them gets a
+            # deterministic path derived from its own completion stamp -- never
+            # a fresh "now" stamp, which would mint a second history artifact.
+            # ONE derivation owner for materialize / duplicate / verify (T-185 C).
+            for item in planned:
+                wave_def = item["wave_def"]
+                wave_state = item["wave_state"]
+                item["latest_path"], item["history_path"] = expected_wave_representation_paths(
+                    wave_number=wave_def.number,
+                    wave_slug=wave_def.slug,
+                    resolved_name=resolved_name,
+                    target_dir=target_dir,
+                    history_dir=history_dir,
+                    completed_at=str(wave_state.get("completed_at") or final_dt),
+                    latest_path=str(wave_state["latest_path"]) if wave_state.get("latest_path") else None,
+                    history_path=str(wave_state["history_path"]) if wave_state.get("history_path") else None,
+                )
+
+            # T-185: ingest reconciles the transport project against the
+            # handoff's own PROJECT_NAME (CORE-005). Materialization must not be
+            # the weaker door: a body naming a different project never gets to
+            # overwrite this project's canonical files. Identity is compared
+            # through canonical registry resolution -- display_name and
+            # audit_project_name aliases of the SAME project are legitimate
+            # (ingest policy), a genuinely different project is a 409.
+            for item in planned:
+                handoff_project = str((item["meta"] or {}).get("project_name") or "").strip()
+                if handoff_project:
+                    handoff_proj = live_registry.get_project_by_name(handoff_project)
+                    base_proj = live_registry.get_project_by_id(
+                        str(state.get("project_id") or "") or (proj.id if not verify_only and proj else "")
+                    ) or (
+                        (not verify_only and proj)
+                        or live_registry.get_project_by_name(resolved_name)
+                        or None
+                    )
+                    if handoff_proj and base_proj and handoff_proj.id != base_proj.id:
+                        self.send_json(409, {
+                            "ok": False,
+                            "error": {
+                                "code": "project_identity_conflict",
+                                "message": (
+                                    f"Wave '{item['wave_def'].id}' handoff PROJECT_NAME "
+                                    f"'{handoff_project}' resolves to project '{handoff_proj.id}' "
+                                    f"but this campaign belongs to '{base_proj.id}'; nothing was written"
+                                ),
+                                "retriable": False,
+                            }
+                        })
+                        return
+                    if not handoff_proj and handoff_project.strip().lower() != resolved_name.strip().lower():
+                        self.send_json(409, {
+                            "ok": False,
+                            "error": {
+                                "code": "project_identity_conflict",
+                                "message": (
+                                    f"Wave '{item['wave_def'].id}' handoff PROJECT_NAME "
+                                    f"'{handoff_project}' does not match canonical project "
+                                    f"'{resolved_name}'; nothing was written"
+                                ),
+                                "retriable": False,
+                            }
+                        })
+                        return
+
+            # T-185 P0-2 (B): the required physical durability set. Every
+            # consumer -- verify_only, receipt replay, materialization
+            # postcondition, duplicate acknowledgement -- shares THIS
+            # derivation; there are no four slightly different lists.
+            campaign_ready = _campaign_requires_final_artifacts(prof, state)
+            final_required = _expected_final_artifacts(prof, state, target_dir, resolved_name)
+            final_classified = classify_required_artifacts(final_required, target_dir)
+
+            # T-185 P0-1 (A1/A2/A3): receipt replay proves the physical effect
+            # of the stored response BEFORE answering. A receipt is an
+            # operation identity, never permission to skip durability.
+            replay_repair_paths: list[str] = []
+            if replay_prior is not None:
+                replay_verdicts: dict[str, str] = {}
+                for item in planned:
+                    for path in (item["latest_path"], item["history_path"]):
+                        replay_verdicts[str(path)] = classify_canonical_file(path, item["content"])
+                for entry in final_classified:
+                    replay_verdicts[entry["path"]] = entry["verdict"]
+                unsafe = [path for path, verdict in replay_verdicts.items()
+                          if verdict in ("WRONG_TYPE", "UNREADABLE", "OUTSIDE_CANONICAL")]
+                if unsafe:
+                    self.send_json(409, {
+                        "ok": False,
+                        "error": {
+                            "code": "materialize_replay_unsafe",
+                            "message": (
+                                "Receipt replay found canonical paths that cannot be safely "
+                                f"verified or repaired: {', '.join(unsafe)}. Nothing was overwritten."
+                            ),
+                            "retriable": False,
+                            "files_unsafe": unsafe,
+                        }
+                    })
+                    return
+                broken = [path for path, verdict in replay_verdicts.items()
+                          if verdict in ("MISSING", "CONTENT_MISMATCH")]
+                if not broken:
+                    # A1: every required effect is still intact -- the stored
+                    # response may be replayed safely.
+                    replay = dict(replay_prior.get("response") or {})
+                    replay["duplicate"] = True
+                    replay["files_intact"] = True
+                    self.send_json(200, replay)
+                    return
+                # A2: the effect was lost. Re-enter canonical materialization
+                # under the SAME receipt -- no new receipt, no second logical
+                # campaign, unchanged wave identity.
+                replay_repair_paths = broken
+
+            if verify_only:
+                # Read-only: report what is on disk and change nothing.
+                # T-185 E: existence is not integrity -- each expected path is
+                # classified against the canonical committed bytes. A corrupted
+                # file is a mismatch, not a silently durable file.
+                # T-185 P0-2 (B4): the final handoff is part of the required
+                # set for a campaign-complete run, never merely waved through.
+                verify_waves = []
+                missing_files = []
+                mismatched_files = []
+                unreadable_files = []
+                for item in planned:
+                    paths = [item["latest_path"], item["history_path"]]
+                    absent = []
+                    mismatched = []
+                    unreadable = []
+                    for path in paths:
+                        if item["content"]:
+                            verdict = classify_canonical_file(path, item["content"])
+                        else:
+                            verdict = classify_canonical_file_by_sha(
+                                path,
+                                physical_sha256=str(item["wave_state"].get("physical_sha256", "")),
+                                logical_sha256=str(item["wave_state"].get("sha256", "")),
+                            )
+                        if verdict == "MISSING":
+                            absent.append(str(path))
+                        elif verdict == "CONTENT_MISMATCH":
+                            mismatched.append(str(path))
+                        elif verdict in ("UNREADABLE", "WRONG_TYPE"):
+                            unreadable.append(str(path))
+                    missing_files.extend(absent)
+                    mismatched_files.extend(mismatched)
+                    unreadable_files.extend(unreadable)
+                    verify_waves.append({
+                        "wave_id": item["wave_def"].id,
+                        "sha256": str(item["wave_state"].get("sha256", "")),
+                        "files": [str(path) for path in paths],
+                        "missing": absent,
+                        "mismatched": mismatched,
+                        "unreadable": unreadable,
+                        "intact": not (absent or mismatched or unreadable),
+                    })
+                final_artifacts = [
+                    {"path": entry["path"], "digest": entry.get("digest", ""), "verdict": entry["verdict"]}
+                    for entry in final_classified
+                ]
+                final_missing = [entry["path"] for entry in final_classified if entry["verdict"] == "MISSING"]
+                final_mismatched = [
+                    entry["path"] for entry in final_classified if entry["verdict"] == "CONTENT_MISMATCH"
+                ]
+                final_unreadable = [
+                    entry["path"] for entry in final_classified
+                    if entry["verdict"] in ("UNREADABLE", "WRONG_TYPE", "OUTSIDE_CANONICAL")
+                ]
+                missing_files.extend(final_missing)
+                mismatched_files.extend(final_mismatched)
+                unreadable_files.extend(final_unreadable)
+                self.send_json(200, {
+                    "ok": True,
+                    "verify_only": True,
+                    "duplicate": False,
+                    "run_id": run_id,
+                    "project": resolved_name,
+                    "profile_id": prof.profile_id,
+                    "waves": verify_waves,
+                    "final_artifacts": final_artifacts,
+                    "missing_files": missing_files,
+                    "mismatched_files": mismatched_files,
+                    "unreadable_files": unreadable_files,
+                    "files_intact": not (missing_files or mismatched_files or unreadable_files),
+                })
+                return
+
+            # T-185 P0-2 (B5): on a campaign-complete run the final handoff is
+            # ALWAYS part of the required repair set -- a partial request that
+            # leaves ALL_3 deleted is the same false durability the replay had.
+            rebuild_final = campaign_ready
+            # A materialization must not move the campaign pointer. campaign.json
+            # falls back to waves[0] when it is handed active_wave_id=None on an
+            # unfinished campaign, so materializing Core on a 1/3 run would
+            # rewrite `current_wave_id` from 'second' back to 'core'. Re-derive
+            # the first still-incomplete wave instead.
+            next_incomplete = next(
+                (w for w in prof.waves if not state["waves"].get(w.id, {}).get("complete")),
+                None,
+            )
+            active_wid = None if campaign_ready else (
+                next_incomplete.id if next_incomplete else None
+            )
+
+            with campaign_transaction_lock(target_dir):
+                snapshot_paths = [target_dir / "campaign.json"]
+                for item in planned:
+                    snapshot_paths.append(item["latest_path"])
+                    snapshot_paths.append(item["history_path"])
+                if rebuild_final:
+                    snapshot_paths.extend(
+                        _final_artifact_paths(prof, target_dir, history_dir, final_dt, resolved_name)
+                    )
+                snapshots, snap_err = capture_file_snapshots(snapshot_paths)
+                if snap_err:
+                    self.send_json(503, {
+                        "ok": False,
+                        "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
+                    })
+                    return
+
+                files_written = []
+                wave_results = []
+                try:
+                    for item in planned:
+                        item["history_path"].parent.mkdir(parents=True, exist_ok=True)
+                        atomic_write(item["history_path"], item["content"])
+                        atomic_write(item["latest_path"], item["content"])
+                        files_written.append(str(item["latest_path"]))
+                        files_written.append(str(item["history_path"]))
+                        wave_results.append({
+                            "wave_id": item["wave_def"].id,
+                            "sha256": item["sha256"],
+                            "files": [str(item["latest_path"]), str(item["history_path"])],
+                        })
+                except Exception as exc:
+                    self.send_json(503, _rollback_error(snapshots, "atomic_write_failed", str(exc)))
+                    return
+
+                if rebuild_final:
+                    parsed_dict = {
+                        w.id: state["waves"][w.id].get("meta", {})
+                        for w in prof.waves
+                        if w.id in state["waves"]
+                    }
+                    try:
+                        synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
+                        _write_final_artifacts(
+                            prof, synth_result, target_dir, history_dir,
+                            final_dt, state, resolved_name,
+                        )
+                    except Exception as exc:
+                        # A4: a failed replay repair keeps the receipt's prior
+                        # success history and records this failure separately.
+                        if replay_prior is not None:
+                            self._record_replay_repair_failure(
+                                state, receipt, [str(p) for p in snapshot_paths]
+                            )
+                            try:
+                                save_run_state(run_id, state)
+                            except RunStatePersistenceError:
+                                pass
+                        self.send_json(503, _rollback_error(snapshots, "finalization_failed", str(exc)))
+                        return
+                    final_path = _get_final_handoff_path(prof, state)
+                    if final_path:
+                        files_written.append(str(final_path))
+
+                # Canonical wave identity is untouched: only the recorded
+                # physical paths are repaired for a legacy record that lacked
+                # them. receipt / sha256 / completed_at / complete stay exactly
+                # as the original ingest committed them. physical_sha256 is the
+                # content-less verify anchor: it now describes the exact bytes
+                # on disk even when they were recreated by materialization.
+                for item in planned:
+                    stored = state["waves"][item["wave_def"].id]
+                    stored["latest_path"] = str(item["latest_path"])
+                    stored["history_path"] = str(item["history_path"])
+                    stored["physical_sha256"] = hashlib.sha256(
+                        canonical_audit_bytes(item["content"])
+                    ).hexdigest()
+                state["history_dir"] = str(history_dir)
+
+                # T-185 A2/A4: postcondition re-verification. Only success after
+                # EVERY required artifact (waves + final) is INTACT.
+                post_final = classify_required_artifacts(
+                    _expected_final_artifacts(prof, state, target_dir, resolved_name),
+                    target_dir,
+                )
+                post_final_bad = [e for e in post_final if e["verdict"] != "INTACT"]
+                post_wave_bad = []
+                for item in planned:
+                    for path_key in ("latest_path", "history_path"):
+                        path = item[path_key]
+                        if classify_canonical_file(path, item["content"]) != "INTACT":
+                            post_wave_bad.append(str(path))
+                if post_final_bad or post_wave_bad:
+                    bad = [e["path"] for e in post_final_bad] + post_wave_bad
+                    if replay_prior is not None:
+                        self._record_replay_repair_failure(state, receipt, bad)
+                        try:
+                            save_run_state(run_id, state)
+                        except RunStatePersistenceError:
+                            pass
+                    self.send_json(503, _rollback_error(snapshots, "materialize_postcondition_failed",
+                                                      f"postcondition re-verification failed for: {', '.join(bad)}"))
+                    return
+
+                try:
+                    save_live_campaign_index(
+                        campaign_root=target_dir,
+                        profile=prof,
+                        run_id=run_id,
+                        project_name=resolved_name,
+                        parsed_waves={
+                            wid: {
+                                "wave_id": wid,
+                                "status": "COMPLETE" if w_info.get("complete") else "IDLE",
+                                "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
+                                "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
+                                "sha256": w_info.get("sha256", ""),
+                                "completed_at": w_info.get("completed_at", final_dt),
+                            }
+                            for wid, w_info in state["waves"].items()
+                        },
+                        completed_waves=[
+                            w.id for w in prof.waves if state["waves"].get(w.id, {}).get("complete")
+                        ],
+                        active_wave_id=active_wid,
+                        status=STATUS_CAMPAIGN_COMPLETE if campaign_ready else STATUS_CAMPAIGN_READY_FOR_WAVE,
+                        final_handoff_path=_get_final_handoff_path(prof, state),
+                    )
+                except Exception as exc:
+                    self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(exc)))
+                    return
+
+                response = {
+                    "ok": True,
+                    "duplicate": bool(replay_prior),
+                    "materialized": True,
+                    "run_id": run_id,
+                    "receipt": receipt,
+                    "project": resolved_name,
+                    "profile_id": prof.profile_id,
+                    "waves": wave_results,
+                    "files": files_written,
+                    "repaired_files": list(replay_repair_paths),
+                    "files_intact": True,
+                    "final_rebuilt": bool(rebuild_final),
+                    "campaign_ready": bool(campaign_ready),
+                    "all3_ready": (
+                        bool(campaign_ready)
+                        if prof.profile_id == "quick3"
+                        else bool(state.get("all3_complete", False))
+                    ),
+                }
+                self._record_materialization(state, receipt, request_sha, response)
+                try:
+                    save_run_state(run_id, state)
+                except RunStatePersistenceError as exc:
+                    self.send_json(503, _rollback_error(snapshots, "run_state_persistence_failed", str(exc)))
+                    return
+
+            terminal_wave_id = planned[-1]["wave_def"].id
+
+            from audapack.bridge.state import publish_audit_generation
+            try:
+                publish_audit_generation(
+                    resolved_name,
+                    terminal_wave_id,
+                    project_id=proj.id if proj else None,
+                )
+            except GenerationPersistenceError:
+                pass
+
+        if _ON_AUDIT_WRITTEN:
+            try:
+                _ON_AUDIT_WRITTEN(resolved_name, terminal_wave_id)
+            except Exception:
+                pass
+
+        self.send_json(200, response)
 
     def handle_audit_submission(self):
         ctype = self.headers.get("Content-Type", "")
@@ -1243,7 +3035,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return
 
         # Validate wave content structure against wave_def and profile
-        valid, wave_meta, parse_err = parse_wave(content, wave_def.id, prof)
+        valid, wave_meta, parse_err = parse_wave(
+            content, wave_def.id, prof, require_identity=(client_api >= 3)
+        )
         if not valid:
             self.send_json(400, {
                 "ok": False,
@@ -1478,9 +3272,13 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             if project or existing_project:
                 state["project"] = project or existing_project
 
-            state["profile_id"] = prof.profile_id
+            state["profile_id"] = wave_meta.get("profile_id", prof.profile_id)
+            # CORE-003: persist the manifest identity that was actually
+            # declared and validated by parse_wave. NEVER launder an absent or
+            # untrusted declared hash into the current canonical hash.
+            declared_manifest = (wave_meta or {}).get("campaign_manifest_sha256") or ""
+            state["manifest_hash"] = declared_manifest or prof.manifest_hash or get_canonical_manifest_hash()
             state["profile_version"] = prof.profile_version
-            state["manifest_hash"] = prof.manifest_hash or get_canonical_manifest_hash()
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -1491,124 +3289,19 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             # Receipt idempotency check
             if wave_state.get("receipt") == receipt:
                 if wave_state.get("sha256") == content_hash:
-                    files_written = []
-                    if wave_state.get("latest_path"):
-                        files_written.append(str(wave_state["latest_path"]))
-                    if wave_state.get("history_path"):
-                        files_written.append(str(wave_state["history_path"]))
-                    is_ready = state.get("campaign_complete", False) or state.get("all3_complete", False)
-                    generation_pending = bool(state.get("generation_pending", False))
-                    if generation_pending:
-                        try:
-                            from audapack.bridge.state import increment_audit_generation
-                            increment_audit_generation(project, wave_def.id, project_id=state.get("project_id") or None)
-                            state["generation_pending"] = False
-                            save_run_state(run_id, state)
-                            generation_pending = False
-                        except GenerationPersistenceError:
-                            pass
-                    completed_count = len([w for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")])
-                    # CORE-002: a same-receipt retry must repair incomplete
-                    # finalization (crash/partial write) instead of contradicting
-                    # the first response.
-                    all_waves_complete = all(
-                        w.id in state.get("waves", {}) and state["waves"][w.id].get("complete")
-                        for w in prof.waves if w.required
+                    status, payload = self._completed_wave_duplicate_response(
+                        prof=prof,
+                        run_id=run_id,
+                        project=project,
+                        project_id=project_id,
+                        live_cfg=live_cfg,
+                        state=state,
+                        wave_def=wave_def,
+                        wave_state=wave_state,
+                        dt_str=dt_str,
+                        content=content,
                     )
-                    if not is_ready and all_waves_complete:
-                        try:
-                            target_dir, resolved_name, proj, _created = resolve_project_audit_dir(
-                                live_cfg, project, project_id, base_dir=self.get_custom_base_dir()
-                            )
-                            target_dir.mkdir(parents=True, exist_ok=True)
-                            parsed_dict = {
-                                w.id: state["waves"][w.id].get("meta", {})
-                                for w in prof.waves if w.id in state.get("waves", {})
-                            }
-                            history_dir = Path(state["history_dir"]) if state.get("history_dir") else None
-                            if history_dir is None or not history_dir.exists():
-                                history_dir = target_dir / "_history" / f"{dt_str}_{run_hash}"
-                                history_dir.mkdir(parents=True, exist_ok=True)
-                                state["history_dir"] = str(history_dir)
-                            # CORE-004: route duplicate finalization repair through
-                            # the same transactional commit gate as normal delivery.
-                            # Snapshot affected artifacts/index, require the live
-                            # campaign-index write to succeed before persisting
-                            # ready/completion, and on failure restore the exact
-                            # prior artifact/index bytes and return retriable 503.
-                            # W2-001: same campaign-root transaction lock as the ingest path and the
-                            # normal delivery path below, so this repair cannot interleave with them.
-                            with campaign_transaction_lock(target_dir):
-                                snap_targets = [target_dir / "campaign.json"]
-                                snap_targets.extend(
-                                    _final_artifact_paths(prof, target_dir, history_dir, dt_str, resolved_name)
-                                )
-                                snapshots, snap_err = capture_file_snapshots(snap_targets)
-                                if snap_err:
-                                    self.send_json(503, {
-                                        "ok": False,
-                                        "error": {"code": "atomic_write_failed", "message": snap_err, "retriable": True}
-                                    })
-                                    return
-                                try:
-                                    synth_result = generate_canonical_campaign(prof, run_id, parsed_dict, resolved_name)
-                                    _write_final_artifacts(prof, synth_result, target_dir, history_dir,
-                                                           dt_str, state, resolved_name)
-                                    save_live_campaign_index(
-                                        campaign_root=target_dir, profile=prof, run_id=run_id,
-                                        project_name=resolved_name,
-                                        parsed_waves={
-                                            wid: {
-                                                "wave_id": wid,
-                                                "status": "COMPLETE",
-                                                "tickets": int(w_info.get("meta", {}).get("tickets", 0)),
-                                                "file": Path(w_info["latest_path"]) if w_info.get("latest_path") else None,
-                                                "sha256": w_info.get("sha256", ""),
-                                                "completed_at": w_info.get("completed_at", dt_str),
-                                            }
-                                            for wid, w_info in state.get("waves", {}).items()
-                                        },
-                                        completed_waves=[w.id for w in prof.waves],
-                                        active_wave_id=None,
-                                        status=STATUS_CAMPAIGN_COMPLETE,
-                                        final_handoff_path=_get_final_handoff_path(prof, state),
-                                    )
-                                except Exception as exc:
-                                    self.send_json(503, _rollback_error(
-                                        snapshots, "campaign_index_failed", str(exc)))
-                                    return
-                                # Persist ready/completion only after the index commit
-                                # succeeded; a failure above already rolled back.
-                                try:
-                                    save_run_state(run_id, state)
-                                except RunStatePersistenceError as exc:
-                                    self.send_json(503, _rollback_error(
-                                        snapshots, "campaign_index_failed", str(exc)))
-                                    return
-                            is_ready = True
-                            from audapack.bridge.state import increment_audit_generation
-                            increment_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
-                        except Exception as exc:
-                            self.send_json(503, {
-                                "ok": False,
-                                "error": {"code": "finalization_failed", "message": str(exc), "retriable": True}
-                            })
-                            return
-                    self.send_json(200, {
-                        "ok": True,
-                        "duplicate": True,
-                        "run_id": run_id,
-                        "profile_id": prof.profile_id,
-                        "project": project,
-                        "wave": wave_def.id,
-                        "wave_index": wave_def.ordinal,
-                        "wave_count": prof.wave_count,
-                        "completed_waves": completed_count,
-                        "total_waves": prof.wave_count,
-                        "campaign_ready": is_ready,
-                        "all3_ready": is_ready if prof.profile_id == "quick3" else state.get("all3_complete", False),
-                        "files": files_written,
-                    })
+                    self.send_json(status, payload)
                     return
                 else:
                     self.send_json(409, {
@@ -1627,28 +3320,22 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             if wave_state.get("complete"):
                 existing_sha = wave_state.get("sha256", "")
                 if existing_sha and existing_sha == content_hash:
-                    files_written = []
-                    if wave_state.get("latest_path"):
-                        files_written.append(str(wave_state["latest_path"]))
-                    if wave_state.get("history_path"):
-                        files_written.append(str(wave_state["history_path"]))
-                    is_ready = state.get("campaign_complete", False) or state.get("all3_complete", False)
-                    completed_count = len([w for w in prof.waves if state.get("waves", {}).get(w.id, {}).get("complete")])
-                    self.send_json(200, {
-                        "ok": True,
-                        "duplicate": True,
-                        "run_id": run_id,
-                        "profile_id": prof.profile_id,
-                        "project": project,
-                        "wave": wave_def.id,
-                        "wave_index": wave_def.ordinal,
-                        "wave_count": prof.wave_count,
-                        "completed_waves": completed_count,
-                        "total_waves": prof.wave_count,
-                        "campaign_ready": is_ready,
-                        "all3_ready": is_ready if prof.profile_id == "quick3" else state.get("all3_complete", False),
-                        "files": files_written,
-                    })
+                    # W2-002: a different receipt over identical committed content
+                    # is the same no-op as a same-receipt retry; route both
+                    # through the one unified duplicate helper.
+                    status, payload = self._completed_wave_duplicate_response(
+                        prof=prof,
+                        run_id=run_id,
+                        project=project,
+                        project_id=project_id,
+                        live_cfg=live_cfg,
+                        state=state,
+                        wave_def=wave_def,
+                        wave_state=wave_state,
+                        dt_str=dt_str,
+                        content=content,
+                    )
+                    self.send_json(status, payload)
                     return
                 # Content differs -> true mutation; reject to preserve immutability.
                 self.send_json(409, {
@@ -1758,6 +3445,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     "complete": True,
                     "ordinal": wave_def.ordinal,
                     "sha256": content_hash,
+                    "physical_sha256": hashlib.sha256(
+                        canonical_audit_bytes(content)
+                    ).hexdigest(),
                     "receipt": receipt,
                     "completed_at": dt_str,
                     "latest_path": str(latest_path),
@@ -1819,13 +3509,12 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                         final_handoff_path=final_handoff_path,
                     )
                 except Exception as ex:
-                    if finalization_ok:
-                        self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(ex)))
-                    else:
-                        self.send_json(503, {
-                            "ok": False,
-                            "error": {"code": "campaign_index_failed", "message": str(ex), "retriable": True}
-                        })
+                    # W2-001 (SRC-041:R005): campaign-index failure rollback is
+                    # UNCONDITIONAL for every wave. Non-final waves used to skip
+                    # the rollback (finalization_ok False) and answer a clean
+                    # retriable campaign_index_failed while the canonical latest
+                    # and history files stayed published -- a durable half-commit.
+                    self.send_json(503, _rollback_error(snapshots, "campaign_index_failed", str(ex)))
                     return
 
                 # W2-002: persist the pending-publication marker as part of the primary
@@ -1838,12 +3527,12 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     self.send_json(500, _rollback_error(snapshots, "run_state_persistence_failed", str(exc)))
                     return
 
-            from audapack.bridge.state import increment_audit_generation
+            from audapack.bridge.state import publish_audit_generation
             generation_pending = True
             try:
                 # W2-003: pass the resolved canonical project id so consumers can
                 # refresh the exact project instead of falling back to name lookup.
-                increment_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
+                publish_audit_generation(resolved_name, wave_def.id, project_id=proj.id if proj else None)
                 generation_pending = False
                 state["generation_pending"] = False
                 try:
@@ -2012,6 +3701,8 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                     # tell that apart from a terminal block, or it drops the
                     # very lease identity reconciliation needs.
                     "recovery_state": owned.recovery_state,
+                    # The worker's own "held, not failed" reason for this lane.
+                    "attention": owned.attention,
                     "campaign_run_id": owned.campaign_run_id,
                     "lease_id": owned.lease_id,
                     "project_id": owned.project_id,
@@ -2174,7 +3865,16 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True, "dispatch": {"dispatch_id": job.dispatch_id, "state": job.state, "status": dispatcher.status()}})
 
     def _validate_browser_submission(self, data: dict) -> None:
-        """Bind submitted artifacts to the registered project pack contract."""
+        """Bind submitted artifacts to the registered project pack contract.
+
+        PERF-001: this is where the queue-time archive digest is ESTABLISHED,
+        exactly once, and written back into ``data`` so the queued job carries
+        the Bridge's own proof. The GUI used to hash the same ZIP first merely
+        to be told what the Bridge was about to work out; a normal delivery read
+        the whole archive twice for that one fact. A client-supplied
+        ``archive_sha256`` from an older caller is still compared -- it can only
+        ever add a rejection, never substitute for the Bridge's own read.
+        """
         project_id = str(data.get("project_id") or "").strip()
         archive_raw = str(data.get("archive_path") or "").strip()
         if not project_id or not archive_raw:
@@ -2186,21 +3886,20 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         # domain-level path and digest checks still apply in that mode.
         if project is None and getattr(cfg, "projects", None):
             raise BrowserDispatchError("unknown_project", "project_id is not registered", retriable=False)
-        if project is None:
-            return
-        if not project.enabled or not project.source_path:
-            raise BrowserDispatchError("ineligible_project", "project is disabled or has no source path", retriable=False)
-        output_dir = resolve_output_dir(
-            project.source_path,
-            cfg.packing,
-            fallback=Path.cwd(),
-            group=project.priority_group,
-            project=project,
-        )
-        expected = find_archive_for_project(project, output_dir)
         submitted = Path(archive_raw).resolve()
-        if expected is None or submitted != expected.resolve():
-            raise BrowserDispatchError("artifact_ownership", "archive is not the canonical project pack artifact", retriable=False)
+        if project is not None:
+            if not project.enabled or not project.source_path:
+                raise BrowserDispatchError("ineligible_project", "project is disabled or has no source path", retriable=False)
+            output_dir = resolve_output_dir(
+                project.source_path,
+                cfg.packing,
+                fallback=Path.cwd(),
+                group=project.priority_group,
+                project=project,
+            )
+            expected = find_archive_for_project(project, output_dir)
+            if expected is None or submitted != expected.resolve():
+                raise BrowserDispatchError("artifact_ownership", "archive is not the canonical project pack artifact", retriable=False)
         try:
             stat = submitted.stat()
         except OSError as exc:
@@ -2209,8 +3908,10 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         declared_hash = str(data.get("archive_sha256") or "").strip().lower()
         if declared_size and declared_size != stat.st_size:
             raise BrowserDispatchError("changed_archive", "archive size does not match submission", retriable=False)
-        if declared_hash and declared_hash != self._sha256_path(submitted):
+        queue_sha = self._sha256_path(submitted)
+        if declared_hash and declared_hash != queue_sha:
             raise BrowserDispatchError("changed_archive", "archive digest does not match submission", retriable=False)
+        data["archive_sha256"] = queue_sha
 
     @staticmethod
     def _sha256_path(path: Path) -> str:
@@ -2370,6 +4071,26 @@ def run_bridge_server(config: AppConfig) -> int:
     except Exception as exc:
         logger.warning("dispatch supervisor did not start: %s", exc)
     HandlerWithConfig.set_dispatch_supervisor(supervisor)
+    prepared_worker = None
+    try:
+        from audapack.prepared_worker import PreparedWorker
+
+        # The prepared AUDIT runtime is optional infrastructure: a failure to
+        # build it must never take down limit probing, ON TIME, ON RESET or
+        # ordinary CLI prepared jobs. Those keep working; AUDIT jobs then show
+        # the exact "runtime not connected" wait reason instead.
+        audit_runtime = None
+        try:
+            from audapack.prepared_audit import build_headless_audit_runtime
+
+            audit_runtime = build_headless_audit_runtime(config)
+        except Exception as exc:
+            logger.warning("prepared audit runtime unavailable: %s", type(exc).__name__)
+        prepared_worker = PreparedWorker(config, audit_runtime=audit_runtime)
+        prepared_worker.start()
+        HandlerWithConfig.prepared_worker = prepared_worker
+    except Exception as exc:
+        logger.warning("prepared scheduler did not start: %s", type(exc).__name__)
     # W2-011: prune expired history on startup (best-effort, non-blocking).
     try:
         from audapack.bridge.storage import prune_audit_history
@@ -2383,12 +4104,32 @@ def run_bridge_server(config: AppConfig) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # W2-001 (audit/12.md): a prepared delivery can LAUNCH a browser and
+        # commit a receipt, so it is the last thing that may still be acting.
+        # `stop()` now returns whether this worker is genuinely quiescent; if it
+        # is not, the server stays up (and the PID file stays) so the still-owned
+        # work has a live Bridge behind it, instead of orphaning a window against
+        # a Bridge that no longer exists. The process then exits non-zero so the
+        # caller can tell a clean stop from an unfinished one.
+        prepared_quiescent = True
+        if prepared_worker is not None:
+            prepared_quiescent = bool(prepared_worker.stop())
+            if not prepared_quiescent:
+                logger.warning("prepared worker still owns work at shutdown; "
+                               "keeping the Bridge up until it is quiescent")
         if supervisor is not None:
             # W2-006: the supervisor may be mid-pass, and a pass can LAUNCH a
             # browser window. Finish its shutdown before the server and the PID
             # file go, or a window opens against a Bridge that no longer exists.
             if not supervisor.stop():
                 logger.warning("bridge supervisor was still running at shutdown")
-        server.server_close()
-        remove_pid(expected_pid=os.getpid(), expected_nonce=INSTANCE_NONCE)
-    return 0
+        quiescent_deadline = time.monotonic() + PREPARED_QUIESCENCE_WAIT_SECONDS
+        while not prepared_quiescent and time.monotonic() < quiescent_deadline:
+            prepared_quiescent = bool(prepared_worker.stop())
+        if prepared_quiescent:
+            server.server_close()
+            remove_pid(expected_pid=os.getpid(), expected_nonce=INSTANCE_NONCE)
+        else:
+            logger.error("prepared work never reached quiescence; leaving the "
+                         "Bridge socket and PID file in place")
+    return 0 if prepared_quiescent else 1

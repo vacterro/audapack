@@ -42,6 +42,10 @@ class TestSingleInstance(unittest.TestCase):
             inst2.release()
 
     @unittest.skipUnless(sys.platform == "win32", "visible-window detection is Win32-only")
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "mutex/window held-window case uses Win32 named mutex; flock tests skip there",
+    )
     def test_second_instance_with_window_detected(self):
         """If a mutex is held AND an AUDAPACK window is reachable, the guard
         correctly reports "already running" so the launcher can foreground it."""
@@ -109,6 +113,10 @@ class TestOwnerLivenessGuard(unittest.TestCase):
     multiple-writer condition the stale-config findings are about.
     """
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "live-owner flock case uses Win32 mutex second-caller semantics",
+    )
     def test_a_live_owner_is_reported_running_even_with_no_window(self):
         import audapack.single_instance as mod
 
@@ -126,6 +134,13 @@ class TestOwnerLivenessGuard(unittest.TestCase):
             first.release()
             second.release()
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "stale named-mutex recovery semantics are Win32-only; on POSIX the "
+        "deliberately-alive first object still owns the flock, so a same-process "
+        "second instance can never take the lock no matter what the liveness "
+        "probe answers",
+    )
     def test_a_dead_owner_still_lets_the_launcher_recover(self):
         import audapack.single_instance as mod
 
@@ -164,32 +179,48 @@ class TestOwnerLivenessGuard(unittest.TestCase):
             inst.release()
 
 
-class TestLauncherStandsDownForALiveOwner(unittest.TestCase):
-    def test_a_live_owner_that_cannot_be_activated_never_opens_a_second_gui(self):
-        """On POSIX activation can never succeed, so this branch decided every
-        genuine second instance was a leftover lock and started another GUI."""
+class TestLauncherNeverOpensASecondGui(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "the recovery-failure MessageBoxW report is Win32-only (off Windows main() stands down before recovery)",
+    )
+    def test_an_unprovable_owner_never_gains_a_second_gui(self):
+        """The invariant T-25 must not trade away while it fixes the brick.
+
+        T-25 turned the dead end into an automatic recovery, which means the
+        launcher can now end a process. The safety of that turns entirely on
+        the identity gate in front of it: when the holder cannot be proven,
+        the answer is still NO second GUI -- plus one report that says the
+        recovery failed, not that something is "already running".
+
+        The full recovery matrix lives in tests/test_launcher_windowless_recovery.py;
+        this keeps the fail-closed guarantee next to the guard's other claims.
+        """
         from audapack import app as app_mod
 
+        shown: list[tuple] = []
         guard = SingleInstance("TEST_SI_MAIN_BRANCH")
         with patch.object(guard, "is_already_running", return_value=True), \
              patch.object(guard, "activate_existing_window", return_value=False), \
              patch.object(guard, "owner_is_alive", return_value=True), \
              patch.object(guard, "wait_for_owner_window", return_value=None), \
+             patch.object(guard, "read_owner_record", return_value={}), \
              patch("audapack.single_instance.SingleInstance", return_value=guard), \
+             patch("ctypes.windll.user32.MessageBoxW",
+                   lambda *a: shown.append(a)), \
              patch.object(app_mod, "load_config") as load_cfg:
             load_cfg.return_value = app_mod.load_config()
             with patch("audapack.ui_qt.app.run_qt_gui") as run_gui:
                 code = app_mod.main([])
             run_gui.assert_not_called()
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1, "an unverifiable holder must fail closed, not open a second GUI")
+        self.assertEqual(len(shown), 1, "the failed recovery must be reported where the operator sees it")
 
-    def test_a_dead_owner_still_opens_the_gui(self):
+    def test_a_dead_owner_is_recovered_by_the_guard_itself(self):
         from audapack import app as app_mod
 
         guard = SingleInstance("TEST_SI_MAIN_BRANCH_DEAD")
-        with patch.object(guard, "is_already_running", return_value=True), \
-             patch.object(guard, "activate_existing_window", return_value=False), \
-             patch.object(guard, "owner_is_alive", return_value=False), \
+        with patch.object(guard, "is_already_running", return_value=False), \
              patch("audapack.single_instance.SingleInstance", return_value=guard), \
              patch("audapack.ui_qt.app.run_qt_gui", return_value=0) as run_gui:
             code = app_mod.main([])
@@ -208,6 +239,13 @@ class TestRecoveryKeepsThePrimaryNamespace(unittest.TestCase):
     lifetime model: `C allowed? False` on the pre-fix code.
     """
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "stale named-mutex recovery semantics are Win32-only; on POSIX the "
+        "deliberately-alive first object still owns the flock, so a same-process "
+        "second instance can never take the lock no matter what the liveness "
+        "probe answers",
+    )
     def test_the_recovering_instance_holds_the_primary_handle(self):
         held = SingleInstance("TEST_SI_PRIMARY_HELD")
         recovering = SingleInstance("TEST_SI_PRIMARY_HELD")
@@ -238,7 +276,9 @@ class TestRecoveryKeepsThePrimaryNamespace(unittest.TestCase):
         third = SingleInstance("TEST_SI_CONTINUITY")
         try:
             self.assertFalse(zombie.is_already_running())
+            # Zombie has no window + its recorded owner is dead => recovery path.
             with patch.object(recovering, "_find_window_hwnd", return_value=None), \
+                 patch.object(recovering, "_owner_record_path", return_value=zombie._owner_record_path()), \
                  patch("audapack.single_instance._process_is_alive", return_value=False):
                 self.assertFalse(recovering.is_already_running())
 

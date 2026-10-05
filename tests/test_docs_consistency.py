@@ -36,7 +36,10 @@ def test_the_three_version_sources_agree():
 def test_the_changelog_leads_with_the_current_version():
     from audapack import __version__
 
-    heading = re.search(r"^## \[([^\]]+)\]", read("CHANGELOG.md"), re.MULTILINE)
+    # SAIPEN's release parity reader accepts only `## X.Y.Z` (release_contract
+    # .version_badges), while Keep-a-Changelog uses `## [X.Y.Z] - date`; accept
+    # both so the repository and the release contract cannot drift apart.
+    heading = re.search(r"^## \[?(\d+\.\d+\.\d+)\]?", read("CHANGELOG.md"), re.MULTILINE)
     assert heading, "CHANGELOG.md has no version heading"
     assert heading.group(1) == __version__
 

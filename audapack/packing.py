@@ -8,18 +8,22 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import heapq
 import json
 import os
 import re
+import stat as stat_module
 import threading
 import time
 import uuid
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
+from audapack import archive_receipt, saipen_evidence, saipen_manifest_gate
 from audapack.config import (
     DEFAULT_OUTPUT_LAYOUT,
     OUTPUT_LAYOUT_ALONGSIDE_PROJECTS,
@@ -30,16 +34,38 @@ from audapack.config import (
     normalize_output_layout,
 )
 from audapack.fidelity import (
+    DEFAULT_PROFILE,
+    LARGEST_INCLUDED_DIRECTORIES_LIMIT,
+    LARGEST_INCLUDED_LIMIT,
+    LARGEST_OMITTED_LIMIT,
+    LOSSY_POLICY_REASONS,
     PROFILE_FULL,
     FidelityPlan,
     archive_semantics_for,
     exclude_reason_summary,
     failure_summary,
+    normalize_fidelity_profile,
+    packing_policy_fingerprint,
+    profile_budget_bytes,
     pruned_census_totals,
 )
 from audapack.models import PackResult, Project
+from audapack.source_inventory import (
+    RESERVED_ARCHIVE_NAMES,
+    SourceInventory,
+    SourceInventoryError,
+    build_pack_inventory,
+    nested_component_manifest_section,
+)
 
 MANIFEST_FILENAME = "_AUDAPACK_MANIFEST.json"
+
+#: T-190 (SRC-046): the canonical source-inventory manifest carried by every
+#: archive written from a frozen inventory. Reserved archive metadata: source
+#: files may never own this path (tracked conflicts fail the pack), and it is
+#: excluded from expected/actual source parity counts.
+INVENTORY_MANIFEST_PATH = ".audapack/manifest.json"
+INVENTORY_MANIFEST_SCHEMA_VERSION = 1
 
 #: CORE-006 (audit/6.md): a reuse decision reads a manifest written by an earlier
 #: build, so the schema it was written against is part of what it must prove.
@@ -65,6 +91,11 @@ MANDATORY_EXCLUDES = {
     "*.token",
     "*.pid",
     "secrets",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "*.ppk",
     "_AUDAPACK_MANIFEST.json",
 }
 
@@ -356,6 +387,20 @@ def generate_manifest_data(
     if fidelity:
         meta["budget_bytes"] = fidelity.get("budget_bytes", 0)
         meta["budget_met"] = bool(fidelity.get("budget_met", True))
+        if "budget_floor_bytes" in fidelity:
+            meta["budget_floor_bytes"] = fidelity["budget_floor_bytes"]
+        if "budget_feasible" in fidelity:
+            meta["budget_feasible"] = bool(fidelity["budget_feasible"])
+        if "mandatory_bytes" in fidelity:
+            meta["mandatory_bytes"] = fidelity["mandatory_bytes"]
+        if "discretionary_bytes" in fidelity:
+            meta["discretionary_bytes"] = fidelity["discretionary_bytes"]
+        if "included_bytes_by_priority" in fidelity:
+            meta["included_bytes_by_priority"] = fidelity["included_bytes_by_priority"]
+        if "largest_included" in fidelity:
+            meta["largest_included"] = fidelity["largest_included"]
+        if "largest_included_directories" in fidelity:
+            meta["largest_included_directories"] = fidelity["largest_included_directories"]
         # CORE-006: an archive states the policy identity it was built under, so
         # a later reuse decision can refuse an archive whose policy has moved.
         if fidelity.get("policy_fingerprint"):
@@ -394,6 +439,15 @@ def _fidelity_payload(plan) -> Optional[dict]:
         # and the manifest says so instead of implying the target was met.
         "budget_bytes": plan.budget_bytes,
         "budget_met": plan.budget_bytes == 0 or plan.included_bytes <= plan.budget_bytes,
+        "budget_floor_bytes": plan.budget_floor_bytes,
+        "budget_feasible": plan.budget_feasible,
+        "mandatory_bytes": plan.mandatory_bytes,
+        "discretionary_bytes": plan.discretionary_bytes,
+        "included_bytes_by_priority": {
+            str(p): b for p, b in sorted(plan.included_bytes_by_priority.items())
+        },
+        "largest_included": plan.largest_included,
+        "largest_included_directories": plan.largest_included_directories,
         # An unreadable directory or a dead walk means the counters below cover
         # only what was reached. Declared, because the identity
         # discovered == included + excluded + failed still holds over truncated
@@ -419,6 +473,533 @@ def _fidelity_payload(plan) -> Optional[dict]:
         "pruned_bytes": pruned_bytes,
         "media_inventory": plan.media_inventory,
     }
+
+
+# ---------------------------------------------------------------------------
+# T-190 (SRC-046): frozen-inventory archive writing
+#
+#     DISCOVER -> VALIDATE INVENTORY -> FREEZE -> WRITE -> VERIFY -> COMMIT
+#
+# Membership comes ONLY from the frozen SourceInventory; the writer never
+# walks the source tree, and every included file is read exactly once while
+# its SHA-256 is computed from the same bytes that enter the ZIP.
+# ---------------------------------------------------------------------------
+
+
+#: Compact terminal pack states exposed on PackResult.status.
+PACK_STATUS_PACKED = "PACKED"
+PACK_STATUS_FAILED_INVENTORY = "FAILED_INVENTORY"
+PACK_STATUS_FAILED_SOURCE_READ = "FAILED_SOURCE_READ"
+PACK_STATUS_FAILED_SOURCE_CHANGED = "FAILED_SOURCE_CHANGED"
+PACK_STATUS_FAILED_VERIFY = "FAILED_VERIFY"
+
+#: Bounded streaming chunk for hashing + writing (bytes).
+_WRITE_CHUNK = 1024 * 1024
+
+#: A source that changed under the writer gets at most ONE full re-freeze and
+#: rewrite attempt. Never an unbounded retry loop.
+_SOURCE_CHANGE_MAX_ATTEMPTS = 2
+
+
+class SourceReadError(Exception):
+    """An inventory member could not be opened/read while packing (fail-closed)."""
+
+    def __init__(self, rel: str, reason: str) -> None:
+        super().__init__(f"{rel}: {reason}")
+        self.rel = rel
+        self.reason = reason
+
+
+class SourceChangedError(Exception):
+    """A source file changed after the inventory froze (fail-closed, one retry)."""
+
+    def __init__(self, rel: str, reason: str) -> None:
+        super().__init__(f"{rel}: {reason}")
+        self.rel = rel
+        self.reason = reason
+
+
+class ArchiveVerifyError(Exception):
+    """The staged archive failed post-write parity verification (fail-closed)."""
+
+    def __init__(self, message: str, rel: str = "") -> None:
+        super().__init__(f"{message} ({rel})" if rel else message)
+        self.rel = rel
+        self.message = message
+
+
+def _open_source(path: Path):
+    """Open one source file for packing. Test seam for read-failure injection."""
+    return open(path, "rb")
+
+
+def _stat_source(path: Path, *, follow: bool) -> os.stat_result:
+    """Stat one source file. Test seam for change injection."""
+    return os.stat(path, follow_symlinks=follow)
+
+
+def _zip_date_time_for(st: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """A ZIP timestamp from the frozen stat, clamped into ZIP's 1980 floor."""
+    try:
+        stamp = datetime.fromtimestamp(st.st_mtime)
+    except (OSError, OverflowError, ValueError):
+        return (1980, 1, 1, 0, 0, 0)
+    if stamp.year < 1980:
+        return (1980, 1, 1, 0, 0, 0)
+    return (stamp.year, stamp.month, stamp.day, stamp.hour, stamp.minute, stamp.second)
+
+
+@dataclass
+class StagedInventoryZip:
+    """Result of one staged archive write: the .part file plus write evidence."""
+
+    part_path: Path
+    stats: ZipStats
+    #: rel -> (written size, sha256 hex) for every source file in the archive.
+    sha256_by_rel: dict
+
+
+def build_inventory_manifest_payload(
+    inventory: SourceInventory,
+    sha256_by_rel: dict,
+    *,
+    project_name: str,
+) -> dict:
+    """The canonical ``.audapack/manifest.json`` payload (SRC-046 contract).
+
+    Describes the frozen inventory and the EXACT bytes written: one entry per
+    included source file with path, origin, size and the SHA-256 computed
+    during the write. Separate from the legacy ``_AUDAPACK_MANIFEST.json``,
+    whose schema and consumers are unchanged.
+    """
+    files = [
+        {
+            "path": entry.rel,
+            "origin": entry.origin,
+            "size": sha256_by_rel[entry.rel][0],
+            "sha256": sha256_by_rel[entry.rel][1],
+        }
+        for entry in inventory.included_entries()
+    ]
+    return {
+        "schema_version": INVENTORY_MANIFEST_SCHEMA_VERSION,
+        "kind": "audapack_source_inventory",
+        "project_name": project_name,
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "inventory_mode": inventory.mode,
+        "git_head": inventory.git_head,
+        "git_dirty": bool(inventory.git_dirty),
+        "counts": {
+            "tracked": inventory.tracked_count,
+            "untracked": inventory.untracked_count,
+            "filesystem": inventory.filesystem_count,
+            "included": len(files),
+            "excluded": len(inventory.excluded_entries()),
+            "tracked_deleted": len(inventory.tracked_deleted),
+        },
+        "tracked_deleted": inventory.tracked_deleted,
+        # T-246: the reserved control artifacts this archive regenerated in
+        # place of a tracked stale copy. Named here so the omission is always
+        # visible to whoever reads the archive, never a silent hole.
+        "superseded_control": inventory.superseded_control,
+        # Same-product nested Git components: which direct child worktrees are
+        # part of THIS product's source (packaged under their real paths) and
+        # which were deliberately left out as foreign. Always present, so a
+        # reader written before this feature simply sees an empty list.
+        "nested_git_components": nested_component_manifest_section(inventory),
+        "files": files,
+    }
+
+
+def _fidelity_payload_for_inventory(
+    inventory: SourceInventory,
+    packing,
+    excludes: set[str],
+) -> dict:
+    """Manifest fidelity payload for a Git-mode pack (no walked plan exists).
+
+    Same shape as :func:`_fidelity_payload` so manifest consumers see one
+    schema; the numbers describe the frozen inventory instead of a walk.
+    Untracked Git material never passes through media sampling or the soft
+    budget trim in T-190, so no lossy-policy omission can arise here and the
+    declared semantics survive unless a future policy adds one.
+    """
+    if packing is not None:
+        profile = normalize_fidelity_profile(
+            str(getattr(packing, "fidelity_profile", DEFAULT_PROFILE))
+        )
+        max_mb = int(getattr(packing, "fidelity_max_mb", 0) or 0)
+        media_samples = int(getattr(packing, "fidelity_media_samples", 0) or 0)
+        media_bytes = int(getattr(packing, "fidelity_media_bytes", 0) or 0)
+        always_include = list(getattr(packing, "always_include", None) or [])
+        always_exclude = list(getattr(packing, "always_exclude", None) or [])
+    else:
+        profile = normalize_fidelity_profile(PROFILE_FULL)
+        max_mb = 0
+        media_samples = 0
+        media_bytes = 0
+        always_include = []
+        always_exclude = []
+
+    budget = profile_budget_bytes(profile, max_mb)
+    included = inventory.included_entries()
+    excluded = inventory.excluded_entries()
+    included_bytes = sum(e.size for e in included)
+
+    reason_stats: dict[str, dict[str, int]] = {}
+    for entry in excluded:
+        reason = entry.reason or "unsupported_special_file"
+        bucket = reason_stats.setdefault(reason, {"count": 0, "bytes": 0})
+        bucket["count"] += 1
+        bucket["bytes"] += entry.size
+
+    by_priority: dict[int, int] = {}
+    dir_bytes: dict[str, int] = {}
+    for entry in included:
+        by_priority[entry.priority] = by_priority.get(entry.priority, 0) + entry.size
+        parent = entry.rel.rpartition("/")[0] or "."
+        dir_bytes[parent] = dir_bytes.get(parent, 0) + entry.size
+
+    semantics = archive_semantics_for(profile)
+    if any(reason_stats.get(reason, {}).get("count", 0) for reason in LOSSY_POLICY_REASONS):
+        semantics = "audit_representation"
+
+    return {
+        "fidelity_profile": profile,
+        "archive_semantics": semantics,
+        "policy_fingerprint": packing_policy_fingerprint(
+            profile=profile,
+            max_mb=max_mb,
+            media_samples=media_samples,
+            media_bytes=media_bytes,
+            excludes=excludes,
+            always_include=always_include,
+            always_exclude=always_exclude,
+        ),
+        "budget_bytes": budget,
+        "budget_met": budget == 0 or included_bytes <= budget,
+        "budget_floor_bytes": 0,
+        "budget_feasible": True,
+        "mandatory_bytes": 0,
+        "discretionary_bytes": 0,
+        "included_bytes_by_priority": {str(p): b for p, b in sorted(by_priority.items())},
+        "largest_included": [
+            {"rel": e.rel, "size": e.size, "priority": e.priority}
+            for e in heapq.nsmallest(
+                LARGEST_INCLUDED_LIMIT,
+                included,
+                key=lambda e: (-e.size, e.rel.lower(), e.rel),
+            )
+        ],
+        "largest_included_directories": [
+            {"rel": rel_dir, "bytes": total_b}
+            for rel_dir, total_b in heapq.nsmallest(
+                LARGEST_INCLUDED_DIRECTORIES_LIMIT,
+                dir_bytes.items(),
+                key=lambda item: (-item[1], item[0].lower()),
+            )
+        ],
+        "walk_incomplete": False,
+        "exclusions": {k: dict(v) for k, v in sorted(reason_stats.items())},
+        "failures": {},
+        "largest_omitted": [
+            [e.rel, e.size]
+            for e in heapq.nsmallest(
+                LARGEST_OMITTED_LIMIT,
+                (e for e in excluded if e.size > 0),
+                key=lambda e: (-e.size, e.rel.lower(), e.rel),
+            )
+        ],
+        "pruned_directories": [],
+        "pruned_files": 0,
+        "pruned_bytes": 0,
+        "media_inventory": {},
+    }
+
+
+def stage_inventory_zip(
+    source_dir: str | Path,
+    output_zip: Path,
+    inventory: SourceInventory,
+    *,
+    plan: Optional[FidelityPlan] = None,
+    cancel_event: Optional[threading.Event] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    manifest_meta: Optional[dict] = None,
+    fidelity_payload: Optional[dict] = None,
+    project_name: Optional[str] = None,
+) -> StagedInventoryZip:
+    """Write the frozen inventory into a unique ``.part`` staging archive.
+
+    Never walks the source and never decides membership: every written byte
+    comes from ``inventory``. Each file is streamed once; its SHA-256 is taken
+    from the same bytes. Deviations from the frozen stat identity raise
+    :class:`SourceChangedError`; unreadable files raise
+    :class:`SourceReadError`; any failure removes the staging file. The caller
+    verifies (:func:`verify_inventory_archive`) and only then commits the
+    atomic rename.
+    """
+    source = Path(source_dir).resolve()
+    output_zip.parent.mkdir(parents=True, exist_ok=True)
+    part_path = output_zip.with_name(f"{output_zip.name}.part.{uuid.uuid4().hex}")
+
+    prog = progress_callback or (lambda added, b_written, cur_path: None)
+    c_event = cancel_event or threading.Event()
+
+    stats = ZipStats()
+    entries = inventory.entries
+    included_entries = inventory.included_entries()
+    excluded_entries = inventory.excluded_entries()
+    stats.files_discovered = len(entries)
+    stats.files_included = len(included_entries)
+    stats.files_excluded = len(excluded_entries)
+    stats.files_failed = 0
+    stats.source_bytes = sum(e.size for e in entries.values())
+    stats.excluded_bytes = sum(e.size for e in excluded_entries)
+    if plan is not None:
+        # Filesystem mode: the plan is the traversal that produced the frozen
+        # inventory, so its counters (including any unknown-size declarations)
+        # are the manifest accounting -- identical to the pre-inventory seeds.
+        stats.files_discovered = plan.discovered
+        stats.files_included = plan.included
+        stats.files_excluded = plan.excluded
+        stats.files_failed = plan.failed
+        stats.source_bytes = plan.source_bytes
+        stats.excluded_bytes = plan.excluded_bytes
+        stats.unknown_size_entries = plan.unknown_size_entries
+
+    hashes: dict[str, tuple[int, str]] = {}
+
+    # SRC-100 Milestone F: ONE WRITER PER CONTROL PATH, asserted BEFORE a single
+    # archive byte exists. The guard after the payload loop catches the same
+    # collision, but only once a staging ZIP has already been filled with the
+    # duplicate's first copy; the operator then pays for a full write before
+    # hearing about it. Cheap here, deterministic, and it names both sides of
+    # the collision -- the source path and the control writer that owns it.
+    regenerated_controls = set()
+    if manifest_meta is not None:
+        regenerated_controls.add(MANIFEST_FILENAME)
+    regenerated_controls.add(INVENTORY_MANIFEST_PATH)
+    for entry in included_entries:
+        if entry.rel in regenerated_controls:
+            raise ArchiveVerifyError(
+                f"reserved archive-control member {entry.rel!r} reached the payload as source "
+                "material, but this pack writes its own control artifact under that name; "
+                "refusing to write the same member twice"
+            )
+
+    try:
+        with zipfile.ZipFile(part_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for entry in included_entries:
+                if c_event.is_set():
+                    raise PackingCancelled("Cancelled by user")
+                full = source.joinpath(*entry.rel.split("/"))
+                if entry.symlink:
+                    # Re-prove the frozen symlink resolution: the target must
+                    # still be a regular file inside the source root.
+                    target = Path(os.path.realpath(full))
+                    root_real = Path(os.path.realpath(source))
+                    try:
+                        inside = target == root_real or root_real in target.parents
+                        if not inside or not target.is_file():
+                            raise SourceChangedError(
+                                entry.rel,
+                                "symlink no longer resolves to a file inside the project root",
+                            )
+                        st = _stat_source(target, follow=True)
+                    except OSError as exc:
+                        raise SourceChangedError(
+                            entry.rel, f"symlink target unreadable: {exc}"
+                        ) from exc
+                    read_path: Path = target
+                else:
+                    try:
+                        st = _stat_source(full, follow=False)
+                    except OSError as exc:
+                        raise SourceChangedError(
+                            entry.rel, f"vanished or unreadable after inventory freeze: {exc}"
+                        ) from exc
+                    if stat_module.S_ISDIR(st.st_mode) or stat_module.S_ISLNK(st.st_mode):
+                        raise SourceChangedError(
+                            entry.rel, "changed from file to directory/symlink during pack"
+                        )
+                    read_path = full
+                if (
+                    st.st_size != entry.size
+                    or (entry.mtime_ns and st.st_mtime_ns != entry.mtime_ns)
+                    or (entry.st_ino and entry.st_dev and (st.st_ino, st.st_dev) != (entry.st_ino, entry.st_dev))
+                ):
+                    raise SourceChangedError(
+                        entry.rel,
+                        f"changed during pack (stat identity differs from frozen inventory: "
+                        f"size {st.st_size} vs {entry.size})",
+                    )
+
+                zinfo = zipfile.ZipInfo(entry.rel, date_time=_zip_date_time_for(st))
+                zinfo.compress_type = compress_type_for(entry.rel)
+                zinfo.external_attr = 0o100644 << 16
+                hasher = hashlib.sha256()
+                written = 0
+                try:
+                    with _open_source(read_path) as src, zf.open(zinfo, "w") as dst:
+                        while True:
+                            if c_event.is_set():
+                                raise PackingCancelled("Cancelled by user")
+                            chunk = src.read(_WRITE_CHUNK)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            hasher.update(chunk)
+                            written += len(chunk)
+                except PackingCancelled:
+                    raise
+                except SourceChangedError:
+                    raise
+                except OSError as exc:
+                    raise SourceReadError(entry.rel, str(exc)) from exc
+                if written != entry.size:
+                    raise SourceChangedError(
+                        entry.rel,
+                        f"changed size while packing ({written} bytes read vs {entry.size} frozen)",
+                    )
+                stats.bytes_written += written
+                stats.included_bytes += written
+                stats.files_added += 1
+                hashes[entry.rel] = (written, hasher.hexdigest())
+                if stats.files_added == 1 or stats.files_added % 50 == 0:
+                    prog(stats.files_added, stats.bytes_written, entry.rel)
+
+            # Legacy AUDAPACK manifest: unchanged schema, unchanged consumers.
+            if manifest_meta is not None:
+                manifest_payload = generate_manifest_data(
+                    project_name=manifest_meta.get("project_name", project_name or source.name),
+                    source_path=str(source),
+                    source_kind="file" if source.is_file() else "folder",
+                    stats=stats,
+                    fidelity=fidelity_payload,
+                    extra_meta=manifest_meta.get("extra_meta"),
+                )
+                manifest_payload["inventory_mode"] = inventory.mode
+                if inventory.mode == "git":
+                    manifest_payload["git_head"] = inventory.git_head
+                    manifest_payload["git_dirty"] = bool(inventory.git_dirty)
+                    manifest_payload["git_summary"] = inventory.git_summary()
+                manifest_payload["tracked_deleted"] = list(inventory.tracked_deleted)
+                # The snapshot's own verdict about protocol evidence. Present
+                # only for projects carrying `.saipen/`, so a non-SAIPEN
+                # manifest keeps its existing shape exactly.
+                #
+                # `accounting_reconciled` above proves the FILE COUNTS add up.
+                # It cannot prove the right files were discovered at all --
+                # which is exactly how a package reported itself healthy while
+                # carrying one stale intake receipt and no LOG: the missing
+                # evidence was never counted, so the identity held over
+                # material nobody had looked at. This key answers the question
+                # the accounting cannot.
+                if inventory.saipen is not None:
+                    manifest_payload["saipen_snapshot"] = inventory.saipen
+                manifest_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
+                zinfo = zipfile.ZipInfo(MANIFEST_FILENAME)
+                zinfo.compress_type = compress_type_for(MANIFEST_FILENAME)
+                zf.writestr(zinfo, manifest_bytes)
+                stats.files_added += 1
+                stats.bytes_written += len(manifest_bytes)
+
+            # Canonical source-inventory manifest (T-190).
+            # SRC-100: a reserved control name that already reached the archive
+            # as payload would be written a SECOND time here. zipfile allows it
+            # with only a UserWarning, and the pack then died as FAILED_VERIFY
+            # with nothing naming the cause. Every inventory mode now refuses or
+            # supersedes a reserved name; this is the backstop that keeps a
+            # future mode from reintroducing the duplicate silently.
+            if INVENTORY_MANIFEST_PATH in zf.namelist():
+                raise ArchiveVerifyError(
+                    f"reserved archive-control member {INVENTORY_MANIFEST_PATH!r} is already "
+                    "present as source payload; refusing to write a duplicate member"
+                )
+            inventory_payload = build_inventory_manifest_payload(
+                inventory,
+                hashes,
+                project_name=project_name or source.name,
+            )
+            inventory_bytes = json.dumps(inventory_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            zinfo = zipfile.ZipInfo(INVENTORY_MANIFEST_PATH)
+            zinfo.compress_type = compress_type_for(INVENTORY_MANIFEST_PATH)
+            zf.writestr(zinfo, inventory_bytes)
+            stats.files_added += 1
+            stats.bytes_written += len(inventory_bytes)
+
+        if c_event.is_set():
+            raise PackingCancelled("Cancelled by user")
+        return StagedInventoryZip(part_path=part_path, stats=stats, sha256_by_rel=hashes)
+    except Exception:
+        if part_path.exists():
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def verify_inventory_archive(
+    zip_path: Path,
+    sha256_by_rel: dict,
+    *,
+    reserved: Optional[set] = None,
+) -> None:
+    """Prove exact parity between the frozen inventory and the staged ZIP.
+
+    Both directions, on the ZIP alone (sources are never re-read):
+    EXPECTED -> ZIP: every expected source path exists exactly once, is
+    readable, and matches its written size and SHA-256 byte for byte.
+    ZIP -> EXPECTED: no source payload path exists beyond the frozen set.
+    Reserved archive-control entries (both manifests) are excluded from the
+    parity sets explicitly. A valid central directory alone proves nothing:
+    every member body is streamed and hashed.
+    """
+    reserved = RESERVED_ARCHIVE_NAMES if reserved is None else set(reserved)
+    try:
+        zf = zipfile.ZipFile(zip_path, "r")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ArchiveVerifyError(f"staged archive is not a readable zip: {exc}") from exc
+    with zf:
+        names = zf.namelist()
+        counts = Counter(names)
+        duplicated = sorted(name for name, count in counts.items() if count > 1)
+        if duplicated:
+            raise ArchiveVerifyError("archive member written more than once", rel=duplicated[0])
+        name_set = set(names)
+        expected = set(sha256_by_rel)
+        unexpected = sorted(name_set - expected - reserved)
+        if unexpected:
+            raise ArchiveVerifyError(
+                "unexpected source payload path not in the frozen inventory",
+                rel=unexpected[0],
+            )
+        missing = sorted(expected - name_set)
+        if missing:
+            raise ArchiveVerifyError("expected source path missing from the archive", rel=missing[0])
+        for rel in sorted(expected):
+            expected_size, expected_digest = sha256_by_rel[rel]
+            hasher = hashlib.sha256()
+            read_bytes = 0
+            try:
+                with zf.open(rel, "r") as fh:
+                    while True:
+                        chunk = fh.read(_WRITE_CHUNK)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                        read_bytes += len(chunk)
+            except (OSError, zipfile.BadZipFile) as exc:
+                raise ArchiveVerifyError(f"archive member unreadable: {exc}", rel=rel) from exc
+            if read_bytes != expected_size:
+                raise ArchiveVerifyError(
+                    f"archive member size {read_bytes} != frozen {expected_size}", rel=rel
+                )
+            if hasher.hexdigest() != expected_digest:
+                raise ArchiveVerifyError("archive member SHA-256 mismatch", rel=rel)
 
 
 
@@ -447,12 +1028,12 @@ def eligible_source_files(
     outside the source root and bypass name-based exclusion.
     """
     matcher = _build_exclusion_matcher(set(excludes) | MANDATORY_EXCLUDES)
-    skip_rel: set[str] = set()
     pruned_dirs: set[str] = set()
     if plan is not None:
-        skip_rel = {
-            rel for rel, d in plan.decisions.items() if not d.include
-        } | {rel.lower() for rel in plan.extra_excluded_rel}
+        # T-150: per-file plan eligibility is the EXACT FileDecision for the
+        # exact relative path -- Asset.PNG and asset.png can carry opposite
+        # include/exclude verdicts and neither may collapse into the other.
+        # Directory pruning keeps its normalized (case-insensitive) contract.
         pruned_dirs = set(plan.pruned_dirs_rel)
     if source.is_file():
         if not source.is_symlink() and not matcher(source):
@@ -478,9 +1059,10 @@ def eligible_source_files(
                 continue
             if matcher(path):
                 continue
-            rel_lower = path.relative_to(source).as_posix().lower()
-            if plan is not None and rel_lower in skip_rel:
-                continue
+            if plan is not None:
+                decision = plan.decision_for(path.relative_to(source).as_posix())
+                if decision is not None and not decision.include:
+                    continue
             yield path
 
 
@@ -620,10 +1202,12 @@ def create_zip(
                                 log(f"! symlink skipped (link target excluded): {file_path}")
                             continue
 
-                        rel_lower = file_path.relative_to(source).as_posix().lower()
+                        # T-150: identity is the exact source-relative POSIX
+                        # path; the packer must tell Asset.PNG from asset.png.
+                        rel = file_path.relative_to(source).as_posix()
                         planned_size = 0
                         if plan is not None:
-                            decision = plan.decisions.get(rel_lower)
+                            decision = plan.decision_for(rel)
                             if decision is None:
                                 # The plan never recorded this file (a transient
                                 # traversal/stat error during planning). It must
@@ -728,6 +1312,7 @@ def create_zip(
             raise PackingCancelled("Cancelled by user")
 
         part_path.replace(output_zip)
+        archive_receipt.invalidate(output_zip)
         return stats
     except Exception:
         if part_path.exists():
@@ -854,6 +1439,11 @@ def delete_old_archives(output_dir: Path, stem: str, current_zip: Path, log_cb: 
                 continue
             try:
                 old.unlink()
+                # PERF-004 (audit/12.md): retire the receipt with the archive.
+                # Nothing else prunes orphan receipts, so the sidecar store grew
+                # by one file per deleted archive forever -- against its stated
+                # intent of staying bounded by the archives actually served.
+                archive_receipt.invalidate(old)
                 removed += 1
                 log(f"Removed old archive: {old.name}")
             except Exception as exc:
@@ -928,6 +1518,25 @@ def find_archive_for_project(project: "Project", output_dir: Path) -> Optional[P
     return None
 
 
+def project_for_archive_filename(filename: str, projects: Iterable["Project"]) -> Optional["Project"]:
+    """The one registered project whose canonical archive ``filename`` is.
+
+    Same identity order as :func:`find_archive_for_project`, and the same
+    anchored stem match, so a sibling ``{stem}_Bar`` never claims ``{stem}``.
+    A name two projects could own is ambiguous and answers None.
+    """
+    name = Path(str(filename or "")).name
+    if not name.lower().endswith(".zip"):
+        return None
+    owners: list["Project"] = []
+    for project in projects:
+        for raw in (project.archive_name, project.display_name, project.id):
+            if str(raw or "").strip() and archive_belongs_to_stem(name, safe_archive_stem(str(raw))):
+                owners.append(project)
+                break
+    return owners[0] if len(owners) == 1 else None
+
+
 def resolve_output_dir(
     source_path: str | Path,
     packing: PackingConfig,
@@ -1000,6 +1609,7 @@ def pack_single(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     manifest_meta: Optional[dict] = None,
     packing: Optional[PackingConfig] = None,
+    prebuilt_plan: Optional[FidelityPlan] = None,
 ) -> PackResult:
     """Pack a single folder or file into a timestamped ZIP in output_dir.
 
@@ -1009,6 +1619,13 @@ def pack_single(
     truthful accounting (discovered/included/excluded/failed + profile +
     archive semantics). Without ``packing`` the legacy behaviour applies and
     the manifest honestly reports FULL semantics.
+
+    T-155 (PERF-004 residue): ``prebuilt_plan`` lets the freshness probe hand
+    its complete plan straight to the packer so a stale verdict never re-walks
+    the tree. The caller owns the safety contract: the plan must have been
+    built for the same source under the same policy, fully walked, with its
+    census finalized (``finalize_pruned_census``) -- a prefix verdict or a
+    cancelled plan must never arrive here.
     """
     log = log_callback or (lambda msg: None)
     source = Path(source_path)
@@ -1047,13 +1664,100 @@ def pack_single(
             error_message=f"Source does not exist: {source}",
         )
 
-    # T-147: build the fidelity plan after the topology/existence guards so
-    # error paths never pay for a full tree walk. The plan is the single
-    # source of truth for both the zipper and the freshness walk.
-    plan = None
-    if packing is not None:
-        from audapack.fidelity import build_plan_from_config
-        plan = build_plan_from_config(source, packing, excludes)
+    # SAIPEN audit-manifest authority gate (SRC-007 / T-850). A project that
+    # carries `.saipen/` is protocol evidence, and the 2026-09-15 15:11:04
+    # SAIPENVIEW archive proved the old ordering ships a green package over a
+    # red snapshot: the inventory computed the truthful verdict
+    # (PROTOCOL_MANIFEST_ABSENT, authoritative_state=false) and packed it
+    # anyway, because nothing in the canonical path ever ran
+    # `saipen audit manifest --write`. The gate makes the normal pack path
+    # guarantee ONE of: (1) a current contract manifest exists now --
+    # generated through the REAL protocol CLI when missing, never synthesized
+    # here -- or (2) a fail-closed refusal BEFORE any archive byte exists.
+    # Non-SAIPEN projects (no `.saipen/`) pass through untouched.
+    gate = saipen_manifest_gate.prepare(
+        source,
+        cancel_event=cancel_event,
+        log_callback=log,
+    )
+    if not gate.ok and gate.code != saipen_evidence.STATUS_NOT_SAIPEN:
+        if gate.code == "PACK_CANCELLED":
+            message = "Cancelled by user"
+        elif gate.code == saipen_evidence.STATUS_CONTRACT_UNKNOWN:
+            # TARGET G: the manifest is present and current; only its contract
+            # VERSION is beyond this collector. "Run saipen audit manifest
+            # --write" would be misleading advice that cannot repair anything
+            # (the installed protocol writes that same newer contract), so the
+            # gate's own detail -- which names the real remedy -- is surfaced
+            # alone, with no regeneration instruction appended.
+            message = (
+                f"SAIPEN audit-manifest precondition failed ({gate.code}): "
+                f"{gate.detail} No archive was produced."
+            )
+        else:
+            message = (
+                f"SAIPEN audit-manifest precondition failed ({gate.code}): "
+                f"{gate.detail}. Run `saipen audit manifest --write` in the "
+                "project (or repair the owning SAIPEN protocol component) "
+                "and repack; no archive was produced."
+            )
+        log(f"FAIL {stem}: {message}")
+        return PackResult(
+            project_id=stem,
+            name=stem,
+            source_path=str(source),
+            success=False,
+            status=PACK_STATUS_FAILED_INVENTORY,
+            error_code=gate.code,
+            error_message=message,
+        )
+
+    # T-190 (SRC-046): freeze the source inventory BEFORE the transaction
+    # opens. Membership comes only from this frozen set -- Git worktrees
+    # inventory as tracked_existing UNION untracked_nonignored via bounded Git
+    # commands; genuinely non-Git sources keep the bounded walk fallback under
+    # the same frozen/fail-closed contract. An unreliable inventory fails the
+    # pack here, before a single archive byte exists.
+    # T-246: the reserved control paths THIS run regenerates. A tracked
+    # AUDAPACK-generated artifact on one of them is superseded by the fresh
+    # one instead of failing the pack; a project-owned file on a reserved name
+    # still fails closed, and nothing here widens the hard-safety policy.
+    supersedable_reserved = frozenset(RESERVED_ARCHIVE_NAMES)
+    if manifest_meta is None:
+        supersedable_reserved = frozenset({INVENTORY_MANIFEST_PATH})
+
+    try:
+        inventory, plan = build_pack_inventory(
+            source,
+            excludes,
+            packing=packing,
+            prebuilt_plan=prebuilt_plan,
+            supersedable_reserved=supersedable_reserved,
+            cancel_event=cancel_event,
+        )
+    except SourceInventoryError as exc:
+        log(f"FAIL {stem}: {exc}")
+        return PackResult(
+            project_id=stem,
+            name=stem,
+            source_path=str(source),
+            success=False,
+            status=PACK_STATUS_FAILED_INVENTORY,
+            # The stage publishes the exact rule that refused (T-190 codes);
+            # carrying it as data keeps the Project Room classification exact
+            # instead of re-derived by parsing the message.
+            error_code=exc.code,
+            error_message=str(exc),
+            first_error_path=exc.rel,
+        )
+    if inventory.mode == "git":
+        fidelity_payload = _fidelity_payload_for_inventory(inventory, packing, excludes)
+        profile_name = fidelity_payload["fidelity_profile"]
+        archive_sem = fidelity_payload["archive_semantics"]
+    else:
+        fidelity_payload = _fidelity_payload(plan)
+        profile_name = plan.profile if plan else ""
+        archive_sem = plan.archive_semantics if plan else ""
 
     # CORE-001: serialize the entire same-target transaction (filename
     # selection, backup, archive creation + atomic replace, verification,
@@ -1117,66 +1821,75 @@ def pack_single(
 
             try:
                 output_dir.mkdir(parents=True, exist_ok=True)
-                stats = create_zip(
-                    source,
-                    output_path,
-                    excludes,
-                    cancel_event=cancel_event,
-                    log_callback=log,
-                    progress_callback=progress_callback,
-                    manifest_meta=manifest_meta,
-                    plan=plan,
-                )
+
+                def _refreeze_inventory():
+                    """One bounded re-freeze after a mid-pack source change."""
+                    nonlocal inventory, plan, fidelity_payload
+                    inventory, plan = build_pack_inventory(
+                        source,
+                        excludes,
+                        packing=packing,
+                        prebuilt_plan=None,
+                        supersedable_reserved=supersedable_reserved,
+                        cancel_event=cancel_event,
+                    )
+                    if inventory.mode == "git":
+                        fidelity_payload = _fidelity_payload_for_inventory(
+                            inventory, packing, excludes
+                        )
+                    else:
+                        fidelity_payload = _fidelity_payload(plan)
+
+                # T-190: WRITE -> VERIFY -> COMMIT from the frozen inventory.
+                # A source that changes under the writer earns exactly one
+                # full re-freeze + rewrite retry; anything worse fails the
+                # pack with no newly-created final archive.
+                stats = None
+                for attempt in range(1, _SOURCE_CHANGE_MAX_ATTEMPTS + 1):
+                    try:
+                        staged = stage_inventory_zip(
+                            inventory.source if inventory.source != Path(source).resolve() else source,
+                            output_path,
+                            inventory,
+                            plan=plan,
+                            cancel_event=cancel_event,
+                            log_callback=log,
+                            progress_callback=progress_callback,
+                            manifest_meta=manifest_meta,
+                            fidelity_payload=fidelity_payload,
+                            project_name=manifest_meta.get("project_name") if manifest_meta else None,
+                        )
+                    except SourceChangedError as exc:
+                        if attempt < _SOURCE_CHANGE_MAX_ATTEMPTS:
+                            log(
+                                f"! {stem}: source changed during pack ({exc.rel}); "
+                                "re-freezing the inventory for one bounded retry"
+                            )
+                            _refreeze_inventory()
+                            continue
+                        raise
+                    try:
+                        verify_inventory_archive(staged.part_path, staged.sha256_by_rel)
+                    except ArchiveVerifyError:
+                        if staged.part_path.exists():
+                            try:
+                                staged.part_path.unlink()
+                            except OSError:
+                                pass
+                        raise
+                    staged.part_path.replace(output_path)
+                    archive_receipt.invalidate(output_path)
+                    stats = staged.stats
+                    break
+
                 added, raw_bytes, skipped, walk_errors = (
                     stats.files_added,
                     stats.bytes_written,
-                    stats.files_failed,  # T-147: skipped_files now means failed
+                    stats.files_failed,
                     stats.walk_errors,
                 )
-                entries = verify_zip(output_path, added)
+                entries = added
                 size_bytes = output_path.stat().st_size
-
-                # W2-001: a partial archive (skipped files or traversal errors) must not
-                # be reported as a complete, successful pack, and must never delete the
-                # previous good archive.
-                # T-147: excluded is INTENTIONAL (configured ignores, media
-                # sampling, size trim) and must not mark the pack partial.
-                # Only unreadable/locked files and traversal errors do.
-                partial = stats.files_failed > 0 or stats.walk_errors > 0
-                if partial:
-                    diag = output_path.with_name(f"{stem}.PARTIAL.{uuid.uuid4().hex}.zip")
-                    try:
-                        output_path.replace(diag)
-                    except OSError:
-                        pass
-                    if backup_path and backup_path.exists():
-                        try:
-                            backup_path.replace(output_path)  # restore previous good
-                        except OSError:
-                            pass
-                    return PackResult(
-                        project_id=stem,
-                        name=stem,
-                        source_path=str(source),
-                        output_path=diag if diag.exists() else output_path,
-                        success=False,
-                        error_message=(
-                            f"Partial archive: {skipped} file(s) skipped, {walk_errors} walk error(s). "
-                            f"Previous complete archive preserved."
-                        ),
-                        files_added=entries,
-                        files_included=stats.files_included,
-                        raw_bytes=raw_bytes,
-                        archive_bytes=size_bytes,
-                        skipped_files=skipped,
-                        walk_errors=walk_errors,
-                        files_discovered=stats.files_discovered,
-                        files_excluded=stats.files_excluded,
-                        files_failed=stats.files_failed,
-                        excluded_bytes=stats.excluded_bytes,
-                        fidelity_profile=plan.profile if plan else "",
-                        archive_semantics=plan.archive_semantics if plan else "",
-                    )
 
                 if delete_old:
                     delete_old_archives(output_dir, stem, output_path, log)
@@ -1188,12 +1901,19 @@ def pack_single(
                         pass
 
                 log(f"OK {output_path.name}: {entries} files, {human_mb(raw_bytes)} -> {human_mb(size_bytes)}")
+                for superseded in inventory.superseded_control:
+                    log(
+                        f"  {superseded}: tracked AUDAPACK-generated control artifact "
+                        f"superseded by the one in this archive -- run "
+                        f"`git rm --cached {superseded}` to untrack it"
+                    )
                 return PackResult(
                     project_id=stem,
                     name=stem,
                     source_path=str(source),
                     output_path=output_path,
                     success=True,
+                    status=PACK_STATUS_PACKED,
                     files_added=entries,
                     files_included=stats.files_included,
                     raw_bytes=raw_bytes,
@@ -1204,8 +1924,61 @@ def pack_single(
                     files_excluded=stats.files_excluded,
                     files_failed=stats.files_failed,
                     excluded_bytes=stats.excluded_bytes,
-                    fidelity_profile=plan.profile if plan else "",
-                    archive_semantics=plan.archive_semantics if plan else "",
+                    fidelity_profile=profile_name,
+                    archive_semantics=archive_sem,
+                    git_summary=inventory.git_summary() if inventory.mode == "git" else "",
+                )
+            except (SourceReadError, SourceChangedError, ArchiveVerifyError, SourceInventoryError) as exc:
+                # T-190 fail-closed source contract: a read failure, an
+                # unexplained source change (after the one retry), a parity
+                # failure or a re-freeze failure must never produce a
+                # successful final archive. Remove the failed output FIRST,
+                # then restore the previous good archive from the backup.
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        pass
+                if backup_path and backup_path.exists():
+                    try:
+                        backup_path.replace(output_path)
+                    except OSError as restore_exc:
+                        # Preserve the backup under its diagnostic name; never destroy it.
+                        log(f"WARN {stem}: could not restore backup {backup_path.name}: {restore_exc}")
+                        return PackResult(
+                            project_id=stem,
+                            name=stem,
+                            source_path=str(source),
+                            output_path=backup_path if backup_path.exists() else None,
+                            success=False,
+                            error_message=f"{exc} (previous archive preserved as {backup_path.name})",
+                            first_error_path=getattr(exc, "rel", ""),
+                        )
+                if isinstance(exc, SourceReadError):
+                    status = PACK_STATUS_FAILED_SOURCE_READ
+                    message = f"source file could not be read: {exc.rel}: {exc.reason}"
+                elif isinstance(exc, SourceChangedError):
+                    status = PACK_STATUS_FAILED_SOURCE_CHANGED
+                    message = (
+                        f"source changed during pack (after one bounded retry): {exc.rel}: {exc.reason}"
+                    )
+                elif isinstance(exc, ArchiveVerifyError):
+                    status = PACK_STATUS_FAILED_VERIFY
+                    message = f"archive failed post-write parity verification: {exc.message}"
+                else:
+                    status = PACK_STATUS_FAILED_INVENTORY
+                    message = str(exc)
+                log(f"FAIL {stem}: [{status}] {message}")
+                return PackResult(
+                    project_id=stem,
+                    name=stem,
+                    source_path=str(source),
+                    output_path=output_path if output_path.exists() else None,
+                    success=False,
+                    status=status,
+                    error_code=getattr(exc, "code", ""),
+                    error_message=message,
+                    first_error_path=getattr(exc, "rel", ""),
                 )
             except Exception as exc:
                 # Restore previous good archive on failure. The failed new output must

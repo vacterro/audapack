@@ -7,7 +7,8 @@
 <p align="center"><strong>Рабочее место Windows для проверенной упаковки ZIP, многоэтапного AI-аудита и локального браузерного моста.</strong></p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.3.0-D4B86A?style=for-the-badge" alt="Релиз v0.3.0"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/релиз-v0.3.1-D4B86A?style=for-the-badge" alt="Релиз v0.3.1"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-4A7A20?style=for-the-badge" alt="Лицензия MIT"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/платформа-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
   <a href="tests/"><img src="https://img.shields.io/badge/Python%20тесты-passing-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Тесты Python проходят"></a>
@@ -57,6 +58,8 @@ python AUDAPACK.pyw --ui tkinter
 
 Браузерную часть установите отдельно: добавьте `resources/AUDAPACK_WIDGET.user.js` в Tampermonkey и откройте ChatGPT. При работающем Bridge виджет подключится к локальному сервису.
 
+Tampermonkey сравнивает только `@version`, поэтому новые байты виджета всегда выходят под новой версией: рядом с userscript лежит фиксируемый в репозитории релизный реестр (`resources/AUDAPACK_WIDGET.release.json`) с версией и SHA-256. Записать релиз — `python scripts/update_widget_release.py`, проверить, что Bridge предлагает именно его, — `python scripts/widget_update_probe.py --installed-version <версия из панели Tampermonkey>`. Ручные шаги в браузере описаны в [`docs/AUDAPACK_WIDGET_ACCEPTANCE.md`](docs/AUDAPACK_WIDGET_ACCEPTANCE.md).
+
 Для автономных аудитов используйте **Settings → Components → Launch AUDAPACK Chromium**. AUDAPACK выбирает установленный Chromium-браузер (Chrome, Cent, Edge, Vivaldi или Opera раньше Brave), запускает его в отдельном профиле `%LOCALAPPDATA%\AUDAPACK\browser_worker` и отключает Chromium-throttling таймеров, перекрытых окон и renderer-процессов. В этом выделенном профиле нужно один раз установить Tampermonkey и виджет. Worker продолжает работу при свёрнутом окне, поверх других приложений и при выключенных экранах; сон или гибернация Windows всё равно останавливают все процессы, поэтому для автономного запуска их нужно отдельно отключить.
 
 ## Project Room
@@ -90,6 +93,8 @@ Bridge проверяет авторизацию, идентичность пр�
 ## Сбор материалов INAUDIT
 
 У стабильного ответа ChatGPT нажмите `IA` рядом со всем ответом или отдельным блоком. Подтверждённая запись Bridge показывает `IA ✓`; если Bridge недоступен, ограниченная очередь IndexedDB показывает `IA QUEUED` и позднее повторяет отправку с тем же идентификатором. В AUDAPACK откройте **INAUDIT → Inbox**, проверьте происхождение и доказательства классификации, выберите зарегистрированный проект и нажмите **Assign**, **Assign + GG** или **Assign + CC**. Кнопка `IA+` на панели сохраняет текущий буфер Windows через то же надёжное хранилище.
+
+Аудиторские ответы собираются без клика: когда ответ, который виджет видел в потоке, завершается, а сообщение, на которое он отвечает, несло ZIP проекта, ответ автоматически попадает в Inbox и закрепляется за проектом, которому принадлежит имя архива. Короткие ответы, повторно открытые старые беседы и прогоны воркеров пропускаются. Отключается в Settings → Bridge → «Auto-capture audit replies to INAUDIT».
 
 В проектах с `.saipen/` AUDAPACK передаёт сохранённые байты через `saipen audit enqueue` с UUID захвата. Номер слоя и публикацию назначает SAIPEN. Повторная попытка использует тот же UUID, в том числе после удаления закрытого слоя. При недоступной привязке SAIPEN захват остаётся в Inbox; локального обхода нет. Автоматическое копирование завершённых аудитов использует тот же API со стабильным UUID, полученным из содержимого. Проекты без SAIPEN сохраняют локальную доставку.
 
@@ -190,3 +195,9 @@ AUDAPACK/
 - Bridge слушает только loopback и требует токен авторизации вне дерева проекта.
 - Запись аудита выполняется через транзакционные снимки и сообщает об ошибках сохранения честно.
 - Обязательные исключения не позволяют упаковывать секреты, runtime-состояние, кэши и вложенные архивы.
+
+## Участие и лицензия
+
+- Правила участия: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Сообщения об уязвимостях: [`SECURITY.md`](SECURITY.md).
+- Лицензия: [MIT](LICENSE).

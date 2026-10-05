@@ -15,6 +15,7 @@ from audapack.services.audit_run_service import (
     AuditRunSnapshot,
     AuditStartIntentStore,
     ManagedWorkerSupervisor,
+    _actions_for,
 )
 
 
@@ -70,6 +71,9 @@ class FakeBridge:
         self.workers = []
         self.cancel_error = ""
         self.abandon_error = ""
+        #: STOP raced the run to a real end: the bridge hands back the terminal
+        #: job UNCHANGED (abandon_job is idempotent) instead of forcing FAILED.
+        self.abandon_terminal_state = ""
         self.submits = 0
         #: PERF-002 counting: how many times this tick asked for /v1/browser/status.
         self.status_calls = 0
@@ -139,8 +143,17 @@ class FakeBridge:
         if self.abandon_error:
             return {"ok": False, "error": {"message": self.abandon_error}}
         job = next(item for item in self.jobs if item["dispatch_id"] == dispatch_id)
-        if job["state"] != "BLOCKED":
-            return {"ok": False, "error": {"code": "invalid_transition", "message": "only a BLOCKED dispatch can be abandoned"}}
+        if self.abandon_terminal_state:
+            return {
+                "ok": True,
+                "dispatch_id": dispatch_id,
+                "state": self.abandon_terminal_state,
+                "error": job["error"],
+            }
+        if job["state"] in {"COMPLETE", "FAILED", "CANCELLED", "SUPERSEDED"}:
+            return {"ok": True, "dispatch_id": dispatch_id, "state": job["state"], "error": job["error"]}
+        if job["state"] not in {"STARTING", "STARTED", "AUDITING", "SAVING", "BLOCKED"}:
+            return {"ok": False, "error": {"code": "invalid_transition", "message": "only a post-start dispatch can be abandoned; cancel pre-start work instead"}}
         job["state"] = "FAILED"
         job["error"] = reason or "operator abandoned a stuck blocked run"
         job["last_error_code"] = "operator_abandoned"
@@ -1130,6 +1143,10 @@ def test_agent_state_is_read_once_per_project_per_refresh(tmp_path, monkeypatch)
     Two retained records of the same project used to each re-run the identical
     agent-inbox fingerprint; the request-local memo must collapse them to one
     read while still keeping distinct projects distinct.
+
+    PERF-004 (audit/10.md): the default composite refresh is the PASSIVE
+    dashboard layer (``read_inbox_passive``); the immediate-change reader is
+    reserved for authoritative callers.
     """
     import audapack.agent_inbox as agent_inbox_module
 
@@ -1154,7 +1171,7 @@ def test_agent_state_is_read_once_per_project_per_refresh(tmp_path, monkeypatch)
             verdict="EMPTY", guidance="", residue=[], summary=lambda: "empty inbox",
         )
 
-    monkeypatch.setattr(agent_inbox_module, "read_inbox_cached", counting)
+    monkeypatch.setattr(agent_inbox_module, "read_inbox_passive", counting)
     runs = service.refresh_runs()
     # Two records of p1, one of p2: p1 must be fingerprinted once, p2 once.
     p1_snaps = [r for r in runs if r.project_id == "p1"]
@@ -1164,7 +1181,34 @@ def test_agent_state_is_read_once_per_project_per_refresh(tmp_path, monkeypatch)
     assert len(reads) == 2, f"expected one read per project, got {len(reads)}"
     assert sorted(set(reads)) == ["C:/p1", "C:/p2"]
     assert all(r.agent_state == "EMPTY" for r in runs if r.project_id in ("p1", "p2"))
-    assert agent_inbox_module.read_inbox_cached is counting, "monkeypatch must still be live"
+    assert agent_inbox_module.read_inbox_passive is counting, "monkeypatch must still be live"
+
+
+def test_authoritative_refresh_uses_the_immediate_change_reader(tmp_path, monkeypatch):
+    """PERF-004: a decision-critical refresh must select the authoritative reader."""
+    import audapack.agent_inbox as agent_inbox_module
+
+    service, bridge, _audits = coordinator(tmp_path)
+    service.start("p1")
+
+    passive_calls = []
+    authoritative_calls = []
+
+    def passive(root, binding_rel=None, **_kwargs):
+        passive_calls.append(str(root))
+        return SimpleNamespace(verdict="EMPTY", guidance="", residue=[], summary=lambda: "x")
+
+    def authoritative(root, binding_rel=None, **_kwargs):
+        authoritative_calls.append(str(root))
+        return SimpleNamespace(verdict="EMPTY", guidance="", residue=[], summary=lambda: "x")
+
+    monkeypatch.setattr(agent_inbox_module, "read_inbox_passive", passive)
+    monkeypatch.setattr(agent_inbox_module, "read_inbox_cached", authoritative)
+    service.refresh_runs()
+    assert passive_calls and not authoritative_calls
+
+    service.refresh_runs(authoritative_inbox=True)
+    assert authoritative_calls, "authoritative_inbox must use read_inbox_cached"
 
 
 def test_quick3_still_shows_three(tmp_path):
@@ -1557,3 +1601,438 @@ def test_a_corrupt_ledger_with_no_live_worker_still_provisions(tmp_path):
 
     supervisor.ensure_capacity({"workers": []}, 1)
     assert launches == [(1, 1)], launches
+
+
+def _write_ledger(path: Path, slots: dict, generation: int = 1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "generation": generation,
+        "slots": slots,
+        "updated_at": time.time(),
+    }), encoding="utf-8")
+
+
+def test_direct_launch_slot_is_idempotent_before_registration(tmp_path):
+    """W2-003 (SRC-041:R007): the ledger itself refuses the duplicate.
+
+    launch_slot x2 used to spawn twice, [(2,1),(2,1)], because it only trusted
+    the live dispatcher, which is blind until the first browser registers.
+    """
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    dispatch = {"workers": []}
+
+    first = supervisor.launch_slot(2, dispatch)
+    second = supervisor.launch_slot(2, dispatch)
+
+    assert first["launched"] is True
+    assert second["launched"] is False
+    assert "already pending" in second["message"]
+    assert launches == [(2, 1)], launches
+
+
+def test_recent_reserved_or_launching_slot_is_not_relaunched(tmp_path):
+    for state in ("RESERVED", "LAUNCHING"):
+        launches: list[tuple[int, int]] = []
+        supervisor = _supervisor(tmp_path, launches)
+        _write_ledger(supervisor.path, {"2": {
+            "state": state,
+            "launch_attempts": 1,
+            "launched_at": time.time(),
+            "cooldown_until": time.time() + 60,
+        }})
+        outcome = supervisor.launch_slot(2, {"workers": []})
+        assert outcome["launched"] is False, state
+        assert launches == [], state
+
+
+def test_expired_reservation_is_relaunched(tmp_path):
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    _write_ledger(supervisor.path, {"2": {
+        "state": "RESERVED",
+        "launch_attempts": 1,
+        "launched_at": 0.0,
+        "cooldown_until": 0.0,
+    }})
+    outcome = supervisor.launch_slot(2, {"workers": []})
+    assert outcome["launched"] is True
+    assert launches == [(2, 1)]
+
+
+def test_launch_failed_slot_is_relaunched(tmp_path):
+    launches: list[tuple[int, int]] = []
+    supervisor = _supervisor(tmp_path, launches)
+    _write_ledger(supervisor.path, {"2": {
+        "state": "LAUNCH_FAILED",
+        "launch_attempts": 1,
+        "launched_at": 0.0,
+        "cooldown_until": 0.0,
+    }})
+    outcome = supervisor.launch_slot(2, {"workers": []})
+    assert outcome["launched"] is True
+    assert launches == [(2, 1)]
+
+
+def test_reset_stale_slot_preserves_a_recent_reservation(tmp_path):
+    supervisor = _supervisor(tmp_path, [])
+    _write_ledger(supervisor.path, {"2": {
+        "state": "RESERVED",
+        "launch_attempts": 1,
+        "launched_at": time.time(),
+        "cooldown_until": time.time() + 60,
+    }})
+    assert supervisor.reset_stale_slot(2) is False
+    doc = json.loads(supervisor.path.read_text(encoding="utf-8"))
+    assert doc["slots"]["2"]["state"] == "RESERVED"
+
+
+def test_reset_stale_slot_clears_a_failed_slot(tmp_path):
+    supervisor = _supervisor(tmp_path, [])
+    _write_ledger(supervisor.path, {"2": {
+        "state": "LAUNCH_FAILED",
+        "launch_attempts": 1,
+        "launched_at": 0.0,
+        "cooldown_until": 0.0,
+    }})
+    assert supervisor.reset_stale_slot(2) is True
+    doc = json.loads(supervisor.path.read_text(encoding="utf-8"))
+    assert "2" not in doc["slots"]
+
+
+def test_concurrent_launch_slot_spawns_once(tmp_path):
+    import threading
+
+    launches: list[tuple[int, int]] = []
+    barrier = threading.Barrier(2)
+
+    def launch(slot, generation):
+        launches.append((slot, generation))
+        return True, "started"
+
+    supervisor = ManagedWorkerSupervisor(launch, tmp_path / "workers.json")
+
+    def _go():
+        barrier.wait(timeout=10)
+        supervisor.launch_slot(2, {"workers": []})
+
+    threads = [threading.Thread(target=_go) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(launches) == 1, launches
+
+
+def test_perf_001_non_terminal_runs_cannot_be_hidden_behind_terminal_history(tmp_path):
+    """PERF-001: active (non-terminal) dispatches must remain in the returned
+    snapshot view even when 200+ terminal history entries would push them out
+    of a naive truncation."""
+    service, bridge, audits = coordinator(tmp_path)
+
+    # Seed a large shape: 200 QUEUED (active) + 100 COMPLETE terminal jobs, all
+    # for project p1, with increasing updated_at so terminal entries are newer.
+    for i in range(200):
+        bridge.jobs.append({
+            "dispatch_id": f"dsp-active-{i:04d}",
+            "project_id": "p1",
+            "project_name": "Project p1",
+            "state": "QUEUED",
+            "assigned_worker_id": "",
+            "campaign_run_id": "",
+            "profile": "quick3",
+            "created_at": float(i),
+            "updated_at": float(i),
+            "completed_at": 0.0,
+            "error": "",
+            "final_handoff_path": "",
+            "final_handoff_sha256": "",
+            "queue_position": i,
+        })
+    for i in range(100):
+        bridge.jobs.append({
+            "dispatch_id": f"dsp-term-{i:04d}",
+            "project_id": "p1",
+            "project_name": "Project p1",
+            "state": "COMPLETE",
+            "assigned_worker_id": "",
+            "campaign_run_id": f"run-{i}",
+            "profile": "quick3",
+            "created_at": float(200 + i),
+            "updated_at": float(200 + i),
+            "completed_at": float(200 + i),
+            "error": "",
+            "final_handoff_path": "",
+            "final_handoff_sha256": "",
+        })
+
+    runs = service.refresh_runs(["p1"])
+
+    # Every non-terminal dispatch survives truncation (PERF-001 guardrail).
+    active = [r for r in runs if r.dispatch_state != "COMPLETE" and r.operator_state != "COMPLETE"]
+    assert len(active) == 200, f"expected 200 non-terminal runs, got {len(active)}"
+
+    # Terminal history is bounded independently.
+    terminal = [r for r in runs if r.operator_state == "COMPLETE"]
+    assert len(terminal) <= 100, f"terminal history not bounded: {len(terminal)}"
+
+    # The 4-second poll cadence must stay ACTIVE because non-terminal work exists.
+    # (This is verified indirectly: all 200 active runs are present.)
+
+
+# ------------------------------------------------------------------- STOP
+#
+# A selected LIVE audit had no operator stop at all: STARTING/AUDITING/SAVING
+# returned ("DETAILS",), so every stop control was greyed out exactly where the
+# operator most wants one. STOP is that control, and it routes through the
+# honest retirement path rather than through CANCEL (which asserts no Core was
+# ever sent and must stay pre-START only).
+
+
+def live_run(service, bridge, state="AUDITING"):
+    """A dispatch that has crossed START and is still working."""
+    started = service.start("p1")
+    bridge.jobs[0].update({
+        "state": state,
+        "campaign_run_id": "run-committed",
+        "start_receipt": "receipt-1",
+    })
+    return started
+
+
+def test_a_live_audit_offers_stop_instead_of_a_dead_panel(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    live_run(service, bridge)
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "AUDITING"
+    assert "STOP" in run.actions, "the operator must be able to stop a running audit"
+    assert "CANCEL" not in run.actions, "CANCELLED would falsely assert no Core was sent"
+
+
+def test_every_live_post_start_state_offers_stop(tmp_path):
+    for state in ("STARTING", "AUDITING", "SAVING"):
+        assert "STOP" in _actions_for(state), state
+        assert "CANCEL" not in _actions_for(state), state
+
+
+def test_pre_start_work_still_reads_cancel_and_never_stop(tmp_path):
+    """STOP must not leak into the states where CANCEL is still honest."""
+    for state in ("WAITING", "RETRYING", "PREPARING", "ATTACHING", "BLOCKED_PRE_START"):
+        assert "CANCEL" in _actions_for(state), state
+        assert "STOP" not in _actions_for(state), state
+
+
+def test_a_blocked_post_start_run_keeps_force_unblock_not_stop(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    blocked_post_start_run(service, bridge)
+    run = service.refresh_runs()[0]
+    assert run.operator_state == "BLOCKED_POST_START"
+    assert "ABANDON" in run.actions
+    assert "STOP" not in run.actions, "the BLOCKED wording must not change"
+
+
+def test_a_terminal_run_has_no_stop_action_at_all():
+    for state in ("FAILED", "CANCELLED", "SUPERSEDED", "INTERRUPTED", "READY"):
+        actions = _actions_for(state)
+        assert "STOP" not in actions, state
+        assert "CANCEL" not in actions, state
+        assert "ABANDON" not in actions, state
+
+
+def test_stop_retires_the_run_as_failed_operator_abandoned(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = live_run(service, bridge)
+    stopped = service.abandon(
+        started.dispatch_id, "operator stopped active audit from Audit Runs panel"
+    )
+    assert stopped.ok
+    assert stopped.state == "FAILED", "a post-START stop is terminal FAILED, never CANCELLED"
+    assert bridge.jobs[0]["state"] == "FAILED"
+    assert bridge.jobs[0]["last_error_code"] == "operator_abandoned"
+
+
+def test_stop_frees_the_lane_without_re_leasing_the_dispatch(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = live_run(service, bridge)
+    service.abandon(started.dispatch_id, "operator stopped active audit from Audit Runs panel")
+
+    resumed = service.start("p1")
+    assert resumed.ok and not resumed.duplicate
+    assert bridge.submits == 2, "the freed project accepts exactly one FRESH dispatch"
+    assert resumed.dispatch_id != started.dispatch_id, "the stopped dispatch is never re-leased"
+    assert len(bridge.jobs) == 2
+
+
+def test_a_stop_that_loses_the_race_never_rewrites_a_finished_run(tmp_path):
+    """The run reached COMPLETE between the click and the bridge call.
+
+    abandon_job() is idempotent and returns the terminal job unchanged, so the
+    coordinator must report THAT state rather than forcing FAILED over a
+    finished audit whose waves were already saved.
+    """
+    service, bridge, _audits = coordinator(tmp_path)
+    started = live_run(service, bridge)
+    bridge.abandon_terminal_state = "COMPLETE"
+
+    stopped = service.abandon(started.dispatch_id, "operator stopped active audit from Audit Runs panel")
+    assert stopped.ok
+    assert stopped.state == "COMPLETE"
+
+    intent = service.intents.find_for_dispatch(started.dispatch_id)
+    assert intent is not None and intent["status"] != "FAILED", (
+        "a completed audit must not be relabelled FAILED by a late STOP"
+    )
+
+
+def test_a_stop_that_loses_the_race_to_failed_still_reports_failed(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = live_run(service, bridge)
+    bridge.abandon_terminal_state = "FAILED"
+    stopped = service.abandon(started.dispatch_id, "operator stopped active audit")
+    assert stopped.ok and stopped.state == "FAILED"
+
+
+def test_a_refused_stop_mutates_nothing(tmp_path):
+    service, bridge, _audits = coordinator(tmp_path)
+    started = live_run(service, bridge)
+    bridge.abandon_error = "bridge offline"
+    refused = service.abandon(started.dispatch_id, "operator stopped active audit")
+    assert not refused.ok
+    assert bridge.jobs[0]["state"] == "AUDITING", "a refused stop must not mutate the run"
+
+
+class TestCloseTokenStopsAnIrreversibleStart:
+    """W2-002 (audit/12.md): `closeEvent()` could drop a debounced START AUDIT,
+    but once `_pump_audit_start_queue()` had moved the batch into
+    `_audit_start_inflight` and submitted `_prepare`, `start_batch()` still
+    provisioned browser windows and dispatched an audit for a window the operator
+    had already closed. The token is checked at each irreversible boundary, and a
+    race PAST a boundary is reported for what it is, never as "cancelled".
+    """
+
+    def test_a_closed_window_never_provisions_capacity_or_dispatches(self, tmp_path):
+        provisioned = []
+
+        class Supervisor:
+            def ensure_capacity(self, _status, demand):
+                provisioned.append(demand)
+                return {"desired": 0, "launched": []}
+
+        closed = []
+        # Control: the token says the window is still open, so the batch runs.
+        open_service, open_bridge, _ = coordinator(
+            tmp_path, [project("p1"), project("p2")], supervisor=Supervisor())
+        assert all(r.ok for r in open_service.start_batch(
+            ["p1", "p2"], should_abort=lambda: bool(closed)))
+        assert provisioned and open_bridge.submits == 2
+
+        closed.append(True)
+        service, bridge, _audits = coordinator(
+            tmp_path / "closed", [project("p1"), project("p2")], supervisor=Supervisor())
+        results = service.start_batch(["p1", "p2"], should_abort=lambda: bool(closed))
+        assert results, "every project must be answered, not silently dropped"
+        assert all(not result.ok for result in results)
+        assert all(result.state == "CANCELLED" for result in results), [
+            (r.project_id, r.state, r.message) for r in results]
+        assert len(provisioned) == 1, "capacity was provisioned again after close"
+        assert bridge.submits == 0, bridge.submits
+
+    def test_closing_between_provisioning_and_submit_dispatches_nothing(self, tmp_path):
+        class Supervisor:
+            def __init__(self, token):
+                self.token = token
+
+            def ensure_capacity(self, _status, demand):
+                self.token.append(True)  # the operator closes HERE
+                return {"desired": 0, "launched": []}
+
+        token = []
+        service, bridge, _audits = coordinator(tmp_path, supervisor=Supervisor(token))
+        results = service.start_batch(["p1"], should_abort=lambda: bool(token))
+        assert len(results) == 1
+        result = results[0]
+        assert not result.ok
+        assert result.state == "CANCELLED", result.state
+        assert bridge.submits == 0, "a dispatch crossed the close boundary"
+
+    def test_a_dispatch_that_raced_past_the_boundary_is_adopted_not_cancelled(self, tmp_path):
+        """Past the durable submission there is nothing to revoke: the job runs.
+        Reporting it as CANCELLED would hide a live dispatch from the board."""
+        token = []
+        service, bridge, _audits = coordinator(tmp_path)
+        original = service.bridge.submit_browser_audit
+
+        def submit_then_close(*args, **kwargs):
+            token.append(True)  # closing wins the race AFTER the submission
+            return original(*args, **kwargs)
+
+        service.bridge.submit_browser_audit = submit_then_close
+        result = service.start("p1", should_abort=lambda: bool(token))
+        assert result.ok, result.message
+        assert result.dispatch_id, "a submitted dispatch must not be reported cancelled"
+        assert result.state != "CANCELLED", result.state
+        assert len(bridge.jobs) == 1
+
+
+class TestTerminalSourceIntentsCompactToTombstones:
+    """W2-003 (audit/12.md): `_trim_intents()` bounded ordinary history to
+    `history_bound` but retained EVERY source-keyed record forever, even at
+    terminal status -- 40 terminally FAILED prepared sources with a bound of 6.
+    A prepared source key is a durable idempotency record, so it must never be
+    dropped; what can go is the diagnostic payload around its identity.
+    """
+
+    def _source_intents(self, tmp_path, count):
+        store = AuditStartIntentStore(tmp_path / "intents.json", history_bound=6)
+        # Each source gets its OWN project: begin() returns the existing
+        # ACTIVE intent for a project rather than creating a second one,
+        # so a shared "p1" would produce a single record, not 40.
+        for index in range(count):
+            store.begin(f"p{index}", f"P{index}", "quick3",
+                        source_execution_id=f"exec-{index}")
+        return store
+
+    def test_terminal_source_records_shrink_to_identity_tombstones(self, tmp_path):
+        store = self._source_intents(tmp_path, 40)
+        for index in range(40):
+            intent = store.find_for_source(f"exec-{index}")
+            store.update(intent["intent_id"], status="FAILED",
+                         error="a diagnostic string " * 20, completed_at=1.0 + index)
+        assert len(store.list()) == 40, "a source key was dropped"
+
+        compacted = store._trim_intents(store.list())
+        assert len(compacted) == 40, "compaction lost an idempotency record"
+        assert sum(1 for item in compacted if item.get("compacted")) >= 34
+        for item in compacted:
+            if item.get("compacted"):
+                assert item["error"] == ""
+                assert item["source_execution_id"]
+
+    def test_a_replay_of_a_compacted_source_is_still_rejected_truthfully(self, tmp_path):
+        store = self._source_intents(tmp_path, 12)
+        for index in range(12):
+            intent = store.find_for_source(f"exec-{index}")
+            store.update(intent["intent_id"], status="FAILED", error="x", completed_at=1.0 + index)
+        store._trim_intents(store.list())
+
+        again, created = store.begin("p1", "P1", "quick3", source_execution_id="exec-0")
+        assert created is False, "a compacted source key was re-issued as new work"
+        assert again["status"] == "FAILED"
+        assert store.find_for_source("exec-0")["intent_id"] == again["intent_id"]
+
+    def test_an_active_or_recent_source_record_keeps_its_full_payload(self, tmp_path):
+        store = self._source_intents(tmp_path, 19)
+        store.begin("p-live", "P-live", "quick3", source_execution_id="exec-live")
+        active = store.find_for_source("exec-live")
+        store.update(active["intent_id"], status="QUEUED", error="still going",
+                     dispatch_id="dsp-1", completed_at=0.0)
+        for index in range(19):
+            intent = store.find_for_source(f"exec-{index}")
+            store.update(intent["intent_id"], status="FAILED", error="x",
+                         completed_at=1.0 + index)
+        compacted = store._trim_intents(store.list())
+        live = next(item for item in compacted if item["intent_id"] == active["intent_id"])
+        assert live.get("compacted") is None
+        assert live["error"] == "still going"

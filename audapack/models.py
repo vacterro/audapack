@@ -181,3 +181,28 @@ class PackResult:
     excluded_bytes: int = 0
     fidelity_profile: str = ""
     archive_semantics: str = ""
+    # T-180: whether ensure_fresh_archive reused an existing archive or packed a
+    # new one. Both default False so every other PackResult caller is unchanged.
+    reused: bool = False
+    packed: bool = False
+    # T-190 (SRC-046): compact terminal pack state. Non-empty on the
+    # inventory-backed pack paths: PACKED, FAILED_INVENTORY,
+    # FAILED_SOURCE_READ, FAILED_SOURCE_CHANGED, FAILED_VERIFY. Legacy
+    # failure paths (missing source, busy lock, backup refusal) keep "".
+    status: str = ""
+    #: Exact classification inside that status, as published by the failing
+    #: stage (e.g. TRACKED_RESERVED_ARCHIVE_NAME_CONFLICT). ``status`` is the
+    #: phase bucket; this is the reason within it, so the Project Room can name
+    #: the precise rule that refused -- and the remediation for it -- without
+    #: parsing message text. Empty when the failure carries no code.
+    error_code: str = ""
+    #: Compact Git summary for Git-mode packs, e.g.
+    #: "Git: 312 tracked + 4 untracked, 2 deleted". Empty otherwise.
+    git_summary: str = ""
+    #: First actionable source-relative path for a failed pack, when safe.
+    first_error_path: str = ""
+    #: P1 TARGET A: bounded per-phase evidence for ONE ensure decision, in
+    #: milliseconds. Empty for callers that do not measure; the Bridge's archive
+    #: ensure endpoint reports it so the dominant phase is provable rather than
+    #: guessed. Never tokens, never archive bytes, never source content.
+    timings: dict = field(default_factory=dict)

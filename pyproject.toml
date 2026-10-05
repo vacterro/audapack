@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audapack"
-version = "0.3.0"
+version = "0.3.1"
 description = "Windows desktop cockpit for verified ZIP packaging, multi-wave AI audit handoff, and a local browser bridge"
 readme = "README.md"
 authors = [
@@ -58,3 +58,6 @@ ignore = ["E501"]
 # import the package it is benchmarking, so its imports cannot be at the top.
 "scripts/*.py" = ["E402"]
 "tools/*.py" = ["E402"]
+# Operator-run live-acceptance scripts drive a real browser and are not
+# collected by pytest; they put the repo on sys.path before importing.
+"tests/test_target_g_live.py" = ["E402"]

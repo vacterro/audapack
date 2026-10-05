@@ -9,11 +9,14 @@ archive semantics so an auditor can tell the two apart at a glance.
 
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from audapack import fidelity
 from audapack.config import PackingConfig
@@ -36,7 +39,7 @@ from audapack.fidelity import (
     profile_media_bytes,
     profile_media_samples,
 )
-from audapack.packing import MANIFEST_FILENAME, pack_single
+from audapack.packing import MANIFEST_FILENAME, create_zip, eligible_source_files, pack_single
 
 
 class _FakeEntry:
@@ -89,12 +92,29 @@ class _FakeScandir:
         return False
 
 
-def _staged_scandir(*, symlinks=(), stat_fails=(), unreadable_dirs=()):
+def _staged_scandir(
+    *, symlinks=(), stat_fails=(), unreadable_dirs=(), vanished_dirs=(), delete_pending_dirs=()
+):
+    """Stage unusual directory reads.
+
+    ``vanished_dirs`` were deleted after their parent listed them;
+    ``delete_pending_dirs`` answer "access denied" once (Windows delete-pending)
+    and are gone on the re-probe.
+    """
     real_scandir = fidelity.os.scandir
+    probed: set[str] = set()
 
     def fake(path):
-        if Path(path).name in unreadable_dirs:
+        name = Path(path).name
+        if name in unreadable_dirs:
             raise OSError(13, "denied")
+        if name in vanished_dirs:
+            raise FileNotFoundError(2, "gone", str(path))
+        if name in delete_pending_dirs:
+            if name not in probed:
+                probed.add(name)
+                raise PermissionError(13, "delete pending", str(path))
+            raise FileNotFoundError(2, "gone", str(path))
         with real_scandir(path) as it:
             entries = list(it)
         return _FakeScandir([
@@ -124,6 +144,27 @@ class FidelityBase(unittest.TestCase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes((prefix * (size // len(prefix) + 1))[:size])
         return p
+
+    def _packing(self, **kw) -> PackingConfig:
+        base = dict(output_dir=str(self.output_dir), fidelity_profile=PROFILE_STANDARD)
+        base.update(kw)
+        return PackingConfig(**base)
+
+    def _pack(self, packing: PackingConfig, stem="Proj"):
+        return pack_single(
+            source_path=self.source,
+            output_dir=self.output_dir,
+            archive_stem=stem,
+            excludes=set(),
+            delete_old=True,
+            include_timestamp=False,
+            packing=packing,
+            manifest_meta={"project_name": stem},
+        )
+
+    def _manifest(self, zip_path: Path) -> dict:
+        with zipfile.ZipFile(zip_path) as zf:
+            return json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
 
     def _media_dir(self, name: str, count: int, size: int = 700_000, ext: str = "wav"):
         d = self.source / name
@@ -229,8 +270,9 @@ class TestMediaSampling(FidelityBase):
         )
         plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
         self._assert_invariant(plan)
-        # decisions keys are lowercased; referenced_files keeps original case
-        ref_decision = plan.decisions.get("sounds/sounds_0.wav")
+        # T-150: decision keys are the exact physical path; referenced_files
+        # carries the reference text's own case.
+        ref_decision = plan.decisions.get("Sounds/Sounds_0.wav")
         self.assertIsNotNone(ref_decision)
         self.assertTrue(ref_decision.include, "referenced wav must be included")
         self.assertIn("Sounds/sounds_0.wav", plan.referenced_files)
@@ -279,9 +321,10 @@ class TestCore005MediaSampling(FidelityBase):
         for rel in dropped:
             self.assertEqual(plan.decisions[rel].reason, REASON_MEDIA_BUDGET)
         # nothing silently omitted: every drop is also visible to the freshness
-        # walk (extra_excluded_rel keeps the original case, decisions lowercase)
+        # walk (T-150: extra_excluded_rel and the decisions keys both carry the
+        # exact physical case for files)
         self.assertEqual(
-            {rel.lower() for rel in plan.extra_excluded_rel} & set(dropped),
+            set(plan.extra_excluded_rel) & set(dropped),
             set(dropped),
         )
 
@@ -317,7 +360,7 @@ class TestCore005MediaSampling(FidelityBase):
         )
         plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT)
         self._assert_invariant(plan)
-        ref = plan.decisions["sounds/sounds_5.wav"]
+        ref = plan.decisions["Sounds/Sounds_5.wav"]
         self.assertTrue(ref.include, "a named asset outranks every arbitrary sample")
         self.assertEqual(ref.priority, 1, "referenced media is mandatory material")
 
@@ -349,7 +392,7 @@ class TestCore005MediaSampling(FidelityBase):
         )
         pinned = build_plan_from_config(self.source, packing, set())
         self._assert_invariant(pinned)
-        self.assertTrue(pinned.decisions["sounds/sounds_4.wav"].include)
+        self.assertTrue(pinned.decisions["Sounds/Sounds_4.wav"].include)
 
     def test_planning_the_same_tree_twice_selects_identically(self):
         self._write("main.py", 64)
@@ -362,6 +405,330 @@ class TestCore005MediaSampling(FidelityBase):
             {rel: (d.include, d.reason) for rel, d in second.decisions.items()},
         )
         self.assertEqual(first.largest_omitted, second.largest_omitted)
+
+
+class TestCaseDistinctFileIdentity(FidelityBase):
+    """T-150: file identity is case-EXACT, policy/reference matching is not.
+
+    On a case-sensitive filesystem ``Asset.PNG`` and ``asset.png`` are two
+    physical files. The old decision map lowercased its keys, so both
+    collapsed into one decision and the later traversal entry silently won
+    while the aggregate counters stayed internally consistent. Identity is
+    now the exact source-relative POSIX path; a lowercase fallback lookup
+    would recreate the aliasing through another door and must not exist.
+    """
+
+    def _case_sensitive_source(self) -> Path:
+        """Create a source tree holding both ``Asset.PNG`` and ``asset.png``.
+
+        Skips -- honestly -- when the filesystem cannot hold case-distinct
+        siblings; it never fakes a PASS by silently accepting one file.
+        """
+        source = Path(self.temp_dir) / "casetree" / "proj"
+        source.mkdir(parents=True)
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["fsutil", "file", "setCaseSensitiveInfo", str(source), "enable"],
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                self.skipTest("per-directory case sensitivity unavailable (fsutil refused)")
+        try:
+            (source / "Asset.PNG").write_bytes(b"A" * 300_000)
+            (source / "asset.png").write_bytes(b"B" * 300_000)
+        except OSError:
+            self.skipTest("filesystem cannot hold case-distinct siblings")
+        if not ((source / "Asset.PNG").is_file() and (source / "asset.png").is_file()):
+            self.skipTest("filesystem collapsed case-distinct siblings into one file")
+        (source / "main.py").write_text("print('x')", encoding="utf-8")
+        return source
+
+    def test_exact_map_identity_is_portable(self):
+        """The identity contract itself needs no case-sensitive filesystem."""
+        plan = fidelity.FidelityPlan(profile=PROFILE_FULL)
+        plan.decisions["Asset.PNG"] = fidelity.FileDecision(
+            "Asset.PNG", 1, True, None, 1
+        )
+        plan.decisions["asset.png"] = fidelity.FileDecision(
+            "asset.png", 2, False, REASON_MEDIA_BUDGET, 3
+        )
+        self.assertIsNot(plan.decision_for("Asset.PNG"), plan.decision_for("asset.png"))
+        self.assertTrue(plan.decision_for("Asset.PNG").include)
+        self.assertFalse(plan.decision_for("asset.png").include)
+        self.assertEqual(plan.decision_for("Asset.PNG").size, 1)
+        self.assertEqual(plan.decision_for("asset.png").size, 2)
+        # No case-folding lookup and no lowercase fallback, by design.
+        self.assertIsNone(plan.decision_for("ASSET.PNG"))
+        self.assertIsNone(plan.decision_for("ASSET.png"))
+        self.assertIsNone(plan.decision_for("asset.PNG"))
+
+    def test_case_distinct_files_plan_as_two_decisions(self):
+        source = self._case_sensitive_source()
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_FULL)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.discovered, 3)  # main.py + two case twins
+        self.assertEqual(len(plan.decisions), 3, "the twins collapsed into one decision")
+        self.assertIn("Asset.PNG", plan.decisions)
+        self.assertIn("asset.png", plan.decisions)
+        self.assertEqual(plan.decision_for("Asset.PNG").rel, "Asset.PNG")
+        self.assertEqual(plan.decision_for("asset.png").rel, "asset.png")
+        self.assertTrue(plan.decision_for("Asset.PNG").include)
+        self.assertTrue(plan.decision_for("asset.png").include)
+
+    def test_case_distinct_media_files_receive_opposite_decisions(self):
+        source = self._case_sensitive_source()
+        # COMPACT keeps exactly one sample per media directory: the twins have
+        # identical lowercase keys and equal sizes, so exactly one is included.
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        self._assert_invariant(plan)
+        first = plan.decision_for("Asset.PNG")
+        second = plan.decision_for("asset.png")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(
+            first.include, second.include,
+            "exactly one case twin may survive the one-sample cap",
+        )
+        kept = first if first.include else second
+        dropped = second if first.include else first
+        self.assertEqual(kept.reason, None)
+        self.assertEqual(dropped.reason, REASON_MEDIA_BUDGET)
+        yielded = {
+            p.relative_to(source).as_posix()
+            for p in eligible_source_files(source, set(), plan=plan)
+        }
+        self.assertEqual(yielded, {"main.py", kept.rel})
+
+    def test_zip_keeps_exactly_the_included_case_twin(self):
+        source = self._case_sensitive_source()
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        output_zip = Path(self.temp_dir) / "out" / "case.zip"
+        output_zip.parent.mkdir(parents=True, exist_ok=True)
+        stats = create_zip(source, output_zip, set(), plan=plan)
+        with zipfile.ZipFile(output_zip) as zf:
+            names = set(zf.namelist())
+        included = "Asset.PNG" if plan.decision_for("Asset.PNG").include else "asset.png"
+        excluded = "asset.png" if included == "Asset.PNG" else "Asset.PNG"
+        self.assertEqual({included, "main.py"} <= names, True)
+        self.assertNotIn(excluded, names)
+        self.assertEqual(stats.files_included, plan.included)
+        self.assertEqual(stats.files_excluded, plan.excluded)
+        self.assertEqual(stats.files_added, plan.included)
+        self.assertEqual(stats.included_bytes, plan.included_bytes)
+        self.assertEqual(stats.excluded_bytes, plan.excluded_bytes)
+
+    def test_planning_case_distinct_media_twice_is_deterministic(self):
+        source = self._case_sensitive_source()
+        first = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        second = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        self.assertEqual(
+            {rel: (d.include, d.reason) for rel, d in first.decisions.items()},
+            {rel: (d.include, d.reason) for rel, d in second.decisions.items()},
+        )
+        self.assertEqual(first.media_inventory, second.media_inventory)
+        self.assertEqual(first.largest_omitted, second.largest_omitted)
+        kept_first = first.decision_for("Asset.PNG").include
+        self.assertEqual(
+            second.decision_for("Asset.PNG").include, kept_first,
+            "the same tree must sample the same case twin every time",
+        )
+
+    def test_reference_matching_survives_a_case_sensitive_fs(self):
+        source = self._case_sensitive_source()
+        # Reference resolution checks the reference against the filesystem
+        # (which is case-exact here), so the text names ``Asset.PNG`` exactly.
+        # Protection must still work on a case-sensitive tree, and the
+        # decision KEY must stay the physical exact-case path. The
+        # case-DIFFERING reference regression lives in
+        # TestMediaSampling.test_referenced_media_outranks_the_sample_cap.
+        (source / "build.ps1").write_text(
+            "Copy-Item Asset.PNG $out", encoding="utf-8"
+        )
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.decision_for("Asset.PNG").priority, 1)
+        self.assertTrue(plan.decision_for("Asset.PNG").include)
+        # Both twins are distinct decisions and both stay protected: the
+        # reference is matched case-insensitively against the physical assets.
+        self.assertTrue(plan.decision_for("asset.png").include)
+        self.assertIn("Asset.PNG", plan.decisions)
+        self.assertIn("asset.png", plan.decisions)
+        self.assertIn("Asset.PNG", plan.referenced_files)
+
+
+class TestCaseInsensitiveReferenceMatching(FidelityBase):
+    """T-168: reference existence is case-INSENSITIVE by contract, identity is not.
+
+    ``scan_asset_references()`` used to verify a textual reference with an
+    exact-case ``candidate.is_file()`` probe, so on a case-sensitive
+    filesystem a source text naming ``Sounds/sounds_0.wav`` failed to
+    register against the physical ``Sounds/Sounds_0.wav`` even though
+    reference matching is explicitly case-insensitive. The plan's
+    classification walk already discovered every physical media entry; that
+    inventory is the existence evidence, so no exact-case probe and no
+    second traversal is needed.
+    """
+
+    def _case_sensitive_source(self, *files: str) -> Path:
+        """A source tree on a genuinely case-sensitive directory.
+
+        Skips -- honestly -- when the filesystem cannot hold one.
+        """
+        source = Path(self.temp_dir) / "casetree" / "proj"
+        source.mkdir(parents=True)
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["fsutil", "file", "setCaseSensitiveInfo", str(source), "enable"],
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                self.skipTest("per-directory case sensitivity unavailable (fsutil refused)")
+        for rel in files:
+            p = source / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            media = rel.lower().endswith((".wav", ".png", ".jpg", ".mp4"))
+            p.write_bytes(b"\x00" * 700_000 if media else b"print('x')")
+        if not all((source / rel).is_file() for rel in files):
+            self.skipTest("filesystem collapsed case-distinct siblings into one file")
+        return source
+
+    def test_case_differing_reference_registers_on_case_sensitive_fs(self):
+        # The mission reproduction, on a real case-sensitive directory:
+        # physical Sounds/Sounds_0.wav, text Sounds/sounds_0.wav.
+        files = ["main.py"] + [f"Sounds/Sounds_{i}.wav" for i in range(8)]
+        source = self._case_sensitive_source(*files)
+        (source / "build.ps1").write_text(
+            "Copy-Item Sounds/sounds_0.wav $out", encoding="utf-8"
+        )
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        # the textual spelling is recorded; the decision map stays exact-case
+        self.assertIn("Sounds/sounds_0.wav", plan.referenced_files)
+        self.assertNotIn("Sounds/sounds_0.wav", plan.decisions)
+        decision = plan.decision_for("Sounds/Sounds_0.wav")
+        self.assertIsNotNone(decision)
+        self.assertIsNone(
+            plan.decision_for("Sounds/sounds_0.wav"),
+            "the identity API must stay exact -- no lowercase alias",
+        )
+        # 8 wavs against the STANDARD sample cap: only the reference protects
+        # this one; an unreferenced spelling would be budget-dropped.
+        self.assertTrue(decision.include, "the referenced asset is protected")
+        self.assertEqual(decision.priority, 1)
+
+    def test_membership_verifies_without_exact_case_probe_and_fallback_stays_exact(self):
+        self._write("main.py", 64)
+        self._media_dir("Sounds", 2, size=700_000)
+        (self.source / "build.ps1").write_text(
+            "Copy-Item Sounds/sounds_0.wav $out\n"
+            "Move-Item 'Sounds/does_not_exist.wav' $out",
+            encoding="utf-8",
+        )
+        def exact_case_is_file(path_self):
+            # POSIX semantics on any host: existence is exact-case.
+            try:
+                for entry in fidelity.os.scandir(path_self.parent):
+                    if entry.name == path_self.name:
+                        return entry.is_file()
+            except OSError:
+                pass
+            return False
+
+        with unittest.mock.patch.object(Path, "is_file", exact_case_is_file), \
+                unittest.mock.patch.object(
+                    Path, "resolve", autospec=True, side_effect=lambda self: self
+                ):
+            with_membership = fidelity.scan_asset_references(
+                self.source,
+                known_media_rel_lower={"sounds/sounds_0.wav"},
+            )
+            without_membership = fidelity.scan_asset_references(self.source)
+        # membership path: the case-differing reference registers without an
+        # exact-case probe; a missing name is not promoted by its extension.
+        self.assertIn("Sounds/sounds_0.wav", with_membership[0])
+        self.assertNotIn("Sounds/does_not_exist.wav", with_membership[0])
+        # no membership supplied: the exact candidate validation is unchanged
+        # and rejects the case-differing spelling under case-sensitive rules.
+        self.assertNotIn("Sounds/sounds_0.wav", without_membership[0])
+        self.assertNotIn("Sounds/does_not_exist.wav", without_membership[0])
+
+    def test_case_distinct_ambiguous_reference_protects_both_twins(self):
+        # Text "asset.png" matches NEITHER exact physical spelling; the
+        # case-insensitive reference predicate legitimately matches both.
+        source = self._case_sensitive_source("main.py", "Asset.PNG", "asset.png")
+        (source / "build.ps1").write_text("Copy-Item asset.png $out", encoding="utf-8")
+        plan = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        self._assert_invariant(plan)
+        self.assertIn("Asset.PNG", plan.decisions)
+        self.assertIn("asset.png", plan.decisions)
+        self.assertEqual(plan.decision_for("Asset.PNG").rel, "Asset.PNG")
+        self.assertEqual(plan.decision_for("asset.png").rel, "asset.png")
+        self.assertTrue(plan.decision_for("Asset.PNG").include)
+        self.assertTrue(plan.decision_for("asset.png").include)
+        self.assertIn("asset.png", plan.referenced_files)
+        second = build_fidelity_plan(source, set(), profile=PROFILE_COMPACT)
+        self.assertEqual(
+            {rel: (d.include, d.reason) for rel, d in plan.decisions.items()},
+            {rel: (d.include, d.reason) for rel, d in second.decisions.items()},
+            "planning must stay deterministic with a case-ambiguous reference",
+        )
+
+    def test_missing_reference_is_not_promoted(self):
+        self._write("main.py", 64)
+        self._media_dir("Sounds", 2, size=700_000)
+        (self.source / "build.ps1").write_text(
+            "Copy-Item Sounds/sounds_0.wav $out\n"
+            "Move-Item 'Sounds/does_not_exist.wav' $out",
+            encoding="utf-8",
+        )
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertIn("Sounds/sounds_0.wav", plan.referenced_files)
+        self.assertNotIn("Sounds/does_not_exist.wav", plan.referenced_files)
+        self.assertNotIn("Sounds/does_not_exist.wav", plan.decisions)
+        self.assertTrue(plan.decision_for("Sounds/Sounds_0.wav").include)
+
+    def test_outside_source_candidates_never_become_references(self):
+        self._write("main.py", 64)
+        self._write("res/nested.py", 64)
+        self._media_dir("Sounds", 1, size=700_000)
+        outside = Path(self.temp_dir) / "outside.wav"
+        outside.write_bytes(b"\x00" * 700_000)
+        (self.source / "build.ps1").write_text(
+            "Move-Item res/../../outside.wav $out\n"
+            "Copy-Item 'Sounds/Sounds_0.wav' $out",
+            encoding="utf-8",
+        )
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertNotIn("res/../../outside.wav", plan.referenced_files)
+        self.assertNotIn("outside.wav", plan.referenced_files)
+        self.assertNotIn("../outside.wav", plan.referenced_files)
+        self.assertIn("Sounds/Sounds_0.wav", plan.referenced_files)
+
+    def test_reference_verification_adds_no_second_discovery_walk(self):
+        self._write("main.py", 64)
+        self._media_dir("Sounds", 2, size=700_000)
+        (self.source / "build.ps1").write_text(
+            "Copy-Item Sounds/sounds_0.wav $out", encoding="utf-8"
+        )
+        walks = []
+        real_walk = fidelity.os.walk
+
+        def counting_walk(top, *args, **kwargs):
+            if Path(top) == self.source:
+                walks.append(str(top))
+            return real_walk(top, *args, **kwargs)
+
+        with unittest.mock.patch.object(fidelity.os, "walk", side_effect=counting_walk):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        # The classification walk is scandir-based; the reference scan is the
+        # ONE os.walk. Membership reuse must not have added a traversal.
+        self.assertEqual(
+            len(walks), 1,
+            f"reference existence must reuse discovered media, not walk again: {walks}",
+        )
 
 
 class TestPriorityLadder(FidelityBase):
@@ -446,6 +813,66 @@ class TestAccountingIdentityUnderFailure(FidelityBase):
         plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
         self._assert_invariant(plan)
         self.assertFalse(plan.walk_incomplete)
+
+    def test_an_untraversable_directory_names_the_first_failing_path(self):
+        self._write("main.py", 64)
+        (self.source / "outer" / "locked").mkdir(parents=True)
+        with _staged_scandir(unreadable_dirs={"locked"}):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self.assertEqual(plan.first_failure_rel, "outer/locked")
+
+    def test_a_directory_deleted_mid_walk_is_not_a_failure(self):
+        # A live project's own tooling (agent session / lock directories)
+        # removes directories between the parent's listing and their read.
+        # A directory that no longer exists holds nothing the walk could miss.
+        self._write("main.py", 64)
+        self._write("runtime/sess_1/log.txt", 64)
+        with _staged_scandir(vanished_dirs={"sess_1"}):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.failed, 0)
+        self.assertFalse(plan.walk_incomplete)
+        self.assertEqual(plan.vanished_entries, 1)
+        self.assertIsNone(plan.first_failure_rel)
+        self.assertTrue(plan.decisions["main.py"].include)
+
+    def test_a_delete_pending_directory_is_reprobed_not_failed(self):
+        self._write("main.py", 64)
+        self._write("runtime/sess_2/log.txt", 64)
+        with _staged_scandir(delete_pending_dirs={"sess_2"}), unittest.mock.patch.object(
+            fidelity, "_DELETE_PENDING_REPROBE_S", 0
+        ):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.failed, 0)
+        self.assertFalse(plan.walk_incomplete)
+        self.assertEqual(plan.vanished_entries, 1)
+
+    def test_a_vanished_source_root_still_fails(self):
+        self._write("main.py", 64)
+        with _staged_scandir(vanished_dirs={self.source.name}):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.failed, 1)
+        self.assertTrue(plan.walk_incomplete)
+        self.assertEqual(plan.first_failure_rel, ".")
+
+    def test_a_file_deleted_mid_walk_is_not_a_failure(self):
+        self._write("main.py", 64)
+        self._write("gone.tmp.txt", 64)
+        real_stat = _FakeEntry.stat
+
+        def vanishing_stat(entry, **kwargs):
+            if entry.name == "gone.tmp.txt":
+                raise FileNotFoundError(2, "gone")
+            return real_stat(entry, **kwargs)
+
+        with _staged_scandir(), unittest.mock.patch.object(_FakeEntry, "stat", vanishing_stat):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.failed, 0)
+        self.assertEqual(plan.vanished_entries, 1)
+        self.assertNotIn("gone.tmp.txt", plan.decisions)
 
 
 class TestCore003Accounting(FidelityBase):
@@ -554,7 +981,14 @@ class TestCore003Accounting(FidelityBase):
         self._assert_invariant(probe)
         self.assertFalse(probe.pruned_census_taken)
         self.assertEqual(probe.discovered, 1, "only the traversed tree is counted")
-        self.assertEqual(probe.pruned_dirs_rel["node_modules"]["files"], 0)
+        # T-155: a pending census is marked by the ABSENCE of "files" -- a
+        # fabricated 0 would read as a counted empty tree. finalize_pruned_census
+        # fills the real counts the manifest writer needs.
+        self.assertNotIn("files", probe.pruned_dirs_rel["node_modules"])
+        from audapack.fidelity import finalize_pruned_census
+        finalize_pruned_census(probe)
+        self.assertEqual(probe.pruned_dirs_rel["node_modules"]["files"], 3)
+        self.assertEqual(probe.pruned_dirs_rel["node_modules"]["bytes"], 300)
 
     def test_the_manifest_declares_its_own_reconciliation(self):
         from audapack.packing import ZipStats, generate_manifest_data, stats_accounting_error
@@ -682,7 +1116,7 @@ class TestOverrides(FidelityBase):
         self._assert_invariant(plan)
         # "References/raw/**" is a 3-segment pattern; the dir itself is not
         # whole-pruned, but every file below it is excluded at file level.
-        dec = plan.decisions.get("references/raw/heavy.dat")
+        dec = plan.decisions.get("References/raw/heavy.dat")
         self.assertIsNotNone(dec)
         self.assertFalse(dec.include)
         self.assertEqual(dec.reason, REASON_CONFIGURED_IGNORE)
@@ -978,9 +1412,9 @@ class TestPerf003BoundedMediaEvidence(FidelityBase):
             # The bounded evidence is real evidence: every sampled name is a
             # decision of the claimed side, not a summary the plan invented.
             for entry in inv["included_sample"]:
-                self.assertTrue(plan.decisions[entry["rel"].lower()].include, entry)
+                self.assertTrue(plan.decisions[entry["rel"]].include, entry)
             for entry in inv["omitted_sample"]:
-                self.assertFalse(plan.decisions[entry["rel"].lower()].include, entry)
+                self.assertFalse(plan.decisions[entry["rel"]].include, entry)
 
     def test_two_media_classes_in_one_directory_keep_separate_aggregates(self):
         """Keying the inventory by directory alone lost a whole group.
@@ -1032,7 +1466,7 @@ class TestPerf003BoundedMediaEvidence(FidelityBase):
             "the fixture must omit only equal-sized files so ties decide the order",
         )
         reference = sorted(
-            omitted, key=lambda item: (-item[1], item[0].lower())
+            omitted, key=lambda item: (-item[1], item[0].lower(), item[0])
         )[:fidelity.LARGEST_OMITTED_LIMIT]
         self.assertEqual(plan.largest_omitted, reference)
         self.assertEqual(len(plan.largest_omitted), fidelity.LARGEST_OMITTED_LIMIT)
@@ -1078,12 +1512,12 @@ class TestPerf003BoundedMediaEvidence(FidelityBase):
             self.assertEqual(inv["excluded_bytes"], sum(d.size for d in dropped), key)
             for entry in inv["included_sample"]:
                 self.assertTrue(
-                    plan.decisions[entry["rel"].lower()].include,
+                    plan.decisions[entry["rel"]].include,
                     f"{entry['rel']} is sampled as included but the plan omits it",
                 )
             for entry in inv["omitted_sample"]:
                 self.assertFalse(
-                    plan.decisions[entry["rel"].lower()].include,
+                    plan.decisions[entry["rel"]].include,
                     f"{entry['rel']} is sampled as omitted but the plan includes it",
                 )
         self.assertEqual(
@@ -1093,6 +1527,647 @@ class TestPerf003BoundedMediaEvidence(FidelityBase):
                 if d.include and self._group_of(d.rel) in plan.media_inventory
             ),
         )
+
+
+class TestControlPlaneAndManifestClosure(FidelityBase):
+    """Regression suite for control-plane priority, manifest closure, and budget feasibility (J1-J25)."""
+
+    def test_01_saipen_intake_active_is_p1(self):
+        self._write(".saipen/intake/active/SRC-004.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for(".saipen/intake/active/SRC-004.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+        self.assertTrue(dec.include)
+
+    def test_02_saipen_intake_inactive_is_not_automatically_p1(self):
+        self._write(".saipen/intake/archive/SRC-001.md", 64)
+        self._write(".saipen/intake/settled/SRC-002.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertNotEqual(plan.decision_for(".saipen/intake/archive/SRC-001.md").priority, 1)
+        self.assertNotEqual(plan.decision_for(".saipen/intake/settled/SRC-002.md").priority, 1)
+
+    def test_03_audit_numeric_is_p1(self):
+        self._write("audit/1.md", 64)
+        self._write("audit/3.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.decision_for("audit/1.md").priority, 1)
+        self.assertEqual(plan.decision_for("audit/3.md").priority, 1)
+        self.assertTrue(plan.decision_for("audit/3.md").include)
+
+    def test_04_audit_non_numeric_is_not_promoted(self):
+        self._write("audit/non-numeric-random-note.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("audit/non-numeric-random-note.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 2)
+
+    def test_05_saipen_audit_numeric_is_p1(self):
+        self._write(".saipen/audit/17.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for(".saipen/audit/17.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+        self.assertTrue(dec.include)
+
+    def test_06_root_checkpoint_is_p1(self):
+        self._write("WAVE_I_CHECKPOINT.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("WAVE_I_CHECKPOINT.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+        self.assertTrue(dec.include)
+
+    def test_07_nested_checkpoint_is_not_automatically_p1(self):
+        self._write("docs/WAVE_I_CHECKPOINT.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("docs/WAVE_I_CHECKPOINT.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 2)
+
+    def test_08_manifest_required_markdown_is_p1(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["REQUIRED_01.md"]}), encoding="utf-8")
+        self._write("saipal/REQUIRED_01.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("saipal/REQUIRED_01.md")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+        self.assertTrue(dec.include)
+
+    def test_09_manifest_required_bin_is_p1(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["data/patch.bin"]}), encoding="utf-8")
+        self._write("saipal/data/patch.bin", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("saipal/data/patch.bin")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+        self.assertTrue(dec.include)
+
+    def test_10_missing_manifest_target_is_not_fabricated(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["NONEXISTENT.md"]}), encoding="utf-8")
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertIsNone(plan.decision_for("saipal/NONEXISTENT.md"))
+        self.assertIsNone(plan.decision_for("NONEXISTENT.md"))
+        self.assertEqual(plan.discovered, 1)
+
+    def test_11_absolute_manifest_path_rejected(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["/etc/passwd", "C:/Windows/win.ini"]}), encoding="utf-8")
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertEqual(plan.discovered, 1)
+
+    def test_12_dotdot_path_escape_rejected(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["../secret.md"]}), encoding="utf-8")
+        self._write("secret.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("secret.md")
+        self.assertEqual(dec.priority, 2)
+
+    def test_13_symlink_escape_rejected(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["link.txt"]}), encoding="utf-8")
+        self._write("saipal/link.txt", 64)
+        with _staged_scandir(symlinks={"link.txt"}):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("saipal/link.txt")
+        self.assertIsNotNone(dec)
+        self.assertFalse(dec.include)
+        self.assertEqual(dec.reason, REASON_UNSUPPORTED)
+
+    def test_14_malformed_manifest_does_not_crash(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text("{broken json", encoding="utf-8")
+        self._write("saipal/REQ.md", 64)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertTrue(plan.decision_for("saipal/MANIFEST.json").include)
+
+    def test_15_duplicate_required_paths_remain_deterministic(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["REQ.md", "REQ.md", "REQ.md"]}), encoding="utf-8")
+        self._write("saipal/REQ.md", 64)
+        plan1 = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        plan2 = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan1)
+        self._assert_invariant(plan2)
+        self.assertEqual(plan1.discovered, plan2.discovered)
+        self.assertEqual(plan1.included, plan2.included)
+
+    def test_16_manifest_closure_no_second_walk(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["REQ.md"]}), encoding="utf-8")
+        self._write("saipal/REQ.md", 64)
+        scandir_calls = 0
+        real_scandir = fidelity.os.scandir
+
+        def tracking_scandir(p):
+            nonlocal scandir_calls
+            scandir_calls += 1
+            return real_scandir(p)
+
+        with unittest.mock.patch.object(fidelity.os, "scandir", side_effect=tracking_scandir):
+            plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        # Root and saipal directory = exactly 2 scandir calls. No second traversal!
+        self.assertEqual(scandir_calls, 2)
+
+    def test_17_p1_bytes_above_budget_budget_feasible_false(self):
+        self._write("big1.py", 2_000_000)
+        self._write("big2.py", 2_000_000)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT, max_mb=1)
+        self._assert_invariant(plan)
+        self.assertFalse(plan.budget_feasible)
+        self.assertEqual(plan.budget_floor_bytes, 4_000_000)
+        self.assertEqual(plan.mandatory_bytes, 4_000_000)
+
+    def test_18_impossible_budget_never_removes_protected_control_plane(self):
+        self._write("big.py", 2_000_000)
+        self._write("audit/3.md", 100)
+        self._write(".saipen/intake/active/SRC-004.md", 100)
+        self._write("WAVE_I_CHECKPOINT.md", 100)
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["REQUIRED_01.md"]}), encoding="utf-8")
+        self._write("saipal/REQUIRED_01.md", 100)
+
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT, max_mb=1)
+        self._assert_invariant(plan)
+        for rel in (
+            "audit/3.md",
+            ".saipen/intake/active/SRC-004.md",
+            "WAVE_I_CHECKPOINT.md",
+            "saipal/REQUIRED_01.md",
+        ):
+            dec = plan.decision_for(rel)
+            self.assertIsNotNone(dec, f"{rel} must be in decisions")
+            self.assertTrue(dec.include, f"{rel} must remain included despite impossible budget")
+            self.assertEqual(dec.priority, 1)
+
+    def test_19_size_limit_never_appears_on_required_manifest_targets(self):
+        self._write("big.py", 2_000_000)
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(json.dumps({"required": ["REQ.md", "data.bin"]}), encoding="utf-8")
+        self._write("saipal/REQ.md", 100)
+        self._write("saipal/data.bin", 100)
+
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT, max_mb=1)
+        self._assert_invariant(plan)
+        for rel in ("saipal/REQ.md", "saipal/data.bin"):
+            dec = plan.decision_for(rel)
+            self.assertTrue(dec.include)
+            self.assertNotEqual(dec.reason, REASON_SIZE_LIMIT)
+
+    def test_20_normal_disposable_p3_still_trims(self):
+        self._write("big.py", 2_000_000)
+        self._write("data/disposable.wav", 500_000)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT, max_mb=1)
+        self._assert_invariant(plan)
+        dec = plan.decision_for("data/disposable.wav")
+        self.assertIsNotNone(dec)
+        self.assertFalse(dec.include)
+        self.assertEqual(dec.reason, REASON_SIZE_LIMIT)
+
+    def test_21_ordinary_optional_prose_trimmable_by_bounded_policy(self):
+        # Mandatory P1 exceeds 1 MB budget
+        self._write("big.py", 2_000_000)
+        self._write("docs/small.md", 1_000)
+        # Massive prose exceeding the bounded allowance
+        self._write("docs/massive.md", 5_000_000)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_COMPACT, max_mb=1)
+        self._assert_invariant(plan)
+        self.assertFalse(plan.decision_for("docs/massive.md").include)
+        self.assertEqual(plan.decision_for("docs/massive.md").reason, REASON_SIZE_LIMIT)
+        # small useful prose is preserved under bounded allowance
+        self.assertTrue(plan.decision_for("docs/small.md").include)
+
+    def test_22_manifest_diagnostics_report_mandatory_discretionary(self):
+        self._write("main.py", 1000)
+        self._write("docs/guide.md", 2000)
+        self._write("data/blob.bin", 3000)
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD, manifest_enabled=True)
+        res = self._pack(packing)
+        self.assertTrue(res.success, res.error_message)
+        m = self._manifest(res.output_path)
+        self.assertEqual(m["mandatory_bytes"], 1000)
+        self.assertEqual(m["discretionary_bytes"], 5000)
+        self.assertEqual(m["budget_floor_bytes"], 1000)
+        self.assertTrue(m["budget_feasible"])
+        self.assertEqual(m["included_bytes_by_priority"]["1"], 1000)
+
+    def test_23_largest_included_reporting_is_bounded(self):
+        for i in range(25):
+            self._write(f"src/file_{i:02d}.py", (i + 1) * 100)
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+        self.assertLessEqual(len(plan.largest_included), fidelity.LARGEST_INCLUDED_LIMIT)
+        self.assertEqual(len(plan.largest_included), 10)
+        # Sorted largest first
+        sizes = [item["size"] for item in plan.largest_included]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        for item in plan.largest_included:
+            self.assertEqual(set(item.keys()), {"rel", "size", "priority"})
+
+    def test_24_policy_fingerprint_changes_on_new_policy(self):
+        # T-190 (SRC-046): archive membership moved to the frozen source
+        # inventory, an intentional compatibility break -> version 4.
+        self.assertEqual(fidelity.POLICY_FINGERPRINT_VERSION, 4)
+        fp_v4 = fidelity.packing_policy_fingerprint(profile=PROFILE_STANDARD)
+        with unittest.mock.patch.object(fidelity, "POLICY_FINGERPRINT_VERSION", 2):
+            fp_v2 = fidelity.packing_policy_fingerprint(profile=PROFILE_STANDARD)
+        self.assertNotEqual(fp_v4, fp_v2)
+
+    def test_25_freshness_rejects_archive_under_old_policy(self):
+        from audapack.freshness import ArchiveFreshness, probe_archive_freshness
+        self._write("main.py", 64)
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD, manifest_enabled=True, excludes=[])
+        res = self._pack(packing)
+        self.assertTrue(res.success)
+        project = SimpleNamespace(
+            source_path=str(self.source), archive_name="Proj", display_name="Proj", id="Proj", priority_group=None
+        )
+        fresh = probe_archive_freshness(project, packing, output_dir=self.output_dir)
+        self.assertEqual(fresh.state, ArchiveFreshness.FRESH)
+
+        with unittest.mock.patch.object(fidelity, "POLICY_FINGERPRINT_VERSION", 2):
+            old_fp = fidelity.policy_fingerprint_from_config(packing, set())
+
+        manifest = self._manifest(res.output_path)
+        manifest["policy_fingerprint"] = old_fp
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+        tmp_zip = res.output_path.with_suffix(".tmp.zip")
+        with zipfile.ZipFile(res.output_path, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
+            for item in zin.infolist():
+                if item.filename == MANIFEST_FILENAME:
+                    zout.writestr(item, manifest_bytes)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        tmp_zip.replace(res.output_path)
+
+        stale = probe_archive_freshness(project, packing, output_dir=self.output_dir)
+        self.assertEqual(stale.state, ArchiveFreshness.STALE)
+        self.assertTrue(stale.policy_mismatch)
+        self.assertTrue(stale.repack_required)
+
+
+class TestSyntheticSaipalFidelityRegression(FidelityBase):
+    """Section I: Realistic SAIPAL regression demonstrating role-aware JSON and control-plane protection."""
+
+    def setUp(self):
+        super().setUp()
+        # T-850/SRC-007: a `.saipen/` tree makes the pack a SAIPEN pack, and
+        # the pre-pack authority gate enrolls the project through the real
+        # protocol CLI (`saipen audit manifest --write`) when the manifest is
+        # missing. These fixtures exercise FIDELITY, not CLI plumbing, so they
+        # ship the same resolvable stub CLI the manifest-gate tests use: the
+        # gate writes the contract through it and the pack proceeds. A real
+        # SAIPEN project without any reachable CLI still fails closed.
+        # Installed lazily via `_ensure_stub_cli()` because fixture writes
+        # into `.saipen/` would clobber the STATE declaration otherwise.
+        self._stub_cli = None
+
+    def _ensure_stub_cli(self):
+        if self._stub_cli is None:
+            from audapack import saipen_manifest_gate_test_support as _stub
+            self._stub_cli = _stub.StubSaipenCli(self.source)
+            self._stub_cli.install()
+        return self._stub_cli
+
+    def _pack(self, packing: PackingConfig, stem="Proj"):
+        self._ensure_stub_cli()
+        return super()._pack(packing, stem=stem)
+
+    def tearDown(self):
+        if self._stub_cli is not None:
+            self._stub_cli.uninstall()
+        super().tearDown()
+
+    def test_saipal_realistic_session_corpus_trimmed_under_standard(self):
+        # 1. Canonical SAIPEN control plane
+        self._write(".saipen/state.md", 128)
+        self._write(".saipen/board.md", 256)
+        self._write(".saipen/log.md", 512)
+        self._write(".saipen/intake/active/SRC-004.md", 256)
+
+        # 2. Canonical active audit layer
+        self._write("audit/3.md", 128)
+
+        # 3. Project-owned MANIFEST.json and required files
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(
+            json.dumps({
+                "name": "saipal",
+                "required": [
+                    "REQUIRED_01.md",
+                    "REQUIRED_02.md",
+                    "sub/REQUIRED_03.md",
+                ],
+            }),
+            encoding="utf-8",
+        )
+        self._write("saipal/REQUIRED_01.md", 128)
+        self._write("saipal/REQUIRED_02.md", 128)
+        self._write("saipal/sub/REQUIRED_03.md", 128)
+
+        # 4. Root active checkpoint
+        self._write("WAVE_I_CHECKPOINT.md", 256)
+
+        # 5. Large session / historical corpus exceeding STANDARD budget (30 MiB)
+        # Two large JSON files totaling ~34 MiB
+        self._write("corpus/session_01.json", 17 * 1024 * 1024)
+        self._write("corpus/session_02.json", 17 * 1024 * 1024)
+
+        # 6. Ordinary optional prose
+        self._write("docs/intro.md", 2048)
+
+        # 7. Ordinary binary/media bulk
+        self._write("assets/audio.wav", 1_000_000)
+
+        # Pack under STANDARD profile (30 MiB budget)
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD, manifest_enabled=True)
+        res = self._pack(packing)
+        self.assertTrue(res.success, res.error_message)
+
+        # Assert accounting identities
+        self.assertEqual(
+            res.files_discovered,
+            res.files_included + res.files_excluded + res.files_failed,
+        )
+
+        manifest = self._manifest(res.output_path)
+        self.assertEqual(manifest["fidelity_profile"], PROFILE_STANDARD)
+        self.assertEqual(manifest["archive_semantics"], "audit_representation")
+        # True mandatory set fits under STANDARD (~1.5 KB << 30 MiB)
+        self.assertTrue(manifest["budget_feasible"])
+        # Discretionary session corpus was trimmed, so budget is met
+        self.assertTrue(manifest["budget_met"])
+        self.assertLessEqual(manifest["budget_floor_bytes"], manifest["budget_bytes"])
+        self.assertEqual(manifest["accounting_reconciled"], True)
+        self.assertLessEqual(manifest["included_bytes"], manifest["budget_bytes"])
+
+        # Assert all control plane files are included
+        with zipfile.ZipFile(res.output_path, "r") as zf:
+            namelist = set(zf.namelist())
+
+        required_control_plane = [
+            ".saipen/state.md",
+            ".saipen/board.md",
+            ".saipen/log.md",
+            ".saipen/intake/active/SRC-004.md",
+            "audit/3.md",
+            "saipal/MANIFEST.json",
+            "saipal/REQUIRED_01.md",
+            "saipal/REQUIRED_02.md",
+            "saipal/sub/REQUIRED_03.md",
+            "WAVE_I_CHECKPOINT.md",
+        ]
+        for rel in required_control_plane:
+            self.assertIn(rel, namelist, f"Load-bearing control plane file {rel} must be included in archive")
+
+        # Confirm that session corpus was NOT priority 1 and was trimmed with size_limit
+        exclusions = manifest.get("exclusions", {})
+        self.assertIn("size_limit", exclusions)
+        # Verify plan decisions: no required file has size_limit reason
+        plan = build_plan_from_config(self.source, packing, set())
+        for rel in required_control_plane:
+            dec = plan.decision_for(rel)
+            self.assertIsNotNone(dec)
+            self.assertTrue(dec.include)
+            self.assertEqual(dec.priority, 1)
+            self.assertNotEqual(dec.reason, "size_limit")
+
+        dec_s1 = plan.decision_for("corpus/session_01.json")
+        dec_s2 = plan.decision_for("corpus/session_02.json")
+        self.assertEqual(dec_s1.priority, 3)
+        self.assertEqual(dec_s2.priority, 3)
+
+        # Validator-style test: Extract archive and run validator
+        extract_dir = Path(self.temp_dir) / "extracted_saipal"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(res.output_path, "r") as zf:
+            zf.extractall(extract_dir)
+
+        def synthetic_saipal_validator(root: Path) -> dict:
+            missing = []
+            for item in required_control_plane:
+                target = root / item
+                if not target.is_file() or target.stat().st_size == 0:
+                    missing.append(item)
+            return {"valid": len(missing) == 0, "missing": missing}
+
+        v_result = synthetic_saipal_validator(extract_dir)
+        self.assertTrue(
+            v_result["valid"],
+            f"Validator failed against extracted audit archive! Missing: {v_result['missing']}",
+        )
+
+    def test_saipal_synthetic_when_mandatory_itself_exceeds_budget(self):
+        """If true mandatory material itself exceeds STANDARD, report truthful budget_feasible=False."""
+        # 1. Canonical SAIPEN control plane
+        self._write(".saipen/state.md", 128)
+        self._write(".saipen/board.md", 256)
+        self._write(".saipen/log.md", 512)
+        self._write(".saipen/intake/active/SRC-004.md", 256)
+        self._write("audit/3.md", 128)
+        self._write("WAVE_I_CHECKPOINT.md", 256)
+
+        # Manifest required file that by ITSELF exceeds STANDARD budget (30 MiB)
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(
+            json.dumps({
+                "name": "saipal",
+                "required": ["HUGE_REQUIRED.md"],
+            }),
+            encoding="utf-8",
+        )
+        self._write("saipal/HUGE_REQUIRED.md", 32 * 1024 * 1024)
+
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD, manifest_enabled=True)
+        res = self._pack(packing)
+        self.assertTrue(res.success)
+
+        manifest = self._manifest(res.output_path)
+        # Because true mandatory exceeds 30 MiB, budget is not feasible
+        self.assertFalse(manifest["budget_feasible"])
+        self.assertFalse(manifest["budget_met"])
+        self.assertGreater(manifest["budget_floor_bytes"], manifest["budget_bytes"])
+
+        # But huge required file is STILL included (mandatory never sacrificed)
+        with zipfile.ZipFile(res.output_path, "r") as zf:
+            namelist = set(zf.namelist())
+        self.assertIn("saipal/HUGE_REQUIRED.md", namelist)
+
+
+class TestRoleAwareJsonClassification(FidelityBase):
+    """10 explicit verification assertions for role-aware JSON classification."""
+
+    def test_01_generic_session_corpus_json_is_not_automatically_p1(self):
+        self.assertEqual(_priority_for("corpus/session.json", "session.json"), 3)
+        self.assertEqual(_priority_for("sessions/history.json", "history.json"), 3)
+        self.assertEqual(_priority_for("transcripts/dump.json", "dump.json"), 3)
+        self.assertEqual(_priority_for("history/conversation.json", "conversation.json"), 3)
+
+    def test_02_normal_project_configuration_json_remains_p1(self):
+        self.assertEqual(_priority_for("package.json", "package.json"), 1)
+        self.assertEqual(_priority_for("tsconfig.json", "tsconfig.json"), 1)
+        self.assertEqual(_priority_for("settings.json", "settings.json"), 1)
+        self.assertEqual(_priority_for("src/config.json", "config.json"), 1)
+        self.assertEqual(_priority_for("config/settings.json", "settings.json"), 1)
+        self.assertEqual(_priority_for(".vscode/launch.json", "launch.json"), 1)
+
+    def test_03_schema_json_remains_p1(self):
+        self.assertEqual(_priority_for("schemas/order.json", "order.json"), 1)
+        self.assertEqual(_priority_for("specs/api.json", "api.json"), 1)
+        self.assertEqual(_priority_for("models/user.schema.json", "user.schema.json"), 1)
+
+    def test_04_tests_fixture_json_remains_protected_by_test_path(self):
+        self.assertEqual(_priority_for("tests/fixtures/sample.json", "sample.json"), 1)
+        self.assertEqual(_priority_for("test_orders/payload.json", "payload.json"), 1)
+        self.assertEqual(_priority_for("fixtures/session.json", "session.json"), 1)
+
+    def test_05_manifest_json_remains_p1(self):
+        self.assertEqual(_priority_for("saipal/MANIFEST.json", "manifest.json"), 1)
+        self.assertEqual(_priority_for("MANIFEST.json", "manifest.json"), 1)
+        self.assertEqual(_priority_for("subproject/manifest.json", "manifest.json"), 1)
+
+    def test_06_manifest_required_corpus_json_is_promoted_back_to_p1(self):
+        m_path = self.source / "saipal" / "MANIFEST.json"
+        m_path.parent.mkdir(parents=True, exist_ok=True)
+        m_path.write_text(
+            json.dumps({"name": "saipal", "required": ["corpus/promoted_session.json"]}),
+            encoding="utf-8",
+        )
+        self._write("saipal/corpus/promoted_session.json", 1024)
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD)
+        plan = build_plan_from_config(self.source, packing, set())
+        dec = plan.decision_for("saipal/corpus/promoted_session.json")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+
+    def test_07_always_include_corpus_json_is_promoted_back_to_p1(self):
+        self._write("corpus/important_session.json", 2048)
+        packing = self._packing(
+            fidelity_profile=PROFILE_STANDARD,
+            always_include=["corpus/important_session.json"],
+        )
+        plan = build_plan_from_config(self.source, packing, set())
+        dec = plan.decision_for("corpus/important_session.json")
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec.priority, 1)
+
+    def test_08_large_unrequired_json_corpus_can_be_trimmed(self):
+        self._write("main.py", 100)
+        self._write("corpus/session.json", 2 * 1024 * 1024)  # 2 MiB
+        packing = self._packing(fidelity_profile=PROFILE_COMPACT, fidelity_max_mb=1)  # 1 MiB target
+        plan = build_plan_from_config(self.source, packing, set())
+        dec_py = plan.decision_for("main.py")
+        dec_json = plan.decision_for("corpus/session.json")
+        self.assertTrue(dec_py.include)
+        self.assertEqual(dec_py.priority, 1)
+        self.assertFalse(dec_json.include)
+        self.assertEqual(dec_json.priority, 3)
+        self.assertEqual(dec_json.reason, "size_limit")
+        self.assertTrue(plan.budget_feasible)
+        self.assertTrue(plan.budget_met)
+
+    def setUp(self):
+        super().setUp()
+        # T-850/SRC-007: same stub protocol CLI as the SAIPAL regression
+        # above -- the `.saipen/state.md` fixture makes this a SAIPEN pack,
+        # so the authority gate needs a reachable enrollment path. Installed
+        # lazily right before the pack (see the SAIPAL class) because fixture
+        # writes into `.saipen/` would clobber the STATE declaration.
+        self._stub_cli = None
+
+    def _ensure_stub_cli(self):
+        if self._stub_cli is None:
+            from audapack import saipen_manifest_gate_test_support as _stub
+            self._stub_cli = _stub.StubSaipenCli(self.source)
+            self._stub_cli.install()
+        return self._stub_cli
+
+    def _pack(self, packing: PackingConfig, stem="Proj"):
+        self._ensure_stub_cli()
+        return super()._pack(packing, stem=stem)
+
+    def tearDown(self):
+        if self._stub_cli is not None:
+            self._stub_cli.uninstall()
+        super().tearDown()
+
+    def test_09_load_bearing_saipal_files_survive_pressure(self):
+        self._write(".saipen/state.md", 100)
+        self._write("audit/1.md", 100)
+        self._write("corpus/session.json", 2 * 1024 * 1024)
+        packing = self._packing(fidelity_profile=PROFILE_COMPACT, fidelity_max_mb=1)
+        res = self._pack(packing)
+        self.assertTrue(res.success)
+        with zipfile.ZipFile(res.output_path, "r") as zf:
+            namelist = set(zf.namelist())
+        self.assertIn(".saipen/state.md", namelist)
+        self.assertIn("audit/1.md", namelist)
+        self.assertNotIn("corpus/session.json", namelist)
+
+    def test_10_policy_fingerprint_invalidates_old_archive(self):
+        # T-190 (SRC-046): version 4 is the intentional compatibility break;
+        # archives fingerprinted under the pre-inventory v3 rules must be
+        # INVALIDATED (stale) and repacked, never compared as fresh.
+        self.assertEqual(fidelity.POLICY_FINGERPRINT_VERSION, 4)
+        from audapack.freshness import ArchiveFreshness, probe_archive_freshness
+        self._write("main.py", 64)
+        packing = self._packing(fidelity_profile=PROFILE_STANDARD, manifest_enabled=True, excludes=[])
+        res = self._pack(packing)
+        self.assertTrue(res.success)
+        project = SimpleNamespace(
+            source_path=str(self.source), archive_name="Proj", display_name="Proj", id="Proj", priority_group=None
+        )
+        # Overwrite the manifest fingerprint with a version-3-era value: an
+        # archive built by the pre-inventory writer.
+        with unittest.mock.patch.object(fidelity, "POLICY_FINGERPRINT_VERSION", 3):
+            stale_fp = fidelity.policy_fingerprint_from_config(packing, set())
+
+        manifest = self._manifest(res.output_path)
+        manifest["policy_fingerprint"] = stale_fp
+        tmp_zip = res.output_path.with_suffix(".tmp.zip")
+        with zipfile.ZipFile(res.output_path, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
+            for item in zin.infolist():
+                if item.filename == MANIFEST_FILENAME:
+                    zout.writestr(item, json.dumps(manifest).encode("utf-8"))
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        tmp_zip.replace(res.output_path)
+
+        fresh = probe_archive_freshness(project, packing, output_dir=self.output_dir)
+        self.assertEqual(fresh.state, ArchiveFreshness.STALE)
+        self.assertTrue(fresh.policy_mismatch)
 
 
 if __name__ == "__main__":

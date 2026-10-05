@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,10 +43,38 @@ class WindowInstance:
     tracked: bool = False
     activity: str = ""
     last_action: str = ""
+    saipen_binding: dict[str, str] | None = None
+    # Native window PID may differ from the process PID recorded at launch
+    # (conhost/TUI path). Keep record identity without lying about ``pid``.
+    launch_pid: int = 0
+    #: Durable launch correlation token of the owning record, when the window
+    #: was proven to belong to it. TitleGuardian.bind_hwnd consumes exactly
+    #: this proven association instead of rediscovering the console window.
+    correlation_token: str = ""
 
     @property
     def selectable(self) -> bool:
         return self.hwnd > 0 and self.state == "running"
+
+
+@dataclass(frozen=True)
+class InstanceSnapshot:
+    """One complete, immutable instance picture produced OFF the GUI thread.
+
+    T-216 TARGET G: the GUI-facing readers (``for_project``, ``focus_candidate``,
+    ``launcher_states``, ``block_reason``) must consume one complete snapshot,
+    never half-mutated worker state. ``scan`` builds it without touching the
+    live ``instances`` list; the GUI installs it atomically with
+    ``apply_snapshot``.
+    """
+
+    records: dict[int, "LaunchRecord"]
+    instances: tuple["WindowInstance", ...]
+    last_error: str = ""
+    records_changed: bool = False
+    #: Shared-record-file generation observed when the scan started, so a GUI
+    #: commit can preserve a launch tracked while the scan was in flight.
+    records_version: int = 0
 
 
 @dataclass
@@ -59,6 +88,22 @@ class LaunchRecord:
     project_path: str
     started_at: str
     process_token: int = 0
+    # T-185: `started_at` alone cannot order two launches. Windows resolves
+    # datetime.now() to roughly the clock tick (~1-16 ms), so two consoles
+    # started back to back routinely share a timestamp -- and "focus the most
+    # recent instance" then fell through to the lowest-PID tie-break and put
+    # the OLDER window in front. `sequence` is a monotonic per-record-file
+    # counter that breaks that tie in launch order. 0 means a legacy record
+    # written before this field existed.
+    sequence: int = 0
+    saipen_binding: dict[str, str] | None = None
+    # T-192: durable launch correlation token. AUDAPACK generates one per
+    # bound launch, embeds it in the spawned console's title, and stores it
+    # here. A window that carries the token is mechanically attributable to
+    # this record even when its visible PID differs from the parent PID and
+    # even when several bound instances of one project are live at once --
+    # the old single-pending-record fallback cannot do that.
+    correlation_token: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Optional[LaunchRecord]:
@@ -74,6 +119,10 @@ class LaunchRecord:
                 project_path=str(raw.get("project_path", "")).strip(),
                 started_at=str(raw.get("started_at", "")).strip(),
                 process_token=int(raw.get("process_token", 0) or 0),
+                sequence=int(raw.get("sequence", 0) or 0),
+                saipen_binding=(raw.get("saipen_binding")
+                                if isinstance(raw.get("saipen_binding"), dict) else None),
+                correlation_token=str(raw.get("correlation_token", "") or ""),
             )
         except (TypeError, ValueError):
             return None
@@ -402,6 +451,39 @@ class InstanceMonitor:
         ("openai codex", "main_codex"),
     )
 
+    #: T-179: identities for agents nobody configured a launcher for. Consulted
+    #: only AFTER the operator's own launchers, so a custom ``my_claude``
+    #: launcher keeps its own id instead of being overwritten by a synthetic
+    #: one. The Claude token is "claude code", never bare "claude": a browser
+    #: tab titled "Chat with Claude" is not an agent console, and a window that
+    #: resolves to one of these without a project still has to pass
+    #: ``_is_probable_agent_window``.
+    _FALLBACK_TITLE_TOKENS: tuple[tuple[str, str], ...] = (
+        ("claude code", "claude"),
+        ("zcode", "zcode"),
+        # SRC-081 TARGET L: added because the product name is specific
+        # evidence on its own (and the non-agent-process rejection above
+        # already bars browsers/chat clients); an arbitrary chat window can
+        # never satisfy this the way a bare "ai" or "agent" token would.
+        ("antigravity", "antigravity"),
+    )
+
+    #: Human-facing names for the fallback identities above. A configured
+    #: launcher's own name always wins over these.
+    _FALLBACK_LAUNCHER_NAMES: dict[str, str] = {
+        "claude": "Claude Code",
+        "zcode": "ZCode",
+        "antigravity": "Antigravity",
+    }
+
+    #: Processes that render other people's text. A launcher word in one of
+    #: their titles is content, not evidence of an agent console.
+    _NON_AGENT_PROCESSES: frozenset[str] = frozenset({
+        "chrome.exe", "brave.exe", "msedge.exe", "firefox.exe", "opera.exe",
+        "vivaldi.exe", "iexplore.exe", "discord.exe", "slack.exe", "teams.exe",
+        "telegram.exe", "whatsapp.exe", "thunderbird.exe", "outlook.exe",
+    })
+
     def __init__(
         self,
         *,
@@ -413,6 +495,12 @@ class InstanceMonitor:
         self.records: dict[int, LaunchRecord] = {}
         self.instances: list[WindowInstance] = []
         self.last_error = ""
+        # T-216 TARGET F/G: one serialized owner for the shared records file and
+        # the live snapshot. A background scan and a GUI install never interleave.
+        self._lock = threading.RLock()
+        #: Monotonic counter of in-process record mutations, so a GUI commit can
+        #: tell whether a launch was tracked while its background scan ran.
+        self._records_version = 0
         self._load_records()
 
     def _load_records(self) -> None:
@@ -420,9 +508,11 @@ class InstanceMonitor:
             raw = json.loads(self.record_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             self.records = {}
+            self._records_version += 1
             return
         if not isinstance(raw, list):
             self.records = {}
+            self._records_version += 1
             return
         loaded: dict[int, LaunchRecord] = {}
         for item in raw:
@@ -435,6 +525,7 @@ class InstanceMonitor:
         # snapshot atomically so a second GUI sees launches made by the first
         # one, and so deleted/exited records cannot survive in memory forever.
         self.records = loaded
+        self._records_version += 1
 
     def _save_records(self) -> None:
         self.record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,38 +541,97 @@ class InstanceMonitor:
             except OSError:
                 pass
 
-    def track_launch(self, pid: Any, launcher_id: str, project: Any) -> bool:
+    def track_launch(
+        self, pid: Any, launcher_id: str, project: Any,
+        *, saipen_binding: dict[str, str] | None = None,
+        correlation_token: str = "",
+    ) -> bool:
         if isinstance(pid, bool) or not isinstance(pid, int):
             return False
         numeric_pid = pid
         if numeric_pid <= 0:
             return False
-        record = LaunchRecord(
-            pid=numeric_pid,
-            launcher_id=str(launcher_id),
-            project_id=str(getattr(project, "id", "")),
-            project_name=str(getattr(project, "display_name", "")),
-            project_path=str(getattr(project, "source_path", "")),
-            started_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            process_token=0,
-        )
-        try:
-            record.process_token = int(self.backend.process_token(numeric_pid) or 0)
-        except Exception:
-            record.process_token = 0
-        self.records[numeric_pid] = record
-        try:
-            self._save_records()
-        except OSError:
+        with self._lock:
+            record = LaunchRecord(
+                pid=numeric_pid,
+                launcher_id=str(launcher_id),
+                project_id=str(getattr(project, "id", "")),
+                project_name=str(getattr(project, "display_name", "")),
+                project_path=str(getattr(project, "source_path", "")),
+                started_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                process_token=0,
+                # Derived from the shared record file, so a second GUI process
+                # continues the same order instead of restarting it.
+                sequence=self._next_launch_sequence(),
+                saipen_binding=saipen_binding,
+                correlation_token=str(correlation_token or ""),
+            )
+            try:
+                record.process_token = int(self.backend.process_token(numeric_pid) or 0)
+            except Exception:
+                record.process_token = 0
+            self.records[numeric_pid] = record
+            self._records_version += 1
+            # T-216 TARGET J: the launch record alone is enough to render
+            # STARTING immediately -- no desktop scan. The next background scan
+            # replaces this provisional row with the proven one.
+            self._install_starting_instance(record)
+            try:
+                self._save_records()
+            except OSError:
+                return False
+            return True
+
+    def _install_starting_instance(self, record: LaunchRecord) -> None:
+        if any(getattr(item, "launch_pid", 0) == record.pid for item in self.instances):
+            return
+        self.instances = self.instances + [
+            WindowInstance(
+                hwnd=0,
+                pid=record.pid,
+                title="Starting — window not visible yet",
+                process_name="",
+                launcher_id=record.launcher_id,
+                launcher_name=record.launcher_id,
+                project_id=record.project_id,
+                project_name=record.project_name,
+                project_path=record.project_path,
+                state="starting",
+                tracked=True,
+                saipen_binding=record.saipen_binding,
+                launch_pid=record.pid,
+                correlation_token=str(getattr(record, "correlation_token", "") or ""),
+            )
+        ]
+
+    def untrack_launch(self, pid: Any) -> bool:
+        if isinstance(pid, bool) or not isinstance(pid, int):
             return False
-        return True
+        numeric_pid = pid
+        with self._lock:
+            if numeric_pid not in self.records:
+                return False
+            del self.records[numeric_pid]
+            self.instances = [
+                item for item in self.instances
+                if int(getattr(item, "launch_pid", 0) or 0) != numeric_pid
+            ]
+            self._records_version += 1
+            try:
+                self._save_records()
+            except OSError:
+                return False
+            return True
 
     @staticmethod
     def _launcher_from_title(title: str, launchers: Iterable[Any]) -> str:
         folded = str(title).casefold()
-        for token, launcher_id in InstanceMonitor._KNOWN_TITLE_TOKENS:
-            if token in folded:
-                return launcher_id
+        # T-179: the operator's configured launchers own their names. A custom
+        # "OpenCode Special" must not be rewritten into the built-in "opencode"
+        # merely because its name contains that generic word, and a configured
+        # "Claude Code Pro" must stay its own id instead of collapsing into the
+        # fallback "claude". Longest token first, so the most specific
+        # configured identity wins; exact ids remain exact, never families.
         candidates: list[tuple[int, str, str]] = []
         for launcher in launchers:
             launcher_id = str(getattr(launcher, "id", "")).strip()
@@ -492,7 +642,24 @@ class InstanceMonitor:
         for _length, token, launcher_id in sorted(candidates, reverse=True):
             if token in folded:
                 return launcher_id
+        # Only with no configured launcher claiming this window may a shipped
+        # canonical identity answer for it.
+        for token, launcher_id in InstanceMonitor._KNOWN_TITLE_TOKENS:
+            if token in folded:
+                return launcher_id
+        # T-179: last, identities for agents nobody configured a launcher for.
+        for token, launcher_id in InstanceMonitor._FALLBACK_TITLE_TOKENS:
+            if token in folded:
+                return launcher_id
         return ""
+
+    @classmethod
+    def _launcher_display_name(cls, launcher_id: str, launcher: Any) -> str:
+        """The operator's own launcher name, else a known fallback, else the id."""
+        configured = str(getattr(launcher, "name", "") or "").strip()
+        if configured:
+            return configured
+        return cls._FALLBACK_LAUNCHER_NAMES.get(launcher_id, launcher_id)
 
     @staticmethod
     def _same_launcher_family(first: str, second: str) -> bool:
@@ -608,6 +775,12 @@ class InstanceMonitor:
     @classmethod
     def _is_probable_agent_window(cls, window: NativeWindow, launcher_id: str, launchers: Iterable[Any]) -> bool:
         """Accept unregistered agent consoles without trusting arbitrary title words."""
+        # T-179: a browser or chat client showing the words "Claude Code" is
+        # displaying somebody's page, not hosting an agent. No title and no
+        # command line inside these processes may promote a window to an agent
+        # console.
+        if window.process_name.casefold() in cls._NON_AGENT_PROCESSES:
+            return False
         command_launcher = cls._launcher_from_title(window.command_line, launchers)
         if command_launcher and cls._same_launcher_family(command_launcher, launcher_id):
             return True
@@ -617,14 +790,25 @@ class InstanceMonitor:
             "freebuff.exe": "freebuff",
             "cline.exe": "cline",
             "codex.exe": "main_codex",
+            # SRC-081 TARGET L: a specific product process is evidence on its
+            # own. A bare ``claude.exe`` keeps the GENERIC fallback identity
+            # "claude" -- it is never guessed as Claude 1 or Claude 2 without
+            # a record, a correlation token or a managed title saying so.
+            "claude.exe": "claude",
+            "zcode.exe": "zcode",
+            "antigravity.exe": "antigravity",
+            "antigravity ide.exe": "antigravity",
         }
         process_launcher = direct_processes.get(process, "")
         return bool(process_launcher and cls._same_launcher_family(process_launcher, launcher_id))
 
-    def _live_records(self) -> tuple[dict[int, LaunchRecord], bool]:
+    def _live_records(
+        self, records: dict[int, LaunchRecord] | None = None
+    ) -> tuple[dict[int, LaunchRecord], bool]:
+        source = self.records if records is None else records
         live: dict[int, LaunchRecord] = {}
         changed = False
-        for pid, record in self.records.items():
+        for pid, record in source.items():
             if not self.backend.process_alive(pid):
                 changed = True
                 continue
@@ -636,35 +820,85 @@ class InstanceMonitor:
         return live, changed
 
     def refresh(self, projects: Iterable[Any], launchers: Iterable[Any]) -> list[WindowInstance]:
-        self.last_error = ""
+        """Synchronous scan+install convenience for non-GUI callers/tests.
+
+        The Qt GUI must NOT call this on its event loop; it requests the
+        background lane instead (T-216 TARGET E/F). Kept for the CLI, the
+        native worker and the existing test contract.
+        """
+        snapshot = self.scan(projects, launchers)
+        self.apply_snapshot(snapshot)
+        return list(self.instances)
+
+    def scan(self, projects: Iterable[Any], launchers: Iterable[Any]) -> InstanceSnapshot:
+        """Build ONE immutable :class:`InstanceSnapshot` (worker-thread safe).
+
+        Performs every native/disk operation -- launch-record read, window
+        enumeration, process metadata, correlation, SAIPEN activity reads -- and
+        returns a complete picture WITHOUT mutating the live ``instances`` list,
+        so the GUI never observes half-mutated worker state (T-216 TARGET G).
+        """
         project_list = list(projects)
         launcher_list = list(launchers)
         launcher_by_id = {str(getattr(item, "id", "")): item for item in launcher_list}
         project_by_id = {str(getattr(item, "id", "")): item for item in project_list}
-        try:
-            # Another AUDAPACK process may have launched or removed an agent
-            # since our last scan. Read the shared launch journal before
-            # checking process liveness; otherwise global capacity is a lie
-            # until this process itself launches something.
+        with self._lock:
             self._load_records()
-            live_records, records_changed = self._live_records()
+            base_records = dict(self.records)
+            base_version = self._records_version
+        try:
+            live_records, records_changed = self._live_records(base_records)
             raw_windows = self.backend.list_windows()
         except Exception as exc:
-            self.instances = []
-            self.last_error = f"Native window scan failed: {exc}"
-            return []
-        self.records = live_records
+            return InstanceSnapshot({}, (), f"Native window scan failed: {exc}", False, base_version)
+
+        # T-192: windows that carry a launch correlation token are attributable
+        # to their record mechanically -- no title heuristics, no "only pending
+        # record" fallback. Tokens must be unique among live records. This
+        # pre-pass runs before any fallback so a legacy unbound window can
+        # never steal a bound record merely by being scanned first.
+        token_map: dict[str, LaunchRecord] = {}
+        for record in live_records.values():
+            token = str(getattr(record, "correlation_token", "") or "")
+            if token:
+                token_map.setdefault(token, record)
+
+        preassigned: dict[int, LaunchRecord] = {}
+        claimed_records: set[int] = set()
+        for raw_window in raw_windows:
+            if live_records.get(raw_window.pid) is not None or raw_window.pid in preassigned:
+                continue
+            window_identity = (
+                f"{raw_window.title} | {raw_window.command_line}"
+                if raw_window.command_line else raw_window.title
+            )
+            for token, candidate in token_map.items():
+                if candidate.pid in claimed_records:
+                    continue
+                if token in window_identity and not self._window_names_another_root(window_identity, candidate):
+                    preassigned[raw_window.pid] = candidate
+                    claimed_records.add(candidate.pid)
+                    break
 
         pending_by_launcher: dict[str, list[LaunchRecord]] = {}
         for record in live_records.values():
             pending_by_launcher.setdefault(record.launcher_id, []).append(record)
         for records in pending_by_launcher.values():
-            records.sort(key=lambda item: item.started_at)
+            # Same total order as focus_candidate: a bare timestamp ties for
+            # launches inside one clock tick (T-185).
+            records.sort(key=lambda item: (item.started_at, int(item.sequence or 0)))
 
         result: list[WindowInstance] = []
         consumed_records: set[int] = set()
         for raw in raw_windows:
             record = live_records.get(raw.pid)
+            # T-179: a native host that only renders other people's text can
+            # never become an agent from its title -- not even when the title
+            # also names a project. A trusted AUDAPACK launch record still
+            # identifies its own process, so the rejection applies to untracked
+            # windows only and legitimate tracked browser launches survive.
+            if record is None and raw.process_name.casefold() in self._NON_AGENT_PROCESSES:
+                continue
             identity = f"{raw.title} | {raw.command_line}" if raw.command_line else raw.title
             launcher_id = record.launcher_id if record else self._launcher_from_title(identity, launcher_list)
             if not launcher_id:
@@ -680,6 +914,14 @@ class InstanceMonitor:
             if record and self._window_names_another_root(identity, record):
                 record = None
 
+            # T-192: a console titled by this record is provably its window,
+            # whichever PID it shows and however many other pending records
+            # exist. This outranks every heuristic fallback below.
+            if record is None and raw.pid in preassigned:
+                record = preassigned[raw.pid]
+                launcher_id = record.launcher_id
+                consumed_records.add(record.pid)
+
             if record:
                 project = project_by_id.get(record.project_id)
             else:
@@ -692,6 +934,10 @@ class InstanceMonitor:
                     for item in live_records.values()
                     if item.project_id == str(getattr(project, "id", ""))
                     and item.pid not in consumed_records
+                    # T-192: a token-bearing bound launch is attributable only
+                    # through its token or its own PID -- a legacy window with
+                    # the same title family must never inherit its binding.
+                    and not str(getattr(item, "correlation_token", "") or "")
                     and self._same_launcher_family(item.launcher_id, launcher_id)
                 ]
                 if len(project_records) == 1:
@@ -702,6 +948,7 @@ class InstanceMonitor:
                 candidates = [
                     item for item in pending_by_launcher.get(launcher_id, [])
                     if item.pid not in consumed_records
+                    and not str(getattr(item, "correlation_token", "") or "")
                     and not self._window_names_another_root(identity, item)
                 ]
                 if len(candidates) == 1:
@@ -727,11 +974,14 @@ class InstanceMonitor:
                     title=raw.title,
                     process_name=raw.process_name,
                     launcher_id=launcher_id,
-                    launcher_name=str(getattr(launcher, "name", launcher_id)),
+                    launcher_name=self._launcher_display_name(launcher_id, launcher),
                     project_id=str(getattr(project, "id", record.project_id if record else "")),
                     project_name=str(getattr(project, "display_name", record.project_name if record else "Unknown project")),
                     project_path=str(getattr(project, "source_path", record.project_path if record else "")),
                     tracked=record is not None,
+                    saipen_binding=record.saipen_binding if record else None,
+                    launch_pid=record.pid if record else 0,
+                    correlation_token=str(getattr(record, "correlation_token", "") or "") if record else "",
                 )
             )
 
@@ -747,12 +997,15 @@ class InstanceMonitor:
                     title="Starting — window not visible yet",
                     process_name="",
                     launcher_id=record.launcher_id,
-                    launcher_name=str(getattr(launcher, "name", record.launcher_id)),
+                    launcher_name=self._launcher_display_name(record.launcher_id, launcher),
                     project_id=record.project_id,
                     project_name=record.project_name,
                     project_path=record.project_path,
                     state="starting",
                     tracked=True,
+                    saipen_binding=record.saipen_binding,
+                    launch_pid=record.pid,
+                    correlation_token=str(getattr(record, "correlation_token", "") or ""),
                 )
             )
 
@@ -765,19 +1018,152 @@ class InstanceMonitor:
             enriched.append(replace(item, activity=activity, last_action=last_action))
         result = enriched
 
-        if records_changed:
-            try:
-                self._save_records()
-            except OSError:
-                pass
-        self.instances = sorted(
+        ordered = tuple(sorted(
             result,
             key=lambda item: (item.project_name.casefold(), item.launcher_name.casefold(), item.title.casefold()),
-        )
-        return list(self.instances)
+        ))
+        return InstanceSnapshot(live_records, ordered, "", bool(records_changed), base_version)
+
+    def apply_snapshot(self, snapshot: InstanceSnapshot) -> None:
+        """Install a completed snapshot atomically, on the GUI thread.
+
+        Runs under the same lock as ``track_launch``/``untrack_launch`` and
+        ``scan``'s base read, so a launch tracked while a scan was in flight is
+        preserved (its record is re-merged) and is never clobbered by the older
+        scan (T-216 TARGET F/G).
+        """
+        with self._lock:
+            if self._records_version != snapshot.records_version:
+                merged = dict(snapshot.records)
+                for pid, record in self.records.items():
+                    merged.setdefault(pid, record)
+                self.records = merged
+                if snapshot.records_changed:
+                    try:
+                        self._save_records()
+                    except OSError:
+                        pass
+            else:
+                self.records = dict(snapshot.records)
+                if snapshot.records_changed:
+                    try:
+                        self._save_records()
+                    except OSError:
+                        pass
+            self.instances = list(snapshot.instances)
+            self.last_error = snapshot.last_error
+
+    def instance_alive(self, instance: WindowInstance) -> bool:
+        """Bounded O(1) liveness probe for ONE instance, no desktop scan.
+
+        T-216: the GUI must not run a full native scan to learn whether an
+        instance that refused focus is still running. This reads the already
+        known launch PID and asks the backend once.
+        """
+        pid = int(getattr(instance, "launch_pid", 0) or getattr(instance, "pid", 0) or 0)
+        if pid <= 0:
+            return False
+        try:
+            return bool(self.backend.process_alive(pid))
+        except Exception:
+            return False
 
     def for_project(self, project_id: str) -> list[WindowInstance]:
         return [item for item in self.instances if item.project_id == project_id]
+
+    def for_project_launcher(self, project_id: str, launcher_id: str) -> list[WindowInstance]:
+        """Instances of EXACTLY this launcher for EXACTLY this project.
+
+        T-179: deliberately NOT ``_same_launcher_family``. main_codex,
+        main_codex2 and main_codex3_free are three separate buttons that open
+        three separate accounts; a click on C2 that focused C1 would be the
+        wrong window, silently. Project identity is exact for the same reason:
+        Project A's OpenCode is not Project B's.
+        """
+        target_project = str(project_id or "")
+        target_launcher = str(launcher_id or "")
+        if not target_project or not target_launcher:
+            return []
+        return [
+            item for item in self.instances
+            if item.project_id == target_project and item.launcher_id == target_launcher
+        ]
+
+    def _next_launch_sequence(self) -> int:
+        highest = 0
+        for record in self.records.values():
+            highest = max(highest, int(getattr(record, "sequence", 0) or 0))
+        return highest + 1
+
+    def _record_recency_key(self, pid: int) -> tuple[str, int]:
+        """Launch recency for one pid: timestamp first, launch order second.
+
+        The sequence is what makes this total. Two launches inside one clock
+        tick carry the same `started_at`, and without a second component the
+        sort was a tie that the stable lowest-PID pass then decided -- so
+        clicking a launcher focused the older console.
+        """
+        record = self.records.get(int(pid or 0))
+        return (
+            str(getattr(record, "started_at", "") or ""),
+            int(getattr(record, "sequence", 0) or 0),
+        )
+
+    def focus_candidate(
+        self, project_id: str, launcher_id: str,
+        *, saipen_binding: dict[str, str] | None = None,
+    ) -> Optional[WindowInstance]:
+        """The one existing window a normal click should focus, or None.
+
+        Deterministic so repeated clicks do not alternate between windows:
+        AUDAPACK-tracked first, then the most recently launched, then the lowest
+        PID as a stable tie-break. Composed as stable sorts, least significant
+        key first.
+        """
+        running = [item for item in self.for_project_launcher(project_id, launcher_id) if item.selectable]
+        if saipen_binding is not None:
+            running = [item for item in running if item.tracked and
+                       item.saipen_binding == saipen_binding]
+        if not running:
+            return None
+        running.sort(key=lambda item: item.pid)
+        running.sort(
+            key=lambda item: self._record_recency_key(item.launch_pid or item.pid),
+            reverse=True,
+        )
+        running.sort(key=lambda item: 0 if item.tracked else 1)
+        return running[0]
+
+    def starting_for_project_launcher(
+        self, project_id: str, launcher_id: str,
+        *, saipen_binding: dict[str, str] | None = None,
+    ) -> list[WindowInstance]:
+        """Matching launches that have not shown a window yet."""
+        starting = [
+            item for item in self.for_project_launcher(project_id, launcher_id)
+            if item.state == "starting" or item.hwnd <= 0
+        ]
+        if saipen_binding is not None:
+            starting = [item for item in starting if item.tracked and
+                        item.saipen_binding == saipen_binding]
+        return starting
+
+    def launcher_states(self, project_id: str) -> dict[str, str]:
+        """``{launcher_id: "running" | "starting"}`` for one project.
+
+        Pure in-memory read of the last refresh, so the Project Room delegate
+        can paint launcher state without any filesystem or native call on the
+        paint path. "running" outranks "starting" for the same launcher.
+        """
+        states: dict[str, str] = {}
+        for item in self.instances:
+            if item.project_id != str(project_id or ""):
+                continue
+            state = "running" if item.selectable else "starting"
+            if states.get(item.launcher_id) == "running":
+                continue
+            states[item.launcher_id] = state
+        return states
 
     def count_for_launcher(self, launcher_id: str) -> int:
         return sum(1 for item in self.instances if item.launcher_id == launcher_id)

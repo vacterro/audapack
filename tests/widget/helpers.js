@@ -48,14 +48,60 @@ function composerFixture(h) {
     'aria-label': 'Chat with ChatGPT'
   });
   input.isContentEditable = true;
+  const upload = h.el('input', { id: 'upload-files', type: 'file', multiple: 'true' });
   const send = h.el('button', { 'data-testid': 'send-button' });
   const stop = h.el('button', { 'aria-label': 'Stop generating' });
   stop.hidden = true;
   form.appendChild(input);
+  form.appendChild(upload);
   form.appendChild(send);
   form.appendChild(stop);
   main.appendChild(form);
-  return { form, input, send, stop };
+  return { form, input, upload, send, stop };
+}
+
+function addComposerAttachmentTile(h, name, options = {}) {
+  const form = h.dom.documentElement.querySelector('form[data-type="unified-composer"]');
+  if (!form) throw new Error('composer fixture missing');
+  const tile = h.el('div', { role: 'group', 'aria-label': name });
+  const remove = h.el('button', { 'aria-label': `Remove file ${name}` });
+  tile.appendChild(remove);
+  if (options.busy) tile.appendChild(h.el('span', { class: 'animate-spin' }));
+  form.appendChild(tile);
+  return tile;
+}
+
+// A click alone is never Send acceptance. Real ChatGPT consumes the submitted
+// composer payload and adds one user turn carrying it (machine receipt
+// included), and the widget's positive verification observes that transition --
+// never the click. `consumeAttachment` also models the attachment tiles leaving
+// the composer, which is how an attachment-only payload proves acceptance.
+function installAcceptedSend(h, fixture, options = {}) {
+  fixture.send.addEventListener('click', () => {
+    // `_sendFails` is the harness hook for a ChatGPT submission that is
+    // refused/unacknowledged: the click happens, but the composer is untouched.
+    if (fixture.send._sendFails) return;
+    const text = String(fixture.input.textContent || '');
+    const tiles = Array.from(fixture.form.children).filter(child =>
+      child.getAttribute && child.getAttribute('role') === 'group');
+    if (!text.trim() && !tiles.length) return;
+    fixture._submitted = text;
+    fixture.input.textContent = '';
+    if (options.consumeAttachment) {
+      for (const tile of tiles) tile.remove();
+    }
+    const index = (Number(fixture._acceptedTurns) || 0) + 1;
+    fixture._acceptedTurns = index;
+    const turn = h.el('article', {
+      'data-message-author-role': 'user',
+      'data-testid': `conversation-turn-${index}`,
+      'data-message-id': `accepted-${index}`
+    });
+    turn._text = text || tiles.map(tile => tile.getAttribute('aria-label')).join(', ');
+    mainEl(h).appendChild(turn);
+    h.mutate(fixture.form);
+  });
+  return fixture;
 }
 
 function leaseFor(h, key, ownerId, nonce, expiresAt) {
@@ -103,4 +149,4 @@ function runtimeFixture(overrides = {}) {
   };
 }
 
-module.exports = { setup, mainEl, userTurn, assistantTurn, addTurns, composerFixture, leaseFor, runtimeFixture, FakeEvent };
+module.exports = { setup, mainEl, userTurn, assistantTurn, addTurns, composerFixture, addComposerAttachmentTile, installAcceptedSend, leaseFor, runtimeFixture, FakeEvent };

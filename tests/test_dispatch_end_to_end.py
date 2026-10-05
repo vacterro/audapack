@@ -8,16 +8,22 @@ how the steps fit together, and only a full pass catches that.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from http.client import HTTPConnection
 from pathlib import Path
 
+from audapack.campaign import get_canonical_manifest_hash, get_profile
+
 CORE_WAVE = """PROJECT_NAME: E2EPROJ
 DATE_TIME: 2026-09-01T12:00:00
+CAMPAIGN_PROFILE: quick3
+CAMPAIGN_PROFILE_VERSION: {profile_version}
+CAMPAIGN_RUN_ID: {run_id}
+CAMPAIGN_MANIFEST_SHA256: {manifest_hash}
 WAVE: AUDIT CORE
 TARGET: E2EPROJ repo
 BASELINE: e2e-1
-CAMPAIGN_RUN_ID: {run_id}
 STATUS: AUDIT_CORE: COMPLETE
 TICKETS: 1
 HANDOFF: IMPLEMENTATION_AGENT
@@ -29,6 +35,15 @@ REPAIR: allow the terminal transitions
 VERIFY: this end-to-end pass
 
 CORE_DONE_WHEN: the dispatch record is COMPLETE"""
+
+
+def core_wave(run_id: str) -> str:
+    profile = get_profile("quick3")
+    return CORE_WAVE.format(
+        run_id=run_id,
+        profile_version=profile.profile_version,
+        manifest_hash=profile.manifest_hash or get_canonical_manifest_hash(),
+    )
 
 
 def _post(conn: HTTPConnection, path: str, body: dict, token: str) -> tuple[int, dict]:
@@ -122,7 +137,7 @@ def test_a_dispatch_reaches_complete_through_the_real_protocol(bridge_server, tm
         "status": "complete",
         "api_version": 3,
         "receipt": "rcpt-e2e-001",
-        "content": CORE_WAVE.format(run_id=run_id),
+        "content": core_wave(run_id),
     }, token)
     assert status == 200, payload
     assert payload.get("ok") is True
@@ -140,11 +155,13 @@ def test_a_dispatch_reaches_complete_through_the_real_protocol(bridge_server, tm
     jobs = [job for job in _jobs(conn, token) if job["dispatch_id"] == dispatch_id]
     assert jobs and jobs[0]["state"] == "FINALIZING", jobs
 
-    # With the handoff on disk the same ACK is proof, and the lane closes.
+    # With the handoff on disk the same ACK carries terminal proof -- path AND
+    # the digest the bytes actually hash to (T-156) -- and the lane closes.
     handoff = Path(config.audits.root) / "E2EPROJ__00_AUDIT_ALL_3.md"
     handoff.parent.mkdir(parents=True, exist_ok=True)
     handoff.write_bytes(b"final handoff bytes")
-    transition("COMPLETE", campaign_run_id=run_id, final_handoff_path=str(handoff))
+    transition("COMPLETE", campaign_run_id=run_id, final_handoff_path=str(handoff),
+               final_handoff_sha256=hashlib.sha256(handoff.read_bytes()).hexdigest())
     jobs = [job for job in _jobs(conn, token) if job["dispatch_id"] == dispatch_id]
     assert jobs and jobs[0]["state"] == "COMPLETE", jobs
     assert jobs[0]["final_handoff_path"] == str(handoff)
@@ -212,7 +229,9 @@ def test_a_polling_worker_keeps_its_run_past_the_lease(bridge_server, tmp_path):
 COMPRESS_WAVE = """PROJECT_NAME: CMPROJ
 DATE_TIME: 2026-09-01T18:30:00
 CAMPAIGN_PROFILE: compress
+CAMPAIGN_PROFILE_VERSION: {profile_version}
 CAMPAIGN_RUN_ID: {run_id}
+CAMPAIGN_MANIFEST_SHA256: {manifest_hash}
 WAVE_ID: compress
 WAVE: COMPRESS AUDIT
 TARGET: CMPROJ repo
@@ -230,6 +249,15 @@ IMPACT: delete 1 file, remove ~240 source LOC, drop one dependency
 VERIFY: full suite green and the CLI smoke test still exits 0
 
 COMPRESS_DONE_WHEN: the file is gone and the suite is green."""
+
+
+def compress_wave(run_id: str, project: str = "CMPROJ") -> str:
+    profile = get_profile("compress")
+    return COMPRESS_WAVE.format(
+        run_id=run_id,
+        profile_version=profile.profile_version,
+        manifest_hash=profile.manifest_hash or get_canonical_manifest_hash(),
+    ).replace("CMPROJ", project)
 
 
 def test_a_compress_campaign_writes_its_own_canonical_handoff(bridge_server, tmp_path):
@@ -250,7 +278,7 @@ def test_a_compress_campaign_writes_its_own_canonical_handoff(bridge_server, tmp
         "status": "complete",
         "api_version": 3,
         "receipt": "rcpt-cm-001",
-        "content": COMPRESS_WAVE.format(run_id=run_id),
+        "content": compress_wave(run_id),
     }, config.bridge.token)
     assert status == 200, payload
     assert payload.get("ok") is True
@@ -284,7 +312,7 @@ def test_the_compress_handoff_is_what_the_audit_index_calls_ready(bridge_server,
         "run_id": run_id, "project": "CMREADY", "wave": "compress",
         "profile_id": "compress", "status": "complete", "api_version": 3,
         "receipt": "rcpt-cm-002",
-        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", "CMREADY"),
+        "content": compress_wave(run_id, "CMREADY"),
     }, config.bridge.token)
     assert status == 200, payload
 
@@ -373,7 +401,7 @@ def test_a_compress_dispatch_reaches_complete_through_the_real_protocol(bridge_s
         "status": "complete",
         "api_version": 3,
         "receipt": "rcpt-cm-lane-001",
-        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", "CMLANE"),
+        "content": compress_wave(run_id, "CMLANE"),
     }, token)
     assert status == 200, payload
 
@@ -485,7 +513,7 @@ def _deliver_compress_wave(conn, token, project: str, run_id: str) -> tuple[int,
         "run_id": run_id, "project": project, "wave": "compress",
         "profile_id": "compress", "status": "complete", "api_version": 3,
         "receipt": f"rcpt-{run_id}",
-        "content": COMPRESS_WAVE.format(run_id=run_id).replace("CMPROJ", project),
+        "content": compress_wave(run_id, project),
     }, token)
 
 
@@ -585,3 +613,242 @@ def test_a_committed_campaign_still_closes_its_lane_and_mirrors(bridge_server, t
     assert jobs and jobs[0]["state"] == "COMPLETE", jobs
     assert jobs[0]["final_handoff_path"].endswith("W2OK__00_COMPRESS_AUDIT.md"), jobs[0]
     assert Path(jobs[0]["final_handoff_path"]).is_file()
+
+
+def _build_quick3_wave_text(project: str, run_id: str, wave_id: str) -> str:
+    from audapack.campaign import get_profile
+
+    profile = get_profile("quick3")
+    wave_def = profile.get_wave_by_id(wave_id)
+    assert wave_def is not None, wave_id
+    return (
+        f"PROJECT_NAME: {project}\n"
+        f"CAMPAIGN_PROFILE: quick3\n"
+        f"CAMPAIGN_PROFILE_VERSION: {profile.profile_version}\n"
+        f"CAMPAIGN_RUN_ID: {run_id}\n"
+        f"CAMPAIGN_MANIFEST_SHA256: {profile.manifest_hash}\n"
+        f"WAVE_ID: {wave_def.id}\n"
+        f"WAVE_INDEX: {wave_def.ordinal}\n"
+        f"WAVE_COUNT: {profile.wave_count}\n"
+        f"WAVE: {wave_def.wave_header}\n"
+        f"TARGET: repo\n"
+        f"BASELINE: main\n"
+        f"{wave_def.status_line}\n"
+        f"TICKETS: 0\n"
+        f"HANDOFF: IMPLEMENTATION_AGENT\n"
+        f"{wave_def.no_findings_marker or 'NO VERIFIED DEFECTS.'}\n"
+        f"{wave_def.done_marker.rstrip(':')}: verified\n"
+    )
+
+
+def _deliver_quick3_wave(conn, token, project, run_id, wave_id, receipt) -> tuple[int, dict]:
+    return _post(conn, "/v1/audits", {
+        "run_id": run_id,
+        "project": project,
+        "wave": wave_id,
+        "profile_id": "quick3",
+        "status": "complete",
+        "api_version": 3,
+        "receipt": receipt,
+        "content": _build_quick3_wave_text(project, run_id, wave_id),
+    }, token)
+
+
+def _complete_quick3(conn, token, project, run_id, tag) -> None:
+    for wave_id in ("core", "second", "performance"):
+        status, payload = _deliver_quick3_wave(
+            conn, token, project, run_id, wave_id, f"{tag}-{wave_id}"
+        )
+        assert status == 200, (wave_id, payload)
+
+
+def test_non_final_index_failure_rolls_back_every_byte(bridge_server, tmp_path, monkeypatch):
+    """W2-001 (SRC-041:R005): the rollback used to be final-wave-only.
+
+    A failed index write on a NON-final wave answered a clean retriable
+    `campaign_index_failed` while the canonical latest and history files stayed
+    published on disk -- a durable half-commit no run state ever recorded.
+    """
+    from audapack.bridge import server as server_mod
+    from audapack.bridge import state as state_mod
+
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    run_id = "acb-w2-001-nonfinal"
+    project = "W2NF"
+    root = Path(config.audits.root)
+    state_file = state_mod.get_run_state_file(run_id)
+    before_state = state_file.read_bytes() if state_file.exists() else None
+
+    monkeypatch.setattr(server_mod, "save_live_campaign_index", lambda **kw: (_ for _ in ()).throw(
+        OSError("injected index write failure")))
+
+    status, payload = _deliver_quick3_wave(conn, token, project, run_id, "core", "nf-core")
+    assert status == 503, payload
+    assert payload["error"]["code"] == "campaign_index_failed", payload
+    assert not list(root.rglob("*AUDIT_CORE*.md")), "the non-final wave survived the rollback"
+    assert not list(root.rglob("campaign.json")), "campaign.json survived the rollback"
+    after_state = state_file.read_bytes() if state_file.exists() else None
+    assert after_state == before_state, "run state changed across a rolled-back non-final wave"
+
+    # Retry after the clean rollback: exactly one eventual history artifact.
+    monkeypatch.undo()
+    status, payload = _deliver_quick3_wave(conn, token, project, run_id, "core", "nf-core")
+    assert status == 200, payload
+    history = [p for p in root.rglob("*AUDIT_CORE*.md") if "_history" in p.parts]
+    assert len(history) == 1, history
+
+
+def test_duplicate_retry_with_new_receipt_flushes_generation_pending(bridge_server, tmp_path, monkeypatch):
+    """W2-002 G2: different-receipt duplicates used to skip generation_pending.
+
+    The old fast path returned a duplicate for identical completed content
+    without touching the pending marker, so the generation count never advanced
+    no matter how many retries arrived.
+    """
+    from audapack.bridge import state as state_mod
+    from audapack.bridge.state import GenerationPersistenceError
+
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    run_id = "acb-w2-002-gen"
+    project = "W2GEN"
+    _complete_quick3(conn, token, project, run_id, "gen")
+
+    state = state_mod.get_run_state(run_id)
+    state["generation_pending"] = True
+    state_mod.save_run_state(run_id, state)
+
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        calls["n"] += 1
+        raise GenerationPersistenceError("injected generation failure")
+
+    monkeypatch.setattr(state_mod, "increment_audit_generation", _boom)
+
+    status, payload = _deliver_quick3_wave(
+        conn, token, project, run_id, "performance", "gen-different-receipt")
+
+    assert status == 200, payload
+    assert payload.get("duplicate") is True
+    assert calls["n"] == 1, calls
+    assert state_mod.get_run_state(run_id).get("generation_pending") is True
+
+
+def test_duplicate_retry_marker_clear_failure_never_drops_the_socket(bridge_server, tmp_path, monkeypatch):
+    """W2-002 G2: publishing then failing the marker-clear dropped the HTTP conn.
+
+    The old same-receipt path let RunStatePersistenceError escape from the
+    duplicate branch, so the retry saw a transport error even though the
+    generation had been published. It must answer valid JSON and keep the
+    durable marker pending for a later repair.
+    """
+    from audapack.bridge import server as server_mod
+    from audapack.bridge import state as state_mod
+    from audapack.bridge.state import RunStatePersistenceError
+
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    run_id = "acb-w2-002-clear"
+    project = "W2CLR"
+    _complete_quick3(conn, token, project, run_id, "clr")
+
+    state = state_mod.get_run_state(run_id)
+    state["generation_pending"] = True
+    state_mod.save_run_state(run_id, state)
+
+    monkeypatch.setattr(state_mod, "increment_audit_generation", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        raise RunStatePersistenceError("injected marker-clear failure")
+
+    monkeypatch.setattr(server_mod, "save_run_state", _flaky)
+
+    # ORIGINAL receipt: the exact payload that once dropped the connection.
+    status, payload = _deliver_quick3_wave(
+        conn, token, project, run_id, "performance", "clr-performance")
+
+    assert status == 200, payload
+    assert payload.get("duplicate") is True
+    assert calls["n"] >= 1, "the marker-clear save was never attempted"
+    assert state_mod.get_run_state(run_id).get("generation_pending") is True
+
+
+def test_duplicate_retry_repairs_incomplete_finalization_without_extra_history(bridge_server, tmp_path, monkeypatch):
+    """W2-002 G3: both receipt variants converge on the same finalization repair.
+
+    The canonical artifacts and index were lost after the wave records were
+    committed. A retry under a NEW receipt used to return campaign_ready=False
+    forever; it must now rebuild the final artifacts, reuse the existing
+    history stamp, and not mint an extra history artifact.
+    """
+    from audapack.bridge import state as state_mod
+
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    run_id = "acb-w2-002-finalize"
+    project = "W2FIN"
+    _complete_quick3(conn, token, project, run_id, "fin")
+
+    root = Path(config.audits.root)
+    all3 = list(root.rglob("*__00_AUDIT_ALL_3.md"))
+    campaign = list(root.rglob("campaign.json"))
+    assert all3 and campaign, "campaign did not finalize"
+    history_before = sorted(
+        p.name for p in root.rglob("*__00_AUDIT_ALL_3__*.md") if "_history" in p.parts
+    )
+    assert history_before
+
+    # Crash residue: canonical artifacts and index gone, waves still complete.
+    all3[0].unlink()
+    campaign[0].unlink()
+    state = state_mod.get_run_state(run_id)
+    state["all3_complete"] = False
+    state.pop("all3_path", None)
+    state_mod.save_run_state(run_id, state)
+
+    status, payload = _deliver_quick3_wave(
+        conn, token, project, run_id, "performance", "fin-different-receipt")
+
+    assert status == 200, payload
+    assert payload.get("campaign_ready") is True, payload
+    assert list(root.rglob("*__00_AUDIT_ALL_3.md")), "finalization was not repaired"
+    assert list(root.rglob("campaign.json")), "campaign.json was not repaired"
+    history_after = sorted(
+        p.name for p in root.rglob("*__00_AUDIT_ALL_3__*.md") if "_history" in p.parts
+    )
+    assert history_after == history_before, "a repair minted an extra history artifact"
+
+
+def test_same_receipt_with_different_content_still_conflicts(bridge_server, tmp_path):
+    """W2-002 G1: unifying duplicate repair must not weaken receipt identity."""
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    token = config.bridge.token
+    run_id = "acb-w2-002-conflict"
+    project = "W2CON"
+
+    status, payload = _deliver_quick3_wave(conn, token, project, run_id, "core", "conflict-r")
+    assert status == 200, payload
+
+    # Same receipt, different content for the SAME wave -> conflict.
+    altered = dict(
+        run_id=run_id,
+        project=project,
+        wave="core",
+        profile_id="quick3",
+        status="complete",
+        api_version=3,
+        receipt="conflict-r",
+        content=_build_quick3_wave_text(project, run_id, "core") + "\nextra line",
+    )
+    status, payload = _post(conn, "/v1/audits", altered, token)
+    assert status == 409, payload
+    assert payload["error"]["code"] == "receipt_conflict", payload

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from audapack.bridge.state import increment_audit_generation
+from audapack.bridge.state import publish_audit_generation
 from audapack.bridge.storage import (
     atomic_write,
     capture_file_snapshots,
@@ -593,13 +593,13 @@ def ingest_audit_text(
     # generation for the campaign is enough; consumers refresh the project.
     try:
         if campaign_generated:
-            increment_audit_generation(
+            publish_audit_generation(
                 resolved_name,
                 "all3" if profile.profile_id == "quick3" else "super_audit",
                 project_id=proj.id if proj else None,
             )
         elif saved_waves:
-            increment_audit_generation(
+            publish_audit_generation(
                 resolved_name,
                 saved_waves[-1],
                 project_id=proj.id if proj else None,
@@ -608,6 +608,7 @@ def ingest_audit_text(
         # The ingest itself committed; surface the notification failure without
         # rolling back files. A stale generation is a refresh problem, not data
         # loss, and the next successful generation or explicit refresh recovers.
+        # Self-healing path already attempted inside publish.
         return IngestResult(
             ok=False,
             project_name=resolved_name,

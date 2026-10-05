@@ -275,6 +275,17 @@ class FakeElement {
         set(v) { this._value = String(v == null ? '' : v); }
       });
     }
+    if (tag === 'input') {
+      Object.defineProperty(this, 'files', {
+        configurable: true,
+        enumerable: true,
+        get() { return this._files || []; },
+        set(v) {
+          this._files = v;
+          if (typeof this._onFilesSet === 'function') this._onFilesSet(this, v);
+        }
+      });
+    }
   }
 
   get id() { return this.attributes.get('id') || ''; }
@@ -301,11 +312,12 @@ class FakeElement {
 
   get firstChild() { return this.children[0] || null; }
   get lastChild() { return this.children[this.children.length - 1] || null; }
+  get parentElement() { return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null; }
 
   get isConnected() {
     let current = this;
     while (current.parentNode) current = current.parentNode;
-    return current === this._rootNode;
+    return Boolean(current && current._documentRoot);
   }
   get _rootNode() {
     let current = this;
@@ -458,7 +470,19 @@ class FakeElement {
   }
   click() {
     this._clicked = true;
+    // T-184: "exactly one Send" needs a count, not a boolean.
+    this._clickCount = (Number(this._clickCount) || 0) + 1;
     this.dispatchEvent(new FakeEvent('click', { bubbles: true }));
+  }
+  // T-260: the composer form is the platform's own submit unit. A form that
+  // cannot be submitted cannot prove the trusted fallback, so the harness
+  // models requestSubmit() the way the DOM does: fire a `submit` event, honour
+  // preventDefault, and count submissions exactly like clicks.
+  requestSubmit(submitter = null) {
+    this._submitCount = (Number(this._submitCount) || 0) + 1;
+    const event = new FakeEvent('submit', { bubbles: true, cancelable: true });
+    event.submitter = submitter;
+    this.dispatchEvent(event);
   }
 }
 
@@ -468,6 +492,7 @@ class FakeEvent {
     this.bubbles = Boolean(init.bubbles);
     this.cancelable = Boolean(init.cancelable);
     this.defaultPrevented = false;
+    this.propagationStopped = false;
     this.target = null;
     this.data = init.data ?? null;
     this.inputType = init.inputType ?? '';
@@ -478,16 +503,76 @@ class FakeEvent {
     this.pointerId = init.pointerId ?? 0;
     this.isPrimary = init.isPrimary ?? false;
     this.button = init.button ?? 0;
+    this.dataTransfer = init.dataTransfer ?? null;
   }
   preventDefault() { this.defaultPrevented = true; }
+  stopPropagation() { this.propagationStopped = true; }
+  stopImmediatePropagation() { this.propagationStopped = true; }
 }
 
 class FakeInputEvent extends FakeEvent {}
 
+class FakeBlob {
+  constructor(parts = [], options = {}) {
+    this.type = String(options.type || '');
+    const chunks = [];
+    for (const part of parts) {
+      if (part instanceof FakeBlob) chunks.push(part._bytes);
+      else if (part instanceof Uint8Array) chunks.push(part);
+      else if (part instanceof ArrayBuffer) chunks.push(new Uint8Array(part));
+      else if (typeof part === 'string') chunks.push(new TextEncoder().encode(part));
+      else if (part && typeof part.length === 'number') chunks.push(Uint8Array.from(part));
+    }
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    this._bytes = bytes;
+    this.size = bytes.length;
+  }
+  async arrayBuffer() { return this._bytes.slice().buffer; }
+  async text() { return Buffer.from(this._bytes).toString('utf8'); }
+  slice() { return new FakeBlob([this._bytes], { type: this.type }); }
+}
+
+class FakeFile extends FakeBlob {
+  constructor(parts, name, options = {}) {
+    super(parts, options);
+    this.name = String(name == null ? '' : name);
+    this.lastModified = Number(options.lastModified || Date.now());
+  }
+}
+
+class FakeDataTransfer {
+  constructor() {
+    this._files = [];
+    this._data = {};
+    const self = this;
+    this.items = { add(file) { self._files.push(file); } };
+    this.types = [];
+  }
+  get files() { return this._files; }
+  setData(type, value) { this._data[String(type)] = String(value); }
+  getData(type) { return this._data[String(type)] || ''; }
+}
+
+class FakeHTMLInputElement {}
+Object.defineProperty(FakeHTMLInputElement.prototype, 'files', {
+  configurable: true,
+  get() { return this._files || []; },
+  set(value) {
+    this._files = value;
+    if (typeof this._onFilesSet === 'function') this._onFilesSet(this, value);
+  }
+});
+
 class FakeDocument {
   constructor(harness) {
     this._harness = harness;
+    this._listeners = new Map();
     this.documentElement = new FakeElement('html');
+    this.documentElement._documentRoot = true;
     this.body = new FakeElement('body');
     this.head = new FakeElement('head');
     this.documentElement.appendChild(this.head);
@@ -521,8 +606,20 @@ class FakeDocument {
     return { selectNodeContents() {}, collapse() {}, getBoundingClientRect: () => ({ width: 0, height: 0 }) };
   }
   execCommand() { return false; }
-  addEventListener() {}
-  removeEventListener() {}
+  addEventListener(type, fn) {
+    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+    this._listeners.get(type).add(fn);
+  }
+  removeEventListener(type, fn) {
+    this._listeners.get(type)?.delete(fn);
+  }
+  dispatchEvent(event) {
+    event.target = event.target || this;
+    event.currentTarget = this;
+    const listeners = this._listeners.get(event.type);
+    if (listeners) for (const fn of Array.from(listeners)) fn.call(this, event);
+    return !event.defaultPrevented;
+  }
 }
 
 class FakeMutationObserver {
@@ -693,6 +790,17 @@ function createHarness(options = {}) {
     brave: { isBrave: () => Promise.resolve(true) }
   };
   const harness = { httpRequests: [], httpResponder: null, timers, gmStore, sessionStore, localStore, _observers: observers, api: null, dom: document, location, navigator: navigatorObj, counters, window: windowObj };
+  // Deliver one mutation round to every connected observer. Without this the
+  // observers were collected but never fired, so a test could only ever prove
+  // the coarse interval fallback -- never the condition-driven release the
+  // waits actually promise.
+  harness.flushObservers = (records = [{ type: 'childList', target: document.body }]) => {
+    for (const observer of Array.from(observers)) {
+      if (observer.connected && typeof observer.callback === 'function') {
+        observer.callback(records, observer);
+      }
+    }
+  };
   document._harness = harness;
 
   const sandbox = {
@@ -702,7 +810,16 @@ function createHarness(options = {}) {
     location,
     navigator: navigatorObj,
     performance: { now: () => timers.now },
-    crypto: { randomUUID: nextUuid, getRandomValues: () => ({}) },
+    crypto: { randomUUID: nextUuid, getRandomValues: () => ({}), subtle: require('node:crypto').webcrypto.subtle },
+    Uint8Array,
+    ArrayBuffer,
+    DataView,
+    TextEncoder,
+    TextDecoder,
+    Blob: FakeBlob,
+    File: FakeFile,
+    DataTransfer: FakeDataTransfer,
+    HTMLInputElement: FakeHTMLInputElement,
     Math,
     Date,
     JSON,
@@ -743,11 +860,30 @@ function createHarness(options = {}) {
       const respond = harness.httpResponder
         ? harness.httpResponder(options)
         : { status: 200, responseText: JSON.stringify({ ok: true }) };
+      // T-184: a responder may model a Bridge that accepts the connection and
+      // never answers (`stall`), or one that answers only after a long wall
+      // clock (`delay`). Both are needed to prove the manual-save deadline and
+      // the stale-callback fence -- the operator's real symptom was a request
+      // that simply never came back.
+      if (respond && respond.stall) return { abort() {} };
+      // SRC-083: a responder may model the userscript manager's passive
+      // callbacks -- headers (readyState 2) and body progress -- each at its own
+      // fake-clock offset, strictly before `onload` at `delay`.
+      if (respond && Array.isArray(respond.progress)) {
+        for (const step of respond.progress) {
+          timers.setTimeout(() => {
+            if (step.readyState && options.onreadystatechange) options.onreadystatechange({ readyState: step.readyState });
+            if (step.loaded !== undefined && options.onprogress) {
+              options.onprogress({ loaded: step.loaded, total: step.total || 0, lengthComputable: Number(step.total) > 0 });
+            }
+          }, Math.max(0, Number(step.at) || 0));
+        }
+      }
       timers.setTimeout(() => {
         if (respond && respond.error && options.onerror) return options.onerror(respond);
         if (respond && respond.timeout && options.ontimeout) return options.ontimeout(respond);
         if (options.onload) options.onload(respond);
-      }, 0);
+      }, Math.max(0, Number(respond && respond.delay) || 0));
       return { abort() {} };
     },
     sessionStorage: {
@@ -782,6 +918,7 @@ function createHarness(options = {}) {
       harness.loadError = error;
     }
     harness.api = sandbox.__ACB_TEST__ || null;
+    harness.sandbox = sandbox;
     return harness.api;
   };
 
@@ -798,9 +935,9 @@ harness.settle = async () => {
 
   harness.advance = ms => timers.advance(ms);
 
-  harness.mutate = root => {
+  harness.mutate = (root, records = []) => {
     for (const observer of Array.from(observers)) {
-      if (observer.connected && observer.root === root) observer.callback([], observer);
+      if (observer.connected && observer.root === root) observer.callback(records, observer);
     }
   };
 
@@ -809,4 +946,4 @@ harness.settle = async () => {
   return harness;
 }
 
-module.exports = { createHarness, FakeElement, FakeEvent, matchesSelector, parseAttrToken, matchCompound };
+module.exports = { createHarness, FakeElement, FakeEvent, FakeFile, FakeBlob, FakeDataTransfer, FakeHTMLInputElement, matchesSelector, parseAttrToken, matchCompound };

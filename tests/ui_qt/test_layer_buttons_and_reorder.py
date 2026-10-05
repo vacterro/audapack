@@ -74,17 +74,26 @@ class TestRowButtons:
         assert plus_rect.height() == info_rect.height()
 
     def test_state_column_stays_clear_of_the_button_block(self, window):
-        """FIXED_ACTIONS_WIDTH grew for the two new buttons; the state column
-        must still start left of them on every row."""
-        from audapack.ui_qt.models.project_delegate import FIXED_ACTIONS_WIDTH
+        """The content boundary must come from the REAL action block geometry.
 
-        assert FIXED_ACTIONS_WIDTH >= 190
+        The old FIXED_ACTIONS_WIDTH guessed a 190px reservation; the real
+        block is narrower, so every row gave away a dead strip that was
+        stolen from the project name. The invariant is now geometric: the
+        state area ends before the leftmost action control on every row, no
+        matter how many launchers are enabled.
+        """
+        from audapack.ui_qt.models.project_delegate import compute_actions_left
+
         rect = _row_rect(window)
+        actions_left = compute_actions_left(rect, window._service.config.launchers)
         launcher_buttons, _gg = compute_row_button_rects(rect, window._service.config.launchers)
         info_rect = compute_info_button_rect(rect, launcher_buttons, _gg)
         plus_rect, edit_rect = compute_layer_button_rects(rect, info_rect)
-        state_col_left = rect.right() - FIXED_ACTIONS_WIDTH - 4 - 175
-        assert edit_rect.left() > state_col_left + 175
+        assert actions_left == edit_rect.left()
+        # ordering: edit < plus < info < launchers, contiguous 2px gaps
+        assert edit_rect.right() < plus_rect.left()
+        assert plus_rect.right() < info_rect.left()
+        assert info_rect.right() < launcher_buttons[0][1].left()
 
     def test_plus_button_opens_the_inaudit_tab_and_creates_a_layer(self, window, qapp):
         """Row [+] must NOT open a separate window — it binds the INAUDIT tab and

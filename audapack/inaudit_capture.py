@@ -52,6 +52,10 @@ class InauditCaptureError(RuntimeError):
         self.status = status
 
 
+class _InauditGenerationCorruption(RuntimeError):
+    """An existing INAUDIT generation file is corrupt/unreadable (CORE-001)."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -186,9 +190,19 @@ class InauditCaptureStore:
         self.pending_signal_path = self.root / "inaudit_pending_signal.json"
         self.affinity_path = self.root / "conversation_affinity.json"
         self.index_path = self.root / "project_identity_index.json"
+        # T-154: durable duplicate-digest accelerator plus the process-local
+        # listing cache. Both are accelerators -- the body/metadata pairs stay
+        # the only authority, and a broken accelerator is disposable.
+        self.digest_index_path = self.root / "content_digest_index.json"
         self.notification_pending = False
         self._owed_signal: dict[str, str] | None = None
         self._unannounced_commit: dict[str, str] | None = None
+        self._digest_index: dict[str, Any] | None = None
+        self._digest_index_ok = False
+        self._digest_index_persist_failed = False
+        self._list_cache: dict[tuple[bool, bool], tuple[tuple[str, int], list[dict[str, Any]]]] = {}
+        self._local_revision = 0
+        self._observed_generation = ""
         self._ensure_dirs()
         owed = self._read_json(self.pending_signal_path)
         if owed is not None:
@@ -208,6 +222,13 @@ class InauditCaptureStore:
                 self._replay_pending_signal()
         self.recover_partial_records()
         self.recover_assignment_transactions()
+        # T-154: the accelerator is built once, after startup recovery has
+        # finished -- it is exactly as complete as the durable records it
+        # summarizes, and a stale or malformed file is simply replaced.
+        with _LOCAL_LOCK, cross_process_lock(self.lock_path):
+            generation = self._read_generation()
+            self._observed_generation = self._generation_token(generation)
+            self._rebuild_digest_index()
 
     def _ensure_dirs(self) -> None:
         for path in (self.inbox_dir, self.archive_dir, self.recovery_dir, self.transactions_dir):
@@ -264,6 +285,12 @@ class InauditCaptureStore:
         next store construction. `notification_pending` is what the API reports
         instead of a false persistence failure.
         """
+        # T-154: the mutation is already committed, so this process's listing
+        # caches are stale no matter what the publication below manages. The
+        # local revision is bumped BEFORE the marker write, so a deferred or
+        # failed generation publish can never leave a stale cached view.
+        self._local_revision += 1
+        self._list_cache.clear()
         self._owed_signal = {"capture_id": capture_id, "event": event}
         self._unannounced_commit = None
         try:
@@ -282,8 +309,16 @@ class InauditCaptureStore:
             self.notification_pending = False
             return
         try:
-            previous = self._read_json(self.generation_path) or {}
-            generation = int(previous.get("generation") or 0) + 1
+            previous = self._read_generation_strict()
+        except _InauditGenerationCorruption:
+            # CORE-001: an existing-but-corrupt generation file is not a fresh
+            # counter. Keep the notification owed instead of manufacturing
+            # generation 1 over unknown prior history.
+            self.notification_pending = True
+            logger.warning("INAUDIT generation publish deferred: corrupt generation state")
+            return
+        try:
+            generation = int((previous or {}).get("generation") or 0) + 1
             self._atomic_json(
                 self.generation_path,
                 {
@@ -304,6 +339,28 @@ class InauditCaptureStore:
         except OSError:
             pass
 
+    def _read_generation_strict(self) -> dict[str, Any] | None:
+        """Read the generation doc, distinguishing MISSING from CORRUPT.
+
+        Returns None when the file genuinely does not exist. Raises
+        :class:`_InauditGenerationCorruption` when an existing file cannot be
+        parsed into a valid non-negative generation.
+        """
+        if not self.generation_path.exists():
+            return None
+        try:
+            value = json.loads(self.generation_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise _InauditGenerationCorruption(str(exc)) from exc
+        if (
+            not isinstance(value, dict)
+            or isinstance(value.get("generation"), bool)
+            or not isinstance(value.get("generation"), int)
+            or value.get("generation") < 0
+        ):
+            raise _InauditGenerationCorruption("invalid generation document")
+        return value
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | None:
         try:
@@ -311,6 +368,221 @@ class InauditCaptureStore:
         except (OSError, ValueError, TypeError):
             return None
         return value if isinstance(value, dict) else None
+
+    # -- T-154: durable digest accelerator + generation-keyed listing cache --
+
+    @staticmethod
+    def _generation_token(value: dict[str, Any] | None) -> str:
+        return str((value or {}).get("generation") or "")
+
+    def _read_generation(self) -> dict[str, Any] | None:
+        return self._read_json(self.generation_path)
+
+    @staticmethod
+    def _index_entry(
+        record: dict[str, Any] | None, location: str, raw_id: str
+    ) -> dict[str, Any] | None:
+        """Validate one sidecar into an accelerator entry, or None.
+
+        The accelerator never invents identity: an entry exists only for a
+        sidecar whose id, status and digest are all self-consistent.
+        """
+        if not isinstance(record, dict) or record.get("capture_id") != raw_id:
+            return None
+        capture_id = str(record.get("capture_id") or "")
+        digest = str(record.get("content_sha256") or "")
+        status = str(record.get("status") or "")
+        if not _UUID_RE.fullmatch(capture_id) or len(digest) != 64 or status not in CAPTURE_STATUSES:
+            return None
+        return {
+            "capture_id": capture_id,
+            "digest": digest,
+            "location": location,
+            "status": status,
+            "created_at": str(record.get("created_at") or ""),
+            "recovery": location == "recovery",
+        }
+
+    def _rebuild_digest_index(self) -> None:
+        """Rebuild the accelerator from the durable lifecycle records.
+
+        Called once per startup (after recovery) and whenever a reloaded index
+        cannot be reconciled. Cost is one sidecar parse per capture -- the same
+        pass recovery already pays -- and never part of a steady-state request.
+        """
+        captures: dict[str, dict[str, Any]] = {}
+        for directory, location in (
+            (self.inbox_dir, "inbox"),
+            (self.archive_dir, "archive"),
+            (self.recovery_dir, "recovery"),
+        ):
+            for path in sorted(directory.glob("*.json")):
+                if path.name.endswith(".broken.json"):
+                    continue
+                entry = self._index_entry(self._read_json(path), location, path.stem)
+                if entry is not None:
+                    captures[entry["capture_id"]] = entry
+        digests: dict[str, list[str]] = {}
+        for entry in captures.values():
+            digests.setdefault(entry["digest"], []).append(entry["capture_id"])
+        payload = {
+            "schema_version": 1,
+            "updated_at": utc_now(),
+            "captures": captures,
+            "digests": {digest: sorted(ids) for digest, ids in sorted(digests.items())},
+        }
+        self._digest_index = payload
+        self._digest_index_ok = True
+        self._digest_index_persist_failed = False
+        try:
+            self._atomic_json(self.digest_index_path, payload)
+        except OSError as exc:
+            # The accelerator is disposable. Canonical captures are already
+            # durable; a failed index write must never surface as data loss.
+            self._digest_index_persist_failed = True
+            logger.warning("INAUDIT digest index persist deferred: %s", exc)
+
+    def _adopt_or_rebuild_digest_index(self, generation: dict[str, Any] | None) -> None:
+        """Reload the durable accelerator after an external generation change.
+
+        The file is maintained by the same cross-process mutation lock that
+        guards the canonical pairs, so a schema-valid file written by another
+        store is adopted as-is -- with one cheap probe: the capture named by the
+        generation event itself must be present, or the file is stale and gets
+        the full rebuild. A malformed file is disposable, never an error.
+        """
+        payload = self._read_json(self.digest_index_path)
+        usable = (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and isinstance(payload.get("captures"), dict)
+            and isinstance(payload.get("digests"), dict)
+        )
+        if usable and generation:
+            event_capture = str(generation.get("capture_id") or "")
+            if event_capture and event_capture not in payload["captures"]:
+                usable = False
+        if usable:
+            self._digest_index = payload
+            self._digest_index_ok = True
+            self._digest_index_persist_failed = False
+        else:
+            with cross_process_lock(self.lock_path):
+                self._rebuild_digest_index()
+
+    def _persist_digest_index(self) -> None:
+        if self._digest_index is None:
+            return
+        if not self._digest_index_persist_failed:
+            self._digest_index["updated_at"] = utc_now()
+            try:
+                self._atomic_json(self.digest_index_path, self._digest_index)
+                return
+            except OSError as exc:
+                self._digest_index_persist_failed = True
+                logger.warning("INAUDIT digest index persist deferred: %s", exc)
+        else:
+            # Retry once per mutation after an earlier failure; the in-memory
+            # view is already correct either way.
+            self._digest_index["updated_at"] = utc_now()
+            try:
+                self._atomic_json(self.digest_index_path, self._digest_index)
+                self._digest_index_persist_failed = False
+            except OSError as exc:
+                logger.warning("INAUDIT digest index persist still deferred: %s", exc)
+
+    def _index_upsert(self, record: dict[str, Any], directory: Path) -> None:
+        """Fold one canonical record into the accelerator (mutation lock held)."""
+        if not self._digest_index_ok or self._digest_index is None:
+            return
+        entry = self._index_entry(record, self._location_name(directory), str(record.get("capture_id") or ""))
+        if entry is None:
+            return
+        captures = self._digest_index["captures"]
+        digests = self._digest_index["digests"]
+        previous = captures.get(entry["capture_id"])
+        if previous is not None and previous["digest"] != entry["digest"]:
+            bucket = [cid for cid in digests.get(previous["digest"], []) if cid != entry["capture_id"]]
+            if bucket:
+                digests[previous["digest"]] = bucket
+            else:
+                digests.pop(previous["digest"], None)
+        captures[entry["capture_id"]] = entry
+        digests.setdefault(entry["digest"], [])
+        if entry["capture_id"] not in digests[entry["digest"]]:
+            digests[entry["digest"]].append(entry["capture_id"])
+        self._persist_digest_index()
+
+    def _index_remove(self, capture_id: str) -> None:
+        """Drop exactly one capture from the accelerator (mutation lock held).
+
+        Only the deleted id leaves: another capture with the same digest keeps
+        the digest entry alive, because the surviving pair is still on disk.
+        """
+        if not self._digest_index_ok or self._digest_index is None:
+            return
+        captures = self._digest_index["captures"]
+        entry = captures.pop(capture_id, None)
+        if entry is None:
+            return
+        digests = self._digest_index["digests"]
+        bucket = [cid for cid in digests.get(entry["digest"], []) if cid != capture_id]
+        if bucket:
+            digests[entry["digest"]] = bucket
+        else:
+            digests.pop(entry["digest"], None)
+        self._persist_digest_index()
+
+    def _location_name(self, directory: Path) -> str:
+        if directory == self.inbox_dir:
+            return "inbox"
+        if directory == self.archive_dir:
+            return "archive"
+        return "recovery"
+
+    def _find_duplicate_of(self, digest: str) -> str:
+        """The capture a new duplicate-of should point at, without the corpus scan.
+
+        Semantics are exactly the legacy list_records scan's: candidates are
+        every non-RECOVERY capture, and the winner is the greatest
+        (created_at, capture_id) -- the first row the old newest-first sort
+        produced. The accelerator only answers faster; when it is unusable the
+        canonical scan runs instead.
+        """
+        if self._digest_index_ok and self._digest_index is not None:
+            best_key: tuple[str, str] | None = None
+            best_id = ""
+            for candidate_id in self._digest_index["digests"].get(digest, []):
+                entry = self._digest_index["captures"].get(candidate_id)
+                if entry is None or entry["recovery"]:
+                    continue
+                key = (entry["created_at"], candidate_id)
+                if best_key is None or key > best_key:
+                    best_key, best_id = key, candidate_id
+            return best_id
+        for existing in self.list_records(include_archived=True, include_recovery=False):
+            if existing.get("content_sha256") == digest:
+                return str(existing.get("capture_id") or "")
+        return ""
+
+    def _scan_records(
+        self, *, include_archived: bool, include_recovery: bool
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        directories = [self.inbox_dir]
+        if include_archived:
+            directories.append(self.archive_dir)
+        if include_recovery:
+            directories.append(self.recovery_dir)
+        for directory in directories:
+            for path in sorted(directory.glob("*.json")):
+                if path.name.endswith(".broken.json"):
+                    continue
+                value = self._read_json(path)
+                if value and value.get("status") in CAPTURE_STATUSES:
+                    records.append(value)
+        records.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("capture_id") or "")), reverse=True)
+        return records
 
     def _lifecycle_dirs(self) -> tuple[Path, ...]:
         return (self.inbox_dir, self.archive_dir, self.recovery_dir)
@@ -656,11 +928,7 @@ class InauditCaptureStore:
                 raise InauditCaptureError("capture_id_conflict", "capture_id already exists with different content", status=409)
             fingerprint = _bounded_text(payload.get("conversation_fingerprint"), "conversation_fingerprint", maximum=512)
             classification = self.classify(text, projects, conversation_fingerprint=fingerprint, project_hints=hints)
-            duplicate_of = ""
-            for existing in self.list_records(include_archived=True, include_recovery=False):
-                if existing.get("content_sha256") == digest:
-                    duplicate_of = str(existing.get("capture_id") or "")
-                    break
+            duplicate_of = self._find_duplicate_of(digest)
             now = utc_now()
             status = "DUPLICATE" if duplicate_of else ("SUGGESTED" if classification["project_id"] else "NEW")
             record: dict[str, Any] = {
@@ -698,25 +966,39 @@ class InauditCaptureStore:
             except Exception:
                 # Preserve any durable half-record for startup recovery.
                 raise
+            self._index_upsert(record, self.inbox_dir)
             self._signal(capture_id, "capture")
             return {"record": record, "duplicate": False, "durable": True}
 
     def list_records(self, *, include_archived: bool = False, include_recovery: bool = True) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        directories = [self.inbox_dir]
-        if include_archived:
-            directories.append(self.archive_dir)
-        if include_recovery:
-            directories.append(self.recovery_dir)
-        for directory in directories:
-            for path in sorted(directory.glob("*.json")):
-                if path.name.endswith(".broken.json"):
-                    continue
-                value = self._read_json(path)
-                if value and value.get("status") in CAPTURE_STATUSES:
-                    records.append(value)
-        records.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("capture_id") or "")), reverse=True)
-        return records
+        """The Inbox view, cached per option pair against the INAUDIT generation.
+
+        T-154: steady-state repeated calls with an unchanged generation and no
+        local mutation neither glob the lifecycle directories again, nor parse
+        the sidecars again, nor re-sort. Two independent invalidation signals
+        guard the cache so it can never outlive the truth: the durable
+        generation file (another process committed) and this store's own local
+        revision (a committed mutation whose publication is still owed). The
+        returned list is a defensive snapshot -- mutating it can never poison
+        the next cached read.
+        """
+        import copy
+
+        with _LOCAL_LOCK:
+            generation = self._read_generation()
+            token = self._generation_token(generation)
+            if token != self._observed_generation:
+                self._observed_generation = token
+                self._list_cache.clear()
+                self._adopt_or_rebuild_digest_index(generation)
+            state = (token, self._local_revision)
+            key = (bool(include_archived), bool(include_recovery))
+            hit = self._list_cache.get(key)
+            if hit is not None and hit[0] == state:
+                return [copy.deepcopy(record) for record in hit[1]]
+            records = self._scan_records(include_archived=include_archived, include_recovery=include_recovery)
+            self._list_cache[key] = (state, copy.deepcopy(records))
+            return records
 
     def get(self, capture_id: str) -> dict[str, Any]:
         capture_id = _safe_uuid(capture_id)
@@ -959,6 +1241,7 @@ class InauditCaptureStore:
                 self._atomic_json(self._meta_path(capture_id), previous)
                 journal_path.unlink(missing_ok=True)
                 raise
+            self._index_upsert(record, self.inbox_dir)
             fingerprint = str(record.get("conversation_fingerprint") or "")
             if fingerprint:
                 affinities = self._load_affinity()
@@ -1010,6 +1293,7 @@ class InauditCaptureStore:
         # Never roll back a SAIPEN-owned layer if metadata persistence fails.
         # The next attempt recovers this same operation, even after consume.
         self._atomic_json(self._meta_path(capture_id), record)
+        self._index_upsert(record, self.inbox_dir)
         if not duplicate:
             fingerprint = str(record.get("conversation_fingerprint") or "")
             if fingerprint:
@@ -1102,6 +1386,7 @@ class InauditCaptureStore:
             self._atomic_json(destination_meta, moved)
             meta.unlink(missing_ok=True)
             body.unlink(missing_ok=True)
+            self._index_upsert(moved, destination)
             self._signal(capture_id, event)
             return moved
 
@@ -1125,6 +1410,7 @@ class InauditCaptureStore:
                     self._unannounced_commit = None
                     return
                 raise InauditCaptureError("capture_not_found", "capture does not exist", status=404)
+            self._index_remove(capture_id)
             self._signal(capture_id, "delete")
 
 

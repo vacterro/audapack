@@ -104,26 +104,76 @@ test('W4-002: manual Retry rebuilds compacted permanent job while automatic reco
   assert.strictEqual(rebuilt.errorCode, '');
 });
 
-test('T83: a wave that is already complete in the canonical run is not a failure', async () => {
-  const { h, api } = setup();
-  api.state.bridgeEnabled = true;
-  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+// T-184 replaces the over-broad T83 regression. `completed_wave_immutable` was
+// asserted to be "not a failure", which locked in false durability: the Bridge
+// emits that code ONLY when the submitted content DIFFERS from the committed
+// wave, so it means the audit was refused, not stored. Identical content
+// already answers 200 duplicate. Both halves are pinned separately below.
 
-  const job = {
+function immutableJob(overrides = {}) {
+  const now = Date.now();
+  return {
+    version: 1,
     jobId: 'job-already-complete',
-    receipt: 'performance-m-abc-123',
+    receipt: 'performance-abc-123',
     wave: 'performance',
     project: 'VACZEN Calendar (CalendarTask)',
     conversationKey: 'c:vaczen',
-    runId: 'acb-mat-abc-123',
-    sourceRunId: 'acb-mat-abc-123',
-    materialize: true,
+    runId: 'acb-real',
+    sourceRunId: 'acb-real',
+    materialize: false,
     content: 'audit body',
     attempts: 0,
-    createdAt: Date.now(),
-    updatedAt: Date.now()
+    permanent: false,
+    errorCode: '',
+    lastError: '',
+    createdAt: now,
+    updatedAt: now,
+    ...overrides
   };
-  assert.ok(api.saveBridgeJob(job));
+}
+
+test('T-184: identical committed content answers 200 duplicate and marks the record durable', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  api.state.autoSaveAuditFiles = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+
+  const record = auditRecord();
+  assert.strictEqual(api.writeAuditResult(record), true);
+  assert.strictEqual(api.enqueueBridgeAuditRecord(record, { deferFlush: true }), true);
+  const job = api.readBridgeJob(record.bridgeReceipt);
+
+  h.httpResponder = () => ({
+    status: 200,
+    responseText: JSON.stringify({
+      ok: true,
+      duplicate: true,
+      run_id: record.runId,
+      files: ['C:/audits/AUDAPACK__01_AUDIT_CORE.md']
+    })
+  });
+
+  const pending = api.deliverBridgeJob(job);
+  await h.settle();
+  assert.strictEqual(await pending, true);
+
+  assert.strictEqual(api.readBridgeJob(job.jobId), null, 'a proven duplicate retires its delivery job');
+  const saved = api.readAuditResultFresh('core', record.conversationKey);
+  assert.ok(Number(saved.bridgeSavedAt) > 0, 'an exact duplicate IS durability proof');
+  assert.strictEqual(saved.bridgeError, '');
+});
+
+test('T-184: completed_wave_immutable is a non-retriable content conflict, never success', async () => {
+  const { h, api } = setup();
+  api.state.bridgeEnabled = true;
+  api.state.autoSaveAuditFiles = true;
+  h.gmStore.set('ai_chatbuttons_bridge_token_v1', 'test-token');
+
+  const record = auditRecord();
+  assert.strictEqual(api.writeAuditResult(record), true);
+  assert.strictEqual(api.enqueueBridgeAuditRecord(record, { deferFlush: true }), true);
+  const job = api.readBridgeJob(record.bridgeReceipt);
 
   h.httpResponder = () => ({
     status: 409,
@@ -131,7 +181,7 @@ test('T83: a wave that is already complete in the canonical run is not a failure
       ok: false,
       error: {
         code: 'completed_wave_immutable',
-        message: "Wave 'performance' is already complete in run acb-real; start a fresh run for replacement",
+        message: "Wave 'core' is already complete in run acb-real; start a fresh run for replacement",
         retriable: false
       }
     })
@@ -139,13 +189,19 @@ test('T83: a wave that is already complete in the canonical run is not a failure
 
   const pending = api.deliverBridgeJob(job);
   await h.settle();
-  const handled = await pending;
+  assert.strictEqual(await pending, false, 'a refused write is not a successful delivery');
 
-  // The end state the job wanted already exists on disk, so the job is done.
-  assert.strictEqual(handled, true);
-  assert.strictEqual(api.readBridgeJob('job-already-complete'), null);
+  const stored = api.readBridgeJob(job.jobId);
+  assert.ok(stored, 'the actionable conflict evidence must survive');
+  assert.strictEqual(stored.permanent, true);
+  assert.strictEqual(stored.errorCode, 'completed_wave_immutable');
+
+  const after = api.readAuditResultFresh('core', record.conversationKey);
+  assert.strictEqual(Number(after.bridgeSavedAt) || 0, 0, 'a rejected wave is never durable');
+  assert.ok(after.bridgeError, 'the operator-visible error must not be cleared');
+  assert.strictEqual(after.text, record.text, 'cached audit text is never discarded');
 
   const log = api.readBridgeDiagnosticLog();
-  assert.ok(log.some(entry => entry.event === 'job_already_complete'), JSON.stringify(log));
-  assert.strictEqual(log.some(entry => entry.event === 'job_failed'), false);
+  assert.strictEqual(log.some(entry => entry.event === 'job_already_complete'), false);
+  assert.ok(log.some(entry => entry.event === 'job_failed'), JSON.stringify(log));
 });

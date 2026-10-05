@@ -240,14 +240,37 @@ class TestProfileLivenessIsAboutTheProfile(unittest.TestCase):
         self.assertIn("already live", message)
         self.assertIs(opener.call_args.kwargs["new_window"], False)
 
-    def test_the_bridge_answer_remains_the_fallback_off_windows(self):
+    def test_the_method_never_consults_the_bridge_at_all(self):
+        """T-152: profile liveness is a window-enumeration answer, not a Bridge one.
+
+        The old fallback read `dispatch.active_workers` off Windows and on any
+        enumeration failure, so a foreign registered widget worker could make
+        the dedicated profile look alive. The method must not even ask.
+        """
         from audapack.services.bridge_service import BridgeService
 
         manager = self._manager()
         with patch("sys.platform", "linux"), \
-             patch.object(BridgeService, "browser_status", return_value={
-                 "ok": True, "dispatch": {"active_workers": 2}}):
-            self.assertTrue(manager._worker_profile_is_live())
+             patch.object(BridgeService, "browser_status", side_effect=AssertionError("Bridge consulted")):
+            self.assertFalse(manager._worker_profile_is_live())
+
+    @unittest.skipUnless(sys.platform == "win32", "window enumeration is Win32-only")
+    def test_bridge_workers_cannot_make_the_profile_live_on_windows(self):
+        from audapack.services.bridge_service import BridgeService
+
+        manager = self._manager()
+        with patch("audapack.window_layout.find_profile_windows", return_value=[]), \
+             patch.object(BridgeService, "browser_status", side_effect=AssertionError("Bridge consulted")):
+            self.assertFalse(manager._worker_profile_is_live())
+
+    @unittest.skipUnless(sys.platform == "win32", "window enumeration is Win32-only")
+    def test_an_enumeration_exception_fails_closed(self):
+        manager = self._manager()
+        with patch("audapack.window_layout.find_profile_windows", side_effect=OSError("injected")):
+            self.assertFalse(
+                manager._worker_profile_is_live(),
+                "an enumeration error must never read as profile liveness",
+            )
 
 
 class TestInstallerDoesNotAddAWindow(unittest.TestCase):

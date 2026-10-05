@@ -138,13 +138,18 @@ class BridgeService:
                 return {"ok": False, "error": "Archive is not the canonical current project pack artifact"}
         except (OSError, TypeError, ValueError) as exc:
             return {"ok": False, "error": f"Archive ownership check failed: {exc}"}
+        # PERF-001: the Bridge owns the queue-time digest. It reads the canonical
+        # archive anyway to validate ownership, and it must hash those same bytes
+        # exactly once to pin what the job will later verify at fetch time. A
+        # client-supplied SHA therefore only ever ADDS a comparison -- the GUI no
+        # longer reads the whole ZIP just to be told what the Bridge is about to
+        # work out for itself.
         return _browser_bridge_request(self.config, "POST", "/v1/browser/jobs", {
             "project_id": str(project.id),
             "project_name": str(project.display_name),
             "archive_filename": archive.name,
             "archive_path": str(archive.resolve()),
             "archive_size": archive.stat().st_size,
-            "archive_sha256": _sha256_file(archive),
             "profile": profile,
         })
 

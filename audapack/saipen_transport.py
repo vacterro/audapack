@@ -21,7 +21,9 @@ def is_managed(root: Path | str) -> bool:
     return (Path(root) / ".saipen").is_dir()
 
 
-def _entrypoint(root: Path) -> Path:
+def bound_entrypoint(root: Path | str) -> Path:
+    """Resolve the CLI named by this project's STATE, never a PATH install."""
+    root = Path(root).resolve()
     try:
         state = (root / ".saipen" / "STATE.md").read_text(encoding="utf-8-sig")
         front = state.split("---", 2)
@@ -43,16 +45,22 @@ def _entrypoint(root: Path) -> Path:
             raise ValueError(f"missing bound CLI: {entry}")
         return entry
     except (OSError, ValueError, TypeError) as exc:
-        raise SaipenTransportError(f"Cannot enqueue audit: {exc}. Repair the project's SAIPEN binding and retry.") from exc
+        raise SaipenTransportError(f"Invalid project SAIPEN binding: {exc}. Repair the project's SAIPEN binding and retry.") from exc
+
+
+def bound_python() -> Path:
+    """Use a console Python even when AUDAPACK itself runs under pythonw."""
+    executable = Path(sys.executable)
+    if executable.name.lower() == "pythonw.exe":
+        executable = executable.with_name("python.exe")
+    return executable
 
 
 def enqueue_file(root: Path | str, body: Path, operation_id: str, *, item_id: str = "") -> dict:
     """Retry the same producer operation, including after its layer was consumed."""
     root = Path(root).resolve()
-    entry = _entrypoint(root)
-    executable = Path(sys.executable)
-    if executable.name.lower() == "pythonw.exe":
-        executable = executable.with_name("python.exe")
+    entry = bound_entrypoint(root)
+    executable = bound_python()
     args = [str(executable), str(entry), "audit", "enqueue", "--producer", "audapack",
             "--operation-id", operation_id, "--file", str(body.resolve()),
             "--project-root", str(root), "--json"]
@@ -60,7 +68,13 @@ def enqueue_file(root: Path | str, body: Path, operation_id: str, *, item_id: st
         args.extend(["--item-id", item_id])
     try:
         expected = hashlib.sha256(body.read_bytes()).hexdigest()
-        result = run_hidden(args, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        # T-210 TARGET G: this bound SAIPEN machine call is non-interactive, so it
+        # owns its stdin instead of inheriting AUDAPACK's (which a stale handle
+        # made unusable). Defense in depth behind the parent-side fix.
+        result = run_hidden(
+            args, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             raise ValueError("CLI returned no result object")

@@ -138,8 +138,8 @@ class AuditRunsWidget(QWidget):
         actions.setSpacing(3)
         self.retry_button = QPushButton("START / RETRY", self)
         self.cancel_button = QPushButton("CANCEL", self)
-        self.abandon_button = QPushButton("FORCE UNBLOCK", self)
-        self.abandon_button.setToolTip("Mark a dead BLOCKED run FAILED so the project can start again")
+        self.abandon_button = QPushButton("STOP", self)
+        self.abandon_button.setToolTip("Stop a live audit; the run ends FAILED and the project frees up")
         self.open_button = QPushButton("OPEN RESULT", self)
         self.details_button = QPushButton("COPY DETAILS", self)
         self.reset_all_button = QPushButton("RESET ALL", self)
@@ -374,7 +374,17 @@ class AuditRunsWidget(QWidget):
         actions = set(run.actions) if run else set()
         self.retry_button.setEnabled(bool(run and actions.intersection({"RETRY", "RECOVER"})))
         self.cancel_button.setEnabled(bool(run and "CANCEL" in actions and run.dispatch_id))
-        self.abandon_button.setEnabled(bool(run and "ABANDON" in actions and run.dispatch_id))
+        # One control, one purpose: end this run. What it says depends only on
+        # what the operator is about to do irreversibly -- STOP on live
+        # post-START work, FORCE UNBLOCK on a dead post-START block. Never
+        # CANCEL, which would assert a Core was never sent.
+        if run and "ABANDON" in actions:
+            self.abandon_button.setText("FORCE UNBLOCK")
+            self.abandon_button.setToolTip("Mark a dead BLOCKED run FAILED so the project can start again")
+        else:
+            self.abandon_button.setText("STOP")
+            self.abandon_button.setToolTip("Stop a live audit; the run ends FAILED and the project frees up")
+        self.abandon_button.setEnabled(bool(run and actions.intersection({"STOP", "ABANDON"}) and run.dispatch_id))
         self.open_button.setEnabled(bool(run and "OPEN" in actions and run.handoff_path))
         self.details_button.setEnabled(bool(run))
         # A row already at an end of the line has nowhere to go, and a button
@@ -402,9 +412,13 @@ class AuditRunsWidget(QWidget):
         self._pending_dispatch_count = max(0, int(count or 0))
         self._sync_actions()
 
+    def selected_run(self):
+        """The run every action button acts on, for callers outside this widget."""
+        return self._selected()
+
     def _abandon_selected(self) -> None:
         run = self._selected()
-        if run and run.dispatch_id and "ABANDON" in set(run.actions):
+        if run and run.dispatch_id and {"STOP", "ABANDON"}.intersection(set(run.actions)):
             self.abandon_requested.emit(run.dispatch_id)
 
     def _start_selected(self) -> None:
