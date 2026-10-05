@@ -8,3 +8,7 @@
 # SAIPEN byte-bound evidence (digest-verified; never convert line endings) -- T-1508.
 .saipen/recovery/log-normalize/** -text
 .saipen/recovery/log-foreign-tail/** -text
+
+# Digest-bound shipped artifact: the release ledger records this file's bytes,
+# so a checkout must never rewrite its line endings.
+resources/AUDAPACK_WIDGET.user.js -text
