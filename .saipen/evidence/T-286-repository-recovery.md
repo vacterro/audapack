@@ -129,8 +129,14 @@ deselected:
 ## 6. Result
 
 - Old HEAD: `a37250f700ec4b93c81d36ec563675bab1c1d9d2`.
-- Recovery commit: see LOG event recorded below (HEAD after the commit).
-- 272 paths committed (the 271 curated + this receipt family).
+- Recovery commit: `db396923f9f28ccc27f90b90e8d8551a0e87d9da`
+  (`chore(recovery): capture verified AUDAPACK source of truth`), parent
+  `a37250f`. `git ls-tree HEAD` proves the critical current-wave files are in
+  HEAD's tree, not merely in the index.
+- 273 paths committed (the 271 curated + this receipt family); 95 211
+  insertions / 3 338 deletions; `git diff --diff-filter=D --name-only a37250f
+  HEAD` returns **zero paths** — nothing is deleted, every changed path is an
+  addition or a modification.
 - **Nothing pushed** — no `git push`, no PR, no tag, no `git add -A`, no
   `git clean`, no `git reset --hard`, no rebase, no pull, no history rewrite.
   `a37250f` is preserved as the parent.
