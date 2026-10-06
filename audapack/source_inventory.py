@@ -86,6 +86,9 @@ __all__ = [
     "build_pack_inventory",
     "saipen_verdict",
     "evidence_omission_reason",
+    "CODE_SOURCE_REVIEW_INCOMPLETE",
+    "component_forbidden_prefix",
+    "source_review_reconciliation",
 ]
 
 
@@ -863,6 +866,107 @@ def nested_component_manifest_section(inventory: SourceInventory) -> list[dict]:
     this feature ignores it.
     """
     return [item.manifest_record() for item in getattr(inventory, "nested_git_components", [])]
+
+
+# ---------------------------------------------------------------------------
+# Source-review reconciliation (T-274)
+# ---------------------------------------------------------------------------
+
+#: Marker code for ``issues``: the archive would not let an external reviewer
+#: read the implementation source the pack claims to carry.
+CODE_SOURCE_REVIEW_INCOMPLETE = "SOURCE_REVIEW_INCOMPLETE"
+
+#: How many reconciliation issues a manifest keeps. One is already a failure;
+#: the cap only keeps a manifest readable when a whole tree surprised us.
+MAX_SOURCE_REVIEW_ISSUES = 20
+
+
+def component_forbidden_prefix(rel: str, components: Iterable[NestedGitComponent]) -> str:
+    """The nested component a path is FORBIDDEN under, or "" for a legal path.
+
+    A canonical component is ingested as first-party SOURCE, so Git's store,
+    dependency trees and build output inside it are reproducible bulk. This is
+    the postcondition twin of ``_component_rel_is_never_archived``: the ingest
+    filter decides membership, this proves the written archive agrees.
+    """
+    for component in components:
+        prefix = component.rel + "/"
+        if rel.startswith(prefix) and _component_rel_is_never_archived(rel[len(prefix):]):
+            return component.rel
+    return ""
+
+
+def source_review_reconciliation(
+    inventory: SourceInventory,
+    *,
+    archive_members: Optional[Iterable[str]] = None,
+) -> dict:
+    """Can an external reviewer inspect this project's own source in the archive?
+
+    Returns the ``source_review`` block the archive manifests carry and the pack
+    UI shows. ``archive_members``, when given, are the ACTUAL written ZIP entry
+    names: the frozen inventory decides intent, the members prove delivery, and
+    a member list that contradicts the inventory is a failure rather than a
+    warning -- a component that is included but written empty is exactly the
+    defect this exists to catch.
+    """
+    included = inventory.included_entries()
+    components = list(getattr(inventory, "nested_git_components", []))
+    component_prefixes = {c.rel: c.rel + "/" for c in components}
+    members = list(archive_members) if archive_members is not None else None
+    rows: list[dict] = []
+    issues: list[str] = []
+
+    for component in components:
+        prefix = component_prefixes[component.rel]
+        entries = [e for e in included if e.rel.startswith(prefix)]
+        row: dict = {
+            "path": component.rel,
+            "origin": component.origin,
+            "included": bool(component.included),
+            "reason": component.reason or "",
+            "source_files": len(entries),
+            "source_bytes": sum(e.size for e in entries),
+        }
+        if component.included and not entries:
+            issues.append(
+                f"nested component {component.rel!r} is included but carries no source entry"
+            )
+        elif not component.included and not component.reason:
+            issues.append(
+                f"nested component {component.rel!r} is omitted with no recorded reason"
+            )
+        if members is not None:
+            written = [m for m in members if m.startswith(prefix)]
+            row["archive_members"] = len(written)
+            if component.included and not written:
+                issues.append(
+                    f"archive carries no member under {component.rel!r} "
+                    "although the inventory included it"
+                )
+        rows.append(row)
+
+    if inventory.entries and not included:
+        issues.append("the frozen inventory carries no included file")
+
+    if members is not None:
+        for member in members:
+            owner = component_forbidden_prefix(member, components)
+            if owner:
+                issues.append(
+                    f"reproducible bulk entered nested component {owner!r}: {member}"
+                )
+
+    review = {
+        "source_review_ready": not issues,
+        "included_files": len(included),
+        "included_bytes": sum(e.size for e in included),
+        "components": rows,
+        "issues": issues[:MAX_SOURCE_REVIEW_ISSUES],
+    }
+    if members is not None:
+        review["archive_members"] = len(members)
+    return review
 
 
 @dataclass(frozen=True)

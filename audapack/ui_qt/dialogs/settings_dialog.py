@@ -1,5 +1,6 @@
 """Qt settings widget and dialog (Wave L/M parity). No schema redesign."""
 
+import copy
 import os
 from pathlib import Path
 
@@ -29,8 +30,12 @@ from audapack.config import (
     OUTPUT_LAYOUT_CHOICES,
     OUTPUT_LAYOUT_GROUPED_BY_PRIORITY,
     OUTPUT_LAYOUT_SINGLE_FOLDER,
+    PROJECT_DOUBLE_CLICK_ACTIONS,
+    PROJECT_DOUBLE_CLICK_DEFAULT,
+    PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT,
     TOOLBAR_BUTTON_KEYS,
     LauncherConfig,
+    normalize_double_click_action,
     normalize_output_layout,
     save_config,
 )
@@ -53,6 +58,20 @@ def short_worker_label(worker: dict) -> str:
         return f"slot {slot}"
     return str(worker.get("worker_id", "?"))[:8]
 
+
+#: T-209: display labels for the project-row double-click action. The DATA is
+#: the stable persistence value (one of PROJECT_DOUBLE_CLICK_ACTIONS) -- a
+#: translated label must never reach the config file.
+_PROJECT_DOUBLE_CLICK_LABELS: dict[str, str] = {
+    "launcher": "Open preferred launcher",
+    "project_folder": "Open project folder",
+    "inaudit": "Open INAUDIT",
+    "instances": "Show Instances",
+    "terminal": "Open terminal",
+    "archive_folder": "Open archive folder",
+    "audit_folder": "Open audit folder",
+    "none": "Nothing",
+}
 
 # Human-readable labels for the output-layout combo. Keep the data value as
 # the canonical key (one of OUTPUT_LAYOUT_CHOICES) so the on-disk config is
@@ -165,10 +184,18 @@ class SettingsWidget(QWidget):
         self.fidelity_media_bytes.valueChanged.connect(lambda: self._autosave_timer.start())
         self.always_include.textChanged.connect(lambda: self._autosave_timer.start())
         self.always_exclude.textChanged.connect(lambda: self._autosave_timer.start())
+        self.auto_pack_all.toggled.connect(lambda: self._save())
+        self.auto_pack_interval.valueChanged.connect(lambda: self._autosave_timer.start())
         self.autostart.toggled.connect(self._on_autostart_toggled)
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
         self.compact_rows.toggled.connect(lambda: self._save())
+        self.project_double_click_action.currentIndexChanged.connect(
+            self._on_double_click_action_changed
+        )
+        self.project_double_click_launcher.currentIndexChanged.connect(
+            lambda: self._save()
+        )
         self.arrange_workers.toggled.connect(lambda: self._save())
         self.worker_minimized.toggled.connect(lambda: self._save())
         self.close_idle_workers.toggled.connect(lambda: self._save())
@@ -211,6 +238,38 @@ class SettingsWidget(QWidget):
         self.compact_rows = QCheckBox("Compact project rows (one line)")
         self.compact_rows.setChecked(getattr(self._config.ui, "compact_rows", False))
         f.addRow("Project rows", self.compact_rows)
+
+        # T-209: what a double-click on a POPULATED project row does. Groups
+        # still expand/collapse; empty slots still add a project.
+        self.project_double_click_action = QComboBox(w)
+        for value in PROJECT_DOUBLE_CLICK_ACTIONS:
+            self.project_double_click_action.addItem(
+                _PROJECT_DOUBLE_CLICK_LABELS.get(value, value), value
+            )
+        configured_action = normalize_double_click_action(
+            getattr(self._config.ui, "project_double_click_action", "")
+        )
+        self.project_double_click_action.setCurrentIndex(
+            max(0, self.project_double_click_action.findData(configured_action))
+        )
+        self.project_double_click_action.setToolTip(
+            "Choose what happens when a populated project row is double-clicked.\n"
+            "Groups still expand/collapse and empty slots still add a project."
+        )
+        f.addRow("Project row double-click", self.project_double_click_action)
+
+        self.project_double_click_launcher = QComboBox(w)
+        self._double_click_launcher_id = str(
+            getattr(self._config.ui, "project_double_click_launcher_id", "")
+            or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
+        )
+        self._populate_double_click_launchers()
+        self.project_double_click_launcher.setToolTip(
+            "The launcher a project-row double-click opens. Stored by launcher id,\n"
+            "so reordering the launcher list does not change it."
+        )
+        f.addRow("Double-click launcher", self.project_double_click_launcher)
+        self._sync_double_click_launcher_enabled()
 
         # Toolbar buttons, one checkbox each. The row has to fit 640px, so a
         # button nobody presses is width taken from one they do.
@@ -318,6 +377,31 @@ class SettingsWidget(QWidget):
         self.always_exclude = QLineEdit(", ".join(getattr(self._config.packing, "always_exclude", None) or []))
         self.always_exclude.setPlaceholderText("References/raw/**")
         f.addRow("Always exclude", self.always_exclude)
+        # T-167 (SRC-039): automatic PACK ALL, hourly by default, on by default.
+        self.auto_pack_all = QCheckBox("Automatic PACK ALL")
+        self.auto_pack_all.setChecked(bool(getattr(self._config.packing, "auto_pack_all_enabled", True)))
+        f.addRow("Auto pack", self.auto_pack_all)
+        self.auto_pack_interval = QSpinBox()
+        self.auto_pack_interval.setRange(5, 1440)
+        self.auto_pack_interval.setSuffix(" min")
+        self.auto_pack_interval.setValue(
+            int(getattr(self._config.packing, "auto_pack_all_interval_minutes", 60) or 60)
+        )
+        self.auto_pack_interval.setToolTip("Period between automatic PACK ALL runs (5..1440 minutes).")
+        f.addRow("Auto-pack interval", self.auto_pack_interval)
+        self.auto_pack_interval.setEnabled(self.auto_pack_all.isChecked())
+        self.auto_pack_all.toggled.connect(self.auto_pack_interval.setEnabled)
+        # T-188: clicking a real project row packs that project. A separate
+        # setting on purpose -- the periodic AUTO PACK ALL meaning stays untouched.
+        self.auto_pack_on_click = QCheckBox("Pack on project row click")
+        self.auto_pack_on_click.setChecked(
+            bool(getattr(self._config.packing, "auto_pack_on_project_click_enabled", True))
+        )
+        self.auto_pack_on_click.setToolTip(
+            "Clicking a project row in Project Room packs it in the background.\n"
+            "Selection changes, startup auto-select and drags never pack."
+        )
+        f.addRow("Pack on row click", self.auto_pack_on_click)
         return w
 
     def _build_audit(self) -> QWidget:
@@ -689,6 +773,12 @@ class SettingsWidget(QWidget):
     # ---------------------------------------------------------------- Launchers
 
     def _build_launchers(self) -> QWidget:
+        # CORE-003: the launcher tab needs to know what it was BUILT with, so a
+        # save can tell an operator edit from something the runtime persisted
+        # while the dialog was open. `_launchers_dirty` says the tab was touched
+        # at all; without it an unrelated checkbox save must not write launchers.
+        self._launcher_baseline = copy.deepcopy(list(self._config.launchers))
+        self._launchers_dirty = False
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -751,13 +841,21 @@ class SettingsWidget(QWidget):
 
     def _on_launcher_letters_toggled(self, checked: bool):
         self._config.ui.launcher_letters = bool(checked)
-        # Migrate labels to match mode for next save
-        letter_map = {"opencode": "OC", "freebuff": "FB", "cline": "CL", "main_codex": "C1", "main_codex2": "C2", "main_codex3_free": "CF"}
-        num_map = {"opencode": "1", "freebuff": "2", "cline": "3", "main_codex": "4", "main_codex2": "5", "main_codex3_free": "6"}
-        target = letter_map if checked else num_map
-        for lc in self._config.launchers:
-            if lc.id in target:
-                lc.short_label = target[lc.id]
+        # SRC-081 TARGET I: label truth is DEFAULT_SHORT_LABELS plus each
+        # launcher's own short_label -- the old double id->label maps are
+        # gone. Letters mode restores the canonical label for known built-ins
+        # (custom launchers keep the operator's own label); numeric mode
+        # writes the positional number into every entry, so the button shows
+        # exactly the Ctrl+digit position (TARGET J) -- including 10.
+        from audapack.config import DEFAULT_SHORT_LABELS
+
+        if checked:
+            for lc in self._config.launchers:
+                if lc.id in DEFAULT_SHORT_LABELS:
+                    lc.short_label = DEFAULT_SHORT_LABELS[lc.id]
+        else:
+            for position, lc in enumerate(self._config.launchers, start=1):
+                lc.short_label = str(position)
         self._refresh_launcher_list()
 
     def _refresh_launcher_list(self):
@@ -781,6 +879,58 @@ class SettingsWidget(QWidget):
                 self.launcher_list.addItem(item)
         finally:
             self._launcher_list_loading = False
+        # T-209: the double-click launcher combo mirrors the SAME list, so
+        # adding, removing, renaming or reordering a launcher keeps the
+        # selector honest. Selection is preserved by ID, never by index.
+        self._populate_double_click_launchers()
+        self._sync_double_click_launcher_enabled()
+
+    def _populate_double_click_launchers(self) -> None:
+        """Rebuild the launcher selector from ``config.launchers``, by id."""
+        combo = getattr(self, "project_double_click_launcher", None)
+        if combo is None:
+            return
+        wanted = str(
+            getattr(self, "_double_click_launcher_id", "")
+            or getattr(self._config.ui, "project_double_click_launcher_id", "")
+            or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
+        )
+        previous = combo.currentData()
+        if previous:
+            wanted = str(previous)
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            seen: set[str] = set()
+            for launcher in getattr(self._config, "launchers", []) or []:
+                lid = str(getattr(launcher, "id", "") or "").strip()
+                if not lid or lid in seen:
+                    continue
+                seen.add(lid)
+                name = str(getattr(launcher, "name", "") or lid)
+                suffix = "" if getattr(launcher, "enabled", True) else " (disabled)"
+                combo.addItem(f"{name}{suffix}", lid)
+            if wanted and wanted not in seen:
+                # Keep a deleted/unavailable selection visible instead of
+                # silently falling back to some other agent.
+                combo.addItem(f"{wanted} (unavailable)", wanted)
+        finally:
+            combo.blockSignals(False)
+        self._double_click_launcher_id = wanted
+        index = combo.findData(wanted)
+        combo.setCurrentIndex(index if index >= 0 else (0 if combo.count() else -1))
+
+    def _on_double_click_action_changed(self) -> None:
+        self._sync_double_click_launcher_enabled()
+        self._save()
+
+    def _sync_double_click_launcher_enabled(self) -> None:
+        """The launcher selector only matters for the launcher action."""
+        action_combo = getattr(self, "project_double_click_action", None)
+        launcher_combo = getattr(self, "project_double_click_launcher", None)
+        if action_combo is None or launcher_combo is None:
+            return
+        launcher_combo.setEnabled(str(action_combo.currentData() or "") == "launcher")
 
     def _on_launcher_item_changed(self, item):
         """Tick / untick a launcher -- shows or hides its row button."""
@@ -794,6 +944,7 @@ class SettingsWidget(QWidget):
         if bool(lc.enabled) == enabled:
             return
         lc.enabled = enabled
+        self._launchers_dirty = True
         self._save()
 
     def _on_launcher_rows_moved(self, *_args):
@@ -806,6 +957,7 @@ class SettingsWidget(QWidget):
             if lc:
                 new_order.append(lc)
         self._config.launchers = new_order
+        self._launchers_dirty = True
         self._refresh_launcher_list()
         self._save()
 
@@ -823,6 +975,7 @@ class SettingsWidget(QWidget):
                 max_instances=data.get("max_instances", 0),
             )
             self._config.launchers.append(new_lc)
+            self._launchers_dirty = True
             self._refresh_launcher_list()
             self._save()
 
@@ -844,6 +997,7 @@ class SettingsWidget(QWidget):
             lc.agent_type = data.get("agent_type", "powershell")
             lc.enabled = data.get("enabled", True)
             lc.max_instances = data.get("max_instances", 0)
+            self._launchers_dirty = True
             self._refresh_launcher_list()
             self._save()
 
@@ -853,6 +1007,7 @@ class SettingsWidget(QWidget):
             return
         lid = item.data(Qt.ItemDataRole.UserRole)
         self._config.launchers = [launcher for launcher in self._config.launchers if launcher.id != lid]
+        self._launchers_dirty = True
         self._refresh_launcher_list()
         self._save()
 
@@ -864,6 +1019,7 @@ class SettingsWidget(QWidget):
             self._config.launchers[row - 1],
             self._config.launchers[row],
         )
+        self._launchers_dirty = True
         self._refresh_launcher_list()
         self.launcher_list.setCurrentRow(row - 1)
         self._save()
@@ -876,6 +1032,7 @@ class SettingsWidget(QWidget):
             self._config.launchers[row + 1],
             self._config.launchers[row],
         )
+        self._launchers_dirty = True
         self._refresh_launcher_list()
         self.launcher_list.setCurrentRow(row + 1)
         self._save()
@@ -913,6 +1070,9 @@ class SettingsWidget(QWidget):
         owned.append(("packing", "fidelity_media_bytes", int(self.fidelity_media_bytes.value())))
         owned.append(("packing", "always_include", [p.strip() for p in self.always_include.text().split(",") if p.strip()]))
         owned.append(("packing", "always_exclude", [p.strip() for p in self.always_exclude.text().split(",") if p.strip()]))
+        owned.append(("packing", "auto_pack_all_enabled", bool(self.auto_pack_all.isChecked())))
+        owned.append(("packing", "auto_pack_all_interval_minutes", int(self.auto_pack_interval.value())))
+        owned.append(("packing", "auto_pack_on_project_click_enabled", bool(self.auto_pack_on_click.isChecked())))
         owned.append(("ui", "hidden_toolbar_buttons", [
             key for key, box in self.toolbar_button_checks.items() if not box.isChecked()
         ]))
@@ -940,6 +1100,20 @@ class SettingsWidget(QWidget):
         owned.append(("ui", "compact_rows", self.compact_rows.isChecked()))
         owned.append(("ui", "tooltip_duration_ms", self.tooltip_duration.value()))
         owned.append(("ui", "flash_duration_ms", self.flash_duration.value()))
+        owned.append((
+            "ui",
+            "project_double_click_action",
+            str(self.project_double_click_action.currentData() or PROJECT_DOUBLE_CLICK_DEFAULT),
+        ))
+        owned.append((
+            "ui",
+            "project_double_click_launcher_id",
+            str(
+                self.project_double_click_launcher.currentData()
+                or getattr(self, "_double_click_launcher_id", "")
+                or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
+            ),
+        ))
         return owned
 
     def _save(self):
@@ -958,7 +1132,12 @@ class SettingsWidget(QWidget):
         Nothing else in the file is touched -- not the project registry, and
         not a neighbouring field in a section this dialog happens to write.
         """
-        from audapack.config import cross_process_lock, get_registry_lock_path, load_config
+        from audapack.config import (
+            cross_process_lock,
+            get_registry_lock_path,
+            load_config,
+            merge_launcher_edits,
+        )
 
         base = getattr(self, "_base_dir", None)
         lock_path = get_registry_lock_path(base)
@@ -997,9 +1176,22 @@ class SettingsWidget(QWidget):
                     target = getattr(latest, section, None)
                     if target is not None and hasattr(target, field):
                         setattr(target, field, value)
-                latest.launchers = self._config.launchers
+                # CORE-003 (audit/12.md): this used to assign the build-time
+                # snapshot over the freshly loaded list, so ANY Settings
+                # autosave rolled back launcher resolution the runtime had
+                # persisted after the dialog opened. An untouched launcher tab
+                # now writes nothing at all; a touched one merges by id and
+                # keeps the runtime-owned resolved_* fields.
+                if self._launchers_dirty:
+                    latest.launchers = merge_launcher_edits(
+                        latest.launchers, self._config.launchers, self._launcher_baseline
+                    )
                 ok = bool(save_config(latest, base))
                 if ok:
+                    if self._launchers_dirty:
+                        self._config.launchers = copy.deepcopy(latest.launchers)
+                        self._launcher_baseline = copy.deepcopy(latest.launchers)
+                        self._launchers_dirty = False
                     # Keep the in-memory snapshot honest, or the next autosave
                     # would write back what we just merged away.
                     self._config.projects = latest.projects

@@ -8,6 +8,7 @@ Verifies:
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +19,9 @@ from PySide6.QtWidgets import QStyleOptionViewItem
 from audapack.config import AppConfig, AuditsConfig
 from audapack.models import AuditSnapshot, AuditTemperature, Project
 from audapack.services.audit_run_service import AuditRunSnapshot
+from audapack.services.events import ProjectMoveResult
 from audapack.services.project_service import ProjectService
+from audapack.ui_qt.models.project_delegate import ProjectItemDelegate
 from audapack.ui_qt.models.project_room_model import MIME_TYPE_PROJECT, ProjectRoomModel
 
 
@@ -205,8 +208,9 @@ def test_pack_failed_invalidates_archive_freshness(model_fixture, monkeypatch):
     model._get_archive_fresh(proj)
     assert proj.id in model._archive_fresh_cache
 
-    # A FAILED pack must drop the stale cached entry (partial zip moved to
-    # .PARTIAL.*; previous archive restored) so the next paint recomputes.
+    # A FAILED pack must drop the stale cached entry (the staged .part.{uuid} is
+    # unlinked and the previous archive restored from .bak.{uuid}) so the next
+    # paint recomputes.
     model.update_pack_state("p1", "PACKING")
     model.update_pack_state("p1", "FAILED", "Partial archive: 2 file(s) skipped")
     assert proj.id not in model._archive_fresh_cache
@@ -214,6 +218,46 @@ def test_pack_failed_invalidates_archive_freshness(model_fixture, monkeypatch):
     # And the fresh entry is recomputed on the next read.
     model._get_archive_fresh(proj)
     assert proj.id in model._archive_fresh_cache
+
+
+def test_failed_pack_exact_reason_reaches_info_and_hover(model_fixture):
+    model, _service, _config, _tmp_path = model_fixture
+    failure = (
+        "SAIPEN audit-manifest precondition failed "
+        "(AUDIT_MANIFEST_STALE_REGENERATION_FAILED): manifest is stale; "
+        "regeneration failed: launcher discovery found no executable"
+    )
+
+    model.update_pack_state("p1", "FAILED", failure)
+    index = model.index_for_project_id("p1")
+    hover = model.data(index, model.ROLES["hover_info"])
+
+    assert hover["pack_state"] == "FAILED"
+    assert hover["pack_message"] == failure
+    html = ProjectItemDelegate.build_tooltip(hover)
+    assert "FAILED" in html
+    assert failure in html
+
+
+def test_compute_uses_pack_hot_proof_before_bounded_probe(model_fixture, monkeypatch):
+    import audapack.ui_qt.models.project_room_model as module
+
+    model, service, _config, tmp_path = model_fixture
+    project = service.get_project("p1")
+    source = tmp_path / "p1"
+    source.mkdir()
+    (source / "app.py").write_text("print('x')\n", encoding="utf-8")
+    archive = tmp_path / "p1.zip"
+    archive.write_bytes(b"zip")
+    monkeypatch.setattr(module, "find_archive_for_project", lambda *_args: archive)
+    monkeypatch.setattr(module.hot_freshness, "lookup", lambda *_args: object())
+
+    def forbidden_probe(*_args, **_kwargs):
+        raise AssertionError("hot proof must avoid the bounded source probe")
+
+    monkeypatch.setattr(module, "probe_archive_freshness", forbidden_probe)
+    entry = model._compute_archive_fresh(project)
+    assert entry["archive_freshness"] == "FRESH"
 
 
 def test_archive_freshness_cache_ttl(model_fixture, monkeypatch):
@@ -224,7 +268,7 @@ def test_archive_freshness_cache_ttl(model_fixture, monkeypatch):
     entry = model._get_archive_fresh(proj)
     assert entry["exists"] is False
     assert entry["freshness_short"] == "none"
-    assert entry["source_older"] is None
+    assert entry["archive_freshness"] == "UNKNOWN"
 
     # Second read within TTL must reuse the cached entry (no recompute)
     model._archive_fresh_cache[proj.id]["computed_at"] = 0.0  # force expiry
@@ -341,8 +385,7 @@ def test_get_archive_info_uses_cached_data_no_stat(model_fixture, monkeypatch):
         "created_str": "12.08.26",
         "temperature": "COLD",
         "sync_status": "SYNCED",
-        "source_mtime": None,
-        "source_older": None,
+        "archive_freshness": "UNKNOWN",
         "freshness_short": "stale",
     }
     model._archive_fresh_cache[proj.id] = cached
@@ -358,28 +401,54 @@ def test_get_archive_info_uses_cached_data_no_stat(model_fixture, monkeypatch):
     assert path == tmp_path / "p1.zip"
 
 
-def test_probe_source_mtime_incomplete_yields_source_older_none(model_fixture, monkeypatch):
-    """PERF-001: a budget-exhausted source traversal must not set source_older,
-    preventing a false 'source is older' conclusion from an incomplete scan."""
+def test_excluded_weight_neither_marks_stale_nor_eats_the_probe_budget(model_fixture):
+    """PERF-002 (audit/9.md): the old raw os.walk stat-ed material the packer
+    excludes, so a newer node_modules/cache.js reported STALE and >1,000
+    excluded files could consume the whole 1,000-entry budget and prevent any
+    verdict. The canonical probe prunes excluded trees before stat-ing them."""
+    import os as _os
+    import time as _time
 
     model, service, _cfg, tmp_path = model_fixture
     proj = service.registry.get_project_by_id("p1")
 
-    # Set output_dir so the archive finder looks in tmp_path.
     service.config.packing.output_dir = str(tmp_path)
-    arc = tmp_path / "p1.zip"
-    arc.write_text("fake", encoding="utf-8")
-
-    # Over 2000 files in source so the budget cap kicks in.
     src_dir = tmp_path / "p1"
     src_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(2000):
-        (src_dir / f"file_{i}.txt").write_text("x", encoding="utf-8")
+    (src_dir / "app.py").write_text("print(1)", encoding="utf-8")
 
+    from audapack.services.packing_service import PackingService
+
+    packer = PackingService(config=service.config, base_dir=service.base_dir)
+    packed = packer.pack_project("p1")
+    assert packed.success, packed.error_message
+    arc = Path(packed.output_path)
+
+    # 1,200 files that the packer excludes, every one newer than the archive.
+    noise = src_dir / "node_modules"
+    noise.mkdir()
+    stamp = arc.stat().st_mtime + 600
+    for i in range(1200):
+        f = noise / f"cache_{i}.js"
+        f.write_text("x", encoding="utf-8")
+        _os.utime(f, (stamp, stamp))
+    _os.utime(src_dir, (arc.stat().st_mtime - 60, arc.stat().st_mtime - 60))
+    _os.utime(noise, (arc.stat().st_mtime - 60, arc.stat().st_mtime - 60))
+
+    model._archive_fresh_cache.clear()
     entry = model._compute_archive_fresh(proj)
     assert entry["exists"] is True, "archive must be found"
-    # With >1000 files the scan is incomplete -> source_older must be None.
-    assert entry["source_older"] is None, "incomplete scan must not claim source is older"
+    assert entry["archive_freshness"] == "FRESH", (
+        "excluded material must neither mark the archive stale nor consume the budget"
+    )
+
+    # An INCLUDED file newer than the archive is real staleness.
+    included = src_dir / "app.py"
+    _os.utime(included, (stamp, stamp))
+    model._archive_fresh_cache.clear()
+    entry = model._compute_archive_fresh(proj)
+    assert entry["archive_freshness"] == "STALE"
+    assert _time.time() > 0
 
 
 def test_archive_age_reads_the_cached_mtime_and_a_live_clock(model_fixture):
@@ -398,7 +467,7 @@ def test_archive_age_reads_the_cached_mtime_and_a_live_clock(model_fixture):
         "computed_at": time.time(), "exists": True, "path": Path("x.zip"),
         "mtime": time.time() - 3600 * 3, "size_str": "1 MB", "created_str": "",
         "temperature": AuditTemperature.NONE, "sync_status": "SYNCED",
-        "source_mtime": None, "source_older": False, "freshness_short": "stale",
+        "archive_freshness": "FRESH", "freshness_short": "stale",
     }
     assert model.data(idx, model.ROLES["archive_age_str"]) == "3h"
 
@@ -477,45 +546,121 @@ def test_the_paint_path_never_walks_a_source_tree(model_fixture, monkeypatch):
     def forbidden_walk(*args, **kwargs):
         raise AssertionError("the paint path walked a source tree")
 
-    monkeypatch.setattr(module.ProjectRoomModel, "_probe_source_mtime", forbidden_walk)
+    # PERF-002 (audit/9.md): the walk is the canonical freshness probe now, so
+    # the paint-path guard is proven against THAT symbol.
+    monkeypatch.setattr(module, "probe_archive_freshness", forbidden_walk)
 
     # No source dir in this fixture, so use the compute guard directly: the
     # probe_source flag must skip the walk branch entirely.
     entry = model._compute_archive_fresh(proj, probe_source=False)
-    assert entry["source_older"] is None
-    assert entry["source_mtime"] is None
+    assert entry["archive_freshness"] == "UNKNOWN"
 
 
-def test_an_observed_newer_file_is_stale_evidence_even_on_a_partial_walk():
-    """PERF-001: refusing positive evidence created a never-verdict loop.
+def test_an_observed_newer_included_file_is_stale_evidence_from_a_prefix(model_fixture):
+    """PERF-002 (audit/9.md): a newer INCLUDED file settles STALE without the
+    walk having to finish. The predecessor discarded evidence it had already
+    seen whenever its 1,000-entry budget was exhausted, so >1,000-file projects
+    paid the scan every TTL cycle and never reached a verdict at all."""
+    import os as _os
 
-    The probe caps at 1,000 files / 0.15 s. For a bigger tree the walk always
-    came back complete=False, and the old code discarded even a file it had
-    actually SEEN newer than the archive -- so >1,000-file projects paid the
-    scan every TTL cycle and never got a freshness answer. Measured: 24 probes
-    on a 1,200-file tree = 160.58 ms, all complete=False.
-    """
-    import shutil
-    import tempfile
-    import time as _time
+    model, service, _cfg, tmp_path = model_fixture
+    proj = service.registry.get_project_by_id("p1")
+    service.config.packing.output_dir = str(tmp_path)
 
-    from audapack.ui_qt.models.project_room_model import ProjectRoomModel
+    src_dir = tmp_path / "p1"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(1200):
+        (src_dir / f"f{i}.txt").write_text("x", encoding="utf-8")
 
-    tmp = Path(tempfile.mkdtemp())
-    try:
-        source = tmp / "proj"
-        source.mkdir()
-        # Enough files to exhaust the 1,000-file cap.
-        for i in range(1200):
-            (source / f"f{i}.txt").write_text("x", encoding="utf-8")
-        import os as _os
-        newer = source / "f1199.txt"
-        stamp = _time.time() + 10_000
-        _os.utime(newer, (stamp, stamp))
+    from audapack.services.packing_service import PackingService
 
-        model = ProjectRoomModel.__new__(ProjectRoomModel)
-        mt, complete = model._probe_source_mtime(source)
-        assert complete is False, "the fixture must exercise the budget-cut path"
-        assert mt is not None and mt > _time.time() + 5_000, "the newer file was not observed"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    packer = PackingService(config=service.config, base_dir=service.base_dir)
+    packed = packer.pack_project("p1")
+    assert packed.success, packed.error_message
+    arc = Path(packed.output_path)
+
+    stamp = arc.stat().st_mtime + 600
+    _os.utime(src_dir / "f1199.txt", (stamp, stamp))
+    _os.utime(src_dir, (arc.stat().st_mtime - 60, arc.stat().st_mtime - 60))
+
+    model._archive_fresh_cache.clear()
+    entry = model._compute_archive_fresh(proj)
+    assert entry["archive_freshness"] == "STALE", "observed newer include is sufficient evidence"
+
+def test_optimistic_move_rolls_back_from_registry_without_a_model_reset(model_fixture,
+                                                                       monkeypatch):
+    """T-19: the drop is optimistic, the persist can fail, and the rollback to
+    the authoritative registry is itself targeted (zero model resets)."""
+    model, service, _config, _tmp_path = model_fixture
+    p1 = model.project_by_id("p1")
+    assert p1 is not None
+    before = model.model_reset_count
+
+    # Optimistic in-memory move p1 MAIN0/1 -> SIDE0/2 (nothing persisted).
+    model.apply_project_move("MAIN0", 1, "SIDE0", 2, p1)
+    assert model.project_at("SIDE0", 2).id == "p1"
+    assert model.project_at("MAIN0", 1) is None
+    assert model.model_reset_count == before, "optimistic move must not reset"
+
+    # The persistence worker fails, so the registry still holds the old row.
+    monkeypatch.setattr(service, "move_project",
+                        lambda *_a, **_k: ProjectMoveResult(project_id="p1", ok=False))
+
+    # Lane end: reconcile from the authoritative registry (CORE-004 E4/E5).
+    model.reconcile_arrangement()
+
+    assert model.project_at("MAIN0", 1).id == "p1"
+    assert model.project_at("SIDE0", 2) is None
+    assert model.model_reset_count == before, "rollback must not reset"
+
+def test_single_project_audit_event_emits_one_row_data_changed(model_fixture):
+    """T-21: an audit event for ONE project must repaint ONE row, in the right
+    group, and must not touch the rest of the room."""
+    model, _service, _config, _tmp_path = model_fixture
+    g0 = model.index(0, 0, QModelIndex())
+    assert model.data(g0, Qt.ItemDataRole.DisplayRole) == "MAIN0"
+
+    seen = []
+    model.dataChanged.connect(lambda tl, br, *_: seen.append((tl, br)))
+    before = model.model_reset_count
+
+    model.update_audit_snapshot("p3", AuditSnapshot(
+        project_id="p3", project_name="Project 3", completed_waves=3,
+        audit_timestamp=datetime.now(), temperature=AuditTemperature.HOT))
+
+    assert len(seen) == 1, f"expected one dataChanged, got {len(seen)}"
+    top_left, bottom_right = seen[0]
+    assert top_left.row() == bottom_right.row(), "dataChanged range is not a single row"
+    assert top_left.parent() == bottom_right.parent(), "dataChanged spans two groups"
+    assert top_left.internalId() == model._groups.index("SIDE0") + 1  # internalId is group_index + 1
+    assert model.data(top_left, model.ROLES["project_id"]) == "p3"
+    # The untouched MAIN0 row keeps its own identity; nothing was repainted as p3.
+    assert model.data(model.index(0, 0, g0), model.ROLES["project_id"]) == "p1"
+    assert model.model_reset_count == before
+
+
+def test_temperature_tick_reads_nothing_from_disk(model_fixture, monkeypatch):
+    """T-21: a temperature tick is pure arithmetic on stored snapshots. Any
+    filesystem call under the project root during the tick fails the test."""
+    model, _service, _config, tmp_path = model_fixture
+    model.update_audit_snapshot("p1", AuditSnapshot(
+        project_id="p1", project_name="Project 1", completed_waves=3,
+        audit_timestamp=datetime.now(), temperature=AuditTemperature.HOT))
+
+    import io
+
+    def _forbidden(where):
+        def _raise(*args, **kwargs):
+            raise AssertionError(f"temperature tick touched the filesystem via {where}: {args[:1]!r}")
+        return _raise
+
+    # pathlib goes through io.open, not builtins.open, so both are sealed. The
+    # seal is scoped: pytest's tmp_path cleanup must still be able to scan.
+    with monkeypatch.context() as seal:
+        for name in ("stat", "scandir", "listdir", "open", "walk"):
+            seal.setattr(os, name, _forbidden(f"os.{name}"))
+        seal.setattr(io, "open", _forbidden("io.open"))
+        model.update_temperature_all(now=datetime.now() + timedelta(hours=80))
+
+    idx = model.index_for_slot("MAIN0", 1)
+    assert model.data(idx, model.ROLES["audit_temperature"]) == AuditTemperature.COLD

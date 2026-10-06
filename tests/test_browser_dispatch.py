@@ -1,6 +1,7 @@
 """SRC-005 browser dispatcher domain regressions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -25,8 +26,10 @@ from audapack.bridge.browser_dispatch import (
     MAX_ACTIVE_WORKERS,
     POST_START_RECOVERY_GRACE_SECONDS,
     TERMINAL_ACK_WINDOW_SECONDS,
+    TERMINAL_STATES,
     WORKER_AUDITING,
     WORKER_FREE,
+    WORKER_RESERVED,
     WORKER_TTL_SECONDS,
     BrowserDispatcher,
     DispatchError,
@@ -347,13 +350,16 @@ def test_full_lifecycle_frees_worker(tmp_path):
     item = d.enqueue_job(job_payload(path))
     lease = d.claim_job("w1")
     handoff = tmp_path / "PROJECT__00_AUDIT_ALL_3.md"
-    handoff.write_text("final", encoding="utf-8")
+    handoff_bytes = b"final"
+    handoff.write_bytes(handoff_bytes)
     for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING, JOB_COMPLETE):
-        # W2-004: terminal COMPLETE needs proof. A worker ACK carrying a handoff
-        # that exists is proof; an empty one is not (see the tests below).
+        # W2-004: terminal COMPLETE needs proof; T-156: a readable artifact
+        # without a declared digest is a claim, not proof, so the digest rides
+        # with the ACK.
         extra = {"campaign_run_id": "run", "start_receipt": "receipt-start"}
         if state == JOB_COMPLETE:
             extra["final_handoff_path"] = str(handoff)
+            extra["final_handoff_sha256"] = hashlib.sha256(handoff_bytes).hexdigest()
         d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, extra)
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
     assert d.status()["free_workers"] == 1
@@ -696,6 +702,76 @@ def test_abandon_frees_a_stuck_post_start_blocked_project(tmp_path):
     # Project lane is free again: a fresh dispatch is accepted.
     fresh = d.enqueue_job(job_payload(path))
     assert fresh.state == JOB_QUEUED
+
+
+def auditing_live(d, path, name="PROJECT"):
+    """A dispatch in the exact state the operator-stop handshake retires.
+
+    SRC-098: an explicit operator A3 OFF on a managed worker issues one
+    `abandon` against a dispatch that is mid-audit, not against a blocked one.
+    The blocked path had coverage; the live AUDITING path is the one the widget
+    actually calls, so it needs its own proof that the Bridge accepts it.
+    """
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path, name))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_STARTED)
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_AUDITING)
+    return item, lease
+
+
+def test_abandon_retires_a_live_auditing_dispatch_for_an_operator_stop(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    item, _lease = auditing_live(d, path)
+    assert d.get_job(item.dispatch_id).state == JOB_AUDITING
+
+    job = d.abandon_job(item.dispatch_id, "operator stopped A3")
+    assert job.state == JOB_FAILED, "an operator stop must retire a live lane terminally"
+    assert job.state in TERMINAL_STATES, "a retired lane must not still be treated as active ownership"
+    assert job.last_error_code == "operator_abandoned"
+    assert "operator stopped A3" in job.error
+    # Post-start lineage survives: the run stays inspectable in Audit Runs and
+    # says plainly that a Core may already have been sent.
+    assert job.campaign_run_id == "run" and job.start_receipt == "receipt"
+    # The worker is not pinned out of the pool behind a run nobody is driving.
+    assert job.assigned_worker_id == "" and job.lease_id == "" and job.lease_expires_at == 0.0
+    # The retired dispatch is never handed out again, and the project lane
+    # accepts new work.
+    assert d.claim_job("w1") is None, "an abandoned live dispatch must never produce a second Core"
+    fresh = d.enqueue_job(job_payload(path, "OTHER"))
+    assert fresh.state == JOB_QUEUED
+
+
+def test_abandon_of_a_live_dispatch_is_idempotent_for_repeat_operator_clicks(tmp_path):
+    """Milestone E: repeated OFF clicks and a resumed retry must converge.
+
+    The widget re-issues the stop on a reload before the acknowledgement, so
+    the Bridge has to treat a second call as an ACK rather than a contradiction.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    item, _lease = auditing_live(d, path)
+    first = d.abandon_job(item.dispatch_id, "operator stopped A3")
+    again = d.abandon_job(item.dispatch_id, "operator stopped A3")
+    assert again.state == first.state == JOB_FAILED
+    assert again.completed_at == first.completed_at, "a repeated stop rewrote the terminal record"
+
+
+def test_abandon_of_a_live_dispatch_keeps_the_pre_start_refusal_boundary(tmp_path):
+    """Abandon stays post-start only: pre-START work is cancelled, not abandoned."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    leased = d.claim_job("w1") if d.enqueue_job(job_payload(path, "PROJECT")) else None
+    with pytest.raises(DispatchError) as refused:
+        d.abandon_job(leased.dispatch_id)
+    assert refused.value.code == "invalid_transition"
+    with pytest.raises(DispatchError) as unknown:
+        d.abandon_job("dsp-0000000000000000")
+    assert unknown.value.code == "unknown_job"
 
 
 def test_abandon_is_idempotent_and_refuses_non_blocked_runs(tmp_path):
@@ -1338,9 +1414,11 @@ def test_a_started_run_can_complete_directly(tmp_path):
         d.transition_job(item.dispatch_id, "w1", lease.lease_id, state,
                          {"campaign_run_id": "run", "start_receipt": "receipt"})
     handoff = tmp_path / "PROJECT__00_AUDIT_ALL_3.md"
-    handoff.write_text("final", encoding="utf-8")
+    handoff_bytes = b"final"
+    handoff.write_bytes(handoff_bytes)
     d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
         "campaign_run_id": "run", "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(handoff_bytes).hexdigest(),
     })
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
 
@@ -2457,6 +2535,53 @@ def test_a_legacy_job_with_no_id_is_still_reachable_by_name(tmp_path):
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
 
 
+def test_a_name_only_close_never_reaches_a_job_by_its_id(tmp_path):
+    """T-272 (saitest TEST-001): an empty id must not borrow the name's domain.
+
+    T-160 closed the caller-has-id direction but left `job_id == wanted_name`
+    live, so a caller holding no id compared a job's canonical ID against its
+    own NAME -- the same cross-domain collision W2-003 removed on the other
+    side. reconcile_finished_campaigns reaches it with a legacy record's empty
+    project_id; server.py reaches it when a submitted name does not resolve.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+
+    foreign = d.enqueue_job(dict(job_payload(path), project_id="beta", project_name="gamma"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+        d.transition_job(foreign.dispatch_id, "w1", lease.lease_id, state,
+                         {"campaign_run_id": "run", "start_receipt": "receipt"})
+
+    assert d.complete_runs_for_project("", "beta", "/final.md", "abc") == 0
+    assert d.get_job(foreign.dispatch_id).state == JOB_AUDITING
+    assert d.get_job(foreign.dispatch_id).final_handoff_path == ""
+
+
+def test_a_name_only_close_still_reaches_the_legacy_record_it_names(tmp_path):
+    """The safe half survives: no id on either side is still name-vs-name."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(supported_worker("w1"))
+    d.register_worker(supported_worker("w2"))
+
+    legacy = d.enqueue_job(job_payload(path, "LEGACY"))
+    foreign = d.enqueue_job(dict(job_payload(path), project_id="beta", project_name="gamma"))
+    for worker_id, item in (("w1", legacy), ("w2", foreign)):
+        lease = d.claim_job(worker_id)
+        if lease is None:
+            continue
+        for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED, JOB_STARTED, JOB_AUDITING):
+            d.transition_job(item.dispatch_id, worker_id, lease.lease_id, state,
+                             {"campaign_run_id": "run", "start_receipt": "receipt"})
+    d.get_job(legacy.dispatch_id).project_id = ""
+
+    assert d.complete_runs_for_project("", "legacy", "/final.md", "abc") == 1
+    assert d.get_job(legacy.dispatch_id).state == JOB_COMPLETE
+    assert d.get_job(foreign.dispatch_id).state == JOB_AUDITING
+
+
 def test_the_id_match_is_case_folded_like_before(tmp_path):
     d = dispatcher(tmp_path)
     path = archive(tmp_path)
@@ -2765,6 +2890,28 @@ def test_a_forged_handoff_path_is_not_proof(tmp_path):
     assert d.get_job(item.dispatch_id).state == JOB_FINALIZING
 
 
+def test_an_artifact_with_no_declared_digest_is_not_proof(tmp_path):
+    """T-156 (SRC-036): a readable file nobody committed to is a claim.
+
+    Bytes can be truncated, foreign, or swapped after the fact; "it exists"
+    was the whole proof. The lane holds at FINALIZING until the durable
+    campaign probe or the Bridge's own finalize path (which carry digests)
+    closes it.
+    """
+    d = dispatcher(tmp_path)
+    item, lease = _to_started(d, tmp_path, "NODIG")
+    handoff = tmp_path / "NODIG__00_AUDIT_ALL_3.md"
+    handoff.write_text("truncated or foreign bytes", encoding="utf-8")
+
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
+        "final_handoff_path": str(handoff),
+    })
+    job = d.get_job(item.dispatch_id)
+    assert job.state == JOB_FINALIZING, "an existing file without a declared digest closed the lane"
+    assert job.assigned_worker_id == "w1", "the lane was released without a digest"
+    assert job.final_handoff_path == "", "the uncommitted artifact was recorded as proof"
+
+
 def test_a_wrong_digest_is_not_proof(tmp_path):
     d = dispatcher(tmp_path)
     item, lease = _to_started(d, tmp_path, "BADSHA")
@@ -2779,8 +2926,6 @@ def test_a_wrong_digest_is_not_proof(tmp_path):
 
 
 def test_a_real_handoff_with_a_matching_digest_closes_the_lane(tmp_path):
-    import hashlib
-
     d = dispatcher(tmp_path)
     item, lease = _to_started(d, tmp_path, "GOODSHA")
     handoff = tmp_path / "GOODSHA__00_AUDIT_ALL_3.md"
@@ -2832,9 +2977,11 @@ def test_an_already_complete_dispatch_acks_idempotently(tmp_path):
     d = dispatcher(tmp_path)
     item, lease = _to_started(d, tmp_path, "REACK")
     handoff = tmp_path / "REACK__00_AUDIT_ALL_3.md"
-    handoff.write_text("final", encoding="utf-8")
+    handoff_bytes = b"final"
+    handoff.write_bytes(handoff_bytes)
     d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_COMPLETE, {
         "final_handoff_path": str(handoff),
+        "final_handoff_sha256": hashlib.sha256(handoff_bytes).hexdigest(),
     })
     assert d.get_job(item.dispatch_id).state == JOB_COMPLETE
 
@@ -2843,3 +2990,259 @@ def test_an_already_complete_dispatch_acks_idempotently(tmp_path):
     job = d.get_job(item.dispatch_id)
     assert job.state == JOB_COMPLETE
     assert job.final_handoff_path == str(handoff)
+
+# ---------------------------------------------------------------------------
+# PERF-003 (audit/10.md): worker retirement owns the reload-dedup entry
+# ---------------------------------------------------------------------------
+
+
+def test_retirement_clears_the_reload_dedup_entry(tmp_path, monkeypatch):
+    """Every worker-removal path must reclaim its ``worker:<id>`` dedup key.
+
+    PERF-003 reproduction: expiry removed the worker from ``_workers`` and left
+    the reload-ask entry behind, so the auxiliary map accumulated one immortal
+    key per stale browser session ever observed (5,000 sessions -> 5,000
+    entries after every live worker was gone).
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    record = d.register_worker(_stale_widget_worker("w-expire", slot=1))
+    assert d.should_ask_widget_reload(record) is True
+    assert "worker:w-expire" in d._widget_reload_asked
+
+    lose_worker(d, "w-expire")
+    d._expire_workers()
+
+    assert "w-expire" not in d._workers
+    assert "worker:w-expire" not in d._widget_reload_asked, (
+        "expiry must retire both the worker and its reload-dedup entry"
+    )
+
+
+def test_offline_registration_clears_the_reload_dedup_entry(tmp_path, monkeypatch):
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    record = d.register_worker(_stale_widget_worker("w-offline", slot=1))
+    assert d.should_ask_widget_reload(record) is True
+
+    offline = _stale_widget_worker("w-offline", slot=1)
+    offline["state"] = "OFFLINE"
+    d.register_worker(offline)
+
+    assert "w-offline" not in d._workers
+    assert "worker:w-offline" not in d._widget_reload_asked
+
+
+def test_the_reload_dedup_map_is_bounded_even_without_retirement(tmp_path, monkeypatch):
+    """A missed retirement path can never turn the dedup map into an unbounded leak."""
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    bound = bd.RELOAD_ASK_BOUND
+    for index in range(bound + 250):
+        # Each registration is a distinct slot-less session and is retired by
+        # the next one only through the explicit helper; here the map is
+        # exercised directly through the public ask path.
+        record = d.register_worker(_stale_widget_worker(f"w{index}", slot=1))
+        d.should_ask_widget_reload(record)
+    assert len(d._widget_reload_asked) <= bound
+
+
+def test_five_thousand_unique_sessions_leave_no_retained_dedup_entries(tmp_path, monkeypatch):
+    """The exact PERF-003 reproduction: churn 5,000 sessions to expiry.
+
+    Before the fix: ``workers_after_expiry=0`` and ``reload_asked_entries=5000``.
+    After: both the live registry and the dedup structure return to their
+    declared bound, exercising the register -> ask -> expiry path.
+    """
+    import audapack.bridge.browser_dispatch as bd
+
+    monkeypatch.setattr(bd, "_get_required_widget_build", lambda: "0.0.9")
+    d = dispatcher(tmp_path)
+    for index in range(5000):
+        record = d.register_worker(_stale_widget_worker(f"session-{index}", slot=1))
+        d.should_ask_widget_reload(record)
+        lose_worker(d, f"session-{index}")
+        d._expire_workers()
+
+    assert len(d._workers) == 0
+    assert len(d._widget_reload_asked) == 0, (
+        f"reload-dedup entries must return to their bound, got {len(d._widget_reload_asked)}"
+    )
+
+
+def test_structural_prestart_block_records_its_exact_code_once(tmp_path):
+    """T-248: a deterministic DOM incompatibility must not spend the whole retry
+    budget and then report one opaque row per project."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    leased = d.claim_job("w1")
+    d.transition_job(item.dispatch_id, "w1", leased.lease_id, JOB_ARTIFACT_FETCHED)
+
+    blocked = d.transition_job(item.dispatch_id, "w1", leased.lease_id, JOB_BLOCKED, {
+        "error": "upload-input-unavailable",
+        "detail": "composer=form attach=1 file_inputs=0 verdict=upload-input-unavailable",
+    })
+    assert blocked.state == JOB_BLOCKED
+    # The code stays comparable; the observation lives in the human-facing text.
+    assert blocked.last_error_code == "upload-input-unavailable"
+    assert blocked.error == (
+        "upload-input-unavailable | composer=form attach=1 file_inputs=0 "
+        "verdict=upload-input-unavailable"
+    )
+    # No retry was spent: the structural verdict is reached on the first look.
+    assert blocked.retry_count == 0
+
+
+def test_retryable_prestart_keeps_a_comparable_code_with_its_detail(tmp_path):
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path))
+    leased = d.claim_job("w1")
+
+    retried = d.transition_job(item.dispatch_id, "w1", leased.lease_id, JOB_RETRYABLE, {
+        "error": "file-injection-rejected",
+        "detail": "setNativeFileList() refused the assignment",
+    })
+    assert retried.last_error_code == "file-injection-rejected"
+    assert retried.error.startswith("file-injection-rejected | ")
+
+
+def test_worker_heartbeat_reports_the_live_upload_topology(tmp_path):
+    """T-248: the live composer shape is evidence the Bridge holds, not a guess."""
+    d = dispatcher(tmp_path)
+    d.register_worker({**worker("w1"), "upload_topology": "composer=form file_inputs=0 verdict=upload-input-unavailable"})
+    record = next(item for item in d.list_workers() if item.worker_id == "w1")
+    assert record.meta["upload_topology"] == "composer=form file_inputs=0 verdict=upload-input-unavailable"
+
+
+def started_live(d, path, name="PROJECT", wid="w1"):
+    """A dispatch that has crossed the fence: START_PREPARED, then STARTED.
+
+    The exact live shape of dsp-731c7e06fc82469a, where the Start poll re-asserted
+    STARTED while the Core was still sitting in the composer.
+    """
+    d.register_worker(worker(wid))
+    item = d.enqueue_job(job_payload(path, name))
+    lease = d.claim_job(wid)
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED):
+        d.transition_job(item.dispatch_id, wid, lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "startcore-1"})
+    return d.transition_job(item.dispatch_id, wid, lease.lease_id, JOB_STARTED), lease
+
+
+def test_the_start_fence_ack_is_idempotent_after_start(tmp_path):
+    """A repeated START_PREPARED ACK must not be refused as an illegal backwards move.
+
+    The widget asks for the same durable acknowledgement before the one
+    irreversible Send click. When a poll has already advanced the dispatch to
+    STARTED, the retry hit `dispatch ... cannot move STARTED -> START_PREPARED`,
+    the widget read `ok: false` as "the fence refused", stood down, and the lane
+    stayed pinned in STARTED with the Core never sent -- measured live on
+    dsp-731c7e06fc82469a after a 409s bounded Send wait.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    job, lease = started_live(d, path)
+    assert job.state == JOB_STARTED
+    ack = d.transition_job(
+        job.dispatch_id, "w1", lease.lease_id, JOB_START_PREPARED,
+        {"campaign_run_id": "run", "start_receipt": "startcore-1"},
+    )
+    assert ack.state == JOB_STARTED, "the retry must not walk the dispatch back over the fence"
+    assert ack.start_receipt == "startcore-1"
+
+
+def test_the_start_fence_ack_stays_idempotent_all_the_way_to_finalizing(tmp_path):
+    """Same receipt, every post-fence state: still a no-op, never a refusal."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    job, lease = started_live(d, path)
+    for state in (JOB_AUDITING, JOB_FINALIZING):
+        d.transition_job(job.dispatch_id, "w1", lease.lease_id, state, {})
+        ack = d.transition_job(
+            job.dispatch_id, "w1", lease.lease_id, JOB_START_PREPARED,
+            {"campaign_run_id": "run", "start_receipt": "startcore-1"},
+        )
+        assert ack.state == state
+
+
+def test_a_conflicting_start_receipt_is_still_refused(tmp_path):
+    """Idempotency covers the SAME receipt only. A second, different claim is a lie."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    job, lease = started_live(d, path)
+    with pytest.raises(DispatchError) as exc:
+        d.transition_job(
+            job.dispatch_id, "w1", lease.lease_id, JOB_START_PREPARED,
+            {"campaign_run_id": "run", "start_receipt": "startcore-SOMEONE-ELSE"},
+        )
+    assert exc.value.code == "invalid_transition"
+    assert d.get_job(job.dispatch_id).state == JOB_STARTED
+
+
+def test_abandoning_a_live_started_run_frees_its_window(tmp_path):
+    """Abandon ends the run, so it must also end the window's reservation.
+
+    dsp-731c7e06fc82469a was abandoned while STARTED and the job went terminal
+    FAILED, but `audapack-managed-1-1-38cc4539nicy9c` stayed RESERVED/OCCUPIED
+    and page_eligible=false forever after: one clean window existed and the
+    campaign still could not start. Every other terminal path here
+    (complete_for_run, mark_complete) frees the worker; abandon did not.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    job, lease = started_live(d, path)
+    d.abandon_job(job.dispatch_id, "widget stood down")
+    record = next(item for item in d.list_workers() if item.worker_id == "w1")
+    assert record.state == WORKER_FREE, "an abandoned run must not keep its window reserved"
+    assert record.campaign_run_id == ""
+
+
+def test_a_window_heartbeating_a_terminal_dispatch_is_released(tmp_path):
+    """Retiring a dispatch must release the window that still reports its lease.
+
+    `owned_job` stops naming a terminal job, so the widget's only signal is the
+    lease it keeps reporting, and it kept answering RESERVED: after
+    dsp-c6763cc27a1242a9 was abandoned FAILED its window stayed RESERVED with
+    page_eligible=false and no honest way back except killing Chrome.
+    """
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    job, lease = started_live(d, path)
+    lease_id = lease.lease_id
+    d.abandon_job(job.dispatch_id, "operator abandoned a stuck post-start run")
+    record = d.register_worker({
+        **worker("w1"),
+        "state": WORKER_RESERVED,
+        "dispatch_id": job.dispatch_id,
+        "lease_id": lease_id,
+    })
+    assert record.state == WORKER_FREE
+    assert record.meta["reports_lease"] is False
+
+
+def test_a_window_heartbeating_a_blocked_dispatch_keeps_its_lease(tmp_path):
+    """BLOCKED post-START must still reconcile against the same lease."""
+    d = dispatcher(tmp_path)
+    path = archive(tmp_path)
+    d.register_worker(worker("w1"))
+    item = d.enqueue_job(job_payload(path, "PROJECT"))
+    lease = d.claim_job("w1")
+    for state in (JOB_ARTIFACT_FETCHED, JOB_ATTACHED, JOB_START_PREPARED):
+        d.transition_job(item.dispatch_id, "w1", lease.lease_id, state, {"campaign_run_id": "run", "start_receipt": "startcore-1"})
+    d.transition_job(item.dispatch_id, "w1", lease.lease_id, JOB_BLOCKED, {"error": "worker lost after START_PREPARED; recovery required"})
+    record = d.register_worker({
+        **worker("w1"),
+        "state": WORKER_RESERVED,
+        "dispatch_id": item.dispatch_id,
+        "lease_id": lease.lease_id,
+    })
+    assert record.meta["reports_lease"] is True

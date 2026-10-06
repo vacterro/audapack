@@ -118,8 +118,11 @@ test('W11: consuming a job arms the engine and applies the dispatched profile', 
   assert.strictEqual(api.getActiveProfile().profile_id, 'compress', 'the job names the profile');
   assert.strictEqual(Boolean(api.autoRuntime.enabled), true, 'the engine must be armed to commit the wave');
   assert.ok(armedBeforeSend, 'arming after the send leaves startAudit running unarmed: no wave stage, nothing harvested');
+  // T-261: the stubbed START proves arming, not adoption. Arming the engine is
+  // what this test is about; AUDITING is earned by the runtime actually owning
+  // a wave, which the poll re-assert crosses once adoption lands.
   assert.deepStrictEqual(transitions, [
-    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
+    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED'
   ]);
 });
 

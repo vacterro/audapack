@@ -15,6 +15,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -142,6 +143,83 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+#: PERF-001 (audit/11.md): a bounded physical-digest proof cache. The same final
+#: handoff was re-hashed from raw bytes on every periodic dashboard poll, and a
+#: mismatched COMPLETE run paid the hash TWICE in one snapshot. The key carries
+#: a file-change signature (mtime_ns + size) so a same-path mutation invalidates
+#: the entry; a missing/unreadable file never produces a cached success.
+_DIGEST_CACHE: "OrderedDict[tuple[str, int, int], str]" = OrderedDict()
+_DIGEST_CACHE_MAX = 256
+
+
+def _sha256_file_cached(path: Path) -> str:
+    """Return the physical SHA-256 of ``path``, reusing a proof only while the
+    file's (path, mtime_ns, size) identity is unchanged. Raises OSError exactly
+    as ``_sha256_file`` when the file cannot be statted/read, so callers keep
+    their "missing/unreadable is a visible failure" contract."""
+
+    stat = path.stat()
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    cached = _DIGEST_CACHE.get(key)
+    if cached is not None:
+        _DIGEST_CACHE.move_to_end(key)
+        return cached
+    digest = _sha256_file(path)
+    # Re-stat after hashing: a concurrent write during the read invalidates the
+    # key we are about to store.
+    after = path.stat()
+    if int(after.st_mtime_ns) == key[1] and int(after.st_size) == key[2]:
+        _DIGEST_CACHE[key] = digest
+        _DIGEST_CACHE.move_to_end(key)
+        while len(_DIGEST_CACHE) > _DIGEST_CACHE_MAX:
+            _DIGEST_CACHE.popitem(last=False)
+    return digest
+
+
+def _clear_digest_cache() -> None:
+    _DIGEST_CACHE.clear()
+
+
+class StaleClaimError(RuntimeError):
+    """A start-pipeline writer no longer owns the intent it is mutating (W2-001)."""
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a claim owner.
+
+    W2-001: PID alone cannot distinguish concurrent calls in one process, so it
+    is only one input -- liveness here, plus a fencing token on every mutation.
+    An uncertain probe returns True (conservative: never steal a claim we cannot
+    prove dead).
+    """
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                return bool(ok) and exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
+
+
 class AuditStartIntentStore:
     """Small atomic journal written before packing or dispatch submission."""
 
@@ -165,10 +243,72 @@ class AuditStartIntentStore:
         with cross_process_lock(self.lock_path):
             return [dict(item) for item in self._read_unlocked()["intents"] if isinstance(item, dict)]
 
-    def begin(self, project_id: str, project_name: str, profile_id: str) -> tuple[dict[str, Any], bool]:
+    def _trim_intents(self, intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Prepared source keys are durable idempotency records. Ordinary
+        # history remains bounded while these keys await reconciliation.
+        ordinary = [item for item in intents if not item.get("source_execution_id")]
+        retained = {item.get("intent_id") for item in ordinary[-self.history_bound:]}
+        kept = [item for item in intents
+                if item.get("source_execution_id") or item.get("intent_id") in retained]
+        stale = self._compactable_ids(kept)
+        return [self._compact_source_intent(item, stale) for item in kept]
+
+    def _compactable_ids(self, population: list[dict[str, Any]]) -> set[int]:
+        """Ids of the source records old enough to be reduced to identities.
+
+        A record is stale when it is source-keyed, not already compacted, not
+        still active, and past the most recent ``history_bound`` records that
+        share its status. The newest slice of each status keeps every field, so
+        a run an operator is still reading is never rewritten underneath them.
+        """
+        by_status: dict[str, list[dict[str, Any]]] = {}
+        for entry in population:
+            if entry.get("compacted") or not entry.get("source_execution_id"):
+                continue
+            by_status.setdefault(str(entry.get("status") or ""), []).append(entry)
+        stale: set[int] = set()
+        for status, group in by_status.items():
+            if status in ACTIVE_INTENT_STATES or len(group) <= self.history_bound:
+                continue
+            group.sort(key=lambda entry: float(entry.get("completed_at")
+                                              or entry.get("updated_at") or 0.0),
+                       reverse=True)
+            stale.update(id(entry) for entry in group[self.history_bound:])
+        return stale
+
+    def _compact_source_intent(self, item: dict[str, Any],
+                               stale: set[int]) -> dict[str, Any]:
+        """Reduce a settled source record to the identity a replay needs.
+
+        W2-003 (audit/12.md): every source-keyed record was retained in full
+        forever -- 40 terminally FAILED prepared sources with a bound of 6 --
+        because a prepared source key is the durable idempotency record and
+        dropping it would re-issue a finished audit. The key must survive; the
+        error text, the owning PID, the single-writer claim and its fence do
+        not, once the record is terminal and settled.
+
+        ponytail: the record COUNT still grows with distinct prepared sources.
+        Move old identities into an age-bounded tombstone table only once a
+        replay older than that window can be refused by the prepared execution
+        tombstone alone.
+        """
+        if id(item) not in stale:
+            return item
+        return {**item, "error": "", "owner_pid": 0, "claim_token": "",
+                "claim_holder_pid": 0, "fence": 0, "campaign_run_id": "",
+                "compacted": True}
+
+
+    def begin(self, project_id: str, project_name: str, profile_id: str,
+              source_execution_id: str = "") -> tuple[dict[str, Any], bool]:
         now = time.time()
         with cross_process_lock(self.lock_path):
             doc = self._read_unlocked()
+            if source_execution_id:
+                prior = next((item for item in reversed(doc["intents"])
+                              if item.get("source_execution_id") == source_execution_id), None)
+                if prior is not None:
+                    return dict(prior), False
             active = next(
                 (
                     item for item in reversed(doc["intents"])
@@ -184,6 +324,7 @@ class AuditStartIntentStore:
                 "project_id": str(project_id),
                 "project_name": str(project_name),
                 "profile_id": str(profile_id or "quick3"),
+                "source_execution_id": str(source_execution_id),
                 "status": "PREPARING",
                 "dispatch_id": "",
                 "campaign_run_id": "",
@@ -192,23 +333,94 @@ class AuditStartIntentStore:
                 "updated_at": now,
                 "completed_at": 0.0,
                 "owner_pid": os.getpid(),
+                # W2-001: begin() records ownership but grants NO claim. The
+                # single writer claim is issued only by claim_or_takeover(),
+                # held for the PREPARING -> PACKING -> SUBMITTING section and
+                # fenced on every mutation, so a stored intent is never confused
+                # with a live critical section.
+                "claim_token": "",
+                "claim_holder_pid": 0,
+                "fence": 0,
             }
             intent["request_id"] = intent["intent_id"]
             intent["phase"] = intent["status"]
             intent["archive_path"] = ""
             doc["intents"].append(intent)
-            doc["intents"] = doc["intents"][-self.history_bound:]
+            doc["intents"] = self._trim_intents(doc["intents"])
             doc["updated_at"] = now
             _atomic_write_json(self.path, doc)
             return dict(intent), True
 
-    def update(self, intent_id: str, **changes: Any) -> dict[str, Any]:
+    def find_for_source(self, source_execution_id: str) -> Optional[dict[str, Any]]:
+        if not source_execution_id:
+            return None
+        with cross_process_lock(self.lock_path):
+            return next((dict(item) for item in reversed(self._read_unlocked()["intents"])
+                         if item.get("source_execution_id") == source_execution_id), None)
+
+
+    def claim_or_takeover(self, intent_id: str, take_over: bool = False) -> tuple[bool, dict[str, Any]]:
+        """W2-001: atomically grant the one writer authorized to advance an intent.
+
+        Returns ``(granted, intent)``. A caller that loses the claim MUST stand
+        down: it may not pack, submit, mutate PACKING/SUBMITTING/QUEUED, or
+        attach FAILED/error to the durable intent. Exactly one claim lives at a
+        time: an in-process holder marks the journal so a second caller refuses
+        itself without any owner-PID comparison, while a second process refuses
+        on the holder's live PID. Recovery is explicit: ``take_over=True``
+        issues a fresh claim token and bumps the fencing generation.
+        """
         now = time.time()
         with cross_process_lock(self.lock_path):
             doc = self._read_unlocked()
             target = next((item for item in doc["intents"] if item.get("intent_id") == intent_id), None)
             if target is None:
                 raise KeyError(f"Unknown audit start intent: {intent_id}")
+            status = str(target.get("status") or "")
+            pre_dispatch = status in {"PREPARING", "PACKING", "SUBMITTING"}
+            # An in-process holder (same process, possibly a second thread) writes
+            # its marker into the journal under the same lock, so no PID
+            # comparison is trusted and a process can be proven dead or not.
+            marker_pid = target.get("claim_holder_pid")
+            holder_marker = (
+                pre_dispatch
+                and isinstance(marker_pid, int)
+                and marker_pid == os.getpid()
+                and bool(target.get("claim_token"))
+            )
+            owner_pid = int(target.get("owner_pid", 0) or 0)
+            owner_alive = (
+                pre_dispatch
+                and _pid_is_alive(owner_pid)
+                and bool(target.get("claim_token"))
+            )
+            if not take_over and (holder_marker or owner_alive):
+                return False, dict(target)
+            token = uuid.uuid4().hex
+            target["claim_token"] = token
+            target["claim_holder_pid"] = os.getpid()
+            target["fence"] = int(target.get("fence", 0) or 0) + 1
+            target["owner_pid"] = os.getpid()
+            target["status"] = "PREPARING"
+            target["phase"] = "PREPARING"
+            target["error"] = ""
+            target["updated_at"] = now
+            doc["updated_at"] = now
+            _atomic_write_json(self.path, doc)
+            return True, dict(target)
+
+    def update(self, intent_id: str, expect_fence: Optional[int] = None, **changes: Any) -> dict[str, Any]:
+        now = time.time()
+        with cross_process_lock(self.lock_path):
+            doc = self._read_unlocked()
+            target = next((item for item in doc["intents"] if item.get("intent_id") == intent_id), None)
+            if target is None:
+                raise KeyError(f"Unknown audit start intent: {intent_id}")
+            if expect_fence is not None and int(target.get("fence", 0) or 0) != int(expect_fence):
+                raise StaleClaimError(
+                    f"Intent {intent_id} is owned by fencing generation "
+                    f"{target.get('fence')}, not {expect_fence}"
+                )
             normalized = {key: value for key, value in changes.items() if key not in {"intent_id", "project_id", "created_at"}}
             if "status" in normalized:
                 normalized["phase"] = normalized["status"]
@@ -218,7 +430,7 @@ class AuditStartIntentStore:
             target["updated_at"] = now
             if str(target.get("status")) in {"READY", "FAILED", "CANCELLED"} and not target.get("completed_at"):
                 target["completed_at"] = now
-            doc["intents"] = doc["intents"][-self.history_bound:]
+            doc["intents"] = self._trim_intents(doc["intents"])
             doc["updated_at"] = now
             _atomic_write_json(self.path, doc)
             return dict(target)
@@ -259,7 +471,7 @@ class AuditStartIntentStore:
                 changed += 1
             if not changed:
                 return 0
-            doc["intents"] = doc["intents"][-self.history_bound:]
+            doc["intents"] = self._trim_intents(doc["intents"])
             doc["updated_at"] = now
             _atomic_write_json(self.path, doc)
             return changed
@@ -503,6 +715,23 @@ class ManagedWorkerSupervisor:
             )
             if live:
                 return {"slot": slot, "generation": generation, "launched": False, "message": "slot already has a live worker"}
+            # W2-003 (SRC-041:R007): enforce the ledger here too. A recent
+            # RESERVED/LAUNCHING entry means a browser may already be opening for
+            # this slot/generation; the second launch_slot call used to spawn a
+            # duplicate before the first ever registered (observed spawns
+            # [(2,1),(2,1)]). An expired reservation is dead and may be retried.
+            pending_entry = doc["slots"].get(str(slot)) or {}
+            pending_state = str(pending_entry.get("state"))
+            pending_at = float(pending_entry.get("launched_at", 0.0) or 0.0)
+            if pending_state in {"RESERVED", "LAUNCHING"} and (
+                now - pending_at < WORKER_LAUNCH_BOOT_GRACE_SECONDS
+            ):
+                return {
+                    "slot": slot,
+                    "generation": generation,
+                    "launched": False,
+                    "message": "slot launch already pending",
+                }
             # W2-005: durable reservation before the spawn, here too.
             doc["slots"][str(slot)] = {
                 "state": "RESERVED",
@@ -528,20 +757,34 @@ class ManagedWorkerSupervisor:
             _atomic_write_json(self.path, doc)
         return {"slot": slot, "generation": generation, "launched": bool(ok), "message": str(message)}
 
-    def _reset_slot(self, slot: int) -> None:
-        """Forget a slot's launch/cooldown accounting so it can be relaunched.
+    def reset_stale_slot(self, slot: int) -> bool:
+        """Forget a slot's ledger entry ONLY when it is demonstrably dead/stale.
 
-        Called by the explicit operator relaunch path. Clearing the tracked
-        entry resets launch_attempts and the cooldown clock, so a slot whose
-        window was closed (and whose tracked state was stuck in LAUNCHING or
-        LAUNCH_FAILED) is treated as fresh by the next ``ensure_capacity``.
+        W2-003 (SRC-041:R007): the explicit operator relaunch path used to reset
+        the slot unconditionally before every relaunch, deleting a recent
+        RESERVED/LAUNCHING reservation written before the irreversible spawn. A
+        retry or double-click during boot then destroyed the only durable
+        evidence a browser might already be opening and opened a second one.
+        A recent reservation now survives; only LAUNCH_FAILED, an expired boot
+        grace, or any other provably dead entry is cleared.
         """
         slot = max(1, min(MAX_AUDIT_LANES, int(slot)))
+        now = time.time()
         with cross_process_lock(self.lock_path):
             doc = self._load()
+            entry = doc["slots"].get(str(slot))
+            if entry is None:
+                return False
+            state = str(entry.get("state"))
+            launched_at = float(entry.get("launched_at", 0.0) or 0.0)
+            if state in {"RESERVED", "LAUNCHING"} and (
+                now - launched_at < WORKER_LAUNCH_BOOT_GRACE_SECONDS
+            ):
+                return False
             doc["slots"].pop(str(slot), None)
-            doc["updated_at"] = time.time()
+            doc["updated_at"] = now
             _atomic_write_json(self.path, doc)
+            return True
 
 
 BLOCKED_REASONS: dict[str, tuple[str, str]] = {
@@ -708,7 +951,10 @@ def _actions_for(operator_state: str) -> tuple[str, ...]:
     if operator_state in {"PREPARING", "ATTACHING"}:
         return ("CANCEL", "DETAILS")
     if operator_state in {"STARTING", "AUDITING", "SAVING"}:
-        return ("DETAILS",)
+        # Live post-START work gets STOP, never CANCEL: CANCELLED asserts that
+        # no Core was ever sent, and from here a prompt is already in the
+        # browser. STOP retires the run honestly through abandon().
+        return ("STOP", "DETAILS")
     if operator_state in {"FAILED", "CANCELLED", "SUPERSEDED"}:
         return ("RETRY", "DETAILS")
     if operator_state == "INTERRUPTED":
@@ -863,13 +1109,68 @@ class AuditRunCoordinator:
                 return free
             time.sleep(WORKER_POOL_SETTLE_POLL_SECONDS)
 
-    def start(self, project_id: str, profile_id: str = "quick3", provision: bool = True) -> AuditStartResult:
+    def _settled_by_close(self, project_id: str, intent_id: str, fence,
+                          where: str) -> AuditStartResult:
+        """The truthful terminal for a start that never crossed a boundary.
+
+        CANCELLED is accurate here and only here: no window was provisioned for
+        it and no dispatch was submitted, so the project is genuinely free again.
+        """
+        try:
+            self.intents.update(intent_id, status="CANCELLED",
+                                error=f"AUDAPACK is closing ({where})",
+                                expect_fence=fence, claim_token="", claim_holder_pid=None)
+        except StaleClaimError:
+            pass
+        return AuditStartResult(False, project_id, intent_id, state="CANCELLED",
+                                message=f"Not dispatched: AUDAPACK closed {where}")
+
+    def start(self, project_id: str, profile_id: str = "quick3", provision: bool = True,
+              source_execution_id: str = "",
+              should_abort: Optional[Callable[[], bool]] = None) -> AuditStartResult:
+        """`should_abort` is the cooperative close token (W2-002, audit/12.md).
+
+        It is checked immediately BEFORE each irreversible boundary -- worker
+        provisioning and the durable dispatch submission -- and never after one.
+        A race that wins past a boundary has already provisioned a window or
+        enqueued a job: that work is reported for what it is, because calling it
+        CANCELLED would hide a live dispatch from the board.
+        """
         project = self.projects.get_project(str(project_id))
         if project is None or not project.enabled or not project.source_path:
             return AuditStartResult(False, str(project_id), message="Project is missing, disabled, or has no source path")
-        self._release_pre_start_block(project.id)
-        intent, created = self.intents.begin(project.id, project.display_name, profile_id)
-        if not created:
+        if not source_execution_id:
+            self._release_pre_start_block(project.id)
+        intent, created = self.intents.begin(project.id, project.display_name, profile_id,
+                                             source_execution_id=source_execution_id)
+        if source_execution_id and not created:
+            if intent.get("source_execution_id") != source_execution_id:
+                return AuditStartResult(False, project.id, str(intent["intent_id"]),
+                                        str(intent.get("dispatch_id") or ""), "BLOCKED",
+                                        "Another audit owns this project")
+            if (str(intent.get("project_id")) != project.id or
+                    str(intent.get("profile_id")) != profile_id):
+                return AuditStartResult(False, project.id, str(intent["intent_id"]),
+                                        str(intent.get("dispatch_id") or ""), "BLOCKED",
+                                        "Prepared audit source identity changed")
+            dispatch_id = str(intent.get("dispatch_id") or "")
+            if dispatch_id:
+                try:
+                    response = self.bridge.browser_jobs(project.id)
+                    prior = next((job for job in response.get("jobs", [])
+                                  if job.get("dispatch_id") == dispatch_id), None)
+                except Exception:
+                    prior = None
+                state = str((prior or {}).get("state") or "RECOVERY_NEEDED")
+                return AuditStartResult(state not in TERMINAL_DISPATCH_STATES,
+                                        project.id, str(intent["intent_id"]), dispatch_id,
+                                        state, "Prepared audit dispatch already exists", True)
+            if str(intent.get("status")) not in ACTIVE_INTENT_STATES:
+                return AuditStartResult(False, project.id, str(intent["intent_id"]),
+                                        str(intent.get("dispatch_id") or ""),
+                                        str(intent.get("status") or "FAILED"),
+                                        "Prepared audit intent is already terminal", True)
+        if not created and not source_execution_id:
             active = self.bridge.active_browser_job(project.id)
             if active:
                 if str(active.get("state")) == "BLOCKED" and not self._is_post_start_block(active):
@@ -905,12 +1206,28 @@ class AuditRunCoordinator:
                     )
                 self.intents.update(str(intent["intent_id"]), status=prior_state)
                 intent, created = self.intents.begin(project.id, project.display_name, profile_id)
-            self.intents.update(str(intent["intent_id"]), status="PREPARING", error="", owner_pid=os.getpid())
 
         intent_id = str(intent["intent_id"])
+        # W2-001: exactly one writer may hold the pre-dispatch claim. A fresh
+        # intent, a resumed interrupted intent, and a concurrent duplicate all
+        # pass through here; only the first is granted and the rest stand down
+        # without packing or submitting.
+        claimed, intent = self.intents.claim_or_takeover(intent_id)
+        if not claimed:
+            return AuditStartResult(
+                True, project.id, intent_id,
+                str(intent.get("dispatch_id") or ""),
+                str(intent.get("status") or "PREPARING"),
+                "Audit run is already in progress", True,
+            )
+        my_fence = intent.get("fence")
+        self.intents.update(intent_id, status="PREPARING", error="", owner_pid=os.getpid(), expect_fence=my_fence)
         try:
             health = self._healthy_bridge_status()
             if provision and self.workers is not None:
+                if should_abort and should_abort():
+                    return self._settled_by_close(project.id, intent_id, my_fence,
+                                                  "before worker provisioning")
                 dispatch_status = (health.get("browser") or {}) if isinstance(health, dict) else {}
                 demand = (
                     int(dispatch_status.get("queued_jobs", 0) or 0)
@@ -918,7 +1235,7 @@ class AuditRunCoordinator:
                     + 1
                 )
                 self.workers.ensure_capacity(dispatch_status, demand)
-            self.intents.update(intent_id, status="PACKING")
+            self.intents.update(intent_id, status="PACKING", expect_fence=my_fence)
             # Freshness is an mtime comparison, and mtime lies often enough to
             # matter: a restored file, a clock skew or a changed exclude list
             # all leave a stale archive looking current, and the operator then
@@ -930,7 +1247,12 @@ class AuditRunCoordinator:
                 packed = self.packing.ensure_fresh_archive(project.id)
             if not packed.success or not packed.output_path:
                 raise RuntimeError(packed.error_message or "Packing failed")
-            self.intents.update(intent_id, status="SUBMITTING", archive_path=str(Path(packed.output_path).resolve()))
+            if should_abort and should_abort():
+                return self._settled_by_close(project.id, intent_id, my_fence,
+                                              "before the dispatch was submitted")
+            self.intents.update(intent_id, status="SUBMITTING", archive_path=str(Path(packed.output_path).resolve()), expect_fence=my_fence)
+            # Past this line the dispatch exists and will run; nothing below may
+            # re-interpret it as cancelled.
             response = self.bridge.submit_browser_audit(project, packed.output_path, profile_id)
             dispatch = response.get("dispatch", {}) if response.get("ok") else {}
             dispatch_id = str(dispatch.get("dispatch_id") or "")
@@ -950,16 +1272,24 @@ class AuditRunCoordinator:
                         if not response.get("ok")
                         else "Bridge returned no dispatch identity"
                     )
-                self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id)
+                self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id, expect_fence=my_fence,
+                                    claim_token="", claim_holder_pid=None)
                 return AuditStartResult(
                     True, project.id, intent_id, dispatch_id,
                     str(adopted.get("state") or "QUEUED"),
                     "Audit queued (adopted after a lost submit response)",
                 )
-            self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id)
+            self.intents.update(intent_id, status="QUEUED", dispatch_id=dispatch_id, expect_fence=my_fence,
+                                claim_token="", claim_holder_pid=None)
             return AuditStartResult(True, project.id, intent_id, dispatch_id, "QUEUED", "Audit queued")
         except Exception as exc:
-            self.intents.update(intent_id, status="FAILED", error=str(exc)[:500])
+            try:
+                self.intents.update(intent_id, status="FAILED", error=str(exc)[:500], expect_fence=my_fence,
+                                    claim_token="", claim_holder_pid=None)
+            except StaleClaimError:
+                # A takeover happened while this writer was failing; the new
+                # owner's durable state must not be overwritten by a stale loser.
+                pass
             return AuditStartResult(False, project.id, intent_id, state="FAILED", message=str(exc))
 
     RESET_SETTLED_STATES = frozenset({"READY", "FAILED", "CANCELLED", "SUPERSEDED"})
@@ -1021,7 +1351,8 @@ class AuditRunCoordinator:
             "total": len(cancelled) + len(unblocked) + len(failed),
         }
 
-    def start_batch(self, project_ids: Iterable[str], profile_id: str = "quick3") -> list[AuditStartResult]:
+    def start_batch(self, project_ids: Iterable[str], profile_id: str = "quick3",
+                    should_abort: Optional[Callable[[], bool]] = None) -> list[AuditStartResult]:
         # No lane cap on the QUEUE. The pool holds the waiting jobs and a window
         # that frees up claims the next one, so asking for more projects than
         # there are windows is a line, not an overflow. Only the WINDOWS are
@@ -1034,13 +1365,16 @@ class AuditRunCoordinator:
         # behind each other. A provisioning failure is never fatal here -- the
         # Bridge supervisor keeps provisioning, and a queued job with no window
         # yet is a wait, not a loss.
+        aborted = bool(should_abort and should_abort())
         provisioned = False
-        try:
-            self.provision_capacity(len(unique))
-            provisioned = True
-        except Exception:
-            provisioned = False
-        return [self.start(project_id, profile_id, provision=not provisioned) for project_id in unique]
+        if not aborted:
+            try:
+                self.provision_capacity(len(unique))
+                provisioned = True
+            except Exception:
+                provisioned = False
+        return [self.start(project_id, profile_id, provision=not provisioned,
+                           should_abort=should_abort) for project_id in unique]
 
     def reorder(self, dispatch_id: str, delta: int) -> AuditStartResult:
         """Move a waiting run up (-1) or down (+1) the line for the next window.
@@ -1077,18 +1411,30 @@ class AuditRunCoordinator:
         return AuditStartResult(False, project_id, str((intent or {}).get("intent_id") or ""), str(dispatch_id), "BLOCKED", str(error))
 
     def abandon(self, dispatch_id: str, reason: str = "") -> AuditStartResult:
-        """Force a stuck BLOCKED run terminal so START AUDIT works again.
+        """Stop a live post-START run, or force a stuck BLOCKED one terminal.
 
-        Cancel refuses a post-start BLOCKED dispatch because CANCELLED asserts
-        no Core was sent. Abandon is the honest terminal: the lane frees up,
-        the record stays FAILED with operator_abandoned, and no second START is
-        issued automatically.
+        Cancel refuses a post-start dispatch because CANCELLED asserts no Core
+        was sent. Abandon is the honest terminal: the lane frees up, the record
+        stays FAILED with operator_abandoned, and no second START is issued
+        automatically.
+
+        The bridge stays authoritative about the terminal state. abandon_job()
+        is idempotent and returns an already-terminal job UNCHANGED, so an
+        audit that reached COMPLETE between the click and this call must NOT be
+        rewritten to FAILED here: that would relabel a finished run whose waves
+        are already saved, and hide a real result behind a stop pressed too late.
         """
         response = self.bridge.abandon_browser_job(str(dispatch_id), reason)
         intent = self.intents.find_for_dispatch(str(dispatch_id))
         project_id = str((intent or {}).get("project_id") or "")
         intent_id = str((intent or {}).get("intent_id") or "")
         if response.get("ok"):
+            terminal = str(response.get("state") or "FAILED").strip().upper() or "FAILED"
+            if terminal != "FAILED":
+                return AuditStartResult(
+                    True, project_id, intent_id, str(dispatch_id), terminal,
+                    f"Run already reached {terminal}; nothing was stopped",
+                )
             if intent:
                 self.intents.update(intent_id, status="FAILED", error="operator abandoned a stuck blocked run")
             return AuditStartResult(True, project_id, intent_id, str(dispatch_id), "FAILED", "Run abandoned; project is free again")
@@ -1369,6 +1715,7 @@ class AuditRunCoordinator:
         self,
         snapshot: AuditRunSnapshot,
         memo: Optional[dict[tuple[str, str], Any]] = None,
+        authoritative: bool = False,
     ) -> AuditRunSnapshot:
         """Answer 'has the agent read this yet' from the project's own inbox.
 
@@ -1382,6 +1729,13 @@ class AuditRunCoordinator:
         filesystem fingerprint. The caller passes one memo for the whole
         refresh so a project's inbox is read once; the key includes the root
         and binding so one project's verdict is never reused for another.
+
+        PERF-004 (audit/10.md): the default path is the PASSIVE dashboard layer
+        (``read_inbox_passive``), so a 4-second repaint reuses a settled verdict
+        inside its freshness budget instead of re-enumerating every inbox.
+        ``authoritative=True`` selects the immediate-change layer
+        (``read_inbox_cached``), which fingerprints on every call and must be
+        used by any caller whose correctness depends on current inbox truth.
 
         AuditRunSnapshot is frozen by design, so the verdict is applied with
         ``dataclasses.replace`` and the enriched copy is returned -- callers
@@ -1397,7 +1751,11 @@ class AuditRunCoordinator:
             key = (root, binding)
             state = memo.get(key) if memo is not None else None
             if state is None:
-                state = agent_inbox.read_inbox_cached(root, binding_rel=binding)
+                reader = (
+                    agent_inbox.read_inbox_cached if authoritative
+                    else agent_inbox.read_inbox_passive
+                )
+                state = reader(root, binding_rel=binding)
                 if memo is not None:
                     memo[key] = state
             return replace(
@@ -1414,12 +1772,20 @@ class AuditRunCoordinator:
         self,
         project_ids: Optional[Iterable[str]] = None,
         status_response: Optional[dict[str, Any]] = None,
+        authoritative_inbox: bool = False,
     ) -> list[AuditRunSnapshot]:
         """The dashboard's composite view of every run.
 
         ``status_response`` lets a caller that already asked the Bridge for
         `/v1/browser/status` hand that snapshot in instead of causing a second
         identical request for the same repaint (PERF-002).
+
+        ``authoritative_inbox`` (PERF-004) selects the immediate-change inbox
+        reader for callers whose correctness depends on current truth (for
+        example an operator action that consumes the verdict). The default
+        passive path reuses a settled verdict inside its freshness budget, so
+        the periodic 4-second repaint does not re-enumerate every project's
+        inbox.
         """
         selected = {str(value) for value in project_ids} if project_ids is not None else None
         jobs_response = self.bridge.browser_jobs()
@@ -1455,10 +1821,34 @@ class AuditRunCoordinator:
         # the same current verdict.
         agent_memo: dict[tuple[str, str], Any] = {}
         jobs = sorted(jobs_response.get("jobs", []), key=lambda item: float(item.get("updated_at") or 0.0), reverse=True)
-        for job in jobs:
-            project_id = str(job.get("project_id") or "")
-            if selected is not None and project_id not in selected:
+        # PERF-001: separate CURRENT (non-terminal) work from TERMINAL history
+        # BEFORE enrichment. Every non-terminal dispatch must remain represented
+        # to the state consumer and queue controls. RUN_HISTORY_BOUND applies
+        # only to terminal history, not to the composite current-state surface.
+        current_jobs = [j for j in jobs if selected is None or str(j.get("project_id") or "") in selected]
+        # Partition into current and terminal before enrichment
+        terminal_jobs: list[dict[str, Any]] = []
+        for job in current_jobs:
+            dispatch_state = str(job.get("state") or "")
+            if dispatch_state in TERMINAL_DISPATCH_STATES:
+                terminal_jobs.append(job)
+        # PERF-001: enrich only terminal jobs up to RUN_HISTORY_BOUND (terminal
+        # history is bounded independently from current work).
+        terminal_jobs.sort(key=lambda item: float(item.get("updated_at") or 0.0), reverse=True)
+        terminal_jobs = terminal_jobs[:RUN_HISTORY_BOUND]
+
+        audit_cache: dict[str, Optional[AuditSnapshot]] = {}
+        intent_updates: dict[str, dict[str, Any]] = {}
+        snapshots: list[AuditRunSnapshot] = []
+        # PERF-005: one agent-inbox read per (root, binding) per refresh -- not
+        # one per retained record. Multiple rows of the same project all want
+        # the same current verdict.
+        # Enrich current (non-terminal) jobs first -- they have priority in the
+        # returned view and must never be hidden behind terminal history.
+        for job in current_jobs:
+            if str(job.get("state") or "") in TERMINAL_DISPATCH_STATES:
                 continue
+            project_id = str(job.get("project_id") or "")
             if project_id not in audit_cache:
                 # PERF-002: `refresh_project()` means force_rescan, which
                 # INVALIDATES the AuditIndexer before scanning -- so the periodic
@@ -1472,7 +1862,41 @@ class AuditRunCoordinator:
                 audit_cache[project_id] = self.audits.get_snapshot(project_id)
             intent = by_dispatch.get(str(job.get("dispatch_id") or ""))
             snapshot = self._snapshot(job, intent, audit_cache[project_id], labels, bridge_context)
-            snapshot = self._stamp_agent_state(snapshot, agent_memo)
+            snapshot = self._stamp_agent_state(snapshot, agent_memo, authoritative=authoritative_inbox)
+            snapshots.append(snapshot)
+            if intent:
+                seen_intents.add(str(intent.get("intent_id")))
+                intent_state = "READY" if snapshot.ready else (
+                    snapshot.operator_state if snapshot.operator_state in {"FAILED", "CANCELLED", "RECOVERY"} else (
+                        "RUNNING" if snapshot.dispatch_state in ACTIVE_DISPATCH_STATES else snapshot.dispatch_state
+                    )
+                )
+                if intent_state == "RECOVERY":
+                    intent_state = "RECOVERY_NEEDED"
+                # A BLOCKED dispatch used to land here as "RUNNING" because
+                # BLOCKED is an ACTIVE_DISPATCH_STATE. The intent then stayed in
+                # ACTIVE_INTENT_STATES forever, so intents.begin() refused every
+                # later START for that project and the lane read as a live run
+                # that would never finish. Split the two real cases instead.
+                if snapshot.operator_state == "BLOCKED_PRE_START":
+                    intent_state = "BLOCKED"
+                elif snapshot.operator_state == "BLOCKED_POST_START":
+                    intent_state = "RECOVERY_NEEDED"
+                intent_updates[str(intent["intent_id"])] = {
+                    "status": intent_state,
+                    "campaign_run_id": snapshot.campaign_run_id,
+                    "error": snapshot.error,
+                }
+        # Enrich terminal jobs up to the terminal-history bound only.
+        for job in terminal_jobs:
+            project_id = str(job.get("project_id") or "")
+            if selected is not None and project_id not in selected:
+                continue
+            if project_id not in audit_cache:
+                audit_cache[project_id] = self.audits.get_snapshot(project_id)
+            intent = by_dispatch.get(str(job.get("dispatch_id") or ""))
+            snapshot = self._snapshot(job, intent, audit_cache[project_id], labels, bridge_context)
+            snapshot = self._stamp_agent_state(snapshot, agent_memo, authoritative=authoritative_inbox)
             snapshots.append(snapshot)
             if intent:
                 seen_intents.add(str(intent.get("intent_id")))
@@ -1504,8 +1928,8 @@ class AuditRunCoordinator:
                 continue
             if selected is not None and str(intent.get("project_id")) not in selected:
                 continue
-            snapshots.append(self._stamp_agent_state(self._intent_snapshot(intent), agent_memo))
-        return snapshots[:RUN_HISTORY_BOUND]
+            snapshots.append(self._stamp_agent_state(self._intent_snapshot(intent), agent_memo, authoritative=authoritative_inbox))
+        return snapshots
 
     def latest_by_project(self, project_ids: Optional[Iterable[str]] = None) -> dict[str, AuditRunSnapshot]:
         result: dict[str, AuditRunSnapshot] = {}

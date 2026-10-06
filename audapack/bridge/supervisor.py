@@ -238,7 +238,12 @@ class DispatchSupervisor:
         self._unproductive_launches = 0
         self._last_launch_at = 0.0
         try:
-            self.workers._reset_slot(slot)
+            # W2-003 (SRC-041:R007): reset only a demonstrably dead slot. The
+            # unconditional reset deleted a recent RESERVED/LAUNCHING entry
+            # written before the spawn, so a retry during boot lost the durable
+            # evidence and opened a duplicate window. A live/recent reservation
+            # is left intact; launch_slot then reports it as already pending.
+            self.workers.reset_stale_slot(slot)
             status = dict(self.dispatcher.status())
         except Exception as exc:
             logger.warning("could not prepare slot %s relaunch: %s", slot, exc)

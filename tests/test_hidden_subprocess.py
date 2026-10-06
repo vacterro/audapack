@@ -20,13 +20,80 @@ WIN32 = sys.platform == "win32"
 
 
 @unittest.skipUnless(WIN32, "console-flash flags are Windows-only")
-class TestHiddenSpawnSites(unittest.TestCase):
+class TestGitInventorySpawnIsHidden(unittest.TestCase):
+    """T-190 Git inventory must use the canonical hidden-spawn boundary.
+
+    ``source_inventory._run_git`` used to call bare ``subprocess.run``, so
+    every Git-mode pack from the windowless GUI (pythonw) flashed ~5 black
+    console windows (rev-parse, rev-parse HEAD, status, 2x ls-files) and
+    stole focus. procutil.py is the single owner of hidden subprocess
+    policy; the inventory must route through it like every other spawn site.
+    """
+
+    GIT_SUBCOMMANDS = (
+        "rev-parse",
+        "status",
+        "ls-files",
+    )
+
+    def _git_calls(self, run_mock) -> list:
+        return [
+            call for call in run_mock.call_args_list
+            if call.args and call.args[0]
+            and str(call.args[0][0]).lower() == "git"
+            and any(arg in self.GIT_SUBCOMMANDS for arg in call.args[0])
+        ]
+
     def assert_hidden(self, call) -> None:
         self.assertIn("startupinfo", call.kwargs)
         si = call.kwargs["startupinfo"]
         self.assertEqual(si.dwFlags, subprocess.STARTF_USESHOWWINDOW)
         self.assertEqual(si.wShowWindow, subprocess.SW_HIDE)
         self.assertTrue(call.kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW)
+
+    def test_run_git_directly_carries_hidden_flags(self):
+        """Red-before/green-after: _run_git must spawn git hidden."""
+        from audapack import source_inventory as si
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            si._run_git(["rev-parse", "--show-toplevel"], cwd=Path("."))
+            git_calls = self._git_calls(run_mock)
+            self.assertEqual(len(git_calls), 1, run_mock.call_args_list)
+            self.assert_hidden(git_calls[0])
+
+    def test_git_inventory_path_spawns_every_git_command_hidden(self):
+        """Stronger form: the whole Git inventory path stays invisible."""
+        import tempfile
+
+        from audapack.source_inventory import build_git_inventory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "proj"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-q"], cwd=str(repo), check=True, capture_output=True
+            )
+            (repo / "app.py").write_text("print('x')", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True
+            )
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+            with patch("subprocess.run", return_value=completed) as run_mock:
+                # The mocked git answers empty; an empty path set still proves
+                # every spawn carried the hidden flags. Assert on the calls,
+                # not on inventory contents.
+                try:
+                    build_git_inventory(repo, set())
+                except Exception:
+                    pass  # mocked-output artifacts must not mask the spawn proof
+                git_calls = self._git_calls(run_mock)
+                self.assertGreaterEqual(
+                    len(git_calls), 4,
+                    f"expected the full git command set, saw {run_mock.call_args_list}",
+                )
+                for call in git_calls:
+                    self.assert_hidden(call)
 
     def test_detect_installed_browsers_powershell_is_hidden(self):
         from audapack.components import widget as widget_mod

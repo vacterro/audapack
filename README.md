@@ -1,5 +1,7 @@
 # AUDAPACK
 
+**v0.3.1**
+
 <p align="center">
   <img src="resources/app_icon.png" width="128" height="128" alt="AUDAPACK Logo">
 </p>
@@ -9,7 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.1-D4B86A?style=for-the-badge&logo=github" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4A7A20?style=for-the-badge" alt="MIT License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10+-332E22?style=for-the-badge&logo=python&logoColor=D4B86A" alt="Python 3.10+"></a>
   <img src="https://img.shields.io/badge/Platform-Windows-332E22?style=for-the-badge&logo=windows&logoColor=D4B86A" alt="Windows">
   <a href="tests/"><img src="https://img.shields.io/badge/Tests-passing-4A7A20?style=for-the-badge&logo=pytest&logoColor=white" alt="Pytest suite passing"></a>
@@ -41,6 +44,22 @@
 - **🎨 Golden Vintage Aesthetic**: Authentic Windows 95 Dark Golden theme with 2px raised/sunken bevels and zero antialiasing for maximum readability.
 - **📥 Durable INAUDIT Inbox**: Filesystem-backed capture store for ChatGPT responses, blocks, or clipboard text; deterministic project classification, canonical SAIPEN enqueue for managed projects, and archive/restore/delete lifecycle.
 - **🧠 Dedicated Chromium Worker**: Launches a Chromium-family browser (Chrome, Edge, Vivaldi, Opera) in an isolated profile with all throttling disabled; the top-level-only Widget guard rejects embedded ChatGPT sentinel frames.
+
+### 🔗 SAI Accounts is optional
+
+AUDAPACK works on its own. If the **SAI Accounts** control plane happens to be installed on this machine, AUDAPACK picks up its shared accounts as extra registry rows — automatically, no setting, no import step. If the plane is absent, stopped, broken or uninstalled, AUDAPACK discovers accounts exactly as it always did. **Nothing in this README requires anything else to be installed.**
+
+Six rules govern the optional federation:
+
+- **Your accounts stay yours.** A shared account appears *alongside* your own; it never replaces one. Shared rows carry `discovery_source = "sai_accounts_shared"` and a `<provider>:shared:<digest>` id, a namespace that can never collide with a locally discovered row.
+- **Merge only on proven identity.** A shared row and a local row collapse into one only when a stable identity locator proves they are the same account — the config-directory path for Claude/Codex, the Windows account name for Antigravity. A matching display name is never evidence; where identity cannot be proven, both rows are shown separately.
+- **Unavailable with a reason, never silently re-read.** A shared account is read *through* the plane, because the plane owns that identity and its execution context. If the plane cannot answer, the row reports `shared_source_offline`, `offline:…`, `auth_required:…` or `unavailable:…` — it never falls back to reading the local CLI, which would report *this* machine's account under someone else's name.
+- **Local settings stay local.** Which launchers an account is bound to, and whether it is enabled here, are AUDAPACK's own settings. Hiding or disabling an account in the shared registry is a *global* action, and is a separate concept from a local one.
+- **One inventory, projected — account rows are not a second list.** Once the plane is installed, AUDAPACK stops treating its built-in Codex/Claude/Antigravity rows as *accounts*: it materialises one launcher row per canonical account (identified as `sai:<canonical account_id>`) from the plane's snapshot and retires those six historical rows, handing their visibility, short label, colours and position to the canonical account they proved. Settings → Launchers, the project-row buttons, `Ctrl+1..0`, instance tracking, Limits, Prepared work and AUTO all read that one list, so nothing else needs rebuilding when an account changes. If the plane stops answering, the projection is marked **STALE** and the last-known-good list is kept — an outage never resurrects the retired built-ins. Selecting an account's execution context is never guessed: an account the plane owns as a Windows logon session (Antigravity reports `execution_backend = windows_user`) is launched **through the plane's own contract** — `sai-accounts launch <canonical account_id> --workdir <project root>` — because the plane is the only thing that can resolve that session; AUDAPACK never switches to whichever profile is current. A backend the plane exposes no contract for stays **UNAVAILABLE** with the minimum upstream contract named.
+
+- **A saved job is re-pointed or blocked — never re-interpreted.** A Prepared/Scheduler job saved before the cut-over still names a retired static launcher id. Once the machine has federated, the scheduler settles each row against the registry before it runs: when the row's identity provably maps onto one canonical account, the binding is re-pointed and the job keeps its trigger, payload and settings; when it does not, the job is marked **BLOCKED** with `ACCOUNT_MAPPING_REQUIRED` and is not launched, because starting a different account of the same provider is worse than a job that waits. The row is annotated, never deleted — its original ids stay visible as the evidence you need — and the block clears itself if the account is proven again. A plane that cannot be read changes nothing at all.
+
+Discovery and probing stay credential-free: the plane is queried for account metadata only, and no token, session cookie or credential blob is ever read, copied, exported or written.
 
 ---
 
@@ -86,6 +105,8 @@ python AUDAPACK.pyw --install-context-menu
 ### 4. Install Browser Widget
 Open Tampermonkey in your browser and install `resources/AUDAPACK_WIDGET.user.js`. When opening ChatGPT, the AUDAPACK toolbar will attach to the prompt input.
 
+The userscript's `@version` is the only thing Tampermonkey compares when deciding whether an installed copy is current, so new widget bytes always ship under a new version: the bundled script is paired with a committed release ledger (`resources/AUDAPACK_WIDGET.release.json`) recording the version and SHA-256 that shipped together. Record a release with `python scripts/update_widget_release.py`, and confirm the Bridge is offering it with `python scripts/widget_update_probe.py --installed-version <dashboard version>`. The manual browser steps live in [`docs/AUDAPACK_WIDGET_ACCEPTANCE.md`](docs/AUDAPACK_WIDGET_ACCEPTANCE.md).
+
 ### 5. Launch a Dedicated Chromium Audit Worker
 Use **Settings → Components → Launch AUDAPACK Chromium**. AUDAPACK picks an installed Chromium-family browser (Google Chrome, Cent, Edge, Vivaldi, or Opera before Brave), launches it with an isolated profile under `%LOCALAPPDATA%\AUDAPACK\browser_worker`, and disables Chromium's background timer, occlusion, and renderer throttling. Install Tampermonkey and the widget once inside that dedicated profile. The worker keeps running minimized, covered by other apps, or with the displays off; Windows sleep still suspends every process.
 
@@ -93,6 +114,8 @@ Only a clean root ChatGPT tab in a Chromium-family browser can claim a new audit
 
 ### 6. INAUDIT Capture Workflow
 On a stable ChatGPT answer, press `IA` beside the response or a code block. A verified Bridge write shows `IA ✓`; if the Bridge is unavailable, the bounded IndexedDB spool shows `IA QUEUED` and retries the same capture identity later. In AUDAPACK, open **INAUDIT → Inbox** to inspect provenance and classification evidence, choose a registered project, then use **Assign** or **Assign + CC**. The toolbar's `IA+` action captures the current Windows clipboard through the same durable store.
+
+Audit replies need no click: when a reply the widget watched stream finishes and the message it answers carried a project ZIP, the reply is captured to the Inbox automatically and pinned to the project that owns that archive name. Short replies, old conversations being reopened and worker-driven runs are skipped. Settings → Bridge → "Auto-capture audit replies to INAUDIT" turns it off.
 
 For projects containing `.saipen/`, AUDAPACK calls the CLI bound by that project's `STATE.md`: `saipen audit enqueue --producer audapack --operation-id <capture UUID> --item-id <capture UUID> --file <capture body>`. SAIPEN allocates the layer number and owns publication. Failed delivery retains the capture; retry uses the same UUID and cannot recreate a consumed layer. A missing or broken SAIPEN binding reports an error without falling back to local allocation. Finished audit mirrors use the same producer API with a stable content-derived operation UUID. Projects without SAIPEN retain local layer delivery.
 
@@ -189,6 +212,14 @@ Detailed guides are available in [`docs/wiki/`](docs/wiki/):
 - **Fail-Closed Security**: The HTTP bridge strictly binds to loopback (`127.0.0.1`), requires a 256-bit authentication token stored outside project source in `%LOCALAPPDATA%`, and enforces request size boundaries.
 - **Strict RunId Isolation**: Audit handoffs enforce run-boundary separation to prevent cross-run wave badge bleed.
 - **Zero Heavy Frameworks**: Core functionality runs on Python standard library without cloud dependencies or telemetry.
+
+---
+
+## 🤝 Contributing & License
+
+- Contributing guidelines: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Security reports and the supported disclosure path: [`SECURITY.md`](SECURITY.md).
+- Released under the [MIT License](LICENSE).
 
 ---
 

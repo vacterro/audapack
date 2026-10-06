@@ -181,3 +181,44 @@ class PackResult:
     excluded_bytes: int = 0
     fidelity_profile: str = ""
     archive_semantics: str = ""
+    # T-180: whether ensure_fresh_archive reused an existing archive or packed a
+    # new one. Both default False so every other PackResult caller is unchanged.
+    reused: bool = False
+    packed: bool = False
+    # T-190 (SRC-046): compact terminal pack state. Non-empty on the
+    # inventory-backed pack paths: PACKED, FAILED_INVENTORY,
+    # FAILED_SOURCE_READ, FAILED_SOURCE_CHANGED, FAILED_VERIFY. Legacy
+    # failure paths (missing source, busy lock, backup refusal) keep "".
+    status: str = ""
+    #: Exact classification inside that status, as published by the failing
+    #: stage (e.g. TRACKED_RESERVED_ARCHIVE_NAME_CONFLICT). ``status`` is the
+    #: phase bucket; this is the reason within it, so the Project Room can name
+    #: the precise rule that refused -- and the remediation for it -- without
+    #: parsing message text. Empty when the failure carries no code.
+    error_code: str = ""
+    #: Compact Git summary for Git-mode packs, e.g.
+    #: "Git: 312 tracked + 4 untracked, 2 deleted". Empty otherwise.
+    git_summary: str = ""
+    #: First actionable source-relative path for a failed pack, when safe.
+    first_error_path: str = ""
+    #: P1 TARGET A: bounded per-phase evidence for ONE ensure decision, in
+    #: milliseconds. Empty for callers that do not measure; the Bridge's archive
+    #: ensure endpoint reports it so the dominant phase is provable rather than
+    #: guessed. Never tokens, never archive bytes, never source content.
+    timings: dict = field(default_factory=dict)
+    #: T-274: post-pack source truth, so the pack surface can report what the
+    #: archive actually carries instead of a green "packed" that says nothing
+    #: about whether the project's own source is in it. `source_review_ready`
+    #: is False only when a pack somehow committed without its source (the
+    #: writer fails closed first, so a False here is a defect, not a policy).
+    source_review_ready: bool = True
+    #: Nested same-product components (direct-child Git worktrees) that were
+    #: included in this archive, and their combined source file count.
+    nested_components_included: int = 0
+    nested_component_files: int = 0
+    #: Source-first byte split: first-party source that is never trimmed, the
+    #: disposable remainder, and the archive bytes above which the operator is
+    #: warned (see packing.ARCHIVE_WARNING_BYTES).
+    mandatory_bytes: int = 0
+    discretionary_bytes: int = 0
+    archive_warning_bytes: int = 0

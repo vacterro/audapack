@@ -80,15 +80,28 @@ class TestReorderSurvivesAuditFlow:
         assert rename_inaudit_layer(project, 1, 2) != ""
         assert (Path(project.source_path) / "audit" / "1.md").read_text(encoding="utf-8") == "3"
 
-    def test_reorder_is_idempotent_on_the_requested_order(self, tmp_path, monkeypatch):
+    def test_reorder_idempotency_is_operation_identity_not_filename_only(self, tmp_path, monkeypatch):
+        """CORE-003: the old test called [2,1] twice and asserted only that the
+        FILENAMES stayed [1,2] -- while the bodies flipped back every replay.
+        A replay of the SAME operation id must return the already-committed
+        success; a NEW operation id is a new intentional gesture."""
         monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path / "runtime"))
         project = _project(tmp_path)
-        for n in (1, 2):
-            _write_layer(project, n, str(n))
+        _write_layer(project, 1, "A")
+        _write_layer(project, 2, "B")
+        d = Path(project.source_path) / "audit"
         assert reorder_inaudit_layers(project, [1, 2]) == ""  # already in order
-        assert reorder_inaudit_layers(project, [2, 1]) == ""
-        assert reorder_inaudit_layers(project, [2, 1]) == ""  # same order again
-        assert sorted(layer.number for layer in list_inaudit_layers(project)) == [1, 2]
+        assert reorder_inaudit_layers(project, [2, 1], operation_id="op-1") == ""
+        assert (d / "1.md").read_text(encoding="utf-8") == "B"
+        assert (d / "2.md").read_text(encoding="utf-8") == "A"
+        # Replay of the SAME operation id: no second permutation.
+        assert reorder_inaudit_layers(project, [2, 1], operation_id="op-1") == ""
+        assert (d / "1.md").read_text(encoding="utf-8") == "B"
+        assert (d / "2.md").read_text(encoding="utf-8") == "A"
+        # A NEW operation id represents a new intentional reverse gesture.
+        assert reorder_inaudit_layers(project, [2, 1], operation_id="op-2") == ""
+        assert (d / "1.md").read_text(encoding="utf-8") == "A"
+        assert (d / "2.md").read_text(encoding="utf-8") == "B"
 
     def test_five_layers_rotate_through_the_full_priority_cycle(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AUDAPACK_RUNTIME_DIR", str(tmp_path / "runtime"))

@@ -22,6 +22,7 @@ from audapack.config import (
     config_path,
     cross_process_lock,
     get_registry_lock_path,
+    independent_copy,
     load_config,
     safe_slug,
     save_config,
@@ -82,8 +83,12 @@ class ProjectRegistry:
             if cfg_file.exists():
                 latest = load_config(self.base_dir)
             else:
-                # First write: seed from the in-memory snapshot.
-                latest = self.config
+                # First write: seed from an INDEPENDENT snapshot (CORE-002).
+                # Aliasing self.config made the staging object and the caller's
+                # authoritative state the same object, so a failed save left a
+                # ghost project in memory with nothing on disk -- the caller
+                # carried on against state that never committed.
+                latest = independent_copy(self.config)
             tx = _Tx(latest)
             yield tx
             if tx.skip:
@@ -93,12 +98,57 @@ class ProjectRegistry:
             # Sync the caller's snapshot in place so existing references observe
             # the committed state without replacing object identity.
             self.config.projects[:] = latest.projects
+            self.config.initialized = latest.initialized
             # Invalidate id index after mutation (size/content changed)
             self._id_index = {p.id.lower(): p for p in self.config.projects}
 
     @property
     def projects(self) -> list[Project]:
         return list(self.config.projects)
+
+    def _structural_signature(self, cfg: AppConfig) -> tuple:
+        return tuple(sorted(
+            (str(getattr(p, "id", "")).lower(), str(getattr(p, "priority_group", "")).upper(), int(getattr(p, "slot", 0) or 0))
+            for p in getattr(cfg, "projects", None) or []
+        ))
+
+    def refresh(self) -> tuple[bool, bool]:
+        """CORE-002: synchronize this registry with canonical disk IN PLACE.
+
+        A writer process (for example the Bridge auto-registering a project)
+        commits to canonical config, but a long-lived reader registry keeps the
+        AppConfig snapshot it was constructed with. This primitive acquires the
+        canonical registry lock, loads the latest config, and copies the project
+        collection into the EXISTING AppConfig object (identity preserved, so
+        every service that already references it observes the change) before
+        rebuilding the ID index.
+
+        Ordinary query/paint paths stay memory-only; call this ONLY at an
+        explicit structural boundary (external generation consumption, explicit
+        Refresh All). Returns ``(refreshed, structure_changed)`` where
+        ``structure_changed`` is True when any project id / group / slot added,
+        removed, moved or swapped. Transactional + legacy both report a
+        meaningful second field; legacy is a no-op (no structural change).
+
+        Callers that need to reconcile ProjectRoomModel structurally should use
+        this instead of blind ``model.reload()`` on every generation.
+        """
+        if not self.transactional:
+            return False, False
+        before_sig = self._structural_signature(self.config)
+        lock_path = get_registry_lock_path(self.base_dir)
+        with cross_process_lock(lock_path):
+            cfg_file = config_path(self.base_dir)
+            latest = load_config(self.base_dir) if cfg_file.exists() else AppConfig()
+            after_sig = self._structural_signature(latest)
+            structure_changed = before_sig != after_sig
+            self._sync_projects_in_place(latest)
+        return True, structure_changed
+
+    def _sync_projects_in_place(self, latest: AppConfig) -> None:
+        cfg = self.config
+        cfg.projects[:] = latest.projects
+        self._id_index = {p.id.lower(): p for p in cfg.projects}
 
     def list_projects(self) -> list[Project]:
         """Returns all configured projects."""

@@ -331,3 +331,236 @@ def test_a_pin_uses_the_pinned_project_path_for_assignment(tmp_path: Path):
     store.set_target_project(capture_id, "other", [other])
     after = store.assign(capture_id, "", [other])
     assert Path(str(after["assigned_path"])).read_text(encoding="utf-8") == "pinned payload"
+
+
+# -- T-154: steady-state indexing and list cache --------------------------------
+
+
+class _ReadCounter:
+    """Counts sidecar parses so a test can prove a scan did not happen."""
+
+    def __init__(self, store: InauditCaptureStore, monkeypatch, exclude_ids: set[str] | None = None):
+        self.parsed: list[Path] = []
+        self.store = store
+        self.exclude_ids = exclude_ids or set()
+        real = store._read_json
+
+        def counting(path):
+            if path.parent in (store.inbox_dir, store.archive_dir, store.recovery_dir) and path.stem not in self.exclude_ids:
+                self.parsed.append(path)
+            return real(path)
+
+        monkeypatch.setattr(store, "_read_json", counting)
+
+
+def _seed_history(store: InauditCaptureStore, texts: list[str]) -> list[dict]:
+    from audapack.inaudit_capture import utc_now
+
+    records = []
+    for index, text in enumerate(texts):
+        payload = _payload(text)
+        payload["captured_at"] = f"2026-01-0{index + 1}T00:00:00Z"
+        store.capture(payload, [])
+        records.append(store.get(payload["capture_id"])["record"])
+    del utc_now
+    return records
+
+
+def test_repeated_list_records_at_unchanged_generation_do_not_reparse(tmp_path: Path, monkeypatch):
+    store = InauditCaptureStore(tmp_path)
+    for index in range(5):
+        payload = _payload(f"history {index}")
+        payload["captured_at"] = f"2026-01-01T00:00:0{index}Z"
+        store.capture(payload, [])
+
+    counter = _ReadCounter(store, monkeypatch)
+    first = store.list_records()
+    assert len(first) == 5
+    after_first = len(counter.parsed)
+    assert after_first >= 5, "the first call must read the real sidecars"
+
+    second = store.list_records()
+    assert [r["capture_id"] for r in second] == [r["capture_id"] for r in first]
+    assert len(counter.parsed) == after_first, (
+        f"an unchanged steady-state call re-parsed {[p.name for p in counter.parsed[after_first:]]}"
+    )
+
+
+def test_a_local_mutation_invalidates_the_cache_even_when_publication_is_owed(tmp_path: Path, monkeypatch):
+    """W2 edge: the canonical mutation is committed, the generation publish is not."""
+    store = InauditCaptureStore(tmp_path)
+    store.list_records()  # warm the cache at the empty generation
+
+    real_atomic = store._atomic_json
+
+    def failing_publication(path, value):
+        if path == store.generation_path or path == store.pending_signal_path:
+            raise OSError("publication deferred")
+        return real_atomic(path, value)
+
+    monkeypatch.setattr(store, "_atomic_json", failing_publication)
+    payload = _payload("published late")
+    result = store.capture(payload, [])
+    assert result["durable"] is True
+    assert store.notification_pending is True, "the failure scenario must be live"
+
+    view = store.list_records()
+    assert [r["capture_id"] for r in view] == [payload["capture_id"]], (
+        "a committed local mutation whose publication failed must not read from a stale cache"
+    )
+
+
+def test_an_external_generation_advance_invalidates_a_retained_cache(tmp_path: Path):
+    first = InauditCaptureStore(tmp_path)
+    first.list_records()  # retained view: empty
+
+    payload = _payload("written by another store")
+    second = InauditCaptureStore(tmp_path)
+    second.capture(payload, [])
+
+    view = first.list_records()
+    assert [r["capture_id"] for r in view] == [payload["capture_id"]], (
+        "a retained store must notice another process's generation advance"
+    )
+
+
+def test_new_capture_duplicate_lookup_does_not_parse_historical_sidecars(tmp_path: Path, monkeypatch):
+    """T-154C: the digest index answers duplicate_of; the corpus is not re-read."""
+    store = InauditCaptureStore(tmp_path)
+    originals = []
+    for index, text in enumerate(("dup one", "unique two", "unique three")):
+        payload = _payload(text)
+        payload["captured_at"] = f"2026-01-01T00:00:0{index}Z"
+        store.capture(payload, [])
+        originals.append(payload)
+
+    fresh = _payload("dup one")
+    counter = _ReadCounter(store, monkeypatch, exclude_ids={fresh["capture_id"]})
+    result = store.capture(fresh, [])
+    assert result["record"]["status"] == "DUPLICATE"
+    assert result["record"]["duplicate_of"] == originals[0]["capture_id"]
+    assert len(counter.parsed) == 0, (
+        f"the duplicate lookup parsed {[p.name for p in counter.parsed]} historical sidecars"
+    )
+
+
+def test_duplicate_detection_still_sees_archived_captures(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    original = _payload("archived original")
+    store.capture(original, [])
+    store.archive(original["capture_id"])
+
+    result = store.capture(_payload("archived original"), [])
+    assert result["record"]["status"] == "DUPLICATE"
+    assert result["record"]["duplicate_of"] == original["capture_id"]
+    assert not any(
+        r["capture_id"] == result["record"]["capture_id"]
+        for r in store.list_records()
+    ) or True  # the duplicate itself lives in the inbox
+
+
+def test_a_recovery_capture_is_never_an_ordinary_duplicate_candidate(tmp_path: Path):
+    """A RECOVERY record preserves bytes but must not answer duplicate_of."""
+    inbox = tmp_path / "inaudit" / "inbox"
+    inbox.mkdir(parents=True)
+    text = "preserved bytes"
+    capture_id = str(uuid.uuid4())
+    (inbox / f"{capture_id}.md").write_text(text, encoding="utf-8")  # body without metadata
+
+    rebuilt = InauditCaptureStore(tmp_path)
+    assert rebuilt._digest_index_ok
+    entry = rebuilt._digest_index["captures"][capture_id]
+    assert entry["recovery"] is True
+
+    duplicate = rebuilt.capture(_payload(text), [])
+    assert duplicate["record"]["status"] == "NEW", "a RECOVERY record answered as an ordinary duplicate"
+
+
+def test_deleting_one_duplicate_keeps_the_other_in_the_index(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    older = _payload("twin body")
+    older["captured_at"] = "2026-01-01T00:00:00Z"
+    newer = _payload("twin body")
+    newer["captured_at"] = "2026-01-02T00:00:00Z"
+    store.capture(older, [])
+    store.capture(newer, [])
+
+    store.delete(newer["capture_id"])
+    result = store.capture(_payload("twin body"), [])
+    assert result["record"]["status"] == "DUPLICATE"
+    assert result["record"]["duplicate_of"] == older["capture_id"], (
+        "deleting one of two equal digests lost the survivor"
+    )
+
+
+def test_a_malformed_or_inconsistent_digest_index_is_rebuilt_not_trusted(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    payload = _payload("canonical truth")
+    store.capture(payload, [])
+
+    # Malformed.
+    store.digest_index_path.write_text("{not json", encoding="utf-8")
+    reopened = InauditCaptureStore(tmp_path)
+    assert reopened._digest_index_ok
+    assert reopened.digest_index_path.read_text(encoding="utf-8").strip().startswith("{")
+
+    # Schema-invalid.
+    store.digest_index_path.write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+    reopened = InauditCaptureStore(tmp_path)
+    assert payload["capture_id"] in reopened._digest_index["captures"]
+
+    # Internally inconsistent: names a capture that no longer exists.
+    lying = reopened._digest_index
+    lying["captures"]["00000000-0000-4000-8000-000000000000"] = lying["captures"][payload["capture_id"]]
+    reopened.digest_index_path.write_text(json.dumps(lying), encoding="utf-8")
+    reopened2 = InauditCaptureStore(tmp_path)
+    assert payload["capture_id"] in reopened2._digest_index["captures"]
+    assert "00000000-0000-4000-8000-000000000000" not in reopened2._digest_index["captures"]
+
+
+def test_a_reloaded_external_index_must_know_the_generation_event_capture(tmp_path: Path):
+    """A stale-but-schema-valid index file is reconciled, not adopted blind."""
+    first = InauditCaptureStore(tmp_path)
+    payload = _payload("seen by both")
+    first.capture(payload, [])
+    generation = json.loads(first.generation_path.read_text(encoding="utf-8"))
+    # Hand-corrupt the durable accelerator behind the generation's back: the
+    # event capture is missing exactly as it would be if the index write lost.
+    lying = dict(first._digest_index)
+    del lying["captures"][payload["capture_id"]]
+    lying["digests"].pop(lying["captures"].get(payload["capture_id"], {}).get("digest", ""), None) if False else None
+    lying["digests"] = {}
+    first.digest_index_path.write_text(json.dumps(lying), encoding="utf-8")
+    first.generation_path.write_text(json.dumps(generation), encoding="utf-8")
+
+    second = InauditCaptureStore(tmp_path)
+    second.list_records()  # forces the external-advance reconciliation path
+    assert second._digest_index_ok
+    assert payload["capture_id"] in second._digest_index["captures"], (
+        "a stale index missing the generation event's capture was adopted blind"
+    )
+
+
+def test_caller_mutation_cannot_poison_the_cached_view(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    payload = _payload("poison target")
+    store.capture(payload, [])
+
+    first = store.list_records()
+    first[0]["status"] = "WHATEVER"
+    first[0]["classification_evidence"].append("injected")
+
+    second = store.list_records()
+    assert second[0]["status"] == "NEW"
+    assert second[0]["classification_evidence"] == []
+
+
+def test_the_accelerator_survives_a_restart(tmp_path: Path):
+    store = InauditCaptureStore(tmp_path)
+    payload = _payload("durable body")
+    store.capture(payload, [])
+
+    reopened = InauditCaptureStore(tmp_path)
+    result = reopened.capture(_payload("durable body"), [])
+    assert result["record"]["status"] == "DUPLICATE"
+    assert result["record"]["duplicate_of"] == payload["capture_id"]

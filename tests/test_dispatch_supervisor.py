@@ -49,8 +49,9 @@ class FakeWorkerSupervisor:
             "generation": 1,
         }
 
-    def _reset_slot(self, slot):
+    def reset_stale_slot(self, slot):
         self.resets.append(int(slot))
+        return True
 
     def launch_slot(self, slot, dispatch):
         # The operator relaunch path targets ONE named slot. Routing it through
@@ -205,6 +206,31 @@ def test_relaunch_resets_unproductive_budget_and_clears_slot():
     # The unproductivity budget is gone, so the next tick can launch again.
     clock.now += LAUNCH_GRACE_SECONDS + 1
     assert sup.tick()["launched"]
+
+
+def test_sequential_relaunch_spawns_once_during_boot(tmp_path):
+    """W2-003 (SRC-041:R007): a retry/double-click must not open two windows.
+
+    The first relaunch reserves the slot durably before spawning; the second
+    used to `_reset_slot` that reservation away and spawn again. It must now
+    adopt the pending reservation.
+    """
+    from audapack.services.audit_run_service import ManagedWorkerSupervisor
+
+    launches: list[tuple[int, int]] = []
+    workers = ManagedWorkerSupervisor(
+        lambda slot, generation: (launches.append((slot, generation)) or (True, "started")),
+        tmp_path / "workers.json",
+    )
+    sup = supervisor(FakeDispatcher(), workers)
+
+    first = sup.relaunch_managed_slot(2)
+    second = sup.relaunch_managed_slot(2)
+
+    assert first["success"] is True
+    assert second["success"] is False
+    assert "already pending" in second["message"]
+    assert launches == [(2, 1)], launches
 
 
 def test_relaunch_targets_the_named_slot_not_a_lane_budget():

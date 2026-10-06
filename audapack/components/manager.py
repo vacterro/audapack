@@ -128,26 +128,21 @@ class ComponentManager:
         impossible by construction and then opened a second window anyway,
         defeating its own "warm it first" purpose.
 
-        The profile's `--user-data-dir` is what actually distinguishes a worker
-        window, and `find_profile_windows` already matches on it. Off Windows
-        there is no window enumeration, so the Bridge answer stays the fallback
-        rather than a hard False.
+        T-152: the Bridge fallback that survived this method reintroduced the
+        exact false positive on non-Windows and on any enumeration failure --
+        `active_workers` means "some browser widget worker is registered", never
+        "the dedicated Chromium user-data-dir has a live window". The method now
+        answers ONLY the dedicated-profile question and fails closed: Win32
+        enumerates the profile windows, every other platform and every
+        enumeration error answers False. The Bridge is never consulted here.
         """
+        if sys.platform != "win32":
+            return False
         try:
             from audapack.components.widget import get_dedicated_chromium_profile_dir
             from audapack.window_layout import find_profile_windows
 
-            if sys.platform == "win32":
-                return bool(find_profile_windows(get_dedicated_chromium_profile_dir()))
-        except Exception:
-            pass
-        try:
-            from audapack.services.bridge_service import BridgeService
-
-            status = BridgeService(self.config).browser_status()
-            if not status.get("ok"):
-                return False
-            return int((status.get("dispatch") or {}).get("active_workers", 0) or 0) > 0
+            return bool(find_profile_windows(get_dedicated_chromium_profile_dir()))
         except Exception:
             return False
 

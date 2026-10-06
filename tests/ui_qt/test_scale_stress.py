@@ -14,34 +14,40 @@ from PySide6.QtCore import QModelIndex
 
 from audapack.audits import reset_audit_counters
 from audapack.config import AppConfig, AuditsConfig
-from audapack.models import Project
+from audapack.models import SLOTS_PER_GROUP, Project
 from audapack.services.audit_service import AuditService
 from audapack.services.project_service import ProjectService
 from audapack.ui_qt.models.project_room_model import ProjectRoomModel
 from audapack.ui_qt.task_runner import TaskRunner
 
 
-def build_scale_project_service(tmp_path, count: int) -> tuple[ProjectService, ProjectRoomModel]:
-    projects = []
-    groups = ["MAIN0", "MAIN1", "SIDE0", "SIDE1", "SIDE2", "SIDE3", "SIDE4", "SIDE5", "SIDE6", "SIDE7"]
-    slot_idx = 0
-    group_idx = 0
+def _group_for_ordinal(ordinal: int) -> str:
+    """Group name for the Nth slot of the registry, in canonical order.
 
-    for i in range(count):
-        g = groups[group_idx]
-        s = (slot_idx % 6) + 1
-        projects.append(
-            Project(
-                id=f"proj_{i:03d}",
-                display_name=f"Project {i:03d}",
-                source_path=str(tmp_path / f"proj_{i:03d}"),
-                priority_group=g,
-                slot=s,
-            )
+    The old builder wrapped after a fixed list of ten groups, so counts above
+    60 reused (group, slot) keys. Projects collided in the registry and the
+    model's keyed dict silently dropped the losers: 240 of 300 never reached
+    the view, while the assertions still passed because they never asked.
+    Dynamic SIDE groups are a real supported layout, so scale the names out.
+    """
+    if ordinal == 0:
+        return "MAIN0"
+    if ordinal == 1:
+        return "MAIN1"
+    return f"SIDE{ordinal - 2}"
+
+
+def build_scale_project_service(tmp_path, count: int) -> tuple[ProjectService, ProjectRoomModel]:
+    projects = [
+        Project(
+            id=f"proj_{i:03d}",
+            display_name=f"Project {i:03d}",
+            source_path=str(tmp_path / f"proj_{i:03d}"),
+            priority_group=_group_for_ordinal(i // SLOTS_PER_GROUP),
+            slot=(i % SLOTS_PER_GROUP) + 1,
         )
-        slot_idx += 1
-        if slot_idx % 6 == 0:
-            group_idx = (group_idx + 1) % len(groups)
+        for i in range(count)
+    ]
 
     config = AppConfig(
         audits=AuditsConfig(root=str(tmp_path / "audits")),
@@ -56,7 +62,14 @@ def build_scale_project_service(tmp_path, count: int) -> tuple[ProjectService, P
 def test_scale_model_construction_and_targeted_moves(tmp_path, qapp, project_count):
     service, model = build_scale_project_service(tmp_path, project_count)
 
-    # Verification of initial load
+    # Verification of initial load: EVERY project must reach the view. The old
+    # fixture lost 240 of 300 this way and still passed, because "at least two
+    # group rows" is true for a registry that silently dropped the rest.
+    registry = service.list_projects()
+    assert len(registry) == project_count
+    keys = {(p.priority_group.upper(), p.slot) for p in registry}
+    assert len(keys) == project_count, "fixture must not collide (group, slot) keys"
+    assert all(model.index_for_project_id(p.id).isValid() for p in registry)
     assert model.rowCount(QModelIndex()) >= 2
     assert model.model_reset_count == 1  # only initial reset
 
@@ -113,31 +126,44 @@ def test_100_audit_events_stress_and_coalescing(tmp_path, qapp):
 
     reset_audit_counters()
     completed_events = []
+    executed = []
 
     # Fire 100 rapid audit events alternating among 4 projects
     for i in range(100):
         target_pid = f"proj_{i % 4:03d}"
         runner.submit_coalesced(
             f"audit:{target_pid}",
-            lambda pid=target_pid: audit_service.refresh_project(pid),
+            lambda pid=target_pid: (
+                executed.append(pid),
+                audit_service.refresh_project(pid),
+            )[1],
             on_success=lambda snap, pid=target_pid: (
                 model.update_audit_snapshot(pid, snap),
                 completed_events.append(pid),
             ),
         )
 
-    # Process events until finished
+    # Process events until every key has drained. Stopping at an arbitrary count
+    # would make the bound below vacuous: it must be measured after the storm is
+    # over, not while it is still running.
     start_wait = time.time()
-    while len(completed_events) < 8 and time.time() - start_wait < 5.0:
+    while time.time() - start_wait < 5.0:
         qapp.processEvents()
+        if completed_events and not any(
+            runner.is_running(f"audit:proj_{i:03d}") for i in range(4)
+        ):
+            break
         time.sleep(0.01)
-
 
     # Invariants:
     # 1. 0 full model resets
     assert model.model_reset_count == initial_resets
-    # 2. Coalescing collapsed 100 rapid requests into bounded executions
-    assert len(completed_events) <= 20
+    # 2. Coalescing collapsed 100 submissions into bounded WORK. Callback count
+    #    alone cannot prove it: plain submit() also yields only 4 callbacks,
+    #    because superseded generations are dropped rather than coalesced. The
+    #    falsifiable quantity is how many worker bodies ran.
+    assert len(executed) <= 20, f"coalescing failed: {len(executed)} bodies ran"
+    assert set(executed) == {f"proj_{i:03d}" for i in range(4)}
     # 3. Model snapshot state updated for target projects
     for i in range(4):
         pid = f"proj_{i:03d}"

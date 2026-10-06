@@ -9,9 +9,12 @@ adapter are both proven.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from http.client import HTTPConnection
 from pathlib import Path
+
+import pytest
 
 
 def _archive(tmp_path: Path, name: str = "PROJ.zip") -> Path:
@@ -120,9 +123,11 @@ def test_dispatch_jobs_submit_then_claim(bridge_server, tmp_path):
             "start_receipt": "receipt-start-1",
         }
         if to_state == "COMPLETE":
-            # W2-004: terminal COMPLETE carries proof, or it is held at
-            # FINALIZING for the Bridge's own reconciliation.
+            # W2-004/T-156: terminal COMPLETE carries proof -- the path AND the
+            # digest the bytes actually hash to -- or it is held at FINALIZING
+            # for the Bridge's own reconciliation.
             body["final_handoff_path"] = str(handoff)
+            body["final_handoff_sha256"] = hashlib.sha256(handoff.read_bytes()).hexdigest()
         status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", body, config.bridge.token)
         assert status == 200, (to_state, payload)
     assert payload["job"]["state"] == "COMPLETE"
@@ -414,3 +419,214 @@ def test_reorder_needs_the_token_like_every_other_dispatch_call(bridge_server, t
     dispatch_id = _enqueue(conn, config, tmp_path, "QE")
     status, _payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/reorder", {"delta": -1}, "wrong-token")
     assert status == 403
+
+
+def _drive_to_auditing(conn, config, dispatch_id: str, worker_id: str = "w_alpha") -> str:
+    """Claim a queued dispatch and walk it to AUDITING, returning the lease id."""
+    status, payload = _post(conn, "/v1/browser/poll", {
+        "worker_id": worker_id,
+        "generating": False,
+        "action_in_flight": False,
+        "has_manual_draft": False,
+        "has_attachments": False,
+    }, config.bridge.token)
+    assert status == 200, payload
+    lease_id = payload["job"]["lease_id"]
+    for to_state in ("ARTIFACT_FETCHED", "ATTACHED", "START_PREPARED", "STARTED", "AUDITING"):
+        status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/state", {
+            "dispatch_id": dispatch_id,
+            "worker_id": worker_id,
+            "lease_id": lease_id,
+            "state": to_state,
+            "campaign_run_id": "runStop",
+            "start_receipt": "receipt-stop-1",
+        }, config.bridge.token)
+        assert status == 200, (to_state, payload)
+    assert payload["job"]["state"] == "AUDITING", payload
+    return lease_id
+
+
+def test_an_explicit_operator_stop_retires_a_live_managed_dispatch(bridge_server, tmp_path):
+    """SRC-098: the widget's operator-A3-OFF handshake, over the real wire.
+
+    This is the exact transition `managedA3OperatorStop()` issues when a human
+    unchecks A3 on a worker that is mid-audit. It has to retire the lane
+    terminally, release the worker, and stay idempotent under the repeat clicks
+    and reload-resumes that Milestone E requires.
+    """
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    dispatch_id = _enqueue(conn, config, tmp_path, "STOPME")
+    _drive_to_auditing(conn, config, dispatch_id)
+
+    status, payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/abandon", {
+        "dispatch_id": dispatch_id,
+        "reason": "a3-checkbox",
+        "source": "operator",
+    }, config.bridge.token)
+    assert status == 200, payload
+    assert payload["state"] == "FAILED", payload
+    assert "a3-checkbox" in str(payload.get("error", "")), payload
+
+    # Terminal, not active AUDIT ownership: the lane is gone from the room's
+    # active set and the worker is free again rather than pinned.
+    dispatcher = _live_dispatcher_owning(dispatch_id)
+    job = dispatcher.get_job(dispatch_id)
+    assert job.state == "FAILED"
+    assert job.assigned_worker_id == "" and job.lease_id == ""
+    assert job.campaign_run_id == "runStop", "the run must stay inspectable in Audit Runs"
+
+    # Milestone E: a repeated OFF click is an ACK, not a contradiction.
+    status, again = _post(conn, f"/v1/browser/jobs/{dispatch_id}/abandon", {"reason": "a3-checkbox"}, config.bridge.token)
+    assert status == 200 and again["state"] == "FAILED", again
+    assert dispatcher.get_job(dispatch_id).completed_at == job.completed_at
+
+
+def test_the_operator_stop_needs_the_token_like_every_other_dispatch_call(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    dispatch_id = _enqueue(conn, config, tmp_path, "STOPAUTH")
+    status, _payload = _post(conn, f"/v1/browser/jobs/{dispatch_id}/abandon", {"reason": "a3-checkbox"}, "wrong-token")
+    assert status == 403
+
+
+# --------------------------------------------------------------------------
+# PERF-001 (audit/12.md): ONE owner for the queue-time archive digest.
+#
+# The GUI used to hash the ZIP only so the Bridge could read the same bytes
+# again to check it, so a normal browser-audit delivery read the whole archive
+# three times before ChatGPT upload even started and a fourth to stream it.
+# The Bridge owns the canonical path and can establish the pinned digest
+# itself; the client's copy was pure duplicate I/O.
+# --------------------------------------------------------------------------
+
+def test_the_gui_does_not_hash_the_archive_to_submit_it(bridge_server, tmp_path, monkeypatch):
+    from audapack.models import Project
+    from audapack.services.bridge_service import BridgeService
+
+    config, _base_url = bridge_server
+    archive = _archive(tmp_path, "PERF_GUI.zip")
+    monkeypatch.setattr(
+        "audapack.services.bridge_service.find_archive_for_project",
+        lambda *_a, **_k: archive,
+    )
+    monkeypatch.setattr(
+        "audapack.services.bridge_service.resolve_output_dir",
+        lambda *_a, **_k: tmp_path,
+    )
+    monkeypatch.setattr(
+        "audapack.services.bridge_service._sha256_file",
+        lambda *_a, **_k: pytest.fail("the GUI must not hash the archive to submit it"),
+    )
+
+    service = BridgeService(config)
+    project = Project(id="p1", display_name="PERF1", source_path=str(tmp_path))
+    result = service.submit_browser_audit(project, archive, profile="quick3")
+    # The submission itself may still fail on transport/auth in this fixture;
+    # what this test pins is that it never read the archive to produce it.
+    assert isinstance(result, dict)
+
+
+def test_the_bridge_hashes_the_archive_exactly_once_per_submission(bridge_server, tmp_path, monkeypatch):
+    config, base_url = bridge_server
+    archive = _archive(tmp_path, "PERF_ONCE.zip")
+    calls = []
+    from audapack.bridge import server as server_mod
+
+    original = server_mod.AudapackBridgeHandler._sha256_path
+    monkeypatch.setattr(
+        server_mod.AudapackBridgeHandler,
+        "_sha256_path",
+        staticmethod(lambda p: (calls.append(Path(p)), original(p))[1]),
+    )
+
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": "PERF_ONCE",
+        "project_id": "p1",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 200, payload
+    assert len(calls) == 1, f"expected exactly one queue-time hash, saw {len(calls)}"
+    assert calls[0].resolve() == archive.resolve()
+
+
+def test_submission_without_a_client_digest_is_pinned_by_the_bridge(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    archive = _archive(tmp_path, "PERF_NOHASH.zip")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": "PERF_NOHASH",
+        "project_id": "p1",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 200, payload
+
+    job = _live_dispatcher_owning(payload["dispatch"]["dispatch_id"]).get_job(
+        payload["dispatch"]["dispatch_id"]
+    )
+    assert job.archive_sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
+    # The leased worker is handed the very same proof.
+    status, poll = _post(conn, "/v1/browser/poll", {
+        "worker_id": "w_perf", "generating": False, "action_in_flight": False,
+        "has_manual_draft": False, "has_attachments": False,
+    }, config.bridge.token)
+    assert status == 200, poll
+    assert poll["job"]["dispatch_id"] == job.dispatch_id
+
+
+def test_a_wrong_legacy_client_digest_is_still_rejected(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    archive = _archive(tmp_path, "PERF_BADDIGEST.zip")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": "PERF_BADDIGEST",
+        "project_id": "p2",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "archive_sha256": "0" * 64,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 400, payload
+    assert payload["error"]["code"] == "changed_archive", payload
+
+
+def test_an_archive_changed_after_enqueue_is_still_refused_at_fetch(bridge_server, tmp_path):
+    config, base_url = bridge_server
+    archive = _archive(tmp_path, "PERF_CHANGED.zip")
+    conn = HTTPConnection(base_url.replace("http://", ""))
+    status, payload = _post(conn, "/v1/browser/jobs", {
+        "project_name": "PERF_CHANGED",
+        "project_id": "p3",
+        "archive_path": str(archive),
+        "archive_filename": archive.name,
+        "archive_size": archive.stat().st_size,
+        "profile": "quick3",
+    }, config.bridge.token)
+    assert status == 200, payload
+    dispatch_id = payload["dispatch"]["dispatch_id"]
+
+    status, poll = _post(conn, "/v1/browser/poll", {
+        "worker_id": "w_perf", "generating": False, "action_in_flight": False,
+        "has_manual_draft": False, "has_attachments": False,
+    }, config.bridge.token)
+    assert status == 200, poll
+    lease_id = poll["job"]["lease_id"]
+
+    archive.write_bytes(b"PKtampered-after-enqueue")
+
+    from audapack.bridge.browser_dispatch import DispatchError
+    dispatcher = _live_dispatcher_owning(dispatch_id)
+    try:
+        dispatcher.resolve_artifact(dispatch_id, "w_perf", lease_id)
+    except DispatchError as exc:
+        assert exc.code == "changed_archive"
+    else:
+        pytest.fail("a tampered archive must not reach the attachment step")

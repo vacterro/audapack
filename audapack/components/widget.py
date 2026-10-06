@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -14,6 +17,11 @@ from audapack.config import app_dir, get_user_runtime_dir
 from audapack.procutil import popen_hidden, run_hidden
 
 WIDGET_FILE_NAME = "AUDAPACK_WIDGET.user.js"
+
+#: The canonical release ledger: the version + digest of the bytes this
+#: repository currently ships. See `widget_release_errors`.
+WIDGET_RELEASE_FILE_NAME = "AUDAPACK_WIDGET.release.json"
+WIDGET_RELEASE_SCHEMA = 1
 
 # Windows browser detection candidates: (display name, candidate paths).
 # Detected from well-known install locations and portable drives.
@@ -270,6 +278,374 @@ def read_bundled_widget_metadata() -> dict[str, str]:
     if key is not None:
         _WIDGET_METADATA_CACHE[key] = dict(meta)
     return meta
+
+
+def get_widget_release_path() -> Path:
+    """The canonical release ledger beside the bundled userscript."""
+    return app_dir() / "resources" / WIDGET_RELEASE_FILE_NAME
+
+
+def read_widget_release() -> dict | None:
+    """The persisted release record, or None when it is absent/unreadable."""
+    path = get_widget_release_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+#: One numeric version segment. Deliberately ASCII-only: a Unicode digit that
+#: `str.isdigit()` accepts is not a version segment any userscript manager
+#: compares, so collapsing it to an integer here would invent an ordering.
+_VERSION_SEGMENT = re.compile(r"\A[0-9]+\Z")
+
+
+def widget_version_key(value: str) -> tuple[int, ...]:
+    """THE canonical numeric userscript version comparator.
+
+    One owner for "which version is newer" (TARGET D): the recorder, the update
+    probe and any future release check all order versions through this, so a
+    release can never be strictly newer to one consumer and equal to another.
+
+    Returns a tuple of non-negative ints; compares lexicographically
+    (`widget_version_key("0.0.59") < widget_version_key("0.0.60")`).
+
+    Raises ``ValueError`` for anything outside the numeric contract. Release
+    identity is a strictly-increasing numeric sequence; a prerelease suffix
+    such as ``0.0.60-beta`` has no defined order in this project's contract, so
+    it is REJECTED explicitly instead of being silently compared as equal to
+    ``0.0.60`` (which would launder exactly the drift T-196 filed).
+    """
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("version is empty")
+    if "-" in text or "+" in text:
+        raise ValueError(f"prerelease/build suffix is unsupported: {value!r}")
+    key: list[int] = []
+    for segment in text.split("."):
+        if not _VERSION_SEGMENT.match(segment):
+            raise ValueError(f"non-numeric version segment {segment!r} in {value!r}")
+        key.append(int(segment))
+    return tuple(key)
+
+
+#: Ledger read states. ABSENT and MALFORMED are different mechanical facts:
+#: a first record is a bootstrap, a corrupt ledger is a fail-closed refusal.
+RELEASE_LEDGER_ABSENT = "ABSENT"
+RELEASE_LEDGER_OK = "OK"
+RELEASE_LEDGER_MALFORMED = "MALFORMED"
+
+
+def load_widget_release_state() -> tuple[str, dict | None]:
+    """The persisted ledger and HOW it read: (state, record)."""
+    path = get_widget_release_path()
+    if not path.exists():
+        return RELEASE_LEDGER_ABSENT, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return RELEASE_LEDGER_MALFORMED, None
+    if not isinstance(data, dict):
+        return RELEASE_LEDGER_MALFORMED, None
+    return RELEASE_LEDGER_OK, data
+
+
+def write_widget_release(record: dict, path: Path | None = None) -> None:
+    """Atomically replace the release ledger with ``record``.
+
+    Written to a sibling temp file, fsynced, then ``os.replace``d, so a crash
+    or a failed write can never truncate or destroy the PREVIOUS valid ledger
+    (TARGET B). The parent directory is never left holding the temp file.
+    """
+    target = path or get_widget_release_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".widget-release-", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def widget_release_transition(
+    current: dict, previous: dict | None
+) -> tuple[bool, str, str]:
+    """Is recording ``current`` over ``previous`` a legal release transition?
+
+    THE monotonic release-identity rule (TARGET A). ``@version`` is the only
+    thing an installed userscript manager compares, so two different builds
+    shipped under one version string are one build as far as every browser is
+    concerned. This answers, mechanically, whether the ledger may move:
+
+      * no previous ledger            -> allowed (bootstrap);
+      * identical bytes               -> allowed (idempotent no-op);
+      * different bytes               -> allowed ONLY when the current
+                                         ``@version`` is STRICTLY GREATER than
+                                         the recorded one;
+      * different bytes, same/lower   -> REFUSED, ledger untouched.
+
+    Returns ``(allowed, code, detail)``; on refusal the code names the exact
+    reason and ``detail`` is the human sentence.
+
+    Both versions are parsed by the ONE canonical comparator. An unsupported
+    (prerelease/non-numeric) version on either side is a refusal, never a
+    silent comparison: releasing inside an ordering the project never defined
+    is how the T-196 defect would come back.
+    """
+    if previous is None:
+        return True, "BOOTSTRAP", "no previous recorded release"
+    previous_sha = str(previous.get("sha256") or "").lower()
+    previous_version = str(previous.get("version") or "")
+    current_sha = str(current.get("sha256") or "").lower()
+    current_version = str(current.get("version") or "")
+
+    if current_sha and current_sha == previous_sha:
+        # Identical bytes: nothing to release. The version cannot differ for
+        # the same bytes (the version lives IN the bytes), so a mismatch means
+        # the ledger was already inconsistent -- fail closed rather than bless.
+        if current_version != previous_version:
+            return (
+                False,
+                "LEDGER_VERSION_MISMATCH",
+                f"recorded bytes hash to {previous_sha[:16]}... but the ledger "
+                f"names version {previous_version!r} while the script declares "
+                f"{current_version!r}; the ledger is inconsistent, refusing to "
+                "rewrite it",
+            )
+        return True, "NO_OP", "bytes and version are unchanged -- nothing to record"
+
+    try:
+        current_key = widget_version_key(current_version)
+    except ValueError as exc:
+        return False, "UNSUPPORTED_VERSION", f"current @version {current_version!r}: {exc}"
+    try:
+        previous_key = widget_version_key(previous_version)
+    except ValueError as exc:
+        return (
+            False,
+            "MALFORMED_LEDGER",
+            f"recorded release version {previous_version!r} is not a supported "
+            f"numeric version: {exc}",
+        )
+
+    if current_key <= previous_key:
+        return (
+            False,
+            "VERSION_NOT_INCREASED",
+            f"shipped bytes changed but // @version is {current_version!r}, "
+            f"which is not strictly greater than the recorded {previous_version!r}; "
+            "an installed userscript manager would never install these bytes. "
+            "Bump // @version and record again",
+        )
+    return True, "RECORDED", f"{previous_version} -> {current_version}"
+
+
+def record_widget_release(
+    *, bootstrap: bool = False, ledger_path: Path | None = None
+) -> dict:
+    """Validate and atomically record the current bytes' release identity.
+
+    The mechanical half of T-196's fix (TARGETS A/B/D). Order is deliberate:
+
+        read previous ledger -> read current bytes -> parse version ->
+        compute SHA -> validate transition -> atomic write -> post-write verify
+
+    Validation happens BEFORE any write, so the evidence needed to detect
+    same-version drift is never destroyed by a failed or illegal record. On
+    refusal the previous valid ledger survives byte-for-byte.
+
+    ``bootstrap`` is the ONE explicit recovery path: it permits the FIRST
+    record over a missing OR malformed ledger. It changes nothing about the
+    monotonic rule for an existing well-formed ledger.
+
+    Returns a structured result (never raises for a protocol refusal):
+    ``{"ok", "code", "detail", "record", "previous", "wrote"}``.
+    """
+    target = ledger_path or get_widget_release_path()
+    current = widget_release_record()
+    if not current.get("version"):
+        return {
+            "ok": False,
+            "code": "NO_VERSION",
+            "detail": f"{get_bundled_widget_path()} declares no // @version",
+            "record": current,
+            "previous": None,
+            "wrote": False,
+        }
+
+    state, previous = load_widget_release_state() if ledger_path is None else _load_ledger_at(target)
+    if state != RELEASE_LEDGER_OK and not bootstrap:
+        if state == RELEASE_LEDGER_MALFORMED:
+            return {
+                "ok": False,
+                "code": "MALFORMED_LEDGER",
+                "detail": f"release ledger {target} is unreadable or not a JSON object; "
+                "refusing to overwrite it (use --bootstrap only to re-establish a "
+                "known-good ledger)",
+                "record": current,
+                "previous": None,
+                "wrote": False,
+            }
+        return {
+            "ok": False,
+            "code": "MISSING_LEDGER",
+            "detail": f"no release ledger at {target}; the FIRST record is an explicit "
+            "bootstrap (run with --bootstrap)",
+            "record": current,
+            "previous": None,
+            "wrote": False,
+        }
+    if state != RELEASE_LEDGER_OK:
+        previous = None
+    allowed, code, detail = widget_release_transition(current, previous)
+    if not allowed:
+        return {
+            "ok": False,
+            "code": code,
+            "detail": detail,
+            "record": current,
+            "previous": previous,
+            "wrote": False,
+        }
+    if code == "NO_OP":
+        return {
+            "ok": True,
+            "code": code,
+            "detail": detail,
+            "record": current,
+            "previous": previous,
+            "wrote": False,
+        }
+
+    write_widget_release(current, path=target)
+    verify_state, written = _load_ledger_at(target)
+    if verify_state != RELEASE_LEDGER_OK or not _records_agree(current, written):
+        return {
+            "ok": False,
+            "code": "WRITE_VERIFY_FAILED",
+            "detail": f"the release ledger at {target} did not read back as the "
+            "recorded release; the previous ledger was replaced and must be "
+            "re-recorded",
+            "record": current,
+            "previous": previous,
+            "wrote": True,
+        }
+    return {
+        "ok": True,
+        "code": code,
+        "detail": detail,
+        "record": current,
+        "previous": previous,
+        "wrote": True,
+    }
+
+
+def _load_ledger_at(path: Path) -> tuple[str, dict | None]:
+    """Ledger state at an explicit path (the recorder's testable seam)."""
+    if not path.exists():
+        return RELEASE_LEDGER_ABSENT, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return RELEASE_LEDGER_MALFORMED, None
+    if not isinstance(data, dict):
+        return RELEASE_LEDGER_MALFORMED, None
+    return RELEASE_LEDGER_OK, data
+
+
+def _records_agree(current: dict, written: dict | None) -> bool:
+    if not isinstance(written, dict):
+        return False
+    for field in ("version", "sha256", "script", "schema"):
+        if current.get(field) != written.get(field):
+            return False
+    return True
+
+
+def widget_release_record(version: str | None = None, sha256: str | None = None) -> dict:
+    """The release record for the CURRENT bytes (or the ones supplied)."""
+    if version is None or sha256 is None:
+        path = get_bundled_widget_path()
+        data = path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        match = re.search(rb"//\s*@version\s+([^\r\n]+)", data)
+        version = match.group(1).strip().decode("ascii", "ignore") if match else ""
+    return {
+        "schema": WIDGET_RELEASE_SCHEMA,
+        "script": WIDGET_FILE_NAME,
+        "version": version,
+        "sha256": sha256,
+    }
+
+
+def widget_release_errors() -> list[str]:
+    """Does the shipped userscript's BYTES identity match its VERSION?
+
+    T-196. `@version` is the only thing Tampermonkey compares when it decides
+    whether an installed script is current, so two materially different builds
+    shipped under one version string are one build as far as every installed
+    browser is concerned: the repository tests exercise the new bytes while the
+    operator's browser keeps executing the old ones.
+
+    The invariant is therefore: DIFFERENT SHIPPED BYTES REQUIRE A DIFFERENT,
+    STRICTLY INCREASING VERSION. It is checked against the release ledger
+    (`AUDAPACK_WIDGET.release.json`), which is committed beside the bundle and
+    records the version and SHA-256 that were shipped together. Timestamps are
+    deliberately NOT release identity -- a checkout rewrites them.
+
+    Returns a list of human-readable violations; empty means consistent.
+    """
+    errors: list[str] = []
+    path = get_bundled_widget_path()
+    if not path.is_file():
+        return [f"bundled userscript is missing: {path}"]
+
+    data = path.read_bytes()
+    sha256 = hashlib.sha256(data).hexdigest()
+    match = re.search(rb"//\s*@version\s+([^\r\n]+)", data)
+    if not match:
+        return [f"{WIDGET_FILE_NAME} declares no // @version"]
+    version = match.group(1).strip().decode("ascii", "ignore")
+
+    ledger = read_widget_release()
+    if ledger is None:
+        return [
+            f"release ledger missing or unreadable: {get_widget_release_path()} -- "
+            f"record the shipped version {version!r} and its SHA-256 "
+            "(use scripts/update_widget_release.py)"
+        ]
+
+    recorded_version = str(ledger.get("version") or "")
+    recorded_sha = str(ledger.get("sha256") or "").lower()
+    if recorded_sha != sha256:
+        errors.append(
+            f"shipped bytes changed without a release: {WIDGET_FILE_NAME} is "
+            f"{sha256[:16]}... but the release ledger records "
+            f"{recorded_sha[:16]}... as version {recorded_version!r}; bump "
+            "// @version and re-record the release"
+        )
+        if recorded_version and version == recorded_version:
+            errors.append(
+                f"different bytes still declare the same // @version "
+                f"{version!r} -- an installed userscript manager sees them as "
+                "one build, so the new bytes never reach the browser"
+            )
+    elif recorded_version != version:
+        errors.append(
+            f"release ledger records version {recorded_version!r} for these "
+            f"bytes but the script declares {version!r}; the two must agree"
+        )
+    return errors
 
 
 CHROMIUM_KEEPALIVE_FLAGS = [

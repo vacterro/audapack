@@ -365,3 +365,283 @@ def test_a_layer_created_after_the_scan_is_skipped_not_emptied(tmp_path, monkeyp
 
     assert target.name == "2.md"
     assert (audit_dir / "1.md").read_text(encoding="utf-8") == "someone else's audit text"
+
+
+# ---------------------------------------------------------------------------
+# PERF-004 (audit/10.md): passive dashboard freshness + bounded cache
+# ---------------------------------------------------------------------------
+
+
+def _clear_inbox_caches():
+    si._CACHE.clear()
+    si._PASSIVE_CACHE.clear()
+
+
+def test_passive_reuse_inside_budget_does_zero_physical_work(tmp_path, monkeypatch):
+    """A repaint inside the freshness budget must not scan the inbox at all."""
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = {"full": 0, "fingerprint": 0}
+    real_read, real_fp = si.read_inbox, si._inbox_fingerprint
+
+    def counting_read(*args, **kwargs):
+        scans["full"] += 1
+        return real_read(*args, **kwargs)
+
+    def counting_fp(*args, **kwargs):
+        scans["fingerprint"] += 1
+        return real_fp(*args, **kwargs)
+
+    monkeypatch.setattr(si, "read_inbox", counting_read)
+    monkeypatch.setattr(si, "_inbox_fingerprint", counting_fp)
+
+    first = si.read_inbox_passive(root, now=1000.0)
+    assert first.verdict == si.UNREAD
+    assert scans["full"] == 1, "the first passive read must probe once"
+
+    second = si.read_inbox_passive(root, now=1000.5)
+    assert second is first
+    assert scans["full"] == 1, "a repaint inside the budget must not rescan"
+    assert scans["fingerprint"] == 0, "a repaint inside the budget must not even fingerprint"
+
+
+def test_passive_probes_once_after_the_budget_expires(tmp_path, monkeypatch):
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = {"full": 0, "fingerprint": 0}
+    real_read, real_fp = si.read_inbox, si._inbox_fingerprint
+
+    def counting_read(*args, **kwargs):
+        scans["full"] += 1
+        return real_read(*args, **kwargs)
+
+    def counting_fp(*args, **kwargs):
+        scans["fingerprint"] += 1
+        return real_fp(*args, **kwargs)
+
+    monkeypatch.setattr(si, "read_inbox", counting_read)
+    monkeypatch.setattr(si, "_inbox_fingerprint", counting_fp)
+
+    si.read_inbox_passive(root, now=1000.0)
+    assert scans["full"] == 1
+    # Inside the budget nothing at all is read, not even a fingerprint.
+    si.read_inbox_passive(root, now=1000.0 + si._PASSIVE_FRESHNESS_SECONDS - 0.1)
+    assert scans["full"] == 1
+    assert scans["fingerprint"] == 0
+    # The budget's expiry runs exactly one fresh physical probe.
+    si.read_inbox_passive(root, now=1000.0 + si._PASSIVE_FRESHNESS_SECONDS)
+    assert scans["full"] == 2
+    assert scans["fingerprint"] == 0
+
+
+def test_passive_force_probe_is_exactly_one_fresh_scan(tmp_path, monkeypatch):
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = {"full": 0}
+    real_read = si.read_inbox
+
+    def counting_read(*args, **kwargs):
+        scans["full"] += 1
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(si, "read_inbox", counting_read)
+
+    si.read_inbox_passive(root, now=1000.0)
+    assert scans["full"] == 1
+    # A decision-critical forced probe inside the budget must still rescan.
+    si.read_inbox_passive(root, now=1000.5, force=True)
+    assert scans["full"] == 2
+
+
+def test_passive_change_is_seen_after_the_budget(tmp_path):
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    assert si.read_inbox_passive(root, now=1000.0).verdict == si.UNREAD
+    (root / si.AUDIT_DIRNAME / "2.md").write_text("second", encoding="utf-8")
+    # Inside the budget the passive layer may serve the settled verdict.
+    assert si.read_inbox_passive(root, now=1000.5).verdict == si.UNREAD
+    # Past the budget the fingerprint notices the new layer.
+    state = si.read_inbox_passive(root, now=1000.0 + si._PASSIVE_FRESHNESS_SECONDS + 0.1)
+    assert state.live_count == 2
+
+
+def test_invalidation_forces_a_fresh_probe(tmp_path):
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    assert si.read_inbox_passive(root, now=1000.0).verdict == si.UNREAD
+    (root / si.AUDIT_DIRNAME / "2.md").write_text("second", encoding="utf-8")
+    si.invalidate_inbox_cache(root)
+    state = si.read_inbox_passive(root, now=1000.5)
+    assert state.live_count == 2, "a known inbox change must invalidate the passive verdict"
+
+
+def test_module_cache_is_bounded_across_many_project_roots(tmp_path):
+    """1,000 create/remove/move roots must not grow the module cache past its bound."""
+    _clear_inbox_caches()
+    for index in range(1000):
+        root = tmp_path / f"proj{index}"
+        inbox = root / si.AUDIT_DIRNAME
+        inbox.mkdir(parents=True)
+        (inbox / "1.md").write_text("audit", encoding="utf-8")
+        si.read_inbox_cached(root, now=1000.0 + index)
+    assert len(si._CACHE) <= si._CACHE_MAX_ENTRIES
+
+    survivor = tmp_path / "survivor"
+    inbox = survivor / si.AUDIT_DIRNAME
+    inbox.mkdir(parents=True)
+    (inbox / "1.md").write_text("audit", encoding="utf-8")
+    assert si.read_inbox_cached(survivor, now=9999.0).verdict == si.UNREAD
+    assert len(si._CACHE) <= si._CACHE_MAX_ENTRIES
+
+
+def test_authoritative_reader_still_follows_a_same_instant_delivery(tmp_path):
+    """PERF-004 must not weaken read_inbox_cached's immediate-change contract."""
+    _clear_inbox_caches()
+    root = _project(tmp_path)
+    assert si.read_inbox_cached(root, now=1000.0).verdict == si.EMPTY
+    (root / si.AUDIT_DIRNAME / "1.md").write_text("audit", encoding="utf-8")
+    assert si.read_inbox_cached(root, now=1000.0).verdict == si.UNREAD
+
+
+# ---------------------------------------------------------------------------
+# PERF-004 closure correction: the budget must beat the REAL 4-second cadence
+# ---------------------------------------------------------------------------
+
+# The active dashboard cadence the passive budget must clear (main_window.py).
+_ACTIVE_POLL_SECONDS = 4.0
+
+
+def _counting_reads(monkeypatch):
+    scans = {"full": 0, "fingerprint": 0}
+    real_read, real_fp = si.read_inbox, si._inbox_fingerprint
+
+    def counting_read(*args, **kwargs):
+        scans["full"] += 1
+        return real_read(*args, **kwargs)
+
+    def counting_fp(*args, **kwargs):
+        scans["fingerprint"] += 1
+        return real_fp(*args, **kwargs)
+
+    monkeypatch.setattr(si, "read_inbox", counting_read)
+    monkeypatch.setattr(si, "_inbox_fingerprint", counting_fp)
+    return scans
+
+
+def test_budget_exceeds_the_active_dashboard_cadence():
+    """The 4-second repaint must land strictly inside the freshness budget."""
+    assert si._PASSIVE_FRESHNESS_SECONDS > _ACTIVE_POLL_SECONDS, (
+        "a budget equal to the active cadence expires on every repaint; "
+        "Qt timers fire at or after their interval"
+    )
+
+
+def test_the_real_four_second_repaint_reuses_the_settled_verdict(tmp_path, monkeypatch):
+    """The key missing test: t=1000 then t=1004.1 must not perform two scans."""
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = _counting_reads(monkeypatch)
+
+    first = si.read_inbox_passive(root, now=1000.0)
+    assert first.verdict == si.UNREAD
+    assert scans["full"] == 1
+
+    second = si.read_inbox_passive(root, now=1004.1)
+    assert second is first
+    assert scans["full"] == 1, "a normal 4-second repaint must not rescan"
+    assert scans["fingerprint"] == 0
+
+
+def test_timer_jitter_does_not_expire_the_passive_verdict(tmp_path, monkeypatch):
+    """Normal scheduling delay (4.05 / 4.2 / 4.5 s) must still reuse."""
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = _counting_reads(monkeypatch)
+
+    si.read_inbox_passive(root, now=1000.0)
+    assert scans["full"] == 1
+    for jitter in (4.05, 4.2, 4.5):
+        si.read_inbox_passive(root, now=1000.0 + jitter)
+        assert scans["full"] == 1, f"jitter {jitter}s must not rescan"
+    assert scans["fingerprint"] == 0
+
+
+def test_expiry_still_probes_once_then_reuses_again(tmp_path, monkeypatch):
+    """Bounded periodic refresh: one scan on expiry, none on the next repaint."""
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = _counting_reads(monkeypatch)
+
+    si.read_inbox_passive(root, now=1000.0)
+    assert scans["full"] == 1
+    # A normal repaint before expiry does no work.
+    si.read_inbox_passive(root, now=1004.1)
+    assert scans["full"] == 1
+    # Genuine expiry (past the 8-second budget) performs exactly one fresh probe.
+    si.read_inbox_passive(root, now=1000.0 + si._PASSIVE_FRESHNESS_SECONDS + 0.1)
+    assert scans["full"] == 2
+    # The next normal repaint reuses that verdict again.
+    si.read_inbox_passive(root, now=1000.0 + si._PASSIVE_FRESHNESS_SECONDS + 4.2)
+    assert scans["full"] == 2
+    assert scans["fingerprint"] == 0
+
+
+def test_active_run_physical_scans_are_fewer_than_repaints(tmp_path, monkeypatch):
+    """Measure the win over a 20-second active run: 6 repaints, ~3 scans."""
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = _counting_reads(monkeypatch)
+
+    polls = [0.0, 4.0, 8.0, 12.0, 16.0, 20.0]
+    for offset in polls:
+        si.read_inbox_passive(root, now=1000.0 + offset)
+    assert len(polls) == 6
+    assert scans["full"] == 3, f"expected ~3 physical scans, got {scans['full']}"
+    assert scans["full"] < len(polls)
+
+
+def test_hundred_project_roots_keep_the_bounded_scan_ratio(tmp_path, monkeypatch):
+    """The same bounded ratio must hold across 100 retained project roots."""
+    _clear_inbox_caches()
+    roots = [
+        _project(tmp_path / f"p{index}", layers={"1.md": "audit"})
+        for index in range(100)
+    ]
+    scans = _counting_reads(monkeypatch)
+
+    polls = [0.0, 4.0, 8.0, 12.0, 16.0, 20.0]
+    for offset in polls:
+        for root in roots:
+            si.read_inbox_passive(root, now=1000.0 + offset)
+    assert scans["full"] == 3 * len(roots), (
+        f"expected {3 * len(roots)} scans for 100 roots, got {scans['full']}"
+    )
+    assert scans["full"] < len(polls) * len(roots)
+
+
+def test_passive_age_uses_monotonic_time_not_wall_clock(tmp_path, monkeypatch):
+    """A wall-clock jump must not expire the passive cache; monotonic governs."""
+    import time as time_module
+
+    _clear_inbox_caches()
+    root = _project(tmp_path, layers={"1.md": "audit"})
+    scans = _counting_reads(monkeypatch)
+
+    clock = {"mono": 500.0, "wall": 1_600_000_000.0}
+    monkeypatch.setattr(time_module, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(time_module, "time", lambda: clock["wall"])
+
+    first = si.read_inbox_passive(root)
+    assert scans["full"] == 1
+
+    # A large wall-clock correction backwards must not matter at all.
+    clock["wall"] -= 3600.0
+    clock["mono"] += 1.0
+    second = si.read_inbox_passive(root)
+    assert second is first, "a wall-clock rollback must not expire the verdict"
+    assert scans["full"] == 1
+
+    # Real elapsed monotonic time past the budget does expire it.
+    clock["mono"] += si._PASSIVE_FRESHNESS_SECONDS + 0.1
+    si.read_inbox_passive(root)
+    assert scans["full"] == 2

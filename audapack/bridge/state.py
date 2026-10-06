@@ -42,6 +42,18 @@ class GenerationPersistenceError(RuntimeError):
     """Raised when the cross-process audit-generation signal cannot be published (W2-012)."""
 
 
+class GenerationStateCorruptionError(GenerationPersistenceError):
+    """Raised when an EXISTING durable generation file is corrupt/unreadable.
+
+    CORE-001: a missing generation file is a legitimate fresh counter (bootstrap
+    at 1), but an existing-but-unreadable file is evidence of unknown prior
+    durable history. It must never be collapsed into generation 0, and the
+    counter must never be republished lower than the last durable value. The
+    corrupt bytes are left untouched so an explicit recovery can quarantine and
+    restart the stream under a new epoch.
+    """
+
+
 def canonical_run_key(run_id: str) -> str:
     """Canonical persistent identity of a run: sha256 of the FULL raw run id.
 
@@ -182,24 +194,160 @@ def get_generation_file_path(base_dir: Optional[Path] = None) -> Path:
     return get_state_dir() / "audit_generation.json"
 
 
-def get_audit_generation(base_dir: Optional[Path] = None) -> dict[str, Any]:
-    """Reads current audit generation counter for cross-process GUI synchronization."""
+def _new_generation_epoch() -> str:
+    """Opaque recovery identity for one generation stream.
+
+    W2-003: a generation counter and the epoch it belongs to are two facts.
+    When durable bytes are unrecoverable the counter restarts, and the epoch
+    change is what tells a consumer to resync instead of ignoring a lower
+    number. The token is random so an unrelated corrupt file cannot resurrect
+    the old stream's identity.
+    """
+    return os.urandom(16).hex()
+
+
+def read_generation_document(base_dir: Optional[Path] = None) -> dict[str, Any]:
+    """Read the audit generation document, distinguishing MISSING from CORRUPT.
+
+    Returns a dict with an added ``exists`` flag. A missing file is a valid
+    fresh counter (``exists`` False, generation 0, empty epoch). An existing
+    file that cannot be parsed into a non-negative integer generation raises
+    :class:`GenerationStateCorruptionError` -- it is NEVER reported as 0.
+    """
     g_file = get_generation_file_path(base_dir)
-    if g_file.exists():
-        try:
-            return json.loads(g_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {
-        "generation": 0,
-        "project_id": "",
-        "last_project": "",
-        "last_wave": "",
-        "updated_at": "",
-    }
+    if not g_file.exists():
+        return {
+            "generation": 0,
+            "epoch": "",
+            "exists": False,
+            "project_id": "",
+            "last_project": "",
+            "last_wave": "",
+            "updated_at": "",
+        }
+    try:
+        raw = json.loads(g_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise GenerationStateCorruptionError(
+            f"audit generation file {g_file} is corrupt or unreadable: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise GenerationStateCorruptionError(
+            f"audit generation file {g_file} is not a JSON object"
+        )
+    generation = raw.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise GenerationStateCorruptionError(
+            f"audit generation file {g_file} has no valid non-negative generation"
+        )
+    doc = dict(raw)
+    doc["exists"] = True
+    doc.setdefault("epoch", "")
+    return doc
+
+
+def get_audit_generation(base_dir: Optional[Path] = None) -> dict[str, Any]:
+    """Reads current audit generation counter for cross-process GUI synchronization.
+
+    CORE-001: raises :class:`GenerationStateCorruptionError` for an existing
+    unreadable file rather than inferring generation 0.
+    """
+    return read_generation_document(base_dir)
 
 
 get_generation_info = get_audit_generation
+
+
+def _quarantine_generation_file(g_file: Path) -> Optional[Path]:
+    """Move corrupt generation bytes aside instead of destroying evidence."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    target = g_file.parent / f"{g_file.name}.corrupt-{stamp}.json"
+    try:
+        g_file.replace(target)
+        return target
+    except OSError:
+        return None
+
+
+def _write_generation_document(g_file: Path, data: dict[str, Any]) -> None:
+    fd, tmp_file = open_new_temp_file(g_file.parent, g_file.name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_file.replace(g_file)
+    except Exception as exc:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+        raise GenerationPersistenceError(
+            f"Failed to publish audit generation: {exc}"
+        ) from exc
+
+
+def recover_audit_generation(base_dir: Optional[Path] = None) -> int:
+    """Explicitly recover a missing or corrupt audit generation stream.
+
+    W2-003: quarantine unreadable bytes and start a NEW epoch at generation 1 so
+    consumers resync and adopt the recovered baseline even though the numeric
+    counter is lower than the last value they observed. A healthy stream is a
+    no-op and returns its current generation.
+    """
+    g_file = get_generation_file_path(base_dir)
+    lock_file = g_file.parent / "audit_generation.lock"
+    with cross_process_lock(lock_file):
+        try:
+            current = read_generation_document(base_dir)
+        except GenerationStateCorruptionError:
+            _quarantine_generation_file(g_file)
+            current = {"generation": 0, "epoch": "", "exists": False}
+        if current.get("exists"):
+            return int(current.get("generation", 0))
+        _write_generation_document(g_file, {
+            "generation": 1,
+            "epoch": _new_generation_epoch(),
+            "project_id": "",
+            "last_project": "",
+            "last_wave": "",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return 1
+
+
+def publish_audit_generation(
+    project_name: str,
+    wave: str,
+    base_dir: Optional[Path] = None,
+    *,
+    project_id: Optional[str] = None,
+    recover_on_corruption: bool = True,
+) -> int:
+    """Post-commit generation publication that never suppresses authoritative commit.
+
+    Contract:
+    - The caller's authoritative data is ALREADY committed when this is invoked.
+    - If the generation file is missing, publish 1 (bootstrap).
+    - If the generation file is corrupt:
+      * the normal call path self-heals via ``recover_audit_generation()`` before
+        publishing, so the deadbeat loop cannot happen;
+      * callers whose call ALREADY succeeded must stay successful even if this
+        publish cannot be delivered -- the returned error is informational.
+    - ``GenerationStateCorruptionError`` is a ``GenerationPersistenceError``
+      so ``except GenerationPersistenceError`` boundaries already cover it.
+
+    Returns the new generation. Raises ``GenerationPersistenceError`` if
+    publication genuinely failed (including a recovery that failed).
+    """
+    try:
+        return increment_audit_generation(project_name, wave, base_dir, project_id=project_id)
+    except GenerationStateCorruptionError:
+        if not recover_on_corruption:
+            raise
+        recover_audit_generation(base_dir)
+        return increment_audit_generation(project_name, wave, base_dir, project_id=project_id)
 
 
 def increment_audit_generation(
@@ -218,29 +366,19 @@ def increment_audit_generation(
     g_file = get_generation_file_path(base_dir)
     lock_file = g_file.parent / "audit_generation.lock"
     with cross_process_lock(lock_file):
-        current = get_audit_generation(base_dir)
+        # CORE-001: read_generation_document raises for an existing corrupt
+        # file, so no synthetic 0 can leak in and no lower generation is ever
+        # published. The corrupt bytes stay on disk for explicit recovery.
+        current = read_generation_document(base_dir)
         next_gen = int(current.get("generation", 0)) + 1
+        epoch = str(current.get("epoch") or "") or _new_generation_epoch()
         new_data = {
             "generation": next_gen,
+            "epoch": epoch,
             "project_id": project_id or "",
             "last_project": project_name,
             "last_wave": wave,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        fd, tmp_file = open_new_temp_file(g_file.parent, g_file.name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(new_data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            tmp_file.replace(g_file)
-            return next_gen
-        except Exception as exc:
-            if tmp_file.exists():
-                try:
-                    tmp_file.unlink()
-                except OSError:
-                    pass
-            raise GenerationPersistenceError(
-                f"Failed to publish audit generation for {project_name}/{wave}: {exc}"
-            ) from exc
+        _write_generation_document(g_file, new_data)
+        return next_gen

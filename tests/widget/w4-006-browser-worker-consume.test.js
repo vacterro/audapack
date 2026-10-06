@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { setup, composerFixture } = require('./helpers');
+const { setup, composerFixture, installAcceptedSend } = require('./helpers');
 
 function addAttachmentTile(h, form, label) {
   const tile = h.el('div', { role: 'group', 'aria-label': label });
@@ -164,9 +164,62 @@ test('P0-10: leased consume performs one exact attach and one irreversible START
   assert.ok(ok);
   assert.strictEqual(injectionCount, 1);
   assert.strictEqual(sendCount, 1);
+  // T-261: this seam answers a bare `true`, which is exactly the ambiguity the
+  // defect was built on -- one boolean meaning both "the Core left the composer"
+  // and "Auto3 owns the Core". A seam that proves nothing about adoption can
+  // only earn STARTED; AUDITING waits for real local wave ownership, which the
+  // poll re-assert crosses as soon as adoption lands.
   assert.deepStrictEqual(transitions.map(item => item.state), [
-    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED', 'AUDITING'
+    'ARTIFACT_FETCHED', 'ATTACHED', 'START_PREPARED', 'STARTED'
   ]);
+});
+
+test('P0-10: an adopted START reaches AUDITING, an unadopted one does not', async () => {
+  const runConsume = async adopt => {
+    const { api } = setup();
+    const transitions = [];
+    const input = {};
+    const root = { contains: node => node === input };
+    const archiveFile = { name: 'TERMISAI_30.08.26-T17-20-40.zip', size: 1234 };
+    const ok = await api.browserWorkerConsume({
+      dispatch_id: 'dsp-0123456789abcdef',
+      worker_id: 'worker-1',
+      lease_id: 'lease-1',
+      project_id: 'termisai',
+      project_name: 'TERMISAI',
+      campaign_run_id: 'run-1',
+      archive_filename: archiveFile.name,
+      archive_size: archiveFile.size
+    }, {
+      transition: async state => { transitions.push(state); return { ok: true }; },
+      fetchArtifact: async () => ({ ok: true, file: archiveFile }),
+      uploadInput: () => input,
+      composerRoot: () => root,
+      injectFiles: () => true,
+      waitForAttachment: async () => ({ ok: true, reason: 'exact-match', observedNames: [archiveFile.name] }),
+      startAudit: async ({ beforeIrreversibleSend }) => {
+        await beforeIrreversibleSend({ receipt: 'receipt-1', campaignRunId: 'run-1' });
+        if (adopt) {
+          api.autoRuntime.stage = 'wait-core';
+          return { sent: true, adopted: true, stage: 'wait-core', turnId: 'turn-core-1' };
+        }
+        api.autoRuntime.stage = 'await-core-user';
+        return { sent: true, adopted: false, stage: 'await-core-user', state: 'pending' };
+      }
+    });
+    return { ok, transitions };
+  };
+
+  const adopted = await runConsume(true);
+  assert.strictEqual(adopted.ok, true);
+  assert.ok(adopted.transitions.includes('AUDITING'),
+    `an adopted Core is auditing: ${JSON.stringify(adopted.transitions)}`);
+
+  const pending = await runConsume(false);
+  assert.strictEqual(pending.ok, true);
+  assert.ok(!pending.transitions.includes('AUDITING'),
+    `a Core whose turn has not registered is not auditing: ${JSON.stringify(pending.transitions)}`);
+  assert.ok(pending.transitions.includes('STARTED'), 'it is STARTED, pending registration');
 });
 
 test('T54: real worker START treats its canonical Core draft as owned and clicks Send', async () => {
@@ -177,7 +230,7 @@ test('T54: real worker START treats its canonical Core draft as owned and clicks
       search: '?audapack_worker=1&audapack_worker_slot=1&audapack_worker_generation=11'
     }
   });
-  const { form, input, send } = composerFixture(h);
+  const { form, input, send } = installAcceptedSend(h, composerFixture(h));
   api.state.bridgeEnabled = true;
   api.state.auditProfile = 'quick3';
   api.state.chatgptPromptDelivery = 'text';

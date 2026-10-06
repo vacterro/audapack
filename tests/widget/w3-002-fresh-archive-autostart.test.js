@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { setup, mainEl, composerFixture, runtimeFixture, userTurn, addTurns } = require('./helpers');
+const { setup, mainEl, composerFixture, installAcceptedSend, runtimeFixture, userTurn, addTurns } = require('./helpers');
 
 function cacheCompletedWaves(api, kinds, runId = 'run-complete') {
   api.autoRuntime.runId = runId;
@@ -14,6 +14,11 @@ function cacheCompletedWaves(api, kinds, runId = 'run-complete') {
       kind,
       gateState: 'complete',
       completedAt: Date.now(),
+      // T-184: these tests assert the campaign-progress label (DONE / x/N),
+      // not save state. A cached wave with bridgeSavedAt == 0 is now correctly
+      // reported as unsaved attention, so the fixture states what it means:
+      // these waves are durably acknowledged by the Bridge.
+      bridgeSavedAt: Date.now(),
       text: `${kind} complete evidence`
     }), true);
   }
@@ -121,7 +126,7 @@ test('W3-002: archive freshness is visible from archive filename timestamp', () 
 
 test('W3-002: one START waits for delayed Send readiness and submits automatically', async () => {
   const { h, api } = setup();
-  const { form, send } = composerFixture(h);
+  const { form, send } = installAcceptedSend(h, composerFixture(h));
   api.state.superCompact = true;
   api.state.auditProfile = 'quick3';
   api.state.chatgptPromptDelivery = 'text';
@@ -136,7 +141,12 @@ test('W3-002: one START waits for delayed Send readiness and submits automatical
   await h.settle();
   const started = await promise;
 
-  assert.strictEqual(started, true);
+  // T-261: START reports sent and adopted separately, so a bare `true` can no
+  // longer mean both "the Core left the composer" and "Auto3 owns the Core".
+  assert.strictEqual(started.sent, true);
+  assert.strictEqual(started.adopted, true, 'the registered Core turn is adopted here');
+  assert.strictEqual(started.stage, 'wait-core');
+  assert.ok(started.turnId, 'the adopted Core turn id is reported');
   assert.strictEqual(send._clicked, true, 'START must click Send after ChatGPT enables it');
   assert.strictEqual(api.autoRuntime.enabled, true, 'START owns and keeps A3 enabled');
 });

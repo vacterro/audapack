@@ -16,6 +16,7 @@ from audapack.campaign import (
     STATUS_CAMPAIGN_READY_FOR_WAVE,
     STATUS_CAMPAIGN_RUN_CONFLICT,
     build_campaign_context_header,
+    get_canonical_manifest_hash,
     get_profile,
     load_profiles,
     resolve_audit_campaign_entrypoint,
@@ -44,7 +45,7 @@ def create_wave_file(
     project: str = "SAIPEN",
     profile: str = "super10",
     run_id: str = "test-run-100",
-    manifest_sha: str = "c01ec812cf5952fdab101d5e7bc83c8251e0d9c21bb0ab06e426f5d58baedff2",
+    manifest_sha: str = "",
     wave_id: str = "architecture",
     wave_index: int = 1,
     status_line: Optional[str] = None,
@@ -52,6 +53,9 @@ def create_wave_file(
     done_marker: Optional[str] = None,
 ) -> Path:
     p = get_profile(profile)
+    if not manifest_sha:
+        # CORE-003: a canonical artifact declares the CURRENT manifest identity.
+        manifest_sha = p.manifest_hash or get_canonical_manifest_hash()
     w_def = p.get_wave_by_id(wave_id) or p.waves[0]
     if status_line is None:
         status_line = w_def.status_line

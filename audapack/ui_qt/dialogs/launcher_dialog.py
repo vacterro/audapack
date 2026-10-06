@@ -82,8 +82,8 @@ class LauncherEditDialog(QDialog):
         self.chk_enabled.setChecked(launcher.enabled if launcher else True)
         form.addRow("", self.chk_enabled)
 
-        # 7. Global capacity. Zero keeps launchers such as OpenCode unlimited;
-        # FreeBuff defaults to one because its client supports one active tab.
+        # 7. Global capacity. Zero keeps a launcher unlimited; any launcher may
+        # carry an explicit cap the operator sets here.
         self.spin_max_instances = QSpinBox(self)
         self.spin_max_instances.setRange(0, 99)
         self.spin_max_instances.setSpecialValueText("Unlimited")
