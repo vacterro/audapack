@@ -29,7 +29,7 @@
 ---
 
 <p align="center">
-  <img width="640" height="540" alt="2026-08-30_025740" src="https://github.com/user-attachments/assets/dbaf0e39-c925-4baa-8edb-7e36d706fd02" />
+  <img width="640" height="540" alt="AUDAPACK Project Room" src="resources/screenshots/audapack-project-room.png" />
 </p>
 
 ---
