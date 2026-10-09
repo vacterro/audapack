@@ -103,6 +103,20 @@ class FederationSync:
     unchanged: bool = True
 
 
+def acquire_listing(providers: Container[str] = PROVIDERS, timeout: float | None = None) -> sai_accounts.SharedListing:
+    """Acquire one immutable authority snapshot from the control plane."""
+    return sai_accounts.snapshot(providers, timeout=timeout)
+
+
+def reconcile_listing(config: AppConfig, listing: sai_accounts.SharedListing, *,
+                      home: Path | None = None, now: datetime | None = None) -> FederationSync:
+    """Reconcile an AppConfig onto an already-acquired SharedListing."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    if not listing.ok:
+        return _unavailable(config, "control plane did not answer")
+    return _reconcile(config, listing, home=home, stamp=stamp)
+
+
 def sync_effective_launchers(config: AppConfig, *, home: Path | None = None,
                              now: datetime | None = None) -> FederationSync:
     """Read the control plane once and reconcile the effective inventory onto it.
@@ -110,17 +124,12 @@ def sync_effective_launchers(config: AppConfig, *, home: Path | None = None,
     Deliberately NOT called anywhere implicitly: one owner per process decides
     when a refresh happens, so no widget can spawn its own ``sai-accounts list``.
     """
-    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     if not sai_accounts.engine_path():
         # No plane on this machine. Never federate one that has no registry, and
         # never mutate a projection this pass could not check.
         return _unavailable(config, "no control plane installed")
-    listing = sai_accounts.snapshot(PROVIDERS)
-    if not listing.ok:
-        # A failed read is not an authoritative empty account list. The
-        # last-known-good projection stays exactly as it is, marked stale.
-        return _unavailable(config, "control plane did not answer")
-    return _reconcile(config, listing, home=home, stamp=stamp)
+    listing = acquire_listing(PROVIDERS)
+    return reconcile_listing(config, listing, home=home, now=now)
 
 
 def _unavailable(config: AppConfig, _why: str) -> FederationSync:
@@ -150,8 +159,15 @@ def _reconcile(config: AppConfig, listing: sai_accounts.SharedListing, *,
       untouched as a LOCAL CUSTOM launcher: that is their work, not ours;
     * a local tool row is never touched.
     """
+    if not listing.ok:
+        return _unavailable(config, "control plane snapshot non-authoritative")
     home = Path(home) if home is not None else Path.home()
     canonical = [entry for entry in listing.accounts if entry.account_id]
+    seen_accounts = set()
+    for entry in canonical:
+        if entry.account_id in seen_accounts:
+            return _unavailable(config, "duplicate canonical account_id in listing")
+        seen_accounts.add(entry.account_id)
     # Keyed by the canonical account_id: that is the identity, and the ``sai:``
     # id is only one of its projections.
     targets = {entry.account_id: entry for entry in canonical}
@@ -497,7 +513,9 @@ def migrate_prepared_bindings(store, *, donors: Mapping[str, str],
     changes nothing at all, so a control-plane outage can neither block nor
     re-point a job; only an authoritative snapshot that lacks the account does.
     """
-    from audapack.prepared import TERMINAL_STATES
+    from dataclasses import replace
+
+    from audapack.prepared import TERMINAL_STATES, JobState, Trigger
 
     migrated: list[str] = []
     blocked: list[str] = []
@@ -506,21 +524,71 @@ def migrate_prepared_bindings(store, *, donors: Mapping[str, str],
         if job.state in TERMINAL_STATES:
             unchanged += 1
             continue
+
         binding = resolve_prepared_binding(job.account_id, job.launcher_id,
                                            donors=donors, proven=proven)
-        if binding.state == MIGRATED:
-            if (job.account_id, job.launcher_id) != (binding.account_id, binding.launcher_id):
-                migrated.append(job.prepared_id)
-                store.save(rebind_job(job, binding))
-            else:
-                unchanged += 1
-        elif binding.state == ACCOUNT_MAPPING_REQUIRED:
+        if binding.state == ACCOUNT_MAPPING_REQUIRED:
             reason = "%s: %s" % (ACCOUNT_MAPPING_REQUIRED, binding.reason)
             if job.state == _blocked_state() and job.waiting_reason == reason:
                 unchanged += 1
                 continue
             blocked.append(job.prepared_id)
             store.save(block_job(job, reason))
+            continue
+
+        sync_members = []
+        if (job.trigger == Trigger.SYNC or getattr(job, "account_id", "") == "SYNC") and hasattr(store, "get_sync_members"):
+            sync_members = store.get_sync_members(job.prepared_id)
+
+        sync_blocked = False
+        sync_migrated = False
+        if sync_members:
+            updated_members = []
+            for m in sync_members:
+                mbinding = resolve_prepared_binding(m.account_id, m.launcher_id,
+                                                    donors=donors, proven=proven)
+                if mbinding.state == ACCOUNT_MAPPING_REQUIRED:
+                    reason = "%s: member %d (%s): %s" % (
+                        ACCOUNT_MAPPING_REQUIRED, m.member_index,
+                        m.account_id or m.launcher_id, mbinding.reason
+                    )
+                    if job.state == _blocked_state() and job.waiting_reason == reason:
+                        sync_blocked = True
+                        break
+                    blocked.append(job.prepared_id)
+                    store.save(block_job(job, reason))
+                    sync_blocked = True
+                    break
+                elif mbinding.state == MIGRATED:
+                    if (m.account_id, m.launcher_id) != (mbinding.account_id, mbinding.launcher_id):
+                        sync_migrated = True
+                        updated_members.append(replace(m, account_id=mbinding.account_id,
+                                                       launcher_id=mbinding.launcher_id))
+                    else:
+                        updated_members.append(m)
+                else:
+                    updated_members.append(m)
+
+            if sync_blocked:
+                if job.prepared_id not in blocked:
+                    unchanged += 1
+                continue
+
+            if sync_migrated and hasattr(store, "save_sync_members"):
+                store.save_sync_members(job.prepared_id, updated_members)
+
+        job_migrated = False
+        if binding.state == MIGRATED:
+            if (job.account_id, job.launcher_id) != (binding.account_id, binding.launcher_id):
+                job_migrated = True
+                job = rebind_job(job, binding)
+                store.save(job)
+
+        if sync_migrated or job_migrated:
+            if job.state == _blocked_state() and job.enabled:
+                job = replace(job, state=JobState.ARMED, waiting_reason="")
+                store.save(job)
+            migrated.append(job.prepared_id)
         else:
             unchanged += 1
     return BindingMigration(tuple(migrated), tuple(blocked), unchanged)

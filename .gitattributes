@@ -12,3 +12,6 @@
 # Digest-bound shipped artifact: the release ledger records this file's bytes,
 # so a checkout must never rewrite its line endings.
 resources/AUDAPACK_WIDGET.user.js -text
+
+# SAIPEN byte-bound evidence (digest-verified; never convert line endings) -- T-1508.
+.saipen/recovery/board-scrub/** -text

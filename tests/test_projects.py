@@ -524,5 +524,39 @@ class TestSlotHealing(unittest.TestCase):
         self.assertEqual(slots, [1, 2])
 
 
+class TestArchiveScope(unittest.TestCase):
+    def test_default_scope_is_auto(self):
+        p = Project(id="p1", display_name="P1", source_path=r"C:\P1")
+        self.assertEqual(p.archive_scope, "auto")
+
+    def test_complete_source_scope(self):
+        p = Project(id="p1", display_name="P1", source_path=r"C:\P1", archive_scope="complete_source")
+        self.assertEqual(p.archive_scope, "complete_source")
+
+    def test_invalid_scope_normalizes_to_auto(self):
+        p = Project(id="p1", display_name="P1", source_path=r"C:\P1", archive_scope="invalid_scope")
+        self.assertEqual(p.archive_scope, "auto")
+
+    def test_case_insensitive_normalization(self):
+        p = Project(id="p1", display_name="P1", source_path=r"C:\P1", archive_scope="COMPLETE_SOURCE")
+        self.assertEqual(p.archive_scope, "complete_source")
+
+    def test_dict_serialization_roundtrip(self):
+        p = Project(id="p1", display_name="P1", source_path=r"C:\P1", archive_scope="complete_source")
+        d = p.to_dict()
+        self.assertEqual(d.get("archive_scope"), "complete_source")
+        restored = Project.from_dict(d)
+        self.assertEqual(restored.archive_scope, "complete_source")
+
+    def test_legacy_dict_without_archive_scope(self):
+        d = {
+            "id": "legacy",
+            "display_name": "Legacy",
+            "source_path": r"C:\Legacy",
+        }
+        p = Project.from_dict(d)
+        self.assertEqual(p.archive_scope, "auto")
+
+
 if __name__ == "__main__":
     unittest.main()

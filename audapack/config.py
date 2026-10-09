@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 from audapack.agent_inbox import DEFAULT_ALLOCATOR_REL, DEFAULT_BINDING_REL
-from audapack.models import Project
+from audapack.models import Project, normalize_archive_scope
 
 CONFIG_FILE_NAME = "config.json"
 LEGACY_REPO_CONFIG_NAME = "audapack.json"
@@ -1133,6 +1133,10 @@ class UIConfig:
     #: ID, never by list index, so reordering launchers cannot change it.
     project_double_click_launcher_id: str = PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
 
+    #: Compact metrics strip above primary actions
+    show_metrics_strip: bool = True
+    compact_metrics: bool = False
+
 
 @dataclass
 class FederationConfig:
@@ -1581,6 +1585,13 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                         enabled=bool(p_data.get("enabled", True)),
                         ignored=bool(p_data.get("ignored", False)),
                         ignore_archive=bool(p_data.get("ignore_archive", False)),
+                        # T-290: this rebuild runs on EVERY load, so an omitted
+                        # key would silently revert a complete_source toggle
+                        # to auto on the next start or registry transaction.
+                        archive_scope=normalize_archive_scope(p_data.get("archive_scope")),
+                        # T-290: this rebuild runs on EVERY load, so an omitted
+                        # key would silently revert a complete_source toggle
+                        # to auto on the next start or registry transaction.
                         audit_copy_count=int(p_data.get("audit_copy_count", 0) or 0),
                         inaudit_aliases=[
                             str(value).strip()
@@ -1708,6 +1719,8 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
             str(ui_raw.get("project_double_click_launcher_id", PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT)).strip()
             or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
         ),
+        show_metrics_strip=bool(ui_raw.get("show_metrics_strip", True)),
+        compact_metrics=bool(ui_raw.get("compact_metrics", False)),
     )
 
     launchers_raw = data.get("launchers")

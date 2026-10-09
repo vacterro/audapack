@@ -130,8 +130,9 @@ class _Child:
     """A child this test file started, by PID, and may therefore end."""
 
     def __init__(self, script: str, ready_token: str = "OWNER_READY"):
+        py_exe = getattr(sys, "_base_executable", sys.executable)
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", script],
+            [py_exe, "-c", script],
             cwd=str(ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

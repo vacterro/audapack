@@ -112,6 +112,7 @@ def _component(
 def _pack(root: Path, tmp_path: Path, logs: list[str], **overrides) -> PackResult:
     out = tmp_path / "out"
     out.mkdir(parents=True, exist_ok=True)
+    packing_kwargs = overrides.pop("packing_kwargs", {})
     return pack_single(
         source_path=root,
         output_dir=out,
@@ -120,7 +121,7 @@ def _pack(root: Path, tmp_path: Path, logs: list[str], **overrides) -> PackResul
         delete_old=False,
         include_timestamp=False,
         log_callback=logs.append,
-        packing=PackingConfig(output_dir=str(out)),
+        packing=PackingConfig(output_dir=str(out), **packing_kwargs),
         manifest_meta={"project_name": "product", "extra_meta": {}},
         **overrides,
     )
@@ -538,6 +539,27 @@ def test_mandatory_source_above_the_ceiling_is_reported_not_dropped(product, tmp
     assert any("BUDGET_INFEASIBLE" in line for line in logs)
 
 
+def test_complete_source_authorizes_large_archive_above_ceiling(product, tmp_path, monkeypatch):
+    """T-290: complete_source sets large_archive_authorized=True and budget_feasible=True."""
+    _component(product)
+    monkeypatch.setattr(packing, "ARCHIVE_HARD_CEILING_BYTES", 1)
+
+    logs: list[str] = []
+    result = _pack(product, tmp_path, logs, project_archive_scope="complete_source")
+    assert result.success, "large archive under complete_source is authorized"
+
+    legacy, inventory, names = _manifests(result.output_path)
+    assert legacy["large_archive_authorized"] is True
+    assert legacy["budget_feasible"] is True
+    assert not legacy.get("budget_infeasible_code")
+    assert legacy.get("archive_scope") == "complete_source"
+    assert inventory.get("archive_scope") == "complete_source"
+    assert inventory.get("large_archive_authorized") is True
+    assert "zcode/src/main.ts" in names
+    assert inventory["source_review_ready"] is True
+    assert not any("BUDGET_INFEASIBLE" in line for line in logs)
+
+
 # ------------------------------------------------------------ 16. who wrote this
 
 def test_both_manifests_record_the_producing_runtime(product, tmp_path):
@@ -578,6 +600,97 @@ def test_a_shipped_copy_without_git_still_writes_a_producer(tmp_path, monkeypatc
     revision = runtime_identity.source_revision()
     assert revision["kind"] == "fingerprint"
     assert revision["packing_implementation_sha256"]
+
+
+# ------------------------------------------------- 19. the reproduced project shape
+
+SAIPEN_CONTRACT_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "saipen" / "MANIFEST.v2.json"
+)
+
+
+def test_a_zaicode_shaped_project_ships_source_and_omits_undeclared_history(tmp_path):
+    """Validation 8: the reproduced product shape, packed through the real writer.
+
+    A root repository carrying SAIPEN memory (declared control plane plus a large
+    pile of undeclared history) with one nested same-origin application
+    worktree. STANDARD must deliver the application source, keep the declared
+    control plane, and represent undeclared history as a named omission rather
+    than as bytes -- the exact inversion the reproduced ZAICODE archive showed.
+    """
+    import shutil
+
+    root = _init(tmp_path / "zaicode", PRODUCT_ORIGIN)
+    _write(root, "src/index.ts", "export const index = 1;\n")
+    _write(root, "package.json", '{"name": "zaicode"}\n')
+
+    # Declared control plane: the SAIPEN contract names these mandatory. The
+    # contract is written LAST so the mandatory evidence is not newer than it
+    # (the AUDIT_MANIFEST staleness gate, which refuses a stale hand-written
+    # contract exactly as the live protocol does).
+    (root / ".saipen").mkdir(parents=True, exist_ok=True)
+    for rel in ("STATE.md", "BOARD.md", "LOG.md", "IDENTITY.md"):
+        _write(root, f".saipen/{rel}", f"# {rel}\n")
+    time.sleep(0.01)
+    shutil.copyfile(SAIPEN_CONTRACT_FIXTURE, root / ".saipen" / "MANIFEST.json")
+    _write(root, ".saipen/intake/active/SRC-900.md", "# brief\n")
+
+    # Undeclared history: real bytes, never named by the contract.
+    scratch = 0
+    for index in range(24):
+        payload = bytes(256 * 1024)
+        (root / ".saipen" / f"scratch_{index:02d}.bin").write_bytes(payload)
+        scratch += len(payload)
+    _commit(root)
+
+    _component(root)  # the nested same-origin application worktree
+    _write(root, ".gitignore", "/zcode/\n")
+    _commit(root, "ignore the nested component")
+
+    logs: list[str] = []
+    result = _pack(root, tmp_path, logs, packing_kwargs={"fidelity_profile": "standard"})
+    assert result.success, result.error_message
+    _legacy, inventory, names = _manifests(result.output_path)
+
+    # The application source the archive exists to deliver is really inside it.
+    assert "zcode/src/main.ts" in names
+    assert "zcode/src/service/audit.ts" in names
+    assert "src/index.ts" in names
+    assert inventory["nested_git_components"][0]["included"] is True
+    assert inventory["nested_git_components"][0]["files"] > 0
+    assert inventory["source_review_ready"] is True
+    assert inventory["source_review"]["components"][0]["archive_members"] > 0
+
+    # Declared state survives; undeclared history is an omission, not payload.
+    assert ".saipen/STATE.md" in names
+    assert not [name for name in names if name.startswith(".saipen/scratch_")], (
+        "undeclared history was shipped as bytes"
+    )
+    assert inventory["counts"]["excluded"] >= 24
+
+    # Storage: the archive is source-sized, not history-sized.
+    assert result.archive_bytes < scratch, "the archive is dominated by history"
+
+
+def test_a_reasonless_component_omission_cannot_produce_a_zip(product, tmp_path, monkeypatch):
+    """Validation 9: `included == false` + `reason == ""` never yields a success."""
+    _component(product)
+    real_build = packing.build_pack_inventory
+
+    def _mutinied(source, excludes, *args, **kwargs):
+        inventory, plan = real_build(source, excludes, *args, **kwargs)
+        inventory.nested_git_components[0].included = False
+        inventory.nested_git_components[0].reason = ""
+        return inventory, plan
+
+    monkeypatch.setattr(packing, "build_pack_inventory", _mutinied)
+
+    logs: list[str] = []
+    result = _pack(product, tmp_path, logs)
+
+    assert result.success is False
+    assert result.error_code == si.CODE_SOURCE_REVIEW_INCOMPLETE
+    assert not list((tmp_path / "out").glob("*.zip")), "an invalid archive was shipped"
 
 
 # ------------------------------------------------- 17/18. the operator sees the truth

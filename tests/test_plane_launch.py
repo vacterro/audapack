@@ -333,6 +333,10 @@ def _assert_not_registered(plane, payload, code):
     from audapack.ui_qt.main_window import MainWindow
 
     _say(plane, **payload)
+    # T-284: the plane call now runs on the TaskRunner and the verdict is applied
+    # back on the GUI thread, so this drives the real envelope validation and
+    # then exactly the seam that owns registration.
+    verdict = sai.launch(AG, ROOT)
     registered: list = []
     messages: list = []
     host = SimpleNamespace(
@@ -340,10 +344,14 @@ def _assert_not_registered(plane, payload, code):
         statusBar=lambda: SimpleNamespace(showMessage=messages.append),
         _sanitize_diagnostic=lambda text, limit=160: MainWindow._sanitize_diagnostic(text, limit),
     )
+    # The rejected verdict is reported through MainWindow's real diagnostic seam,
+    # so the asserted code comes from production formatting, not a stub.
+    host._report_plane_launch_failure = (
+        lambda *a, **k: MainWindow._report_plane_launch_failure(host, *a, **k)
+    )
     cfg = SimpleNamespace(id=target_id(AG), name="AG1")
-    MainWindow._launch_plane_account(
-        host, cfg, SimpleNamespace(display_name="P"),
-        SimpleNamespace(cwd=ROOT),
+    MainWindow._apply_plane_launch_verdict(
+        host, verdict, cfg, SimpleNamespace(display_name="P"),
         SimpleNamespace(account_id=AG, stage="plane_launch"),
     )
     assert registered == []

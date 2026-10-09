@@ -68,6 +68,45 @@ class TestConfig(unittest.TestCase):
         loaded = load_config(self.base_dir)
         self.assertFalse(loaded.packing.include_timestamp, "user unchecked include_timestamp; restart must not revert it")
 
+    def test_archive_scope_survives_a_config_round_trip(self):
+        """T-290: load_config rebuilds every Project, so the per-project
+        complete_source toggle must be carried through the migration or a
+        restart silently reverts it to auto."""
+        from audapack.models import (
+            ARCHIVE_SCOPE_AUTO,
+            ARCHIVE_SCOPE_COMPLETE_SOURCE,
+            Project,
+        )
+
+        cfg = AppConfig()
+        cfg.projects = [
+            Project(
+                id="full",
+                display_name="Full",
+                source_path=str(self.base_dir),
+                archive_scope=ARCHIVE_SCOPE_COMPLETE_SOURCE,
+            ),
+            Project(id="plain", display_name="Plain", source_path=str(self.base_dir)),
+        ]
+        self.assertTrue(save_config(cfg, self.base_dir))
+
+        loaded = {p.id: p for p in load_config(self.base_dir).projects}
+        self.assertEqual(loaded["full"].archive_scope, ARCHIVE_SCOPE_COMPLETE_SOURCE)
+        self.assertEqual(loaded["plain"].archive_scope, ARCHIVE_SCOPE_AUTO)
+
+        # A persisted value outside the enum is not a second scope: it falls
+        # back to auto exactly like a missing key would.
+        config_file = self.base_dir / "config.json"
+        raw = json.loads(config_file.read_text(encoding="utf-8"))
+        for entry in raw["projects"]:
+            if entry["id"] == "plain":
+                entry["archive_scope"] = "COMPLETE_SOURCE_SOON"
+        config_file.write_text(json.dumps(raw), encoding="utf-8")
+
+        again = {p.id: p for p in load_config(self.base_dir).projects}
+        self.assertEqual(again["plain"].archive_scope, ARCHIVE_SCOPE_AUTO)
+        self.assertEqual(again["full"].archive_scope, ARCHIVE_SCOPE_COMPLETE_SOURCE)
+
     def test_auto_pack_defaults_are_on_and_hourly_for_legacy_configs(self):
         """T-167 (SRC-039): the feature ships enabled at one hour."""
         cfg = AppConfig()

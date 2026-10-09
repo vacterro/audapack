@@ -48,10 +48,14 @@ from typing import Iterable, Optional
 from audapack import saipen_evidence
 from audapack.config import MANDATORY_EXCLUDES
 from audapack.fidelity import (
+    REASON_MEDIA_BUDGET,
+    REASON_SIZE_LIMIT,
     _build_matcher,
     _priority_for,
     exclusion_reason_for,
+    is_test_oracle_path,
 )
+from audapack.models import ARCHIVE_SCOPE_COMPLETE_SOURCE, normalize_archive_scope
 
 __all__ = [
     "SourceOrigin",
@@ -69,6 +73,7 @@ __all__ = [
     "REASON_NESTED_GIT_DIFFERENT_ORIGIN",
     "REASON_COMPONENT_OPTIONAL",
     "CODE_NESTED_COMPONENT_INVENTORY",
+    "CODE_NESTED_COMPONENT_LIMIT",
     "CODE_GIT_UNAVAILABLE",
     "CODE_INVENTORY_INCONSISTENT",
     "CODE_TRACKED_HARD_DENY_CONFLICT",
@@ -121,6 +126,13 @@ CODE_PATH_INVALID = "PATH_INVALID"
 #: read, and the pack must fail rather than ship an archive that is quietly
 #: missing a first-party component.
 CODE_NESTED_COMPONENT_INVENTORY = "NESTED_GIT_COMPONENT_INVENTORY_FAILED"
+#: T-290: more direct nested Git worktrees exist than the safety bound allows.
+#: The bound stays (a scan must be bounded), but exceeding it is REFUSED rather
+#: than silently truncating: an archive that stops discovering components at 64
+#: could not truthfully call itself "complete source", and the omitted component
+#: would have no omission record at all -- invisible to the manifest and to
+#: source-review reconciliation.
+CODE_NESTED_COMPONENT_LIMIT = "NESTED_GIT_COMPONENT_LIMIT_EXCEEDED"
 
 
 #: Exclusion reasons used for inventory entries that are not written. The
@@ -162,6 +174,19 @@ REASON_NESTED_GIT_DIFFERENT_ORIGIN = "nested_git_different_origin"
 #: mandatory -- media, an archive, a generated bundle, or a single oversized
 #: payload. Named so the omission is auditable instead of silent.
 REASON_COMPONENT_OPTIONAL = "nested_component_optional"
+
+#: Exclusion reasons that silently degrade a declared test-oracle set. Every one
+#: of these is AUDAPACK's OWN optimization (media sampling, soft-budget trim,
+#: the nested-component compact tier), so an oracle lost to one is partial
+#: evidence loss rather than an operator decision -- and the source review
+#: refuses to report ready over it. Explicit policy (``configured_ignore``) and
+#: hard safety (``secret_policy``) are deliberately absent: those are the
+#: operator's call and their omission is already reported as such.
+SILENT_ORACLE_LOSS_REASONS = frozenset({
+    REASON_MEDIA_BUDGET,
+    REASON_SIZE_LIMIT,
+    REASON_COMPONENT_OPTIONAL,
+})
 
 #: How far the nested-component scan reaches and what it refuses to carry.
 #: Direct children only: a worktree two levels down is a checkout somebody made,
@@ -597,9 +622,10 @@ class NestedGitComponent:
     reason: str = ""
     file_count: int = 0
     included_bytes: int = 0
+    authority: str = ""
 
     def manifest_record(self) -> dict:
-        return {
+        record = {
             "path": self.rel,
             "origin": self.origin,
             "root_branch": self.root_branch,
@@ -609,6 +635,9 @@ class NestedGitComponent:
             "files": int(self.file_count),
             "bytes": int(self.included_bytes),
         }
+        if self.authority:
+            record["authority"] = self.authority
+        return record
 
 
 def _component_git_text(component: Path, args: Iterable[str], *, what: str) -> str:
@@ -661,6 +690,12 @@ def discover_nested_git_components(source: Path, *, cancel_event=None) -> list[N
     ``MAX_NESTED_COMPONENTS`` of them. No recursive walk of ignored trees and
     no reading of prose: a child is recognised solely by being a worktree, and
     its identity comes from Git, never from its name.
+
+    T-290: the bound is a REFUSAL, not a silent stop. Meeting one more real
+    worktree than the bound allows raises ``NESTED_GIT_COMPONENT_LIMIT_EXCEEDED``
+    instead of dropping it: a truncated scan would leave the extra component out
+    of ``nested_git_components`` with no omission record, so the manifest could
+    not name it and the archive would claim a completeness it does not have.
     """
     source_resolved = Path(source).resolve()
     found: list[NestedGitComponent] = []
@@ -673,10 +708,17 @@ def discover_nested_git_components(source: Path, *, cancel_event=None) -> list[N
             break
         if child.name.startswith(".") or not child.is_dir() or child.is_symlink():
             continue
-        if len(found) >= MAX_NESTED_COMPONENTS:
-            break
         if not (child / ".git").exists():
             continue
+        if len(found) >= MAX_NESTED_COMPONENTS:
+            raise SourceInventoryError(
+                CODE_NESTED_COMPONENT_LIMIT,
+                f"the configured safety limit of {MAX_NESTED_COMPONENTS} direct "
+                f"nested Git repositories was reached and at least one more exists "
+                f"({child.name!r} was not inventoried); the archive was refused "
+                "rather than silently claiming complete source",
+                rel=child.name,
+            )
         # A checkout with no origin has no identity to compare, and "probably
         # the same product" is not a proof: it keeps the safe omission. Only a
         # real query failure is fail-closed -- "no such remote" is an answer.
@@ -708,6 +750,8 @@ def build_nested_component_entries(
     component: NestedGitComponent,
     excludes: set[str],
     *,
+    always_include: Optional[Iterable[str]] = None,
+    always_exclude: Optional[Iterable[str]] = None,
     cancel_event=None,
 ) -> dict[str, SourceInventoryEntry]:
     """Inventory one canonical component under its real nested paths.
@@ -718,10 +762,25 @@ def build_nested_component_entries(
     tracked file still faces a compact tier -- source and configuration stay
     mandatory, media/archives/generated bundles and a single oversized payload
     do not -- and every decline is a named exclusion, never a silent hole.
+
+    T-290: the component consumes the SAME explicit packing policy the root
+    does, evaluated against the real archive-relative path
+    ``<component>/<inner>``. A root-relative pattern therefore means the same
+    thing wherever the file lives, while a generic pattern (``*.log``, ``dist``)
+    still matches by path component. Precedence mirrors ``_classify_untracked``:
+
+        hard safety -> component reproducible tree -> always_exclude
+        -> always_include -> optional payload -> configured -> include
+
+    Hard safety and the reproducible component trees stay unconditional:
+    ``always_include`` cannot resurrect ``.git``, a dependency tree, a build
+    cache or secret material. This is complete SOURCE, not machine backup.
     """
     root = component.path
     entries: dict[str, SourceInventoryEntry] = {}
     hard = _build_matcher(set(HARD_SAFETY_EXCLUDES))
+    always_excl = _build_matcher({p for p in (always_exclude or [])})
+    always_incl = _build_matcher({p for p in (always_include or [])})
     configured = _build_matcher(set(excludes) | set(MANDATORY_EXCLUDES))
     lower_seen: dict[str, str] = {}
 
@@ -738,18 +797,38 @@ def build_nested_component_entries(
         lower_seen[lower] = rel
 
     def _tier(inner: str, size: int) -> tuple[bool, Optional[str]]:
-        """The compact component decision, applied to tracked and untracked alike."""
+        """The compact component decision, applied to tracked and untracked alike.
+
+        The policy matchers see the real archive-relative path, so an explicit
+        root-relative exclude such as ``child/private/**`` matches here exactly
+        as it would at the root; the reproducible-tree and optional-payload
+        tests stay component-relative, because they describe the component's own
+        internal shape rather than a path the operator spelled.
+        """
+        full_rel = f"{component.rel}/{inner}"
         name_lower = inner.rpartition("/")[2].lower()
-        if hard(inner.lower()):
+        if hard(full_rel):
             # Hard safety is not a compact-tier opinion: a secret inside a
             # component fails the whole pack exactly as it does at the root.
-            raise _tracked_path_conflict(f"{component.rel}/{inner}")
+            raise _tracked_path_conflict(full_rel)
         if _component_rel_is_never_archived(inner):
             return False, "component_reproducible_tree"
+        if always_excl(full_rel):
+            return False, "configured_ignore"
+        if always_incl(full_rel):
+            return True, None
+        # A versioned test oracle inside this component is reproducibility
+        # source for the SAME reason it is at the root, so the optional-payload
+        # tier must not swallow it: nested component media filtering used to
+        # drop a child's ``tests/baselines/**`` exactly like the root sampler
+        # did. Placed after the explicit operator excludes, which stay
+        # authoritative.
+        if is_test_oracle_path(full_rel.lower()):
+            return True, None
         if name_lower.endswith(tuple(COMPONENT_OPTIONAL_SUFFIXES)):
             return False, REASON_COMPONENT_OPTIONAL
-        if configured(inner.lower()):
-            return False, exclusion_reason_for(inner.lower(), name_lower)
+        if configured(full_rel):
+            return False, exclusion_reason_for(full_rel.lower(), name_lower)
         return True, None
 
     # Four Git content commands per component, never one per file.
@@ -798,8 +877,26 @@ def build_nested_component_entries(
         full = root.joinpath(*inner.split("/"))
         st = _stat_existing(full, inner)
         if mode == "120000" or stat_module.S_ISLNK(st.st_mode):
-            entry = _resolve_symlink_entry(root, full, inner, ORIGIN_TRACKED)
+            # T-290: membership/safety classification comes BEFORE any symlink
+            # handling, exactly as it does for a regular file. Deciding by
+            # filesystem representation let a tracked symlink named
+            # `id_ed25519` (or one under `dist/`) enter an archive that would
+            # have failed closed on the same path as a regular file: the writer
+            # resolves the link and writes the target bytes, so a hard-safety
+            # name was packaged by spelling it as a link.
+            include, reason = _tier(inner, st.st_size)
             _claim_lower(rel)
+            if not include:
+                entries[rel] = SourceInventoryEntry(
+                    rel=rel,
+                    origin=ORIGIN_TRACKED,
+                    size=st.st_size,
+                    include=False,
+                    reason=reason,
+                    symlink=True,
+                )
+                continue
+            entry = _resolve_symlink_entry(root, full, inner, ORIGIN_TRACKED)
             entries[rel] = SourceInventoryEntry(
                 rel=rel,
                 origin=ORIGIN_TRACKED,
@@ -949,6 +1046,31 @@ def source_review_reconciliation(
     if inventory.entries and not included:
         issues.append("the frozen inventory carries no included file")
 
+    # Versioned test oracles (visual/snapshot/golden baselines) are the source a
+    # declared test:visual run reproduces against. The counts below let a
+    # portable archive PROVE they survived: an oracle the policy classifier
+    # dropped is partial loss, not a smaller archive, so it fails closed here
+    # instead of the archive advertising source_review_ready over a baseline set
+    # it no longer carries. Explicit operator excludes keep their authority --
+    # what this refuses is AUDAPACK's OWN sampling and budget trimming.
+    oracle_total = 0
+    oracle_included = 0
+    lost_oracles: list[str] = []
+    for entry in inventory.entries.values():
+        if not is_test_oracle_path(entry.rel.lower()):
+            continue
+        oracle_total += 1
+        if entry.include:
+            oracle_included += 1
+            continue
+        if entry.reason in SILENT_ORACLE_LOSS_REASONS:
+            lost_oracles.append(entry.rel)
+    if lost_oracles:
+        issues.append(
+            f"{len(lost_oracles)} versioned test-oracle file(s) were dropped by "
+            f"packing policy (first: {lost_oracles[0]!r})"
+        )
+
     if members is not None:
         for member in members:
             owner = component_forbidden_prefix(member, components)
@@ -961,6 +1083,8 @@ def source_review_reconciliation(
         "source_review_ready": not issues,
         "included_files": len(included),
         "included_bytes": sum(e.size for e in included),
+        "test_oracle_files_total": oracle_total,
+        "test_oracle_files_included": oracle_included,
         "components": rows,
         "issues": issues[:MAX_SOURCE_REVIEW_ISSUES],
     }
@@ -1400,6 +1524,7 @@ def build_git_inventory(
     always_exclude: Optional[list[str]] = None,
     supersedable_reserved: Optional[frozenset] = None,
     cancel_event=None,
+    project_archive_scope: str = "auto",
 ) -> SourceInventory:
     """Frozen ``tracked_existing UNION untracked_nonignored`` inventory.
 
@@ -1414,6 +1539,9 @@ def build_git_inventory(
     name holding project-owned content, the pack still fails closed.
     """
     source_resolved = source.resolve()
+    # T-290: public/direct calls normalize here too, so no caller can spell the
+    # scope in a way that decides membership differently from the fingerprint.
+    project_archive_scope = normalize_archive_scope(project_archive_scope)
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -1465,6 +1593,8 @@ def build_git_inventory(
     # normalized origin means it is this product's own component and its source
     # belongs in the archive; anything else keeps the safe omission below and is
     # named in the manifest instead of vanishing.
+    # When project_archive_scope == "complete_source", explicit operator authority
+    # includes every direct nested Git worktree regardless of origin identity.
     try:
         root_origin = _normalized_component_origin(source_resolved)
     except SourceInventoryError:
@@ -1472,15 +1602,21 @@ def build_git_inventory(
     nested_components = discover_nested_git_components(
         source_resolved, cancel_event=cancel_event
     )
-    same_origin_components: dict[str, NestedGitComponent] = {}
+    included_components: dict[str, NestedGitComponent] = {}
+    is_complete_source = (project_archive_scope == ARCHIVE_SCOPE_COMPLETE_SOURCE)
     for component in nested_components:
-        component.reason = (
-            REASON_NESTED_GIT_DIFFERENT_ORIGIN
-            if not root_origin or not component.origin or component.origin != root_origin
-            else ""
-        )
-        if not component.reason:
-            same_origin_components[component.rel] = component
+        is_same_origin = bool(root_origin and component.origin and component.origin == root_origin)
+        if is_complete_source:
+            component.authority = "same_origin" if is_same_origin else "project_complete_source"
+            component.reason = ""
+            included_components[component.rel] = component
+        elif is_same_origin:
+            component.authority = "same_origin"
+            component.reason = ""
+            included_components[component.rel] = component
+        else:
+            component.authority = ""
+            component.reason = REASON_NESTED_GIT_DIFFERENT_ORIGIN
 
     mandatory = _build_matcher(set(MANDATORY_EXCLUDES))
     hard = _build_matcher(set(HARD_SAFETY_EXCLUDES))
@@ -1594,7 +1730,7 @@ def build_git_inventory(
             rel = validate_rel_path(raw_path.rstrip("/"))
             if rel in entries:
                 continue
-            if rel in same_origin_components:
+            if rel in included_components:
                 # Superseded by the component's own ingestion phase below --
                 # never a second ingestion trigger. Outer Git policy may hide
                 # or reveal this directory at will; membership was decided by
@@ -1682,9 +1818,13 @@ def build_git_inventory(
     # (build_nested_component_entries raises NESTED_GIT_COMPONENT_INVENTORY_FAILED).
     # Foreign components never reach this phase: they keep the named omission
     # recorded above and in the manifest.
-    for component in same_origin_components.values():
+    for component in included_components.values():
         component_entries = build_nested_component_entries(
-            component, set(excludes), cancel_event=cancel_event
+            component,
+            set(excludes),
+            always_include=list(always_include or []),
+            always_exclude=list(always_exclude or []),
+            cancel_event=cancel_event,
         )
         for member_rel, member in component_entries.items():
             if member_rel in entries:
@@ -1784,6 +1924,22 @@ def build_git_inventory(
         full = source_resolved.joinpath(*rel.split("/"))
         st = _stat_existing(full, rel)
         if stat_module.S_ISDIR(st.st_mode):
+            continue
+        if component_forbidden_prefix(rel, nested_components):
+            # T-290: an explicit always_include or manifest reference may not
+            # resurrect a nested component's reproducible bulk (Git's store,
+            # dependency trees, build output). The nested ingest filter already
+            # refuses these; without the same guard here the ROOT overlay would
+            # admit one, and the archive's own post-write source review would
+            # then refuse the whole pack. A named exclusion is the honest,
+            # non-fatal verdict and keeps that promise out of fail-late.
+            entries[rel] = SourceInventoryEntry(
+                rel=rel,
+                origin=ORIGIN_UNTRACKED,
+                size=st.st_size,
+                include=False,
+                reason="component_reproducible_tree",
+            )
             continue
         if stat_module.S_ISLNK(st.st_mode):
             entries[rel] = _resolve_symlink_entry(source_resolved, full, rel, ORIGIN_UNTRACKED)
@@ -2252,6 +2408,7 @@ def build_pack_inventory(
     prebuilt_plan=None,
     supersedable_reserved: Optional[frozenset] = None,
     cancel_event=None,
+    project_archive_scope: str = "auto",
 ) -> tuple[SourceInventory, object]:
     """Discover, validate and freeze the pack's source inventory.
 
@@ -2261,6 +2418,9 @@ def build_pack_inventory(
     established reliably -- the caller must fail the pack, never fall back.
     """
     source = Path(source)
+    # T-290: one canonical scope before it reaches either branch (Git inventory
+    # or fidelity plan), so behaviour, manifest and fingerprint cannot diverge.
+    project_archive_scope = normalize_archive_scope(project_archive_scope)
     if source.is_file():
         return inventory_from_single_file(source, excludes), None
 
@@ -2272,6 +2432,7 @@ def build_pack_inventory(
             always_exclude=list(getattr(packing, "always_exclude", None) or []) if packing is not None else [],
             supersedable_reserved=supersedable_reserved,
             cancel_event=cancel_event,
+            project_archive_scope=project_archive_scope,
         )
         return inventory, None
 
@@ -2292,7 +2453,9 @@ def build_pack_inventory(
     if packing is not None:
         from audapack.fidelity import build_plan_from_config
 
-        plan = build_plan_from_config(source, packing, excludes, cancel_event=cancel_event)
+        plan = build_plan_from_config(
+            source, packing, excludes, cancel_event=cancel_event, archive_scope=project_archive_scope
+        )
         if plan.cancelled:
             raise SourceInventoryError(CODE_INVENTORY_INCONSISTENT, "inventory cancelled")
         if plan.walk_incomplete or plan.failed > 0:

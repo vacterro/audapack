@@ -1640,3 +1640,34 @@ class InauditWidget(QWidget):
                     w.model.refresh_inaudit(self._project.id)
         except Exception:
             pass
+
+    def shutdown(self) -> None:
+        """Deterministic teardown for timers, watchers and tasks on close."""
+        try:
+            self._debounce.stop()
+        except Exception:
+            pass
+        try:
+            self._inbox_debounce.stop()
+        except Exception:
+            pass
+        try:
+            paths = list(self._watcher.directories()) + list(self._watcher.files())
+            if paths:
+                self._watcher.removePaths(paths)
+        except Exception:
+            pass
+        try:
+            inbox_paths = list(self._inbox_watcher.directories()) + list(self._inbox_watcher.files())
+            if inbox_paths:
+                self._inbox_watcher.removePaths(inbox_paths)
+        except Exception:
+            pass
+        try:
+            self._task_runner.close()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)

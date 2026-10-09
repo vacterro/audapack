@@ -34,7 +34,6 @@ from audapack import saipen_evidence as se
 from audapack.config import PackingConfig
 from audapack.packing import (
     MANIFEST_FILENAME,
-    PACK_STATUS_FAILED_INVENTORY,
     pack_single,
 )
 from audapack.source_inventory import (
@@ -562,30 +561,25 @@ class TestArchiveProvenance(SaipenEvidenceCase):
         self.assertEqual(verdicts[0], verdicts[1])
 
     def test_incomplete_snapshot_does_not_claim_authority(self):
-        """A project missing MANDATORY evidence cannot ship an archive at all.
+        """A project missing MANDATORY evidence does not claim authority.
 
-        The pre-pack authority gate (T-850/SRC-007) catches this before the
-        inventory freeze: the contract names `.saipen/STATE.md` mandatory, the
-        file is gone, so the manifest is stale and the protocol layout is
-        broken -- `saipen audit manifest --write` refuses to mint a contract
-        over a broken checkpoint (LAYOUT_MALFORMED). The pack fails CLOSED
-        with an actionable precondition error and produces NO archive: the
-        old behaviour (ship the PROTOCOL_INCOMPLETE package anyway) is the
-        exact green-package-over-red-snapshot defect the gate exists to
-        remove. The discovery-level verdict for the same tree still reports
-        PROTOCOL_INCOMPLETE / authoritative_state=false for consumers that
-        build their own inventory.
+        Missing mandatory evidence is an evidence incompleteness concern
+        evaluated by saipen_evidence, NOT manifest staleness. The produced
+        archive snapshot truthfully reports PROTOCOL_INCOMPLETE with
+        authoritative_state=false and required_evidence_omitted=true.
         """
         sp = self.write_saipen()
         (sp / "STATE.md").unlink()
         self.ignore(".saipen/*")
         self.commit()
         result = self._pack()
-        self.assertFalse(result.success)
-        self.assertEqual(result.status, PACK_STATUS_FAILED_INVENTORY)
-        self.assertIn("audit-manifest precondition failed", result.error_message)
-        self.assertIn("saipen audit manifest --write", result.error_message)
-        self.assertFalse(self.output.joinpath("Proj.zip").exists())
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as zf:
+            snapshot = json.loads(zf.read(MANIFEST_FILENAME))["saipen_snapshot"]
+        self.assertFalse(snapshot["authoritative_state"])
+        self.assertTrue(snapshot["required_evidence_omitted"])
+        self.assertIn(".saipen/STATE.md", snapshot["mandatory_missing"])
+        self.assertEqual(snapshot["status"], se.STATUS_PROTOCOL_INCOMPLETE)
         # The verdict layer independently refuses authority for the same tree.
         collection = se.collect_for_inventory(self.repo)
         verdict = se.evaluate(collection, included=set())
@@ -2396,6 +2390,120 @@ class TestCapturedProfileStoresAreNotEvidence(SaipenEvidenceCase):
         # authoritative instead of degrading over files the contract banned.
         self.assertFalse(snapshot["required_evidence_omitted"])
         self.assertTrue(snapshot["authoritative_state"], snapshot["detail"])
+
+
+class TestNpmCacheBlobsAreNotEvidence(SaipenEvidenceCase):
+    """T-299: a probe's npm cache is the machine, not the project.
+
+    `.saipen/kitchen` is an OPTIONAL recursive evidence dir (real manifest),
+    so a `tmp-control/ctrlv-probe` run that pointed `npm_config_cache` at a
+    probe-local directory ships its whole `_cacache` blob store -- ~20.7 MB
+    compressed -- in every audit bundle. The blobs are reproducible by
+    running npm again and say nothing about the project, so they are refused
+    wherever they sit INSIDE the memory root (T-274 precedent), as a NAMED
+    transient omission. Probe notes, sources and tests are unaffected: the
+    ban names cache segments only, and applies inside `.saipen` alone.
+    """
+
+    PROBE = ".saipen/kitchen/tmp-control/ctrlv-probe"
+
+    #: The layout npm actually writes under a cache root.
+    REFUSED_BLOBS = (
+        "_cacache/content-v2/sha512/ab/cd/blobdata",
+        "_cacache/content-v2/sha512/ef/01/moreblobdata",
+        "_cacache/index-v5/11/22/entryjson",
+        "_cacache/tmp/manifest-fetch-1a2b3c.json",
+    )
+
+    #: Probe material that must keep shipping.
+    KEPT_NOTES = (
+        "probe.json",
+        "run.log",
+        "ctrlv-probe.md",
+    )
+
+    def _doc(self):
+        doc = TestSaipenContractV3Precedence._v3_contract(None)
+        doc["evidence"]["optional"] = [
+            {"kind": "dir", "path": "kitchen", "recursive": True, "max_files": 500},
+        ]
+        return doc
+
+    def _contract(self):
+        return se.read_contract_from_document(self._doc())
+
+    def test_npm_cache_blobs_are_refused_as_transient(self):
+        contract = self._contract()
+        for tail in self.REFUSED_BLOBS:
+            rel = f"{self.PROBE}/{tail}"
+            with self.subTest(rel=rel):
+                self.assertEqual(
+                    se.export_decision(rel, contract),
+                    (False, se.EXPORT_RULE_TRANSIENT),
+                )
+                self.assertTrue(se.is_non_exportable(rel, contract))
+
+    def test_probe_notes_sources_and_tests_stay_exportable(self):
+        contract = self._contract()
+        for tail in self.KEPT_NOTES:
+            rel = f"{self.PROBE}/{tail}"
+            with self.subTest(rel=rel):
+                exportable, _rule = se.export_decision(rel, contract)
+                self.assertTrue(exportable, rel)
+        for rel in (
+            ".saipen/kitchen/T-158-validation.md",
+            ".saipen/STATE.md",
+            "src/app.py",
+        ):
+            with self.subTest(rel=rel):
+                exportable, rule = se.export_decision(rel, contract)
+                self.assertTrue(exportable, rel)
+                self.assertIn(rule, ("", se.EXPORT_RULE_DURABLE))
+
+    def test_the_ban_is_named_and_the_pack_drops_the_cache(self):
+        sp = self.write_saipen(contract=self._doc())
+        probe = sp / "kitchen" / "tmp-control" / "ctrlv-probe"
+        for tail in self.REFUSED_BLOBS:
+            blob = probe / tail
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            blob.write_bytes(b"\x00" * 4096)
+        for tail in self.KEPT_NOTES:
+            (probe / tail).write_text("kept\n", encoding="utf-8")
+        (sp / "kitchen" / "T-158-validation.md").write_text("kept\n", encoding="utf-8")
+        self.commit()
+
+        blob_rels = [f"{self.PROBE}/{tail}" for tail in self.REFUSED_BLOBS]
+        inv = self.inventory()
+        included = self.included(inv)
+        for rel in blob_rels:
+            with self.subTest(rel=rel):
+                self.assertNotIn(rel, included)
+        excluded = {entry.rel: entry for entry in inv.excluded_entries()}
+        for rel in blob_rels:
+            with self.subTest(rel=rel):
+                self.assertEqual(excluded[rel].reason, se.REASON_SAIPEN_NON_EXPORTABLE)
+        for tail in self.KEPT_NOTES:
+            self.assertIn(f"{self.PROBE}/{tail}", included)
+        self.assertIn(".saipen/kitchen/T-158-validation.md", included)
+
+        result = pack_single(
+            source_path=self.repo,
+            output_dir=self.output,
+            archive_stem="Proj",
+            excludes=set(),
+            delete_old=True,
+            include_timestamp=False,
+            manifest_meta={"project_name": "Proj"},
+            packing=PackingConfig(),
+        )
+        self.assertTrue(result.success, result.error_message)
+        with zipfile.ZipFile(result.output_path) as zf:
+            names = set(zf.namelist())
+        for rel in blob_rels:
+            with self.subTest(rel=rel):
+                self.assertNotIn(rel, names)
+        for tail in self.KEPT_NOTES:
+            self.assertIn(f"{self.PROBE}/{tail}", names)
 
 
 class TestSaipenV3HardSafetyOrdering(TestSaipenContractV3Precedence):

@@ -670,6 +670,39 @@ class _WindowBackendStub:
         return int(pid) * 1000 if int(pid) in self.alive else 0
 
 
+class _InlineTaskRunner:
+    """Deterministic stand-in for :class:`TaskRunner`.
+
+    T-284 moved the blocking ``sai_accounts.launch`` call off the GUI thread and
+    into the shared TaskRunner. This suite tests the control-plane *contract*
+    (identity, envelope validation, registration, fail-closed), not the
+    threading, which has its own suite. So it runs the submitted work inline on
+    this thread and forwards the verdict straight to the completion seam -- the
+    same order of operations the real runner produces on the GUI thread, with no
+    event loop and no thread pool.
+    """
+
+    def __init__(self) -> None:
+        self._running: set[str] = set()
+
+    def is_running(self, key: str) -> bool:
+        return key in self._running
+
+    def submit(self, key, func, *, on_success=None, on_error=None) -> bool:
+        self._running.add(key)
+        try:
+            result = func()
+        except Exception as exc:  # noqa: BLE001 - mirrors TaskRunner's contained error
+            if on_error is not None:
+                on_error(exc)
+            return True
+        finally:
+            self._running.discard(key)
+        if on_success is not None:
+            on_success(result)
+        return True
+
+
 class _ProjectRoomHarness:
     """Binds MainWindow's real Project Room launch dispatch methods to an isolated config."""
 
@@ -682,7 +715,11 @@ class _ProjectRoomHarness:
         self._service = SimpleNamespace(
             config=config,
             list_projects=lambda: list(config.projects),
+            get_project=lambda pid: next(
+                (item for item in config.projects if item.id == pid), None
+            ),
         )
+        self.task_runner = _InlineTaskRunner()
         self._audit_service = SimpleNamespace(get_preferred_audit_file_path=lambda _id: None)
         self.backend = _WindowBackendStub()
         self._instance_monitor = InstanceMonitor(
@@ -751,6 +788,18 @@ class _ProjectRoomHarness:
         from audapack.ui_qt.main_window import MainWindow
 
         MainWindow._launch_plane_account(self, cfg, target, launch_target, resolution)
+
+    def _apply_plane_launch_verdict(self, verdict, cfg, target, resolution) -> None:
+        from audapack.ui_qt.main_window import MainWindow
+
+        MainWindow._apply_plane_launch_verdict(self, verdict, cfg, target, resolution)
+
+    def _report_plane_launch_failure(self, cfg, target, resolution, reason, detail) -> None:
+        from audapack.ui_qt.main_window import MainWindow
+
+        MainWindow._report_plane_launch_failure(
+            self, cfg, target, resolution, reason, detail
+        )
 
     def _report_cli_launch_unavailable(self, cfg, target, resolution) -> None:
         from audapack.ui_qt.main_window import MainWindow
@@ -1177,3 +1226,136 @@ class TestControlPlaneLaunchContract:
         room.click(proj, ag1_id, force_new=True)
         launch_calls = [c for c in plane.calls if c and c[0] == "launch"]
         assert launch_calls[-1][1] == "antigravity:windows-user:AAA"
+
+
+# ── T-278 SETTINGS LAUNCHERS FEDERATED INVENTORY SPLIT & ROUTING ────────────
+
+
+class TestFederationSettingsView:
+    def test_launchers_tab_splits_local_tools_and_sai_accounts(self, qapp, tmp_path) -> None:
+        from PySide6.QtCore import Qt
+
+        from audapack.config import AppConfig, LauncherConfig
+        from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
+
+        config = AppConfig(launchers=[
+            LauncherConfig(id="opencode", name="OpenCode", short_label="OC"),
+            LauncherConfig(id="freebuff", name="FreeBuff", short_label="FB"),
+            LauncherConfig(id="sai:claude:profile-dir:aaa", name="Claude 1", short_label="C1", enabled=True),
+        ])
+        w = SettingsWidget(config)
+        w._base_dir = tmp_path
+
+        # Distinct QGroupBox sections
+        assert w.grp_local.title() == "LOCAL TOOLS"
+        assert w.grp_sai.title() == "SAI ACCOUNTS"
+
+        # Correct row split
+        assert w.local_launcher_list.count() == 2
+        assert w.sai_launcher_list.count() == 1
+
+        local_texts = [w.local_launcher_list.item(i).text() for i in range(w.local_launcher_list.count())]
+        assert any("OpenCode" in t for t in local_texts)
+        assert any("FreeBuff" in t for t in local_texts)
+
+        sai_item = w.sai_launcher_list.item(0)
+        assert "Claude 1" in sai_item.text()
+        assert "managed by SAI Accounts" in sai_item.text()
+        assert sai_item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        assert sai_item.checkState() == Qt.CheckState.Checked
+
+        # Local enable toggle works on SAI accounts without mutating identity
+        sai_item.setCheckState(Qt.CheckState.Unchecked)
+        sai_row = next(lc for lc in config.launchers if lc.id == "sai:claude:profile-dir:aaa")
+        assert sai_row.enabled is False
+        assert sai_row.name == "Claude 1"
+        assert sai_row.id == "sai:claude:profile-dir:aaa"
+
+    def test_sai_manager_routing_and_path_resolution(self, qapp, monkeypatch, tmp_path) -> None:
+        from audapack import sai_accounts
+        from audapack.config import AppConfig, LauncherConfig
+        from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
+
+        # 1. Path resolution
+        monkeypatch.setattr(sai_accounts, "TestManager", lambda: "V:/mock/SAITULS.exe")
+        assert sai_accounts.manager_path() == "V:/mock/SAITULS.exe"
+
+        # 2. Open manager invokes canonical seam
+        opened = []
+        monkeypatch.setattr(sai_accounts, "TestOpenManager", lambda action="": (opened.append(action), {"ok": True, "error": ""})[1])
+
+        config = AppConfig(launchers=[
+            LauncherConfig(id="sai:codex:profile-dir:c1", name="Codex 1", short_label="C1"),
+        ])
+        w = SettingsWidget(config)
+        w._base_dir = tmp_path
+
+        w.btn_add_sai.click()
+        assert len(opened) == 1
+
+        w.btn_remove_sai.click()
+        assert len(opened) == 2
+
+        w.btn_manage_sai.click()
+        assert len(opened) == 3
+
+    def test_federation_status_display_fresh_stale_standalone(self, qapp, tmp_path) -> None:
+        from audapack.config import AppConfig
+        from audapack.launch_federation import FederationSync
+        from audapack.ui_qt.dialogs.settings_dialog import SettingsWidget
+
+        # Standalone
+        cfg_standalone = AppConfig()
+        cfg_standalone.federation.active = False
+        w_standalone = SettingsWidget(cfg_standalone)
+        w_standalone._base_dir = tmp_path
+        assert "STANDALONE" in w_standalone.lbl_federation_status.text()
+
+        # Fresh
+        cfg_fresh = AppConfig()
+        cfg_fresh.federation.active = True
+        cfg_fresh.federation.stale = False
+        cfg_fresh.federation.last_sync = "2026-10-08T04:00:00+00:00"
+        w_fresh = SettingsWidget(cfg_fresh)
+        w_fresh._base_dir = tmp_path
+        assert "FRESH" in w_fresh.lbl_federation_status.text()
+
+        # Stale / Control Plane Offline
+        cfg_stale = AppConfig()
+        cfg_stale.federation.active = True
+        cfg_stale.federation.stale = True
+        cfg_stale.federation.last_sync = "2026-10-08T03:00:00+00:00"
+        w_stale = SettingsWidget(cfg_stale)
+        w_stale._base_dir = tmp_path
+        status_text = w_stale.lbl_federation_status.text()
+        assert "STALE" in status_text and "CONTROL PLANE OFFLINE" in status_text
+
+        # update_federation_state with stale result does NOT mutate launcher projection
+        initial_launchers = list(cfg_stale.launchers)
+        w_stale.update_federation_state(FederationSync(state="stale", fresh=False, generation=1))
+        assert [lc.id for lc in cfg_stale.launchers] == [lc.id for lc in initial_launchers]
+        assert "STALE" in w_stale.lbl_federation_status.text()
+
+    def test_single_refresh_owner_coalesces_on_task_runner(self) -> None:
+        import time
+
+        from audapack.ui_qt.task_runner import TaskRunner
+
+        runner = TaskRunner(max_threads=2)
+        runs = []
+
+        def worker():
+            runs.append(time.monotonic())
+            time.sleep(0.05)
+            return "ok"
+
+        # Submit multiple concurrent refreshes under the same key "federation:refresh"
+        runner.submit_coalesced("federation:refresh", worker)
+        runner.submit_coalesced("federation:refresh", worker)
+        runner.submit_coalesced("federation:refresh", worker)
+
+        # Let the task settle
+        runner.close()
+
+        # Must have coalesced to at most 2 runs (1 in flight + at most 1 follow-up)
+        assert len(runs) <= 2

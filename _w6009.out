@@ -1,0 +1,11 @@
+✔ W6-009: the manual ZIP patience outlasts a silent upload (1446.7096ms)
+✔ W6-009: an automatic send waits out a silent upload instead of demanding the operator (2327.489ms)
+✔ W6-009: automated callers keep the short early exit (1222.7717ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 5065.5358

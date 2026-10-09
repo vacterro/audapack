@@ -279,7 +279,7 @@ class TestFederated:
     def test_two_reads_do_not_double_the_records(
             self, plane: Plane, tmp_path) -> None:
         entry = shared("antigravity:windows-user:aaa", "antigravity", "B", locator="u1")
-        plane.answer_list(entry, entry)
+        plane.answer_list(entry)
         home = home_with(tmp_path)
         assert len(only_shared(discover_accounts([], home=home))) == 1
         assert len(only_shared(discover_accounts([], home=home))) == 1
@@ -369,7 +369,8 @@ class TestHybrid:
     def test_a_shared_account_never_appears_twice(self, plane: Plane, tmp_path) -> None:
         entry = shared("antigravity:windows-user:aaa", "antigravity", "B", locator="u1")
         plane.answer_list(entry, entry)
-        assert len(only_shared(discover_accounts([], home=home_with(tmp_path)))) == 1
+        # Duplicate canonical account id in snapshot fails closed (CORE-001)
+        assert len(only_shared(discover_accounts([], home=home_with(tmp_path)))) == 0
 
 
 # ── DUPLICATE DISCOVERY ─────────────────────────────────────────────────────

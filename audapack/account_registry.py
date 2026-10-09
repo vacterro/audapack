@@ -108,7 +108,8 @@ def local_candidates(home: Path) -> list[tuple[str, str, str, Path]]:
 
 
 def discover_accounts(
-    launchers: Iterable[object], *, home: Path | None = None, now: datetime | None = None
+    launchers: Iterable[object], *, home: Path | None = None, now: datetime | None = None,
+    shared_accounts: list[sai_accounts.SharedAccount] | None = None,
 ) -> list[AccountIdentity]:
     """Inspect only known profile locations and configured launcher identities.
 
@@ -146,7 +147,9 @@ def discover_accounts(
         found.append((key, record))
         if key:
             local_by_key[key] = record
-    fresh_shared, replaced = _shared_accounts(candidates, local_by_key, stamp, configured)
+    fresh_shared, replaced = _shared_accounts(
+        candidates, local_by_key, stamp, configured, shared_accounts=shared_accounts,
+    )
     withdrawn = sai_accounts.suppressed_keys()
     out: list[AccountIdentity] = []
     for key, record in found:
@@ -170,6 +173,7 @@ def _shared_accounts(
     local_by_key: Mapping[str, AccountIdentity],
     stamp: str,
     configured: Mapping[str, object],
+    shared_accounts: list[sai_accounts.SharedAccount] | None = None,
 ) -> tuple[list[AccountIdentity], dict[str, AccountIdentity]]:
     """Shared accounts, split into new identities and proven duplicates.
 
@@ -185,7 +189,12 @@ def _shared_accounts(
     """
     from audapack.launch_federation import target_id
 
-    shared = sai_accounts.fresh_list({provider for provider, _l, _n, _p in candidates})
+    if shared_accounts is not None:
+        shared = list(shared_accounts)
+    elif sai_accounts.has_cached_accounts():
+        shared = sai_accounts.cached_accounts()
+    else:
+        shared = sai_accounts.fresh_list({provider for provider, _l, _n, _p in candidates})
     fresh: list[AccountIdentity] = []
     replaced: dict[str, AccountIdentity] = {}
     seen: set[str] = set()

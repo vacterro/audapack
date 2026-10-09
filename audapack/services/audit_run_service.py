@@ -13,9 +13,11 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -226,7 +228,56 @@ class AuditStartIntentStore:
     def __init__(self, path: Optional[Path] = None, history_bound: int = RUN_HISTORY_BOUND):
         self.path = Path(path) if path else get_state_dir() / "audit_start_intents.json"
         self.lock_path = self.path.with_suffix(".lock")
+        self.tombstone_db_path = self.path.parent / f"{self.path.stem}_tombstones.db"
         self.history_bound = max(MAX_AUDIT_LANES, int(history_bound))
+
+    def _get_tombstone_db(self) -> sqlite3.Connection:
+        self.tombstone_db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.tombstone_db_path, timeout=10)
+        db.execute("PRAGMA busy_timeout=10000")
+        db.execute("""CREATE TABLE IF NOT EXISTS source_tombstones (
+            source_execution_id TEXT PRIMARY KEY,
+            intent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            dispatch_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL NOT NULL,
+            error TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_source_tombstones_dispatch ON source_tombstones(dispatch_id)")
+        return db
+
+    def _find_tombstone(self, source_execution_id: str) -> Optional[dict[str, Any]]:
+        if not source_execution_id or not self.tombstone_db_path.exists():
+            return None
+        with closing(self._get_tombstone_db()) as db:
+            row = db.execute(
+                """SELECT intent_id, project_id, project_name, status, dispatch_id,
+                          created_at, updated_at, completed_at, error
+                   FROM source_tombstones WHERE source_execution_id=?""",
+                (source_execution_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "intent_id": row[0],
+                "project_id": row[1],
+                "project_name": row[2],
+                "profile_id": "quick3",
+                "source_execution_id": source_execution_id,
+                "status": row[3],
+                "phase": row[3],
+                "dispatch_id": row[4],
+                "created_at": row[5],
+                "updated_at": row[6],
+                "completed_at": row[7],
+                "error": row[8],
+                "campaign_run_id": "",
+                "compacted": True,
+            }
 
     def _read_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -245,22 +296,43 @@ class AuditStartIntentStore:
 
     def _trim_intents(self, intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Prepared source keys are durable idempotency records. Ordinary
-        # history remains bounded while these keys await reconciliation.
+        # history remains bounded while settled keys migrate to durable tombstones.
         ordinary = [item for item in intents if not item.get("source_execution_id")]
         retained = {item.get("intent_id") for item in ordinary[-self.history_bound:]}
         kept = [item for item in intents
                 if item.get("source_execution_id") or item.get("intent_id") in retained]
-        stale = self._compactable_ids(kept)
-        return [self._compact_source_intent(item, stale) for item in kept]
+        stale_ids = self._compactable_ids(kept)
+        to_tombstone = [
+            item for item in kept
+            if item.get("source_execution_id") and (id(item) in stale_ids or item.get("compacted"))
+        ]
+        if to_tombstone:
+            with closing(self._get_tombstone_db()) as db:
+                db.executemany(
+                    """INSERT OR REPLACE INTO source_tombstones
+                    (source_execution_id, intent_id, project_id, project_name, status,
+                     dispatch_id, created_at, updated_at, completed_at, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(
+                        str(item.get("source_execution_id")),
+                        str(item.get("intent_id") or ""),
+                        str(item.get("project_id") or ""),
+                        str(item.get("project_name") or ""),
+                        str(item.get("status") or ""),
+                        str(item.get("dispatch_id") or ""),
+                        float(item.get("created_at") or 0.0),
+                        float(item.get("updated_at") or 0.0),
+                        float(item.get("completed_at") or 0.0),
+                        "",
+                    ) for item in to_tombstone]
+                )
+                db.commit()
+            tombstone_source_ids = {str(item.get("source_execution_id")) for item in to_tombstone}
+            kept = [item for item in kept if str(item.get("source_execution_id")) not in tombstone_source_ids]
+        return kept
 
     def _compactable_ids(self, population: list[dict[str, Any]]) -> set[int]:
-        """Ids of the source records old enough to be reduced to identities.
-
-        A record is stale when it is source-keyed, not already compacted, not
-        still active, and past the most recent ``history_bound`` records that
-        share its status. The newest slice of each status keeps every field, so
-        a run an operator is still reading is never rewritten underneath them.
-        """
+        """Ids of the source records old enough to be reduced to durable tombstones."""
         by_status: dict[str, list[dict[str, Any]]] = {}
         for entry in population:
             if entry.get("compacted") or not entry.get("source_execution_id"):
@@ -276,29 +348,6 @@ class AuditStartIntentStore:
             stale.update(id(entry) for entry in group[self.history_bound:])
         return stale
 
-    def _compact_source_intent(self, item: dict[str, Any],
-                               stale: set[int]) -> dict[str, Any]:
-        """Reduce a settled source record to the identity a replay needs.
-
-        W2-003 (audit/12.md): every source-keyed record was retained in full
-        forever -- 40 terminally FAILED prepared sources with a bound of 6 --
-        because a prepared source key is the durable idempotency record and
-        dropping it would re-issue a finished audit. The key must survive; the
-        error text, the owning PID, the single-writer claim and its fence do
-        not, once the record is terminal and settled.
-
-        ponytail: the record COUNT still grows with distinct prepared sources.
-        Move old identities into an age-bounded tombstone table only once a
-        replay older than that window can be refused by the prepared execution
-        tombstone alone.
-        """
-        if id(item) not in stale:
-            return item
-        return {**item, "error": "", "owner_pid": 0, "claim_token": "",
-                "claim_holder_pid": 0, "fence": 0, "campaign_run_id": "",
-                "compacted": True}
-
-
     def begin(self, project_id: str, project_name: str, profile_id: str,
               source_execution_id: str = "") -> tuple[dict[str, Any], bool]:
         now = time.time()
@@ -309,6 +358,9 @@ class AuditStartIntentStore:
                               if item.get("source_execution_id") == source_execution_id), None)
                 if prior is not None:
                     return dict(prior), False
+                tombstone = self._find_tombstone(source_execution_id)
+                if tombstone is not None:
+                    return tombstone, False
             active = next(
                 (
                     item for item in reversed(doc["intents"])
@@ -355,8 +407,12 @@ class AuditStartIntentStore:
         if not source_execution_id:
             return None
         with cross_process_lock(self.lock_path):
-            return next((dict(item) for item in reversed(self._read_unlocked()["intents"])
-                         if item.get("source_execution_id") == source_execution_id), None)
+            doc = self._read_unlocked()
+            prior = next((dict(item) for item in reversed(doc["intents"])
+                          if item.get("source_execution_id") == source_execution_id), None)
+            if prior is not None:
+                return prior
+            return self._find_tombstone(source_execution_id)
 
 
     def claim_or_takeover(self, intent_id: str, take_over: bool = False) -> tuple[bool, dict[str, Any]]:
@@ -477,7 +533,38 @@ class AuditStartIntentStore:
             return changed
 
     def find_for_dispatch(self, dispatch_id: str) -> Optional[dict[str, Any]]:
-        return next((item for item in reversed(self.list()) if item.get("dispatch_id") == dispatch_id), None)
+        if not dispatch_id:
+            return None
+        found = next((item for item in reversed(self.list()) if item.get("dispatch_id") == dispatch_id), None)
+        if found is not None:
+            return found
+        if not self.tombstone_db_path.exists():
+            return None
+        with closing(self._get_tombstone_db()) as db:
+            row = db.execute(
+                """SELECT intent_id, project_id, project_name, status, dispatch_id,
+                          created_at, updated_at, completed_at, error, source_execution_id
+                   FROM source_tombstones WHERE dispatch_id=?""",
+                (dispatch_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "intent_id": row[0],
+                "project_id": row[1],
+                "project_name": row[2],
+                "profile_id": "quick3",
+                "source_execution_id": row[9],
+                "status": row[3],
+                "phase": row[3],
+                "dispatch_id": row[4],
+                "created_at": row[5],
+                "updated_at": row[6],
+                "completed_at": row[7],
+                "error": row[8],
+                "campaign_run_id": "",
+                "compacted": True,
+            }
 
 
 class ManagedWorkerSupervisor:

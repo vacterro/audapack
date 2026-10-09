@@ -95,18 +95,22 @@ def sha256(text: str) -> str:
 
 
 class MaterializeTestCase(unittest.TestCase):
-    port = 18977
+    @staticmethod
+    def _free_port() -> int:
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = str(Path(tempfile.mkdtemp()).resolve())
         self.audit_root = Path(self.temp_dir) / "AUDITING_IMPLEMENTATION"
         self.audit_root.mkdir(parents=True)
 
         self.config = AppConfig()
         self.config.audits.root = str(self.audit_root)
         self.config.bridge.host = "127.0.0.1"
-        self.config.bridge.port = type(self).port
-        type(self).port += 1
+        self.config.bridge.port = self._free_port()
         self.config.bridge.token = "materialize_secret_token_123456"
         self.config.projects = [
             Project(

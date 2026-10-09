@@ -1,0 +1,10 @@
+============================= test session starts ==============================
+collected 68 items
+
+tests\test_launcher_windowless_recovery.py ..ssssss.ssssssss             [ 25%]
+tests\test_single_instance.py s...ssss...sssss....                       [ 54%]
+tests\test_qt_launcher_visibility.py s.s..                               [ 61%]
+tests\test_qt_app_icon.py .....ss.ss.s                                   [ 79%]
+tests\test_docs_consistency.py ..............                            [100%]
+
+======================== 37 passed, 31 skipped in 0.74s ========================

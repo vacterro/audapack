@@ -35,6 +35,16 @@ class AuditTemperature(str, Enum):
     NONE = "NONE"      # No audit found
 
 
+ARCHIVE_SCOPE_AUTO = "auto"
+ARCHIVE_SCOPE_COMPLETE_SOURCE = "complete_source"
+VALID_ARCHIVE_SCOPES = frozenset({ARCHIVE_SCOPE_AUTO, ARCHIVE_SCOPE_COMPLETE_SOURCE})
+
+
+def normalize_archive_scope(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return ARCHIVE_SCOPE_COMPLETE_SOURCE if raw == ARCHIVE_SCOPE_COMPLETE_SOURCE else ARCHIVE_SCOPE_AUTO
+
+
 @dataclass
 class Project:
     id: str
@@ -55,6 +65,10 @@ class Project:
     ignore_archive: bool = False
     audit_copy_count: int = 0
     inaudit_aliases: list[str] = field(default_factory=list)
+    archive_scope: str = ARCHIVE_SCOPE_AUTO
+
+    def __post_init__(self) -> None:
+        self.archive_scope = normalize_archive_scope(self.archive_scope)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +90,7 @@ class Project:
             "ignore_archive": self.ignore_archive,
             "audit_copy_count": self.audit_copy_count,
             "inaudit_aliases": list(self.inaudit_aliases),
+            "archive_scope": self.archive_scope,
         }
 
     @classmethod
@@ -102,6 +117,7 @@ class Project:
             ignore_archive=bool(data.get("ignore_archive", False)),
             audit_copy_count=int(data.get("audit_copy_count", 0) or 0),
             inaudit_aliases=[str(value).strip() for value in raw_inaudit_aliases if str(value).strip()],
+            archive_scope=normalize_archive_scope(data.get("archive_scope")),
         )
 
 

@@ -15,7 +15,7 @@ from typing import Callable
 
 from audapack.config import get_state_dir
 from audapack.limits import Availability, LimitSnapshot, parse_time, utc_now
-from audapack.prepared_sync import PreparedSyncMember
+from audapack.prepared_sync import MAX_SYNC_MEMBERS, PreparedSyncMember
 
 
 class Trigger(str, Enum):
@@ -358,6 +358,8 @@ class PreparedStore:
             raise ValueError("prepared_id required")
         if len(members) < 2:
             raise ValueError("SYNC requires at least two distinct accounts")
+        if len(members) > MAX_SYNC_MEMBERS:
+            raise ValueError(f"SYNC exceeds maximum allowed members ({MAX_SYNC_MEMBERS})")
         account_ids = [m.account_id for m in members]
         if len(account_ids) != len(set(account_ids)):
             raise ValueError("SYNC requires distinct accounts")

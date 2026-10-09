@@ -202,10 +202,14 @@ def _sync_launcher_inventory(service) -> None:
     bit-for-bit what it always was.
     """
     from audapack.config import scoped_config_write
-    from audapack.launch_federation import sync_effective_launchers
+    from audapack.launch_federation import PROVIDERS, acquire_listing, reconcile_listing, sai_accounts
+
+    if not sai_accounts.engine_path():
+        return
 
     try:
-        result = sync_effective_launchers(service.config)
+        listing = acquire_listing(PROVIDERS)
+        result = reconcile_listing(service.config, listing)
     except Exception as exc:               # never let discovery block startup
         logger.warning("launcher federation unavailable: %s", exc)
         return
@@ -218,10 +222,9 @@ def _sync_launcher_inventory(service) -> None:
     )
 
     def _persist(latest):
-        # Reconciling the freshly loaded object keeps the write truthful even if
-        # the config changed since startup, and the same reports are copied back
-        # so the running window reads exactly what was saved.
-        sync_effective_launchers(latest)
+        # Reconciling the freshly loaded object onto the already-acquired listing
+        # keeps the write truthful without performing a second read of the control plane.
+        reconcile_listing(latest, listing)
         service.config.launchers = latest.launchers
         service.config.federation = latest.federation
 
@@ -239,8 +242,6 @@ def run_qt_gui(service=None) -> int:
 
     if service is None:
         service = ProjectService()
-
-    _sync_launcher_inventory(service)
 
     if sys.platform == "win32":
         try:

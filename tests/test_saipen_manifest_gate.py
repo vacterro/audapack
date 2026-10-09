@@ -235,17 +235,6 @@ class SaipenGateCase(unittest.TestCase):
         if behavior != "current_once":
             marker.unlink(missing_ok=True)
 
-    def age_manifest(self):
-        """Make the installed manifest look stale without sleeping.
-
-        Mandatory evidence newer than the document is exactly what a real
-        project looks like after a canonical write, and it is what forces the
-        gate to regenerate through the protocol CLI.
-        """
-        state = self.repo / ".saipen" / "STATE.md"
-        st = state.stat()
-        os.utime(state, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
-
     def build_stub_cli(self):
         """A stub protocol CLI reachable through the project's own saipen_home.
 
@@ -357,141 +346,223 @@ class TestMissingManifestRegression(SaipenGateCase):
         self.assertEqual([p.name for p in self.out.iterdir() if p.suffix == ".zip"], [])
 
 
-class TestStaleManifestRegression(SaipenGateCase):
-    """Brief: generate -> mutate authoritative evidence -> package again ->
-    prove the old manifest is not blindly trusted (regenerate or reject)."""
+class TestProducerContractRegression(SaipenGateCase):
+    """Regressions pinning SAIPEN producer authority:
+    The manifest is a declarative contract of evidence rules, not an mtime-bound
+    snapshot. Ordinary lifecycle activity never stales MANIFEST.json.
+    """
 
-    def test_stale_manifest_with_missing_cli_fails_closed_with_discovery_reason(self):
+    def test_case_1_checkpoint_mutation_does_not_stale_declaration(self):
+        """CASE 1: Mutating checkpoint files (STATE, BOARD, LOG, IDENTITY)
+        and making them newer than MANIFEST.json must never cause manifest
+        regeneration. Gate returns ok=True, generated=False, manifest bytes
+        remain byte-identical, and protocol CLI is invoked ZERO times.
+        """
+        for rel in ("STATE.md", "BOARD.md", "LOG.md", "IDENTITY.md"):
+            with self.subTest(file=rel):
+                self.install_contract(CONTRACT)
+                manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+                before_bytes = manifest_path.read_bytes()
+
+                target = self.repo / ".saipen" / rel
+                target.write_text(f"mutation content for {rel}\n", encoding="utf-8")
+                mst = manifest_path.stat()
+                os.utime(target, ns=(mst.st_atime_ns, mst.st_mtime_ns + 5_000_000_000))
+                self.assertGreater(target.stat().st_mtime_ns, mst.st_mtime_ns)
+
+                with mock.patch.object(sg, "run_hidden") as runner:
+                    gate = sg.prepare(self.repo)
+
+                self.assertTrue(gate.ok, gate.detail)
+                self.assertFalse(gate.generated, gate.detail)
+                self.assertEqual(manifest_path.read_bytes(), before_bytes)
+                runner.assert_not_called()
+
+    def test_case_2_multiple_lifecycle_writes_pack_succeeds_without_regeneration(self):
+        """CASE 2: Multiple sequential writes/appends to STATE, BOARD, LOG.
+        Normal pack_single() succeeds, archive contains the updated content,
+        and no manifest regeneration is attempted.
+        """
         self.install_contract(CONTRACT)
-        self.age_manifest()
-        with mock.patch.object(
-            sg, "SAIPEN_CLI_CANDIDATES", (("no-such-saipen-binary-xyz",),)
-        ):
-            result = self.pack()
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        manifest_bytes = manifest_path.read_bytes()
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.status, PACK_STATUS_FAILED_INVENTORY)
-        self.assertIn("AUDIT_MANIFEST_STALE_REGENERATION_FAILED", result.error_message)
-        self.assertIn("launcher discovery", result.error_message)
-        self.assertIn("no-such-saipen-binary-xyz", result.error_message)
-        self.assertFalse((self.out / "proj.zip").exists())
+        sp = self.repo / ".saipen"
+        for i in range(5):
+            (sp / "STATE.md").write_text(
+                f"phase: RUN_{i}\nsaipen_home: {self._saipen_home.as_posix()}\n",
+                encoding="utf-8",
+            )
+            with (sp / "BOARD.md").open("a", encoding="utf-8") as f:
+                f.write(f"- task_{i}\n")
+            with (sp / "LOG.md").open("a", encoding="utf-8") as f:
+                f.write(f"- event_{i}\n")
 
-    def test_pack_after_evidence_mutation_regenerates_not_blind_trusts(self):
-        first = self.pack()
-        self.assertTrue(first.success, first.error_message)
-        first_generated_at = self.source_manifest_from_archive()["generated_at"]
-        self.assertTrue(first_generated_at)
+        with mock.patch.object(sg, "run_hidden") as runner:
+            res = self.pack()
 
-        state = self.repo / ".saipen" / "STATE.md"
-        # The mutation must keep the fixture's real saipen_home line: it is
-        # the CLI discovery path the gate needs when it regenerates the
-        # stale contract below. (The literal "..." destroyed it and made the
-        # regeneration fail with an unrelated executable-not-found error.)
-        state.write_text(
-            f"phase: SCOUT\nsaipen_home: {self._saipen_home.as_posix()}\n",
-            encoding="utf-8",
-        )
-        # Coarse filesystems quantize mtime; force the mutation to be strictly
-        # newer than the existing contract without any wall-clock sleeping.
-        st = state.stat()
-        os.utime(state, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        self.assertTrue(res.success, res.error_message)
+        runner.assert_not_called()
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
 
-        # Gate level (airtight): the stale contract is REGENERATED.
-        gate = sg.prepare(self.repo)
-        self.assertTrue(gate.ok, gate.detail)
-        self.assertTrue(gate.generated, gate.detail)
+        with zipfile.ZipFile(self.out / "proj.zip") as zf:
+            arch_state = zf.read(".saipen/STATE.md").decode("utf-8")
+            arch_board = zf.read(".saipen/BOARD.md").decode("utf-8")
+            arch_log = zf.read(".saipen/LOG.md").decode("utf-8")
+        self.assertIn("phase: RUN_4", arch_state)
+        self.assertIn("- task_4", arch_board)
+        self.assertIn("- event_4", arch_log)
 
-        second = self.pack()
-        self.assertTrue(second.success, second.error_message)
-        second_contract = self.source_manifest_from_archive()
-        # The regenerated contract is a different document from the one the
-        # first archive trusted.
-        self.assertNotEqual(second_contract["generated_at"], first_generated_at)
-        with self.archive() as zf:
-            names = set(zf.namelist())
-        self.assertIn(".saipen/MANIFEST.json", names)
         snapshot = self.legacy_manifest()["saipen_snapshot"]
+        self.assertEqual(snapshot["status"], "COMPLETE")
         self.assertTrue(snapshot["authoritative_state"])
 
-    def test_stale_current_noop_is_forced_to_recreate_and_verify_freshness(self):
+    def test_case_3_missing_mandatory_evidence_is_evidence_incompleteness_not_manifest_staleness(self):
+        """CASE 3: Missing mandatory evidence (IDENTITY.md deleted) is an evidence
+        incompleteness concern for saipen_evidence, NOT manifest staleness.
+        The gate must not invoke the CLI to regenerate, and saipen_evidence
+        truthfully reports mandatory_missing=['IDENTITY.md'].
+        """
         self.install_contract(CONTRACT)
-        before = (self.repo / ".saipen" / "MANIFEST.json").read_bytes()
-        self.age_manifest()
-        self.stub_behavior("current_once")
-        logs = []
+        identity_path = self.repo / ".saipen" / "IDENTITY.md"
+        identity_path.unlink()
 
-        gate = sg.prepare(self.repo, log_callback=logs.append)
+        with mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
+        self.assertTrue(gate.ok, gate.detail)
+        self.assertFalse(gate.generated, gate.detail)
+        runner.assert_not_called()
 
+        contract = se.read_contract(self.repo)
+        collected = se.collect(self.repo, contract)
+        self.assertTrue(any("IDENTITY.md" in m for m in collected.mandatory_missing))
+
+        res = self.pack()
+        self.assertTrue(res.success, res.error_message)
+        arch_snapshot = self.legacy_manifest()["saipen_snapshot"]
+        self.assertTrue(any("IDENTITY.md" in m for m in arch_snapshot["mandatory_missing"]))
+        self.assertFalse(arch_snapshot["authoritative_state"])
+        self.assertTrue(arch_snapshot["required_evidence_omitted"])
+        self.assertEqual(arch_snapshot["status"], se.STATUS_PROTOCOL_INCOMPLETE)
+
+    def test_case_4_missing_manifest_still_regenerates(self):
+        """CASE 4: When MANIFEST.json is absent on a real checkpoint,
+        prepare() generates it via the protocol CLI. If the CLI fails,
+        pack fails closed before archive creation.
+        """
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        manifest_path.unlink(missing_ok=True)
+        gate = sg.prepare(self.repo)
         self.assertTrue(gate.ok, gate.detail)
         self.assertTrue(gate.generated, gate.detail)
-        self.assertEqual(gate.generated_by[-3:], ["audit", "manifest", "--write"])
-        after_path = self.repo / ".saipen" / "MANIFEST.json"
-        self.assertNotEqual(after_path.read_bytes(), before)
-        contract = se.read_contract(self.repo)
-        self.assertEqual(sg._contract_staleness(self.repo, contract), "")
-        self.assertTrue(any("manifest bytes unchanged" in line for line in logs), logs)
-        self.assertGreaterEqual(
-            sum("saipen audit manifest --write ->" in line for line in logs), 2, logs
-        )
-        self.assertEqual(list((self.repo / ".saipen").glob("*.audapack-*.bak")), [])
+        self.assertTrue(manifest_path.exists())
 
-    def test_stale_regeneration_refusal_preserves_old_manifest_and_fails_closed(self):
-        self.install_contract(CONTRACT)
-        before = (self.repo / ".saipen" / "MANIFEST.json").read_bytes()
-        self.age_manifest()
-        self.stub_behavior("refuse_after_current")
-
-        gate = sg.prepare(self.repo)
-
-        self.assertFalse(gate.ok)
-        self.assertEqual(gate.code, "AUDIT_MANIFEST_STALE_REGENERATION_FAILED")
-        self.assertIn("protocol refusal", gate.detail)
-        self.assertIn("previous stale manifest restored", gate.detail)
-        self.assertEqual((self.repo / ".saipen" / "MANIFEST.json").read_bytes(), before)
-        self.assertEqual(list((self.repo / ".saipen").glob("*.audapack-*.bak")), [])
-
-    def test_pack_exposes_protocol_refusal_reason(self):
-        self.install_contract(CONTRACT)
-        self.age_manifest()
-        self.stub_behavior("refuse")
-
-        logs = []
-        result = self.pack(log_callback=logs.append)
-
-        self.assertFalse(result.success)
-        self.assertEqual(result.status, PACK_STATUS_FAILED_INVENTORY)
-        self.assertIn("AUDIT_MANIFEST_STALE_REGENERATION_FAILED", result.error_message)
-        self.assertIn("protocol refusal", result.error_message)
-        self.assertIn("CAPABILITY_REFUSED", result.error_message)
-        self.assertTrue(any(result.error_message in line for line in logs), logs)
+        manifest_path.unlink(missing_ok=True)
+        with mock.patch.object(sg, "SAIPEN_CLI_CANDIDATES", (("no-such-saipen-binary-xyz",),)):
+            res = self.pack()
+        self.assertFalse(res.success)
+        self.assertEqual(res.status, PACK_STATUS_FAILED_INVENTORY)
+        self.assertIn("AUDIT_MANIFEST_GENERATION_FAILED", res.error_message)
         self.assertFalse((self.out / "proj.zip").exists())
 
-    def test_successful_but_invalid_rewrite_restores_authority_and_fails_closed(self):
-        self.install_contract(CONTRACT)
-        before = (self.repo / ".saipen" / "MANIFEST.json").read_bytes()
-        self.age_manifest()
-        self.stub_behavior("stale_contract")
+    def test_case_5_malformed_manifest_fails_closed_no_overwrite(self):
+        """CASE 5: A malformed manifest fails closed immediately; it is not
+        implicitly overwritten or regenerated.
+        """
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        malformed_bytes = b"{\n  not valid json: true\n"
+        manifest_path.write_bytes(malformed_bytes)
 
-        gate = sg.prepare(self.repo)
-
-        self.assertFalse(gate.ok)
-        self.assertEqual(gate.code, "AUDIT_MANIFEST_STALE_REGENERATION_FAILED")
-        self.assertIn("manifest remains stale", gate.detail)
-        self.assertIn("previous stale manifest restored", gate.detail)
-        self.assertEqual((self.repo / ".saipen" / "MANIFEST.json").read_bytes(), before)
-
-    def test_stale_regeneration_timeout_is_exact_and_actionable(self):
-        self.install_contract(CONTRACT)
-        self.age_manifest()
-        timeout = subprocess.TimeoutExpired(["saipen", "audit", "manifest", "--write"], 7)
-
-        with mock.patch.object(sg, "run_hidden", side_effect=timeout):
-            gate = sg.prepare(self.repo, timeout_seconds=7)
+        with mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
 
         self.assertFalse(gate.ok)
-        self.assertEqual(gate.code, "AUDIT_MANIFEST_STALE_REGENERATION_FAILED")
-        self.assertIn("launcher timeout", gate.detail)
-        self.assertIn("timed out after 7s", gate.detail)
+        self.assertEqual(gate.code, se.STATUS_MANIFEST_MALFORMED)
+        self.assertIn("not regenerating", gate.detail)
+        self.assertEqual(manifest_path.read_bytes(), malformed_bytes)
+        runner.assert_not_called()
+
+        res = self.pack()
+        self.assertFalse(res.success)
+        self.assertEqual(res.status, PACK_STATUS_FAILED_INVENTORY)
+        self.assertIn(se.STATUS_MANIFEST_MALFORMED, res.error_message)
+        self.assertIn("Repair the project-owned MANIFEST", res.error_message)
+        self.assertEqual(manifest_path.read_bytes(), malformed_bytes)
+
+    def test_case_6_unsupported_newer_contract_fails_closed_no_downgrade(self):
+        """CASE 6: An unsupported newer contract fails closed as PROTOCOL_CONTRACT_UNKNOWN.
+        Regeneration is NOT prescribed or attempted as a downgrade mechanism.
+        """
+        future = json.loads(json.dumps(CONTRACT_V2))
+        future["contract_version"] = 3
+        future["generator"] = "saipen-audit-manifest/3"
+        future["evidence"]["non_exportable"] = [{"path": "locks", "kind": "dir"}]
+        self.install_contract(future)
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        before_bytes = manifest_path.read_bytes()
+
+        with mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
+
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.code, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertIn("Regeneration is deliberately NOT attempted", gate.detail)
+        self.assertEqual(manifest_path.read_bytes(), before_bytes)
+        runner.assert_not_called()
+
+        res = self.pack()
+        self.assertFalse(res.success)
+        self.assertEqual(res.status, PACK_STATUS_FAILED_INVENTORY)
+        self.assertEqual(res.error_code, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertIn("contract support", res.error_message.lower())
+
+    def test_case_7_compatible_degraded_newer_contract_passes(self):
+        """CASE 7: A newer contract that carries required capabilities passes as
+        COMPATIBLE_DEGRADED without regeneration.
+        """
+        future = json.loads(json.dumps(CONTRACT_V2))
+        future["contract_version"] = 3
+        future["generator"] = "saipen-audit-manifest/3"
+        self.install_contract(future)
+
+        with mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
+
+        self.assertTrue(gate.ok, gate.detail)
+        self.assertFalse(gate.generated, gate.detail)
+        self.assertEqual(gate.code, se.STATUS_COMPATIBLE_DEGRADED)
+        runner.assert_not_called()
+
+    def test_producer_parity_checkpoint_mutation_remains_current(self):
+        """Producer parity:
+        1. Produce/install current SAIPEN manifest.
+        2. Mutate STATE/BOARD/LOG.
+        3. Protocol CLI would report AUDIT_MANIFEST_CURRENT.
+        4. AUDAPACK gate accepts that same document without force refresh.
+        5. Normal packing does not try to force-refresh it.
+        """
+        self.install_contract(CONTRACT)
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        before_bytes = manifest_path.read_bytes()
+
+        sp = self.repo / ".saipen"
+        (sp / "STATE.md").write_text("phase: BUILD\n", encoding="utf-8")
+        (sp / "BOARD.md").write_text("# Board updated\n", encoding="utf-8")
+        (sp / "LOG.md").write_text("- E-2 checkpoint\n", encoding="utf-8")
+
+        self.stub_behavior("current")
+
+        with mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
+
+        self.assertTrue(gate.ok, gate.detail)
+        self.assertFalse(gate.generated, gate.detail)
+        self.assertEqual(manifest_path.read_bytes(), before_bytes)
+        runner.assert_not_called()
+
+        res = self.pack()
+        self.assertTrue(res.success, res.error_message)
+        self.assertEqual(manifest_path.read_bytes(), before_bytes)
 
     def test_cli_discovery_order_and_absolute_path_resolution(self):
         local_bin = self.repo / "bin"
@@ -513,11 +584,6 @@ class TestStaleManifestRegression(SaipenGateCase):
         path_launcher = self.root / "path-bin" / "saipen.exe"
         path_launcher.parent.mkdir()
         path_launcher.write_text("stub", encoding="utf-8")
-        # The PATH step is what this asserts, so the earlier steps are held out.
-        # _well_known_install_candidates() finds a REAL install under
-        # %LOCALAPPDATA% on any machine that has one, and it legitimately
-        # outranks PATH (that is how a foreign saipen_home stops blocking a pack),
-        # so without this the assertion only holds on a machine without SAIPEN.
         with (
             mock.patch.object(sg.shutil, "which", return_value=str(path_launcher)),
             mock.patch.object(sg, "_well_known_install_candidates", return_value=[]),
@@ -526,8 +592,7 @@ class TestStaleManifestRegression(SaipenGateCase):
         self.assertEqual(resolved[0], [str(path_launcher.resolve())])
 
     def test_cli_runs_hidden_noninteractive_and_unbound_in_target_root(self):
-        self.install_contract(CONTRACT)
-        self.age_manifest()
+        (self.repo / ".saipen" / "MANIFEST.json").unlink(missing_ok=True)
         real_runner = sg.run_hidden
         calls = []
 
@@ -691,17 +756,12 @@ class TestContractVersionGate(SaipenGateCase):
         # v2's added exclusion is enforced, not merely recorded.
         self.assertNotIn(".saipen/LOCAL_STATE.json", names)
 
-    def test_case_stale_v1_regenerated_as_v2_is_accepted(self):
-        """Item 13: the CLI upgrades v1 -> v2; the result must be accepted.
-
-        A stale v1 manifest is regenerated by the CURRENT protocol install,
-        which writes v2. Refusing the regenerated document would leave such a
-        project permanently un-packable, which is the defect that escaped.
+    def test_case_absent_manifest_generated_as_v2_is_accepted(self):
+        """When manifest is absent on a checkpoint, generation via CLI writes v2;
+        the result must be accepted and pack must succeed.
         """
-        self.install_contract(CONTRACT)
+        (self.repo / ".saipen" / "MANIFEST.json").unlink(missing_ok=True)
         self.stub_writes(CONTRACT_V2)
-        self.age_manifest()
-        self.commit()
         gate = sg.prepare(self.repo)
         self.assertTrue(gate.ok, gate.detail)
         self.assertTrue(gate.generated, gate.detail)
@@ -831,7 +891,7 @@ class TestContractVersionGate(SaipenGateCase):
         self.assertTrue(snapshot["authoritative_state"])
         runner.assert_not_called()
 
-    def test_case_missing_manifest_is_generated_through_the_real_cli(self):
+    def test_case_malformed_json_fails_closed(self):
         (self.repo / ".saipen" / "MANIFEST.json").write_text(
             "{not json\n", encoding="utf-8"
         )

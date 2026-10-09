@@ -49,7 +49,7 @@ from audapack.fidelity import (
     profile_budget_bytes,
     pruned_census_totals,
 )
-from audapack.models import PackResult, Project
+from audapack.models import PackResult, Project, normalize_archive_scope
 from audapack.source_inventory import (
     CODE_SOURCE_REVIEW_INCOMPLETE,
     RESERVED_ARCHIVE_NAMES,
@@ -409,6 +409,8 @@ def generate_manifest_data(
             "archive_hard_ceiling_bytes",
             "archive_warning_bytes",
             "largest_mandatory",
+            "archive_scope",
+            "large_archive_authorized",
         ):
             if key in fidelity:
                 meta[key] = fidelity[key]
@@ -443,12 +445,18 @@ def _fidelity_payload(plan) -> Optional[dict]:
     if plan is None:
         return None
     pruned_files, pruned_bytes = pruned_census_totals(plan)
+    scope = normalize_archive_scope(getattr(plan, "archive_scope", "auto"))
+    large_authorized = bool(
+        getattr(plan, "large_archive_authorized", False) or scope == "complete_source"
+    )
     return {
         "fidelity_profile": plan.profile,
         "archive_semantics": plan.archive_semantics,
         # CORE-006: the policy that produced this archive, so freshness can be a
         # question about identity rather than only about timestamps.
         "policy_fingerprint": plan.policy_fingerprint,
+        "archive_scope": scope,
+        "large_archive_authorized": large_authorized,
         # T-147: the budget is SOFT. Mandatory audit material is never trimmed
         # to reach it, so a source-heavy project can legitimately overshoot --
         # and the manifest says so instead of implying the target was met.
@@ -597,6 +605,7 @@ def build_inventory_manifest_payload(
     project_name: str,
     producer: Optional[dict] = None,
     source_review: Optional[dict] = None,
+    fidelity: Optional[dict] = None,
 ) -> dict:
     """The canonical ``.audapack/manifest.json`` payload (SRC-046 contract).
 
@@ -653,6 +662,13 @@ def build_inventory_manifest_payload(
     if source_review is not None:
         payload["source_review"] = source_review
         payload["source_review_ready"] = bool(source_review.get("source_review_ready"))
+    if fidelity:
+        if "archive_scope" in fidelity:
+            payload["archive_scope"] = fidelity["archive_scope"]
+        if "large_archive_authorized" in fidelity:
+            payload["large_archive_authorized"] = fidelity["large_archive_authorized"]
+        if "policy_fingerprint" in fidelity:
+            payload["policy_fingerprint"] = fidelity["policy_fingerprint"]
     return payload
 
 
@@ -660,6 +676,8 @@ def _fidelity_payload_for_inventory(
     inventory: SourceInventory,
     packing,
     excludes: set[str],
+    *,
+    project_archive_scope: str = "auto",
 ) -> dict:
     """Manifest fidelity payload for a Git-mode pack (no walked plan exists).
 
@@ -669,6 +687,9 @@ def _fidelity_payload_for_inventory(
     budget trim in T-190, so no lossy-policy omission can arise here and the
     declared semantics survive unless a future policy adds one.
     """
+    # T-290: report the NORMALIZED scope, never the caller's raw spelling, so the
+    # manifest can never disagree with the membership the inventory applied.
+    project_archive_scope = normalize_archive_scope(project_archive_scope)
     if packing is not None:
         profile = normalize_fidelity_profile(
             str(getattr(packing, "fidelity_profile", DEFAULT_PROFILE))
@@ -696,6 +717,7 @@ def _fidelity_payload_for_inventory(
     # carry, and the floor that is never trimmed to reach a size target. The
     # rest is discretionary -- useful, reproducible or historical -- and only it
     # may be removed when the archive approaches the ceiling.
+    # T-290: complete_source explicitly authorizes large archives.
     mandatory = [e for e in included if e.priority == 1]
     mandatory_bytes = sum(e.size for e in mandatory)
     saipen_bytes = sum(
@@ -703,7 +725,8 @@ def _fidelity_payload_for_inventory(
         for e in included
         if e.rel == ".saipen" or e.rel.startswith(".saipen/")
     )
-    feasible = mandatory_bytes <= ARCHIVE_HARD_CEILING_BYTES
+    is_complete_source = (project_archive_scope == "complete_source")
+    feasible = is_complete_source or (mandatory_bytes <= ARCHIVE_HARD_CEILING_BYTES)
 
     reason_stats: dict[str, dict[str, int]] = {}
     for entry in excluded:
@@ -734,7 +757,10 @@ def _fidelity_payload_for_inventory(
             excludes=excludes,
             always_include=always_include,
             always_exclude=always_exclude,
+            archive_scope=project_archive_scope,
         ),
+        "archive_scope": project_archive_scope,
+        "large_archive_authorized": is_complete_source,
         "budget_bytes": budget,
         "budget_met": budget == 0 or included_bytes <= budget,
         "budget_floor_bytes": mandatory_bytes,
@@ -1026,6 +1052,7 @@ def stage_inventory_zip(
                 project_name=project_name or source.name,
                 producer=producer,
                 source_review=source_review,
+                fidelity=fidelity_payload,
             )
             inventory_bytes = json.dumps(inventory_payload, ensure_ascii=False, indent=2).encode("utf-8")
             zinfo = zipfile.ZipInfo(INVENTORY_MANIFEST_PATH)
@@ -1480,8 +1507,12 @@ def archive_policy_mismatch(
     archive as a success -- its own manifest still declaring
     ``fidelity_profile=compact``, ``archive_semantics=audit_representation``.
 
+    T-288: so is packing IMPLEMENTATION identity. A superseded writer's archive
+    that still matches the policy is not reusable evidence, and neither is one
+    whose producer block (or source review) is absent.
+
     Missing or legacy metadata is a mismatch, never a pass: an archive that cannot
-    prove which policy built it has to be rebuilt once.
+    prove which policy and which implementation built it has to be rebuilt once.
 
     PERF-001: ``manifest`` lets a caller that already read it (to report the
     reused archive's own policy fields) supply it instead of paying a second zip
@@ -1509,6 +1540,31 @@ def archive_policy_mismatch(
             f"packing policy changed (archive {recorded[:12]} != current "
             f"{expected_fingerprint[:12]})"
         )
+    # T-288: packing POLICY identity is not packing IMPLEMENTATION identity. Two
+    # archives can share a fingerprint and a fresh mtime while one of them was
+    # written by code that no longer exists -- the reproduced ZAICODE failure was
+    # exactly that: a resident runtime holding superseded packing code wrote an
+    # archive whose own manifest said `included=false, reason=""` for its
+    # application component, and every later reuse decision handed it back
+    # because the policy matched. Both facts an archive can state about its own
+    # author are therefore part of reusability: which implementation wrote it,
+    # and whether that implementation proved its source is inside it.
+    producer = manifest.get("producer")
+    if not isinstance(producer, dict):
+        return "archive predates producer identity (no producer block)"
+    recorded_impl = str(producer.get("packing_implementation_sha256") or "")
+    if not recorded_impl:
+        return "archive producer block names no packing implementation"
+    if recorded_impl != runtime_identity.LOADED_PACKING_DIGEST:
+        return (
+            f"packing implementation changed (archive {recorded_impl[:12]} != current "
+            f"{runtime_identity.LOADED_PACKING_DIGEST[:12]})"
+        )
+    # A successful pack refuses to ship an archive whose source review is not
+    # ready, so an archive that is not ready cannot have been written by code
+    # that had that promise to keep. Never reuse it.
+    if manifest.get("source_review_ready") is not True:
+        return "archive does not prove its own source is inside it (source_review_ready)"
     # Same policy, different project: the archive is not about this source.
     recorded_source = str(manifest.get("source_path") or "")
     if recorded_source:
@@ -1714,6 +1770,7 @@ def pack_single(
     manifest_meta: Optional[dict] = None,
     packing: Optional[PackingConfig] = None,
     prebuilt_plan: Optional[FidelityPlan] = None,
+    project_archive_scope: str = "auto",
 ) -> PackResult:
     """Pack a single folder or file into a timestamped ZIP in output_dir.
 
@@ -1734,6 +1791,12 @@ def pack_single(
     log = log_callback or (lambda msg: None)
     source = Path(source_path)
     stem = safe_archive_stem(archive_stem)
+    # T-290: ONE canonical archive_scope for the whole run. Normalizing here (and
+    # again, defensively, inside the inventory) means a direct caller passing
+    # "COMPLETE_SOURCE" or " complete_source " gets the same membership the
+    # manifest and the policy fingerprint already describe. An invalid value
+    # falls back to AUTO in behaviour, manifest and fingerprint alike.
+    project_archive_scope = normalize_archive_scope(project_archive_scope)
     pack_started_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # T-274: a resident GUI/bridge process keeps the packing modules it imported
@@ -1816,22 +1879,30 @@ def pack_single(
         if gate.code == "PACK_CANCELLED":
             message = "Cancelled by user"
         elif gate.code == saipen_evidence.STATUS_CONTRACT_UNKNOWN:
-            # TARGET G: the manifest is present and current; only its contract
-            # VERSION is beyond this collector. "Run saipen audit manifest
-            # --write" would be misleading advice that cannot repair anything
-            # (the installed protocol writes that same newer contract), so the
-            # gate's own detail -- which names the real remedy -- is surfaced
-            # alone, with no regeneration instruction appended.
+            # The manifest is present; only its contract VERSION is beyond this
+            # collector. Tell the operator AUDAPACK contract support must be updated;
+            # regeneration cannot downgrade what the installed protocol implements.
             message = (
                 f"SAIPEN audit-manifest precondition failed ({gate.code}): "
-                f"{gate.detail} No archive was produced."
+                f"{gate.detail} Update AUDAPACK contract support; no archive was produced."
+            )
+        elif gate.code == saipen_evidence.STATUS_MANIFEST_MALFORMED:
+            message = (
+                f"SAIPEN audit-manifest precondition failed ({gate.code}): "
+                f"{gate.detail}. Repair the project-owned MANIFEST/protocol state "
+                "and repack; no archive was produced."
+            )
+        elif gate.code in ("AUDIT_MANIFEST_GENERATION_FAILED", saipen_evidence.STATUS_MANIFEST_ABSENT):
+            message = (
+                f"SAIPEN audit-manifest precondition failed ({gate.code}): "
+                "AUDAPACK attempted canonical manifest generation via "
+                f"`saipen audit manifest --write` but launcher/protocol failed: {gate.detail}. "
+                "No archive was produced."
             )
         else:
             message = (
                 f"SAIPEN audit-manifest precondition failed ({gate.code}): "
-                f"{gate.detail}. Run `saipen audit manifest --write` in the "
-                "project (or repair the owning SAIPEN protocol component) "
-                "and repack; no archive was produced."
+                f"{gate.detail}. No archive was produced."
             )
         log(f"FAIL {stem}: {message}")
         return PackResult(
@@ -1866,6 +1937,7 @@ def pack_single(
             prebuilt_plan=prebuilt_plan,
             supersedable_reserved=supersedable_reserved,
             cancel_event=cancel_event,
+            project_archive_scope=project_archive_scope,
         )
     except SourceInventoryError as exc:
         log(f"FAIL {stem}: {exc}")
@@ -1883,7 +1955,9 @@ def pack_single(
             first_error_path=exc.rel,
         )
     if inventory.mode == "git":
-        fidelity_payload = _fidelity_payload_for_inventory(inventory, packing, excludes)
+        fidelity_payload = _fidelity_payload_for_inventory(
+            inventory, packing, excludes, project_archive_scope=project_archive_scope
+        )
         profile_name = fidelity_payload["fidelity_profile"]
         archive_sem = fidelity_payload["archive_semantics"]
     else:
@@ -1973,10 +2047,11 @@ def pack_single(
                         prebuilt_plan=None,
                         supersedable_reserved=supersedable_reserved,
                         cancel_event=cancel_event,
+                        project_archive_scope=project_archive_scope,
                     )
                     if inventory.mode == "git":
                         fidelity_payload = _fidelity_payload_for_inventory(
-                            inventory, packing, excludes
+                            inventory, packing, excludes, project_archive_scope=project_archive_scope
                         )
                     else:
                         fidelity_payload = _fidelity_payload(plan)

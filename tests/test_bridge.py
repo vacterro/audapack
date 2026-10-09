@@ -1402,8 +1402,9 @@ class TestStopBridgeRealSubprocessLifecycle(unittest.TestCase):
             script = Path(tmp) / "fake_bridge.py"
             script.write_text(_FAKE_BRIDGE_SOURCE, encoding="utf-8")
 
+            py_exe = getattr(sys, "_base_executable", sys.executable)
             proc = subprocess.Popen(
-                [sys.executable, str(script), str(port), nonce],
+                [py_exe, str(script), str(port), nonce],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

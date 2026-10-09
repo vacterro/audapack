@@ -1,0 +1,12 @@
+agent: buffy-02
+role: core
+model_or_runtime: unknown
+project: vacterro-audapack
+saipen_version: 8.0.1
+protocol_fingerprint: sha256:0bab8e3dd3931bdd392234e626e24d9f7f3be56fb5cdece5e2ad1be54dcc7185
+source_head: 38a7cc48ef0ed635e6f7e6beadf13669ff2a5fe1
+source_tree_fingerprint: git-delta-v1:a9c918b7a35a4c5421e47b6f1a72b0c1470482057a23b64228bcda1452801015
+discovery_model: git-delta-v1
+context_scope: SAIPEN audit, phase DONE
+context_available: partial
+report_status: draft

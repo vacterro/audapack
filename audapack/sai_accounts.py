@@ -66,6 +66,8 @@ _LOCATOR_FIELDS = ("profile_locator", "windows_user", "context_label")
 # for the whole test session by conftest; nothing else may set them.
 TestEngine = None
 TestRun = None
+TestManager = None
+TestOpenManager = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,55 @@ def engine_path() -> str:
     if installed.is_file():
         return str(installed)
     return shutil.which("sai-accounts") or ""
+
+
+def manager_path() -> str:
+    """Resolve the canonical SAI Accounts Manager (SAITULS.exe). Never raises.
+
+    Resolution order: the test seam, the explicit environment override, the
+    canonical ProgramData install, the local developer checkout, and PATH.
+    Every branch may legitimately produce "".
+    """
+    if TestManager is not None:
+        return TestManager() or ""
+    override = os.environ.get("SAI_ACCOUNTS_MANAGER_EXE", "") or os.environ.get("SAITULS_EXE", "")
+    if override and os.path.isfile(override):
+        return override
+    canonical = CANONICAL_INSTALL / "SAITULS.exe"
+    if canonical.is_file():
+        return str(canonical)
+    local_dev = Path("V:/___VAC/__K/__CODE/__SAITULS/SAITULS.exe")
+    if local_dev.is_file():
+        return str(local_dev)
+    found = shutil.which("SAITULS.exe") or shutil.which("SAITULS")
+    return str(found) if found else ""
+
+
+def open_manager(action: str = "") -> dict:
+    """Launch the canonical SAI Accounts Manager (SAITULS.exe). Never raises.
+
+    Spawns the manager GUI process without blocking the Qt GUI thread.
+    """
+    if TestOpenManager is not None:
+        return TestOpenManager(action)
+    exe = manager_path()
+    if not exe:
+        return {"ok": False, "error": "manager_absent"}
+    try:
+        argv = [exe]
+        if action:
+            argv.append(action)
+        subprocess.Popen(
+            argv,
+            cwd=str(Path(exe).parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+        return {"ok": True, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def _run(argv: list[str], timeout: float) -> dict:
@@ -224,11 +275,15 @@ def withdrawn_by_plane(entry: dict) -> bool:
     return state != "ENABLED"
 
 
+LIST_SUPPORTED_SCHEMA = "sai.accounts/list/1"
+LIST_SUPPORTED_STATUS = "ok"
+
+
 def read_registry(provider_ids, timeout: float | None = None) -> SharedListing:
     """Read the plane once and split its accounts into drawn and suppressed."""
     exe = engine_path()
     if not exe:
-        return SharedListing([], frozenset())
+        return SharedListing([], frozenset(), ok=False, generation=0)
     # --all so an ARCHIVED account is still projected. Without it the plane
     # drops archived accounts from the payload entirely, and a withdrawal this
     # consumer cannot see is a withdrawal it cannot honour.
@@ -238,29 +293,65 @@ def read_registry(provider_ids, timeout: float | None = None) -> SharedListing:
         # exited nonzero or never answered said nothing at all about the
         # accounts, and treating that as "no accounts" is how a stale launcher
         # or a resurrected static default survives an outage.
-        return SharedListing([], frozenset())
+        return SharedListing([], frozenset(), ok=False, generation=0)
     payload = _json_object(result.get("stdout", ""))
+    if not isinstance(payload, dict):
+        return SharedListing([], frozenset(), ok=False, generation=0)
+
+    # Establish authoritative LIST envelope validator (CORE-001)
+    if payload.get("schema") != LIST_SUPPORTED_SCHEMA or payload.get("status") != LIST_SUPPORTED_STATUS:
+        return SharedListing([], frozenset(), ok=False, generation=0)
+
     entries = payload.get("accounts")
     if not isinstance(entries, list):
         # No well-formed payload: NOT an authoritative empty registry.
-        return SharedListing([], frozenset())
+        return SharedListing([], frozenset(), ok=False, generation=0)
     generation = payload.get("generation")
     generation = generation if isinstance(generation, int) and generation >= 0 else 0
-    wanted = {str(p).lower() for p in provider_ids}
+    wanted = {str(p).strip().lower() for p in provider_ids if str(p).strip()}
     found: list[SharedAccount] = []
     suppressed: set[str] = set()
+    seen_account_ids: set[str] = set()
+
     for entry in entries:
         if not isinstance(entry, dict):
-            continue
+            # Malformed entry makes entire snapshot non-authoritative
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
         account_id = entry.get("account_id")
         provider = entry.get("provider_id")
+
+        canon_p = _canonical_provider(account_id) if isinstance(account_id, str) else ""
+        norm_p = provider.strip().lower() if isinstance(provider, str) else ""
+
+        is_relevant = (norm_p in wanted) or (canon_p in wanted)
+        if not is_relevant:
+            continue
+
+        # Strictly validate every relevant wanted-provider row
         if not isinstance(account_id, str) or not account_id.strip():
-            continue
-        if not isinstance(provider, str) or provider.strip().lower() not in wanted:
-            continue
-        locator = locator_of(entry)
+            return SharedListing([], frozenset(), ok=False, generation=0)
+        if not isinstance(provider, str) or not provider.strip():
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
+        # Provider / canonical account identity contradiction
+        if not canon_p or canon_p != norm_p:
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
+        norm_account_id = account_id.strip()
+        # Enforce canonical account_id uniqueness across accepted wanted-provider records (CORE-001).
+        # Any duplicate canonical account_id (identical or contradictory) makes the entire snapshot non-authoritative.
+        if norm_account_id in seen_account_ids:
+            return SharedListing([], frozenset(), ok=False, generation=0)
+        seen_account_ids.add(norm_account_id)
+
+        # Validate operational_state if provided
         state = entry.get("operational_state")
+        if state is not None and not isinstance(state, str):
+            return SharedListing([], frozenset(), ok=False, generation=0)
         state = state if isinstance(state, str) and state else "ENABLED"
+
+        locator = locator_of(entry)
         if withdrawn_by_plane(entry):
             # An unprovable identity suppresses nothing: it would suppress
             # every record that also has no locator, which is a different one.
@@ -269,9 +360,9 @@ def read_registry(provider_ids, timeout: float | None = None) -> SharedListing:
                 suppressed.add(key)
             continue
         found.append(SharedAccount(
-            account_id=account_id.strip(),
+            account_id=norm_account_id,
             provider_id=provider.strip(),
-            display_name=str(entry.get("display_name") or account_id),
+            display_name=str(entry.get("display_name") or norm_account_id),
             compact_label=str(entry.get("compact_label") or ""),
             backend=str(entry.get("execution_backend") or ""),
             locator=locator,
@@ -301,6 +392,16 @@ def remember(shared: list[SharedAccount]) -> list[SharedAccount]:
     _LIST_CACHE[:] = list(shared)
     _SUPPRESSED = frozenset()
     return list(_LIST_CACHE)
+
+
+def cached_accounts() -> list[SharedAccount]:
+    """The shared accounts from the last successful read of the plane."""
+    return list(_LIST_CACHE)
+
+
+def has_cached_accounts() -> bool:
+    """True when at least one snapshot has been remembered."""
+    return bool(_LIST_CACHE)
 
 
 def suppressed_keys() -> frozenset[str]:
@@ -487,6 +588,33 @@ def launch(account_id: str, workdir: str | Path, timeout: float | None = None) -
     )
 
 
+@dataclass(frozen=True)
+class GrantWorkdirResult:
+    ok: bool
+    account_id: str
+    workdir: str
+    status: str = ""
+    detail: str = ""
+
+
+def grant_workdir(account_id: str, workdir: str | Path, timeout: float | None = 30.0) -> GrantWorkdirResult:
+    target_account = str(account_id or "").strip()
+    target_workdir = str(workdir or "").strip()
+    if not target_account or not target_workdir:
+        return GrantWorkdirResult(ok=False, account_id=target_account, workdir=target_workdir, detail="account_id and workdir required")
+    result = _run(
+        ["grant-workdir", target_account, "--workdir", target_workdir],
+        timeout=timeout,
+    )
+    payload = _json_object(result.get("stdout", ""))
+    status = str(payload.get("status") or "").strip()
+    if result.get("ok") and status in ("granted", "already_granted"):
+        return GrantWorkdirResult(ok=True, account_id=target_account, workdir=target_workdir, status=status)
+    err = str(payload.get("detail") or payload.get("error") or result.get("error") or status or "grant_failed")
+    return GrantWorkdirResult(ok=False, account_id=target_account, workdir=target_workdir, status=status or "grant_failed", detail=err)
+
+
+
 def parse_windows(payload: dict) -> list:
     """Translate the plane's window list into ``LimitWindow`` records.
 
@@ -542,11 +670,21 @@ def probe(account_id: str, timeout: float | None = None) -> tuple:
     state about one account, not an outage, and reporting it as an outage would
     be a lie about the whole control plane.
     """
-    result = _run(["usage", account_id],
+    requested_id = str(account_id or "").strip()
+    if not requested_id:
+        return [], "unavailable", "invalid requested account id"
+
+    result = _run(["usage", requested_id],
                   USAGE_TIMEOUT_CAP_S if timeout is None else timeout)
     payload = _json_object(result.get("stdout", ""))
     if not payload:
         return [], "unavailable", "SAI Accounts did not answer"
+
+    # CORE-002: Prove exact canonical account identity from authoritative account_id field
+    reported_id = payload.get("account_id")
+    if not isinstance(reported_id, str) or not reported_id.strip() or reported_id.strip() != requested_id:
+        return [], "unavailable", "account identity mismatch or missing in usage response"
+
     windows = parse_windows(payload)
     if windows:
         return windows, "ok", ""

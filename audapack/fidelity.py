@@ -44,6 +44,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
+from audapack.models import (
+    ARCHIVE_SCOPE_COMPLETE_SOURCE,
+    normalize_archive_scope,
+)
+
 # ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
@@ -170,6 +175,7 @@ def packing_policy_fingerprint(
     always_include=(),
     always_exclude=(),
     mandatory_excludes=None,
+    archive_scope: str = "auto",
 ) -> str:
     """Canonical identity of every content-affecting packing policy input.
 
@@ -201,21 +207,61 @@ def packing_policy_fingerprint(
         "always_include": norm(always_include),
         "always_exclude": norm(always_exclude),
         "mandatory": norm(MANDATORY_EXCLUDES if mandatory_excludes is None else mandatory_excludes),
+        # T-290: the SAME canonicalizer the inventory and the manifest use. A raw
+        # ``.strip().lower()`` here made "COMPLETE_SOURCE" fingerprint as
+        # complete_source while the inventory compared the raw string and stayed
+        # AUTO -- one fingerprint describing two different archive memberships.
+        # An invalid value is AUTO here exactly as it is everywhere else.
+        "archive_scope": normalize_archive_scope(archive_scope),
     }
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:32]
 
 
-def policy_fingerprint_from_config(packing, excludes) -> str:
-    """``packing_policy_fingerprint`` for a ``PackingConfig`` + its excludes."""
+def policy_fingerprint_for_project(
+    packing,
+    excludes,
+    *,
+    project=None,
+    archive_scope: Optional[str] = None,
+) -> str:
+    """Canonical packing policy fingerprint for a specific project.
+
+    Consumes project.archive_scope ('auto' vs 'complete_source') so that changing
+    scope invalidates hot reuse and freshness probes.
+    """
+    if archive_scope is None:
+        if project is not None:
+            archive_scope = getattr(project, "archive_scope", "auto")
+        elif packing is not None:
+            archive_scope = getattr(packing, "archive_scope", "auto")
+        else:
+            archive_scope = "auto"
     return packing_policy_fingerprint(
-        profile=str(getattr(packing, "fidelity_profile", DEFAULT_PROFILE)),
-        max_mb=int(getattr(packing, "fidelity_max_mb", 0) or 0),
-        media_samples=int(getattr(packing, "fidelity_media_samples", 0) or 0),
-        media_bytes=int(getattr(packing, "fidelity_media_bytes", 0) or 0),
+        profile=str(getattr(packing, "fidelity_profile", DEFAULT_PROFILE)) if packing is not None else DEFAULT_PROFILE,
+        max_mb=int(getattr(packing, "fidelity_max_mb", 0) or 0) if packing is not None else 0,
+        media_samples=int(getattr(packing, "fidelity_media_samples", 0) or 0) if packing is not None else 0,
+        media_bytes=int(getattr(packing, "fidelity_media_bytes", 0) or 0) if packing is not None else 0,
         excludes=excludes,
-        always_include=list(getattr(packing, "always_include", None) or []),
-        always_exclude=list(getattr(packing, "always_exclude", None) or []),
+        always_include=list(getattr(packing, "always_include", None) or []) if packing is not None else [],
+        always_exclude=list(getattr(packing, "always_exclude", None) or []) if packing is not None else [],
+        archive_scope=archive_scope,
+    )
+
+
+def policy_fingerprint_from_config(
+    packing,
+    excludes,
+    *,
+    project=None,
+    archive_scope: Optional[str] = None,
+) -> str:
+    """``packing_policy_fingerprint`` for a ``PackingConfig`` + its excludes."""
+    return policy_fingerprint_for_project(
+        packing,
+        excludes,
+        project=project,
+        archive_scope=archive_scope,
     )
 
 
@@ -330,6 +376,51 @@ def media_class_for(path: Path | str) -> Optional[str]:
     if dot <= 0:
         return None
     return MEDIA_EXTENSIONS.get(name[dot + 1:].lower())
+
+
+#: Directory names that make a tree a canonical test-oracle location: the
+#: versioned reference material a test READS. A file in one of these is an input
+#: the suite compares against, not an output a test run produces.
+TEST_ORACLE_DIR_NAMES = frozenset({
+    "baselines", "baseline", "golden", "goldens", "snapshots",
+    "__snapshots__", "reference", "references", "expected",
+})
+
+#: The context that turns an oracle-looking directory into an actual test
+#: oracle. Every name above is also an ordinary English word, so the directory
+#: name alone is no evidence at all: ``docs/reference`` is prose. A test-context
+#: directory must be an ANCESTOR of the oracle directory.
+TEST_CONTEXT_DIR_NAMES = frozenset({
+    "tests", "test", "__tests__", "e2e", "playwright",
+    "visual-tests", "visual-regression", "regression-tests",
+})
+
+
+def is_test_oracle_path(rel_lower: str) -> bool:
+    """True when a POSIX-relative path is versioned test-oracle material.
+
+    A ``tests/baselines/home.png`` is the image a visual suite asserts against:
+    source for reproducibility, whatever its bytes happen to be. The media
+    sampler ranked it like any other asset and kept only the profile's sample
+    count, so a real project's nine declared baselines reached the archive as
+    three and the archive could not reproduce the validation it advertised.
+
+    STRUCTURE decides, never the extension: the path must carry a test-context
+    directory and, BELOW it, an oracle directory. So ``tests/baselines/**``,
+    ``e2e/golden/**`` and ``__tests__/__snapshots__/**`` are oracles while
+    ``screenshots/actual/**``, a bare ``reference/theme.png`` and
+    ``docs/reference/**`` keep their existing classification.
+
+    Deliberately a bounded recognized-name policy, not a test parser: a tree
+    laid out some other way keeps the policy it has today.
+    """
+    segs = rel_lower.split("/")
+    context_at = next(
+        (i for i, seg in enumerate(segs) if seg in TEST_CONTEXT_DIR_NAMES), None
+    )
+    if context_at is None:
+        return False
+    return any(seg in TEST_ORACLE_DIR_NAMES for seg in segs[context_at + 1:])
 
 
 #: Priority-1 (mandatory audit material) extensions: code, tests, configs,
@@ -490,6 +581,12 @@ def _priority_for(rel_lower: str, name_lower: str, size: int = 0) -> int:
         if len(segs) > 2 and segs[1] in SAIPEN_DOC_DIRS:
             return 2
         return 3
+
+    # A versioned test oracle is reproducibility source, not discretionary
+    # bulk, so it never leaves priority 1: no media sample cap, no budget trim,
+    # no prose allowance can drop a baseline the suite compares against.
+    if is_test_oracle_path(rel_lower):
+        return 1
 
     # Direct project-root checkpoint documents: *_CHECKPOINT.md
     if len(segs) == 1 and (name_lower.endswith("_checkpoint.md") or name_lower == "checkpoint.md"):
@@ -837,6 +934,8 @@ class FidelityPlan:
     #: exclude change silently reused an archive with materially different
     #: contents. Persisted in the manifest, compared before any mtime reuse.
     policy_fingerprint: str = ""
+    archive_scope: str = "auto"
+    large_archive_authorized: bool = False
     #: T-155: whole-pruned directories whose census is pending, rel -> path.
     #: The manifest writer finalizes these counts; a probe that stopped early
     #: never carries them. Internal, not serialized.
@@ -1172,6 +1271,7 @@ def build_fidelity_plan(
     newer_than_mtime: Optional[float] = None,
     census_pruned: bool = True,
     cancel_event: object = None,
+    archive_scope: str = "auto",
 ) -> FidelityPlan:
     """Classify every file under ``source`` and decide what the archive holds.
 
@@ -1190,12 +1290,16 @@ def build_fidelity_plan(
     from audapack.packing import MANDATORY_EXCLUDES
 
     profile = normalize_fidelity_profile(profile)
+    norm_scope = normalize_archive_scope(archive_scope)
+    is_complete_source = norm_scope == ARCHIVE_SCOPE_COMPLETE_SOURCE
     plan = FidelityPlan(
         profile=profile,
         archive_semantics=archive_semantics_for(profile),
         budget_bytes=profile_budget_bytes(profile, max_mb),
         media_samples=profile_media_samples(profile, media_samples),
         media_bytes_per_dir=profile_media_bytes(profile, media_bytes),
+        archive_scope=norm_scope,
+        large_archive_authorized=is_complete_source,
     )
     plan.pruned_census_taken = census_pruned
     always_incl = _build_matcher({p for p in (always_include or [])})
@@ -1211,6 +1315,7 @@ def build_fidelity_plan(
         always_include=always_include or (),
         always_exclude=always_exclude or (),
         mandatory_excludes=mandatory_excludes,
+        archive_scope=norm_scope,
     )
 
     # PERF-001 (audit/6.md): the reference scan is a SECOND full walk that reads
@@ -1443,7 +1548,7 @@ def build_fidelity_plan(
                     manifest_candidates.append((rel, Path(entry.path)))
 
                 mclass = media_class_for(name)
-                if mclass is not None:
+                if mclass is not None and not is_test_oracle_path(rel_lower):
                     # PERF-003: rel + size is everything the sampler decides on.
                     # A per-file Path object was retained here and never read.
                     media_groups.setdefault((mclass, rel_prefix or "."), []).append(
@@ -1633,7 +1738,7 @@ def build_fidelity_plan(
     plan.mandatory_bytes = mandatory_bytes
     plan.discretionary_bytes = discretionary_bytes
     plan.budget_floor_bytes = mandatory_bytes
-    plan.budget_feasible = plan.budget_bytes == 0 or mandatory_bytes <= plan.budget_bytes
+    plan.budget_feasible = is_complete_source or plan.budget_bytes == 0 or mandatory_bytes <= plan.budget_bytes
 
     # ---- soft budget trim: ordinary assets first, prose second, never P1 ---
     # Two ordered passes, largest-first inside each. Priority 1 (code, tests,
@@ -1834,8 +1939,11 @@ def build_plan_from_config(
     newer_than_mtime: Optional[float] = None,
     census_pruned: bool = True,
     cancel_event=None,
+    archive_scope: Optional[str] = None,
 ) -> FidelityPlan:
     """Build a plan from a ``PackingConfig`` (or object with same attrs)."""
+    if archive_scope is None:
+        archive_scope = getattr(packing, "archive_scope", "auto") if packing is not None else "auto"
     return build_fidelity_plan(
         source,
         excludes,
@@ -1848,6 +1956,7 @@ def build_plan_from_config(
         newer_than_mtime=newer_than_mtime,
         census_pruned=census_pruned,
         cancel_event=cancel_event,
+        archive_scope=archive_scope,
     )
 
 

@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from audapack.procutil import run_hidden
 
 #: Files whose content decides what bytes an archive carries. A change in any
 #: of them makes a resident process's already-imported copy obsolete.
@@ -164,7 +165,7 @@ def source_revision() -> dict:
     """
     root = _package_root().parent
     try:
-        head = subprocess.run(
+        head = run_hidden(
             ["git", "rev-parse", "HEAD"],
             cwd=str(root),
             capture_output=True,
@@ -173,7 +174,7 @@ def source_revision() -> dict:
         )
         if head.returncode != 0:
             raise OSError("not a git checkout")
-        status = subprocess.run(
+        status = run_hidden(
             ["git", "status", "--porcelain"],
             cwd=str(root),
             capture_output=True,

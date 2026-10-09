@@ -119,9 +119,12 @@ test('W3-002: archive freshness is visible from archive filename timestamp', () 
   assert.ok(modifiedAt > 0);
   const freshness = api.composerArchiveFreshness(modifiedAt + (5 * 60 * 1000));
   assert.strictEqual(freshness.name, name);
-  assert.strictEqual(freshness.short, 'ZIP 5m');
+  // T-296: canonical clock contract is ZIP HH:MM:SS (T-294/T-295 rework of
+  // compactElapsedAge); the pre-rework 'ZIP 5m' short form is stale.
+  assert.strictEqual(freshness.short, 'ZIP 00:05:00');
   assert.strictEqual(freshness.freshness, 'fresh');
-  assert.strictEqual(freshness.source, 'filename');
+  // T-296: canonical source label is 'archive filename' (T-295 rework).
+  assert.strictEqual(freshness.source, 'archive filename');
 });
 
 test('W3-002: one START waits for delayed Send readiness and submits automatically', async () => {

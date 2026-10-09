@@ -454,18 +454,50 @@ class FakeElement {
     walk(root);
     return order;
   }
-  addEventListener(type, fn) {
-    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
-    this._listeners.get(type).add(fn);
+  addEventListener(type, fn, options) {
+    if (!this._listeners.has(type)) this._listeners.set(type, []);
+    const capture = options === true || Boolean(options && options.capture);
+    this._listeners.get(type).push({ fn, capture });
   }
   removeEventListener(type, fn) {
-    this._listeners.get(type)?.delete(fn);
+    const listeners = this._listeners.get(type);
+    if (listeners) this._listeners.set(type, listeners.filter(entry => entry.fn !== fn));
   }
   dispatchEvent(event) {
+    // Production-realistic propagation: document capture listeners observe the
+    // intent BEFORE target handlers run (ChatGPT consumes the composer payload
+    // in the same task), then target handlers, then bubble back to document.
+    // Without this, a test that clicks Send and inserts a turn never exercises
+    // the widget's document-level delegated Send tracking path.
     event.target = event.target || this;
-    event.currentTarget = this;
-    const listeners = this._listeners.get(event.type);
-    if (listeners) for (const fn of Array.from(listeners)) fn.call(this, event);
+    const path = [];
+    let node = this;
+    while (node) { path.push(node); node = node.parentNode; }
+    const root = path[path.length - 1];
+    const doc = (root && root._documentRoot) ? root._ownerDocument : null;
+    const fire = (target, captureOnly) => {
+      const listeners = target._listeners?.get(event.type);
+      if (!listeners) return;
+      event.currentTarget = target;
+      for (const entry of Array.from(listeners)) {
+        if (captureOnly !== null && entry.capture !== captureOnly) continue;
+        entry.fn.call(target, event);
+        if (event.propagationStopped) return;
+      }
+    };
+    if (doc && doc !== this) fire(doc, true);
+    for (let i = path.length - 1; i >= 1; i -= 1) {
+      fire(path[i], true);
+      if (event.propagationStopped) return !event.defaultPrevented;
+    }
+    fire(this, null);
+    if (event.bubbles && !event.propagationStopped) {
+      for (let i = 1; i < path.length; i += 1) {
+        fire(path[i], false);
+        if (event.propagationStopped) break;
+      }
+      if (doc && doc !== this && !event.propagationStopped) fire(doc, false);
+    }
     return !event.defaultPrevented;
   }
   click() {
@@ -504,6 +536,15 @@ class FakeEvent {
     this.isPrimary = init.isPrimary ?? false;
     this.button = init.button ?? 0;
     this.dataTransfer = init.dataTransfer ?? null;
+    this.key = init.key ?? '';
+    this.code = init.code ?? '';
+    this.shiftKey = init.shiftKey ?? false;
+    this.ctrlKey = init.ctrlKey ?? false;
+    this.metaKey = init.metaKey ?? false;
+    this.altKey = init.altKey ?? false;
+    this.isComposing = init.isComposing ?? false;
+    this.keyCode = init.keyCode ?? 0;
+    this.which = init.which ?? 0;
   }
   preventDefault() { this.defaultPrevented = true; }
   stopPropagation() { this.propagationStopped = true; }
@@ -573,6 +614,7 @@ class FakeDocument {
     this._listeners = new Map();
     this.documentElement = new FakeElement('html');
     this.documentElement._documentRoot = true;
+    this.documentElement._ownerDocument = this;
     this.body = new FakeElement('body');
     this.head = new FakeElement('head');
     this.documentElement.appendChild(this.head);
@@ -606,18 +648,20 @@ class FakeDocument {
     return { selectNodeContents() {}, collapse() {}, getBoundingClientRect: () => ({ width: 0, height: 0 }) };
   }
   execCommand() { return false; }
-  addEventListener(type, fn) {
-    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
-    this._listeners.get(type).add(fn);
+  addEventListener(type, fn, options) {
+    if (!this._listeners.has(type)) this._listeners.set(type, []);
+    const capture = options === true || Boolean(options && options.capture);
+    this._listeners.get(type).push({ fn, capture });
   }
   removeEventListener(type, fn) {
-    this._listeners.get(type)?.delete(fn);
+    const listeners = this._listeners.get(type);
+    if (listeners) this._listeners.set(type, listeners.filter(entry => entry.fn !== fn));
   }
   dispatchEvent(event) {
     event.target = event.target || this;
     event.currentTarget = this;
     const listeners = this._listeners.get(event.type);
-    if (listeners) for (const fn of Array.from(listeners)) fn.call(this, event);
+    if (listeners) for (const entry of Array.from(listeners)) entry.fn.call(this, event);
     return !event.defaultPrevented;
   }
 }
@@ -737,18 +781,20 @@ function createHarness(options = {}) {
 
   const windowObj = {
     _listeners: new Map(),
-    addEventListener(type, fn) {
-      if (!this._listeners.has(type)) this._listeners.set(type, new Set());
-      this._listeners.get(type).add(fn);
+    addEventListener(type, fn, options) {
+      if (!this._listeners.has(type)) this._listeners.set(type, []);
+      const capture = options === true || Boolean(options && options.capture);
+      this._listeners.get(type).push({ fn, capture });
     },
     removeEventListener(type, fn) {
-      this._listeners.get(type)?.delete(fn);
+      const listeners = this._listeners.get(type);
+      if (listeners) this._listeners.set(type, listeners.filter(entry => entry.fn !== fn));
     },
     dispatchEvent(event) {
       event.target = event.target || this;
       event.currentTarget = this;
       const listeners = this._listeners.get(event.type);
-      if (listeners) for (const fn of Array.from(listeners)) fn.call(this, event);
+      if (listeners) for (const entry of Array.from(listeners)) entry.fn.call(this, event);
       return !event.defaultPrevented;
     },
     innerWidth: 800,

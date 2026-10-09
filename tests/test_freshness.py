@@ -271,6 +271,8 @@ class ArchiveFreshnessContractTests(unittest.TestCase):
         self.assertTrue(verdict.policy_mismatch)
 
     def test_a_matching_manifest_keeps_the_reused_policy_metadata(self):
+        from audapack import runtime_identity
+
         config = self._config()
         archive = self.output_dir / "proj.zip"
         with zipfile.ZipFile(archive, "w") as zf:
@@ -284,6 +286,14 @@ class ArchiveFreshnessContractTests(unittest.TestCase):
                 "policy_fingerprint": policy_fingerprint_from_config(
                     config.packing, set(config.packing.excludes)
                 ),
+                # T-288: policy identity alone is no longer enough to reuse. The
+                # fixture models an archive THIS implementation wrote and whose
+                # own source review passed, which is what a real pack emits.
+                "producer": {
+                    "audapack_version": __import__("audapack").__version__,
+                    "packing_implementation_sha256": runtime_identity.LOADED_PACKING_DIGEST,
+                },
+                "source_review_ready": True,
             }))
         newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
         self._touch(archive, newest + 600)
@@ -292,6 +302,140 @@ class ArchiveFreshnessContractTests(unittest.TestCase):
         verdict = self._probe(config)
         self.assertIs(verdict.state, ArchiveFreshness.FRESH)
         self.assertEqual(verdict.manifest.get("archive_semantics"), "full_snapshot")
+
+    # --------------------------------------------- T-288: reuse identity
+    def _write_synthetic_archive(self, config, manifest_updates) -> Path:
+        """A policy-correct archive whose manifest is mutated by the caller."""
+        from audapack import runtime_identity
+
+        archive = self.output_dir / "proj.zip"
+        manifest = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "product": "AUDAPACK",
+            "source_path": str(self.source),
+            "fidelity_profile": config.packing.fidelity_profile,
+            "archive_semantics": "full_snapshot",
+            "policy_fingerprint": policy_fingerprint_from_config(
+                config.packing, set(config.packing.excludes)
+            ),
+            "producer": {
+                "packing_implementation_sha256": runtime_identity.LOADED_PACKING_DIGEST,
+            },
+            "source_review_ready": True,
+        }
+        manifest.update(manifest_updates)
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("main.py", "print('x')")
+            zf.writestr(MANIFEST_FILENAME, json.dumps(manifest))
+        newest = max(p.stat().st_mtime for p in self.source.rglob("*") if p.is_file())
+        self._touch(archive, newest + 600)
+        self._freeze_root_older_than(archive)
+        return archive
+
+    def test_an_archive_written_by_a_superseded_implementation_is_stale(self):
+        """Requirement 9: fresh mtime + identical policy is NOT reuse identity.
+
+        The reproduced defect: an older writer shipped `included=false,
+        reason=""` for its application component, and every later reuse handed
+        that ZIP back because the policy fingerprint matched.
+        """
+        config = self._config()
+        archive = self._write_synthetic_archive(config, {
+            "producer": {"packing_implementation_sha256": "0" * 64},
+        })
+        verdict = self._probe(config)
+        self.assertIs(verdict.state, ArchiveFreshness.STALE, verdict.reason)
+        self.assertTrue(verdict.policy_mismatch)
+        self.assertTrue(verdict.repack_required)
+        self.assertIn("packing implementation changed", verdict.reason)
+        self.assertTrue(archive.exists(), "a read-only probe must not touch the archive")
+
+    def test_an_archive_without_producer_identity_is_stale(self):
+        config = self._config()
+        self._write_synthetic_archive(config, {"producer": None})
+        verdict = self._probe(config)
+        self.assertIs(verdict.state, ArchiveFreshness.STALE, verdict.reason)
+        self.assertIn("no producer block", verdict.reason)
+
+    def test_an_archive_that_does_not_prove_its_source_is_stale(self):
+        config = self._config()
+        self._write_synthetic_archive(config, {"source_review_ready": False})
+        verdict = self._probe(config)
+        self.assertIs(verdict.state, ArchiveFreshness.STALE, verdict.reason)
+        self.assertIn("source_review_ready", verdict.reason)
+
+    def test_ensure_fresh_archive_rebuilds_a_superseded_implementation(self):
+        """The reuse owner must act on the same verdict the probe returns."""
+        from audapack import runtime_identity
+        from audapack.services.packing_service import PackingService
+
+        config = self._config()
+        self._write_synthetic_archive(config, {
+            "producer": {"packing_implementation_sha256": "f" * 64},
+        })
+
+        service = PackingService(config, base_dir=self.root)
+        packed = []
+        original_pack = service.pack_project
+        service.pack_project = lambda project_id, **kw: (
+            packed.append(project_id), original_pack(project_id, **kw)
+        )[1]
+
+        result = service.ensure_fresh_archive("proj")
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(packed, ["proj"], "a superseded writer's ZIP was reused")
+
+        from audapack.packing import read_archive_manifest
+
+        fresh = read_archive_manifest(Path(result.output_path))
+        producer = fresh.get("producer") or {}
+        self.assertEqual(
+            producer.get("packing_implementation_sha256"),
+            runtime_identity.LOADED_PACKING_DIGEST,
+        )
+        self.assertTrue(fresh.get("source_review_ready"))
+
+    def test_archive_scope_change_invalidates_freshness(self):
+        """T-290: switching AUTO <-> COMPLETE_SOURCE invalidates the archive."""
+        from audapack.models import ARCHIVE_SCOPE_AUTO, ARCHIVE_SCOPE_COMPLETE_SOURCE
+        from audapack.services.packing_service import PackingService
+
+        config = self._config()
+        proj = config.projects[0]
+        proj.archive_scope = ARCHIVE_SCOPE_AUTO
+
+        service = PackingService(config, base_dir=self.root)
+        result = service.pack_project(proj.id)
+        self.assertTrue(result.success)
+        archive = Path(result.output_path)
+        self._freeze_root_older_than(archive)
+
+        # Fresh with AUTO
+        verdict = probe_archive_freshness(proj, config.packing, fallback_dir=self.root)
+        self.assertIs(verdict.state, ArchiveFreshness.FRESH)
+
+        # Toggle to COMPLETE_SOURCE -> probe must report STALE / policy mismatch
+        proj.archive_scope = ARCHIVE_SCOPE_COMPLETE_SOURCE
+        verdict_cs = probe_archive_freshness(proj, config.packing, fallback_dir=self.root)
+        self.assertIs(verdict_cs.state, ArchiveFreshness.STALE)
+        self.assertTrue(verdict_cs.policy_mismatch)
+        self.assertTrue(verdict_cs.repack_required)
+
+        # Pack under COMPLETE_SOURCE
+        result2 = service.pack_project(proj.id)
+        self.assertTrue(result2.success)
+        archive2 = Path(result2.output_path)
+        self._freeze_root_older_than(archive2)
+
+        # Fresh under COMPLETE_SOURCE
+        verdict_cs_fresh = probe_archive_freshness(proj, config.packing, fallback_dir=self.root)
+        self.assertIs(verdict_cs_fresh.state, ArchiveFreshness.FRESH)
+
+        # Toggle back to AUTO -> probe must report STALE / policy mismatch
+        proj.archive_scope = ARCHIVE_SCOPE_AUTO
+        verdict_auto_stale = probe_archive_freshness(proj, config.packing, fallback_dir=self.root)
+        self.assertIs(verdict_auto_stale.state, ArchiveFreshness.STALE)
+        self.assertTrue(verdict_auto_stale.policy_mismatch)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from typing import Callable, Optional
 
 from audapack import hot_freshness, runtime_identity
 from audapack.config import AppConfig, app_dir, load_config
-from audapack.fidelity import policy_fingerprint_from_config
+from audapack.fidelity import policy_fingerprint_for_project
 from audapack.freshness import probe_archive_freshness
 from audapack.models import PackResult
 from audapack.packing import (
@@ -27,10 +27,12 @@ class PackingService:
         self.config = config or load_config(base_dir)
         self.registry = ProjectRegistry(self.config, base_dir=base_dir, transactional=True)
 
-    def _policy_fingerprint(self) -> str:
+    def _policy_fingerprint(self, proj=None) -> str:
         """The ONE fingerprint a hot proof is keyed by, for pack and ensure alike."""
-        return policy_fingerprint_from_config(
-            self.config.packing, set(self.config.packing.excludes or [])
+        return policy_fingerprint_for_project(
+            self.config.packing,
+            set(self.config.packing.excludes or []),
+            project=proj,
         )
 
     def _stale_runtime_refusal(self, project_id: str, source_path: str, proj=None) -> Optional[PackResult]:
@@ -102,7 +104,7 @@ class PackingService:
         refusal = self._stale_runtime_refusal(project_id, source_path, proj)
         if refusal is not None:
             return refusal
-        fingerprint = self._policy_fingerprint() if source_path else ""
+        fingerprint = self._policy_fingerprint(proj=proj) if source_path else ""
         arm_token = hot_freshness.begin(source_path, fingerprint) if source_path else None
         result = pack()
         cancelled = cancel_event is not None and cancel_event.is_set()
@@ -159,6 +161,7 @@ class PackingService:
             manifest_meta={"project_name": proj.display_name, "extra_meta": extra_meta} if self.config.packing.manifest_enabled else None,
             packing=self.config.packing,
             prebuilt_plan=prebuilt_plan,
+            project_archive_scope=getattr(proj, "archive_scope", "auto"),
         )
 
     def ensure_fresh_archive(self, project_id: str, *, cancel_event=None, log_callback=None):
@@ -191,7 +194,7 @@ class PackingService:
             group=proj.priority_group,
             project=proj,
         )
-        fingerprint = self._policy_fingerprint()
+        fingerprint = self._policy_fingerprint(proj=proj)
         existing = find_archive_for_project(proj, output_dir)
         hot = hot_freshness.lookup(proj.source_path, fingerprint, existing)
         if hot is not None:

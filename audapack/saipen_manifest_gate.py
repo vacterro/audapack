@@ -13,28 +13,26 @@ from the outside: a green package over a red snapshot.
 
 THE CONTRACT
 ------------
-``saipen_evidence`` already fails closed INSIDE the verdict. This module
-closes the remaining gap -- the verdict arriving at the manifest writer at
-all -- by making the normal pack path guarantee one of:
+The SAIPEN audit manifest is DECLARATIVE (it defines evidence rules, not a
+snapshot/file listing). Therefore ordinary lifecycle writes (STATE.md,
+BOARD.md, LOG.md) never stale MANIFEST.json. Evidence presence and completeness
+are evaluated downstream by ``saipen_evidence``, not by this gate.
 
-1. a current ``.saipen/MANIFEST.json`` exists immediately before the
-   inventory freeze (generated through the REAL protocol CLI, never
-   synthesized here); or
-2. the pack fails closed with a precise, actionable precondition error
-   (``FAILED_INVENTORY``), so no authoritative-looking archive is produced.
-
-``gate`` is deliberately separated from ``prepare`` so the stale/missing
-regressions can call ``gate`` directly against a prepared tree.
+This module ensures that:
+1. A supported, structurally valid ``.saipen/MANIFEST.json`` contract exists
+   before inventory freeze.
+2. If absent on a real SAIPEN checkpoint, it is generated through the REAL
+   protocol CLI (``saipen audit manifest --write``).
+3. If malformed or unsupported, packing fails closed with a precise,
+   actionable precondition error (``FAILED_INVENTORY``).
 
 WHAT IS NOT DONE HERE
 ---------------------
-* No manifest content is ever fabricated: generation is delegated to the
-  SAIPEN protocol CLI (``saipen audit manifest --write``). If the CLI cannot
-  be found or fails, the defect is reported, not papered over.
-* The SAIPEN contract stays the sole authority on evidence; this module
-  only proves the contract document exists and is structurally the
-  published audit manifest before packing proceeds.
-* Non-SAIPEN projects (no ``.saipen/`` directory) are untouched.
+* No manifest content is fabricated: generation delegates to the protocol CLI.
+* No evidence mtimes or disk mandatory sets are used as false staleness:
+  SAIPEN owns the meaning of SAIPEN's declarative manifest.
+* Non-SAIPEN projects (no ``.saipen/`` directory or no STATE.md checkpoint)
+  are untouched.
 """
 
 from __future__ import annotations
@@ -42,9 +40,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import stat as stat_module
 import subprocess
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -295,56 +291,17 @@ def _invoke_manifest_cli(
     )
 
 
-def _restore_manifest_backup(manifest_path: Path, backup_path: Path) -> str:
-    """Restore the exact stale document after a failed forced refresh."""
-    try:
-        if manifest_path.is_symlink() or manifest_path.exists():
-            if manifest_path.is_dir():
-                return f"cannot restore: {manifest_path} is a directory; stale copy preserved at {backup_path}"
-            manifest_path.unlink()
-        if backup_path.exists():
-            backup_path.replace(manifest_path)
-        return ""
-    except OSError as exc:
-        return f"rollback failed: {exc}; stale copy preserved at {backup_path}"
-
-
-def _restore_manifest_bytes(manifest_path: Path, data: bytes) -> str:
-    """Atomically put the exact pre-generation document back after a bad write."""
-    restore = manifest_path.with_name(
-        f".{manifest_path.name}.audapack-restore-{uuid.uuid4().hex}.tmp"
-    )
-    try:
-        restore.write_bytes(data)
-        restore.replace(manifest_path)
-        return ""
-    except OSError as exc:
-        try:
-            restore.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return f"rollback failed: {exc}"
-
-
 def _verified_generation(project_root: Path, outcome: ManifestGateOutcome) -> ManifestGateOutcome:
-    """A successful process is not proof; the resulting authority must be fresh."""
+    """A successful process is not proof; the resulting authority must be structurally valid."""
     verified = validate_contract_document(project_root)
     if not verified.ok:
         return ManifestGateOutcome(
             ok=False,
             code=verified.code,
             detail=(
-                "SAIPEN CLI reported success but manifest re-validation failed "
+                "SAIPEN CLI reported success but manifest validation failed "
                 f"({verified.code}): {verified.detail}"
             ),
-        )
-    contract = saipen_evidence.read_contract(project_root)
-    why = _contract_staleness(project_root, contract)
-    if why:
-        return ManifestGateOutcome(
-            ok=False,
-            code="AUDIT_MANIFEST_STALE_REGENERATION_FAILED",
-            detail=f"SAIPEN CLI reported success but manifest remains stale: {why}",
         )
     return ManifestGateOutcome(
         ok=True,
@@ -355,87 +312,12 @@ def _verified_generation(project_root: Path, outcome: ManifestGateOutcome) -> Ma
     )
 
 
-def _refresh_current_manifest(
-    project_root: Path,
-    outcome: ManifestGateOutcome,
-    *,
-    timeout_seconds: int,
-    log_callback=None,
-) -> ManifestGateOutcome:
-    """Make a stale-but-CURRENT declaration converge through the real CLI.
-
-    Current SAIPEN compares contract shape, not evidence mtimes, so a stale
-    declaration can legitimately answer ``AUDIT_MANIFEST_CURRENT``. Retire the
-    exact old document atomically, run the same canonical command again, then
-    validate and prove freshness before deleting the rollback copy.
-    """
-    manifest_path = project_root / saipen_evidence.MANIFEST_REL
-    if not manifest_path.is_file():
-        return ManifestGateOutcome(
-            ok=False,
-            code="AUDIT_MANIFEST_STALE_REGENERATION_FAILED",
-            detail="cannot refresh current manifest: .saipen/MANIFEST.json disappeared",
-        )
-    backup_path = manifest_path.with_name(
-        f".{manifest_path.name}.audapack-{uuid.uuid4().hex}.bak"
-    )
-    try:
-        manifest_path.replace(backup_path)
-    except OSError as exc:
-        return ManifestGateOutcome(
-            ok=False,
-            code="AUDIT_MANIFEST_STALE_REGENERATION_FAILED",
-            detail=f"manifest refresh failed while preserving the stale copy: {exc}",
-        )
-
-    regenerated = _invoke_manifest_cli(
-        outcome.generated_by or [],
-        project_root,
-        timeout_seconds=timeout_seconds,
-        command=outcome.generated_by,
-    )
-    if not regenerated.ok:
-        rollback_error = _restore_manifest_backup(manifest_path, backup_path)
-        detail = regenerated.detail
-        if rollback_error:
-            detail = f"{detail}; {rollback_error}"
-        else:
-            detail = f"{detail}; previous stale manifest restored"
-        return ManifestGateOutcome(ok=False, code=regenerated.code, detail=detail)
-
-    verified = _verified_generation(project_root, regenerated)
-    if not verified.ok:
-        rollback_error = _restore_manifest_backup(manifest_path, backup_path)
-        detail = verified.detail
-        if rollback_error:
-            detail = f"{detail}; {rollback_error}"
-        else:
-            detail = f"{detail}; previous stale manifest restored"
-        return ManifestGateOutcome(ok=False, code=verified.code, detail=detail)
-
-    if log_callback is not None:
-        try:
-            log_callback(f"saipen audit manifest --write -> {regenerated.detail[:200]}")
-        except Exception:
-            pass
-    try:
-        backup_path.unlink()
-    except OSError as exc:
-        if log_callback is not None:
-            try:
-                log_callback(f"saipen manifest refreshed; rollback copy cleanup failed: {exc}")
-            except Exception:
-                pass
-    return verified
-
-
 def generate_manifest(
     project_root: Path,
     *,
     cancel_event=None,
     timeout_seconds: int = 120,
     log_callback=None,
-    refresh_current: bool = False,
 ) -> ManifestGateOutcome:
     """Run the REAL ``saipen audit manifest --write`` protocol command.
 
@@ -460,14 +342,6 @@ def generate_manifest(
     for argv in _cli_candidates(project_root, memory_root):
         if cancel_event is not None and cancel_event.is_set():
             return ManifestGateOutcome(ok=False, code="PACK_CANCELLED")
-        try:
-            before = _manifest_snapshot(manifest_path)
-        except OSError as exc:
-            return ManifestGateOutcome(
-                ok=False,
-                code="AUDIT_MANIFEST_GENERATION_FAILED",
-                detail=f"cannot snapshot existing manifest before regeneration: {exc}",
-            )
         outcome = _invoke_manifest_cli(
             argv,
             project_root,
@@ -488,35 +362,15 @@ def generate_manifest(
         except OSError as exc:
             failures.append(f"cannot verify manifest after SAIPEN CLI success: {exc}")
             continue
-        changed = after != before
-        if log_callback is not None:
-            try:
-                suffix = "" if changed else "; manifest bytes unchanged"
-                log_callback(f"saipen audit manifest --write -> {outcome.detail[:200]}{suffix}")
-            except Exception:  # logging must never gate a pack
-                pass
-        if refresh_current and not changed:
-            contract = saipen_evidence.read_contract(project_root)
-            if not _contract_staleness(project_root, contract):
-                return _verified_generation(project_root, outcome)
-            return _refresh_current_manifest(
-                project_root,
-                outcome,
-                timeout_seconds=timeout_seconds,
-                log_callback=log_callback,
-            )
-        if not changed and after is None:
+        if after is None:
             failures.append("SAIPEN CLI reported success but did not create .saipen/MANIFEST.json")
             continue
-        verified = _verified_generation(project_root, outcome)
-        if not verified.ok and refresh_current and before is not None:
-            rollback_error = _restore_manifest_bytes(manifest_path, before)
-            detail = verified.detail
-            detail = (
-                f"{detail}; {rollback_error or 'previous stale manifest restored'}"
-            )
-            return ManifestGateOutcome(ok=False, code=verified.code, detail=detail)
-        return verified
+        if log_callback is not None:
+            try:
+                log_callback(f"saipen audit manifest --write -> {outcome.detail[:200]}")
+            except Exception:  # logging must never gate a pack
+                pass
+        return _verified_generation(project_root, outcome)
     tried = ", ".join(sorted({str(candidate[0]) for candidate in _ordered_cli_candidates()}))
     discovery_detail = "launcher discovery found no executable in project bin, STATE saipen_home, or PATH"
     if tried:
@@ -526,6 +380,7 @@ def generate_manifest(
         code="AUDIT_MANIFEST_GENERATION_FAILED",
         detail="; ".join(failures) or discovery_detail,
     )
+
 
 
 
@@ -625,71 +480,6 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
     )
 
 
-def _disk_mandatory_paths(project_root: Path, contract) -> set[str]:
-    """Mandatory contract paths that genuinely exist as real files on disk.
-
-    Mirrors ``saipen_evidence.collect``'s own file test: a symlink or a
-    non-regular file is NOT evidence, so staleness is judged over what the
-    protocol would actually pack.
-    """
-    found: set[str] = set()
-    for rel in contract.mandatory:
-        full = project_root.joinpath(*rel.split("/"))
-        try:
-            st = full.lstat()
-        except OSError:
-            continue
-        if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISREG(st.st_mode):
-            continue
-        found.add(rel)
-    return found
-
-
-def _evidence_newer_than_manifest(project_root: Path, contract) -> list[str]:
-    """Mandatory evidence files whose mtime postdates the manifest document.
-
-    The manifest file's own mtime (not ``generated_at``) is the baseline: it
-    is the same clock that stamps the evidence, so clock skew between the
-    protocol stamp and the filesystem cannot produce a false verdict, and a
-    hand-authored contract written after its fixtures reads as current.
-    The comparison is deliberately STRICT with no skew tolerance: a false
-    "stale" verdict costs one idempotent regeneration through the protocol
-    CLI, while a false "current" verdict is exactly the blind trust this
-    gate exists to prevent. Equality counts as current (a copied tree
-    preserves it in any order).
-    """
-    manifest_path = project_root.joinpath(*saipen_evidence.MANIFEST_REL.split("/"))
-    try:
-        baseline_ns = manifest_path.stat().st_mtime_ns
-    except OSError:
-        return []
-    stale: list[str] = []
-    for rel in contract.mandatory:
-        full = project_root.joinpath(*rel.split("/"))
-        try:
-            mtime_ns = full.lstat().st_mtime_ns
-        except OSError:
-            continue
-        if mtime_ns > baseline_ns:
-            stale.append(rel)
-    return stale
-
-
-def _contract_staleness(project_root: Path, contract) -> str:
-    """Exact reason the installed contract is not current, or an empty string."""
-    disk_mandatory = sorted(_disk_mandatory_paths(project_root, contract))
-    declared_mandatory = sorted(contract.mandatory)
-    if disk_mandatory != declared_mandatory:
-        return (
-            "declared mandatory evidence no longer matches disk: "
-            f"declared={declared_mandatory} on_disk={disk_mandatory}"
-        )
-    stale_evidence = _evidence_newer_than_manifest(project_root, contract)
-    if stale_evidence:
-        return f"mandatory evidence mutated after the manifest was written: {stale_evidence}"
-    return ""
-
-
 def prepare(
     project_root: Path,
     *,
@@ -697,72 +487,43 @@ def prepare(
     timeout_seconds: int = 120,
     log_callback=None,
 ) -> ManifestGateOutcome:
-    """The pre-pack precondition: ensure a CURRENT contract manifest exists.
+    """The pre-pack precondition: ensure a valid contract manifest exists.
 
     Order of authority:
 
-    1. A structurally valid contract document that still names exactly the
-       mandatory evidence present on disk wins -- the protocol CLI is never
-       invoked for a current manifest, so a normal pack never mutates a
-       project whose contract is up to date.
-    2. A STALE contract (declared mandatory evidence no longer matches disk,
-       e.g. STATE/BOARD/LOG mutated after the manifest was written) is
-       regenerated through the real protocol command before the pack may
-       trust it; regeneration failure fails closed.
-    3. A missing manifest is generated through the real ``saipen audit
-       manifest --write`` (cwd = the project root) and re-validated.
-    4. Otherwise the outcome fails closed with a precise, actionable error;
-       the caller must refuse to produce an authoritative-looking archive.
+    1. A structurally valid contract document exists and is supported
+       (complete or compatible-degraded). The protocol CLI is NEVER invoked
+       for a valid manifest; ordinary checkpoint writes (STATE/BOARD/LOG)
+       never stale a declarative manifest contract.
+    2. Non-SAIPEN projects (or a .saipen/ directory without STATE.md) pass through.
+    3. Malformed contract or unknown newer contract without required capabilities
+       fails closed without implicit overwrite or regeneration.
+    4. A missing manifest on a real SAIPEN checkpoint is generated through the
+       real `saipen audit manifest --write` (cwd = project root) and validated.
     """
     root = Path(project_root)
     existing = validate_contract_document(root)
     if existing.ok:
-        contract = saipen_evidence.read_contract(root)
-        why = _contract_staleness(root, contract)
-        if not why:
-            return existing
-        # Stale-contract repair: authoritative evidence mutated after the
-        # manifest was written. Current SAIPEN may answer CURRENT because its
-        # declaration shape did not change; refresh_current retires that exact
-        # stale document and runs the same canonical command again.
-        regenerated = generate_manifest(
-            root,
-            cancel_event=cancel_event,
-            timeout_seconds=timeout_seconds,
-            log_callback=log_callback,
-            refresh_current=True,
-        )
-        if not regenerated.ok:
-            return ManifestGateOutcome(
-                ok=False,
-                code="AUDIT_MANIFEST_STALE_REGENERATION_FAILED",
-                detail=f"manifest is stale ({why}); regeneration failed: {regenerated.detail}",
-            )
-        return ManifestGateOutcome(
-            ok=True,
-            code=regenerated.code,
-            detail=f"stale manifest regenerated: {regenerated.detail}",
-            generated=True,
-            generated_by=regenerated.generated_by,
-        )
+        return existing
+
     if existing.code == saipen_evidence.STATUS_NOT_SAIPEN:
         return existing
+
     if not _is_saipen_checkpoint(root / saipen_evidence.MEMORY_ROOT):
         # Not a checkpoint (no STATE.md): there is no lifecycle a contract
         # could describe, so this is ordinary content, not a missing
         # manifest. Pass through like any non-SAIPEN project instead of
         # failing the pack over a precondition that cannot exist here.
         return ManifestGateOutcome(ok=False, code=saipen_evidence.STATUS_NOT_SAIPEN)
+
     if cancel_event is not None and cancel_event.is_set():
         return ManifestGateOutcome(ok=False, code="PACK_CANCELLED")
+
     if existing.code == saipen_evidence.STATUS_CONTRACT_UNKNOWN:
-        # TARGET G: the manifest EXISTS and may well be current; it is the
-        # contract VERSION this collector cannot read. Prescribing
-        # `saipen audit manifest --write` here would be false advice, because
-        # the installed protocol writes exactly the newer contract that was
-        # refused -- regeneration cannot downgrade it. Say what actually
-        # repairs the failure: this consumer. `existing.detail` already names
-        # that (saipen_evidence.contract_unknown_detail).
+        # The manifest EXISTS and may well be current; it is the contract
+        # VERSION this collector cannot read. Prescribing `saipen audit manifest --write`
+        # here would be false advice, because the installed protocol writes that
+        # same newer contract -- regeneration cannot downgrade it.
         return ManifestGateOutcome(
             ok=False,
             code=existing.code,
@@ -773,9 +534,8 @@ def prepare(
                 "manifest."
             ),
         )
-    if existing.code in (
-        saipen_evidence.STATUS_MANIFEST_MALFORMED,
-    ):
+
+    if existing.code == saipen_evidence.STATUS_MANIFEST_MALFORMED:
         # A present-but-unusable contract is a project defect the protocol
         # owner must fix; regenerating on top of it would silently rewrite
         # evidence the operator may be relying on.
@@ -784,6 +544,8 @@ def prepare(
             code=existing.code,
             detail=f"precondition failed; not regenerating: {existing.detail}",
         )
+
+    # Manifest absent on a real checkpoint: generate it
     generated = generate_manifest(
         root,
         cancel_event=cancel_event,
@@ -809,6 +571,7 @@ def prepare(
         generated=True,
         generated_by=generated.generated_by,
     )
+
 
 
 __all__ = [

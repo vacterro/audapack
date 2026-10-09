@@ -19,15 +19,18 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from audapack.bridge.storage import atomic_write
+from audapack.config import cross_process_lock
 
 DROP_DIRNAME = "audapack_handoffs"
 INDEX_NAME = ".audapack_handoffs.json"
+LOCK_NAME = ".handoff.lock"
 INDEX_MAX_ENTRIES = 500
 #: A SAIHANDOFF marker must appear this early; a reply that merely mentions the
 #: word deep in its prose is not a handoff.
@@ -158,26 +161,87 @@ def materialize(
     """
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    digest = _digest(text)
-    index = _read_index(folder)
-    known = index.get(digest)
-    if known:
-        candidate = folder / known
-        try:
-            if candidate.is_file() and _digest(candidate.read_text(encoding="utf-8")) == digest:
-                return candidate, True
-        except (OSError, UnicodeDecodeError):
-            pass
-    path = folder / drop_filename(label, when)
-    base, suffix = path.with_suffix(""), path.suffix
-    n = 2
-    while path.exists():
-        path = Path(f"{base}_{n}{suffix}")
-        n += 1
-    atomic_write(path, text)
-    if _digest(path.read_text(encoding="utf-8")) != digest:
-        raise OSError(f"handoff verification failed: {path.name}")
-    index.pop(digest, None)
-    index[digest] = path.name
-    _write_index(folder, index)
-    return path, False
+    lock_path = folder / LOCK_NAME
+    text_bytes = text.encode("utf-8")
+    digest = hashlib.sha256(text_bytes).hexdigest()
+
+    with cross_process_lock(lock_path):
+        index = _read_index(folder)
+        known = index.get(digest)
+        if known:
+            candidate = folder / known
+            try:
+                if candidate.is_file() and candidate.read_bytes() == text_bytes:
+                    return candidate, True
+            except OSError:
+                pass
+
+        path = folder / drop_filename(label, when)
+        base, suffix = path.with_suffix(""), path.suffix
+        n = 2
+        while True:
+            # Check existing file: if matching bytes, reuse it under the transaction
+            if path.exists():
+                try:
+                    if path.is_file() and path.read_bytes() == text_bytes:
+                        try:
+                            index[digest] = path.name
+                            _write_index(folder, index)
+                        except Exception:
+                            pass
+                        return path, True
+                except OSError:
+                    pass
+                path = folder / f"{base.name}_{n}{suffix}"
+                n += 1
+                continue
+
+            # Atomic exclusive create: NO-CLOBBER publication (W2-003)
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            try:
+                fd = os.open(path, flags, 0o666)
+            except (FileExistsError, OSError) as exc:
+                # If path exists or external writer raced in between exists() and os.open():
+                # Re-enter suffix allocation; do not clobber foreign or existing files.
+                if isinstance(exc, FileExistsError) or path.exists():
+                    try:
+                        if path.is_file() and path.read_bytes() == text_bytes:
+                            try:
+                                index[digest] = path.name
+                                _write_index(folder, index)
+                            except Exception:
+                                pass
+                            return path, True
+                    except OSError:
+                        pass
+                    path = folder / f"{base.name}_{n}{suffix}"
+                    n += 1
+                    continue
+                raise
+
+            try:
+                with open(fd, "wb", closefd=True) as f:
+                    f.write(text_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                raise
+
+            if path.read_bytes() != text_bytes:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                raise OSError(f"handoff verification failed: {path.name}")
+
+            try:
+                index.pop(digest, None)
+                index[digest] = path.name
+                _write_index(folder, index)
+            except Exception:
+                pass
+            return path, False

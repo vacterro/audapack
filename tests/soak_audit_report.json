@@ -1,0 +1,115 @@
+{
+  "verdict": "PASS",
+  "checks": {
+    "no_orphan_processes": true,
+    "recurring_timers_stopped_on_close": true,
+    "private_bytes_bounded_growth": true,
+    "handles_bounded_growth": true,
+    "threads_settled_range": true,
+    "gdi_objects_valid_non_null": true,
+    "user_objects_valid_non_null": true,
+    "gdi_objects_bounded_growth": true,
+    "user_objects_bounded_growth": true
+  },
+  "baseline": {
+    "timestamp": 1791332399.83,
+    "cpu_percent": 0.0,
+    "rss_mb": 175.77,
+    "private_mb": 95.8,
+    "threads": 14,
+    "handles": 1992,
+    "gdi_objects": 26,
+    "user_objects": 40,
+    "gui_resources_error": null
+  },
+  "post_idle": {
+    "timestamp": 1791332405.83,
+    "cpu_percent": 0.0,
+    "rss_mb": 176.19,
+    "private_mb": 96.41,
+    "threads": 14,
+    "handles": 1992,
+    "gdi_objects": 26,
+    "user_objects": 40,
+    "gui_resources_error": null
+  },
+  "operation_rounds": [
+    {
+      "timestamp": 1791332409.83,
+      "cpu_percent": 0.0,
+      "rss_mb": 176.29,
+      "private_mb": 96.46,
+      "threads": 15,
+      "handles": 2000,
+      "gdi_objects": 26,
+      "user_objects": 40,
+      "gui_resources_error": null
+    },
+    {
+      "timestamp": 1791332413.84,
+      "cpu_percent": 0.0,
+      "rss_mb": 176.33,
+      "private_mb": 96.46,
+      "threads": 15,
+      "handles": 2000,
+      "gdi_objects": 26,
+      "user_objects": 40,
+      "gui_resources_error": null
+    },
+    {
+      "timestamp": 1791332417.82,
+      "cpu_percent": 0.0,
+      "rss_mb": 176.49,
+      "private_mb": 96.46,
+      "threads": 15,
+      "handles": 2000,
+      "gdi_objects": 26,
+      "user_objects": 40,
+      "gui_resources_error": null
+    }
+  ],
+  "final_stabilized": {
+    "timestamp": 1791332423.82,
+    "cpu_percent": 0.0,
+    "rss_mb": 176.5,
+    "private_mb": 96.46,
+    "threads": 15,
+    "handles": 2000,
+    "gdi_objects": 26,
+    "user_objects": 40,
+    "gui_resources_error": null
+  },
+  "deltas": {
+    "rss_mb_delta": 0.73,
+    "private_mb_delta": 0.66,
+    "threads_delta": 1,
+    "handles_delta": 8,
+    "gdi_objects_delta": 0,
+    "user_objects_delta": 0
+  },
+  "orphan_processes": [],
+  "soak_samples": [
+    {
+      "timestamp": 1791332401.75,
+      "cpu_percent": 0.0,
+      "rss_mb": 176.18,
+      "private_mb": 96.41,
+      "threads": 14,
+      "handles": 1992,
+      "gdi_objects": 26,
+      "user_objects": 40,
+      "gui_resources_error": null
+    },
+    {
+      "timestamp": 1791332403.42,
+      "cpu_percent": 0.0,
+      "rss_mb": 176.18,
+      "private_mb": 96.41,
+      "threads": 14,
+      "handles": 1992,
+      "gdi_objects": 26,
+      "user_objects": 40,
+      "gui_resources_error": null
+    }
+  ]
+}
