@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from audapack import account_registry as ar
 from audapack import sai_accounts as sai
 from audapack.account_registry import AccountIdentity, discover_accounts, identity_locator
 from audapack.limit_adapters import AntigravityLimitAdapter
@@ -743,3 +744,45 @@ class TestReadOnly:
         monkeypatch.setattr(sai, "TestEngine", None)
         monkeypatch.setenv(sai.ENV_OVERRIDE, str(exe))
         assert sai.engine_path() == str(exe)
+
+
+class TestSharedAccountFallback:
+    """T-317: an unlisted shared read is one plane read, not a process cache.
+
+    ``_shared_accounts`` used to reuse the last listing this process remembered
+    (``has_cached_accounts`` -> ``cached_accounts``) when the caller passed no
+    explicit list; that branch is gone and every unlisted read now performs one
+    authoritative ``fresh_list`` read. Pinned here so the fallback cannot drift
+    back to the cache, or forward into something else, without a test naming it.
+    """
+
+    CANDIDATES = [("codex", "loc-a", "Codex A", pathlib.Path("C:/fake"))]
+
+    def test_no_explicit_list_performs_one_plane_read(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: dict[str, set[str]] = {}
+
+        def spy(providers, timeout=None):
+            calls["providers"] = set(providers)
+            return []
+
+        monkeypatch.setattr(sai, "fresh_list", spy)
+        fresh, replaced = ar._shared_accounts(
+            self.CANDIDATES, {}, "stamp", {}, shared_accounts=None)
+        assert calls["providers"] == {"codex"}
+        assert fresh == [] and replaced == {}
+
+    def test_explicit_list_never_reads_the_plane(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shared = sai.SharedAccount(
+            account_id="acct-1", provider_id="codex", display_name="Codex A",
+            compact_label="CA", backend="profile_directory", locator="loc-a",
+            operational_state="ok")
+
+        def refused(*args, **kwargs):
+            pytest.fail("an explicit shared list must not trigger a plane read")
+
+        monkeypatch.setattr(sai, "fresh_list", refused)
+        fresh, _replaced = ar._shared_accounts(
+            self.CANDIDATES, {}, "stamp", {}, shared_accounts=[shared])
+        assert len(fresh) == 1
