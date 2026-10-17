@@ -11,10 +11,12 @@ recovery, Quick3/Super10 campaigns, fresh-archive startup, terminal states,
 gate recovery, manual-save persistence truth, manual archive-drop START
 end-to-end, and performance-sensitive observer/drag paths.
 
-Run all suites (the canonical full-suite gate):
+Run all suites (the canonical full-suite gate, one bounded runner per file --
+the single directory-glob invocation is not the canonical form: T-206 recorded
+it stalling on Node v24 with no summary and no exit):
 
 ```powershell
-node --test tests/widget/*.test.js
+Get-ChildItem tests/widget/*.test.js | ForEach-Object { node --test $_.FullName }
 ```
 
 Run one suite while debugging:
