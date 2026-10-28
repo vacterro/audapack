@@ -191,8 +191,6 @@ def _shared_accounts(
 
     if shared_accounts is not None:
         shared = list(shared_accounts)
-    elif sai_accounts.has_cached_accounts():
-        shared = sai_accounts.cached_accounts()
     else:
         shared = sai_accounts.fresh_list({provider for provider, _l, _n, _p in candidates})
     fresh: list[AccountIdentity] = []

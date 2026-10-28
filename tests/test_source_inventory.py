@@ -498,6 +498,51 @@ class TestProtectedControlPlaneOverlay(unittest.TestCase):
         by_rel = {e.rel: e for e in inv.entries.values()}
         self.assertEqual(by_rel["vault/required.md"].priority, 1)
 
+    def test_ignored_always_include_glob_is_inventoried(self):
+        self._commit_base("audit/\nfuture_gate/\n")
+        audit_dir = self.repo / "audit"
+        audit_dir.mkdir()
+        (audit_dir / "AUDAPACK_20261010_1411.md").write_text("AUDIT 1411", encoding="utf-8")
+        (audit_dir / "other.txt").write_text("NOT MD", encoding="utf-8")
+        gate_dir = self.repo / "future_gate"
+        gate_dir.mkdir()
+        (gate_dir / "gate1.md").write_text("GATE 1", encoding="utf-8")
+
+        inv = build_git_inventory(
+            self.repo,
+            set(),
+            always_include=["audit/*.md", "future_gate/*.md"],
+        )
+        included = {e.rel for e in inv.included_entries()}
+        self.assertIn("audit/AUDAPACK_20261010_1411.md", included)
+        self.assertIn("future_gate/gate1.md", included)
+        self.assertNotIn("audit/other.txt", included)
+        by_rel = {e.rel: e for e in inv.entries.values()}
+        self.assertEqual(by_rel["audit/AUDAPACK_20261010_1411.md"].priority, 1)
+        self.assertEqual(by_rel["future_gate/gate1.md"].priority, 1)
+
+    def test_always_include_glob_refuses_forbidden_roots_and_safety_bypasses(self):
+        self._commit_base("secrets/\n.venv/\n")
+        secrets_dir = self.repo / "secrets"
+        secrets_dir.mkdir()
+        (secrets_dir / "secret.key").write_text("LEAK", encoding="utf-8")
+        venv_dir = self.repo / ".venv"
+        venv_dir.mkdir()
+        (venv_dir / "lib.py").write_text("# py", encoding="utf-8")
+        (self.repo / "test.secret").write_text("LEAK2", encoding="utf-8")
+
+        inv = build_git_inventory(
+            self.repo,
+            set(),
+            always_include=["secrets/*", ".venv/*", "*.secret", ".git/*"],
+        )
+        included = {e.rel for e in inv.included_entries()}
+        self.assertNotIn("secrets/secret.key", included)
+        self.assertNotIn(".venv/lib.py", included)
+        self.assertNotIn("test.secret", included)
+        for rel in included:
+            self.assertFalse(rel.startswith(".git/"))
+
     def test_ignored_manifest_required_file_is_inventoried(self):
         (self.repo / "MANIFEST.json").write_text(
             '{"required": ["vault/asset.bin"]}', encoding="utf-8"

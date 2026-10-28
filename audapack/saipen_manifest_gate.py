@@ -41,7 +41,7 @@ import json
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -90,7 +90,7 @@ SAIPEN_HOME_STATE_KEYS = ("saipen_home",)
 class ManifestGateOutcome:
     """Terminal result of the pre-pack authority gate."""
 
-    #: True only when a structurally valid contract document exists on disk.
+    #: True only for a valid document with an implemented native contract.
     ok: bool
     #: Machine-readable terminal state (mirrors the snapshot vocabulary plus
     #: the generation-failure states this gate owns).
@@ -105,6 +105,11 @@ class ManifestGateOutcome:
     #: an authoritative refusal, not a missing launcher: trying another CLI would
     #: silently bypass the authority this gate exists to enforce.
     refused: bool = False
+    #: Parsing, implementation support and admission are separate diagnostics;
+    #: evidence completeness is assessed later against inventory/archive content.
+    manifest_parse_valid: bool = False
+    contract_supported: bool = False
+    admission: str = ""
 
 
 def _ordered_cli_candidates() -> tuple[tuple[str, ...], ...]:
@@ -295,18 +300,15 @@ def _verified_generation(project_root: Path, outcome: ManifestGateOutcome) -> Ma
     """A successful process is not proof; the resulting authority must be structurally valid."""
     verified = validate_contract_document(project_root)
     if not verified.ok:
-        return ManifestGateOutcome(
-            ok=False,
-            code=verified.code,
+        return replace(
+            verified,
             detail=(
                 "SAIPEN CLI reported success but manifest validation failed "
                 f"({verified.code}): {verified.detail}"
             ),
         )
-    return ManifestGateOutcome(
-        ok=True,
-        code=verified.code,
-        detail=verified.detail,
+    return replace(
+        verified,
         generated=True,
         generated_by=outcome.generated_by,
     )
@@ -393,13 +395,19 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
     gate reuses exactly that authority instead of a second drifting parser.
     """
     contract = saipen_evidence.read_contract(project_root)
+    diagnostics = {
+        "manifest_parse_valid": contract.manifest_parse_valid,
+        "contract_supported": contract.contract_supported,
+        "admission": contract.admission,
+    }
     if contract.status == saipen_evidence.STATUS_NOT_SAIPEN:
-        return ManifestGateOutcome(ok=False, code=saipen_evidence.STATUS_NOT_SAIPEN)
+        return ManifestGateOutcome(ok=False, code=saipen_evidence.STATUS_NOT_SAIPEN, **diagnostics)
     if contract.status == saipen_evidence.STATUS_MANIFEST_ABSENT:
         return ManifestGateOutcome(
             ok=False,
             code=saipen_evidence.STATUS_MANIFEST_ABSENT,
             detail=contract.detail,
+            **diagnostics,
         )
     if contract.status in (
         saipen_evidence.STATUS_MANIFEST_MALFORMED,
@@ -414,13 +422,14 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
             ok=False,
             code=contract.status,
             detail=contract.detail,
+            **diagnostics,
         )
-    # STATUS_COMPATIBLE_DEGRADED: forward-compat admitted; allow but mark.
-    if contract.admission == saipen_evidence.ManifestAdmission.COMPATIBLE_DEGRADED:
+    if not diagnostics["contract_supported"] or contract.admission != saipen_evidence.ManifestAdmission.NATIVE:
         return ManifestGateOutcome(
-            ok=True,
-            code=saipen_evidence.STATUS_COMPATIBLE_DEGRADED,
-            detail=contract.detail,
+            ok=False,
+            code=saipen_evidence.STATUS_CONTRACT_UNKNOWN,
+            detail=contract.detail or saipen_evidence.contract_unknown_detail(contract.contract_version),
+            **diagnostics,
         )
     # STATUS_COMPLETE (provisional) from read_contract: the document parsed,
     # declared mandatory evidence and announced a supported version. The gate
@@ -439,6 +448,7 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
                 "saipen-audit-manifest generator; refusing to treat it as "
                 "protocol evidence"
             ),
+            **{**diagnostics, "manifest_parse_valid": False},
         )
     declared_generator_version = generator[len(prefix):]
     if not declared_generator_version.isdigit() or int(declared_generator_version) != contract.contract_version:
@@ -451,6 +461,7 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
                 "the protocol writes both together, so this document is not "
                 "the published contract"
             ),
+            **{**diagnostics, "manifest_parse_valid": False},
         )
     path = project_root.joinpath(*saipen_evidence.MANIFEST_REL.split("/"))
     try:
@@ -459,6 +470,7 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
                 ok=False,
                 code=saipen_evidence.STATUS_MANIFEST_MALFORMED,
                 detail=f".saipen/MANIFEST.json exceeds {CONTRACT_MAX_BYTES} bytes",
+                **{**diagnostics, "manifest_parse_valid": False},
             )
         json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -466,17 +478,20 @@ def validate_contract_document(project_root: Path) -> ManifestGateOutcome:
             ok=False,
             code=saipen_evidence.STATUS_MANIFEST_MALFORMED,
             detail=f".saipen/MANIFEST.json unreadable: {exc}",
+            **{**diagnostics, "manifest_parse_valid": False},
         )
     except ValueError as exc:
         return ManifestGateOutcome(
             ok=False,
             code=saipen_evidence.STATUS_MANIFEST_MALFORMED,
             detail=f".saipen/MANIFEST.json is not valid JSON: {exc}",
+            **{**diagnostics, "manifest_parse_valid": False},
         )
     return ManifestGateOutcome(
         ok=True,
         code=saipen_evidence.STATUS_COMPLETE,
         detail=f"contract_version={contract.contract_version} generator={contract.generator}",
+        **diagnostics,
     )
 
 
@@ -492,11 +507,11 @@ def prepare(
     Order of authority:
 
     1. A structurally valid contract document exists and is supported
-       (complete or compatible-degraded). The protocol CLI is NEVER invoked
+       with native implementation support. The protocol CLI is NEVER invoked
        for a valid manifest; ordinary checkpoint writes (STATE/BOARD/LOG)
        never stale a declarative manifest contract.
     2. Non-SAIPEN projects (or a .saipen/ directory without STATE.md) pass through.
-    3. Malformed contract or unknown newer contract without required capabilities
+    3. Malformed contract or unknown version, regardless of structural compatibility,
        fails closed without implicit overwrite or regeneration.
     4. A missing manifest on a real SAIPEN checkpoint is generated through the
        real `saipen audit manifest --write` (cwd = project root) and validated.
@@ -509,13 +524,6 @@ def prepare(
     if existing.code == saipen_evidence.STATUS_NOT_SAIPEN:
         return existing
 
-    if not _is_saipen_checkpoint(root / saipen_evidence.MEMORY_ROOT):
-        # Not a checkpoint (no STATE.md): there is no lifecycle a contract
-        # could describe, so this is ordinary content, not a missing
-        # manifest. Pass through like any non-SAIPEN project instead of
-        # failing the pack over a precondition that cannot exist here.
-        return ManifestGateOutcome(ok=False, code=saipen_evidence.STATUS_NOT_SAIPEN)
-
     if cancel_event is not None and cancel_event.is_set():
         return ManifestGateOutcome(ok=False, code="PACK_CANCELLED")
 
@@ -524,9 +532,8 @@ def prepare(
         # VERSION this collector cannot read. Prescribing `saipen audit manifest --write`
         # here would be false advice, because the installed protocol writes that
         # same newer contract -- regeneration cannot downgrade it.
-        return ManifestGateOutcome(
-            ok=False,
-            code=existing.code,
+        return replace(
+            existing,
             detail=(
                 f"{existing.detail} Regeneration is deliberately NOT attempted: "
                 "`saipen audit manifest --write` writes the contract version the "
@@ -539,11 +546,16 @@ def prepare(
         # A present-but-unusable contract is a project defect the protocol
         # owner must fix; regenerating on top of it would silently rewrite
         # evidence the operator may be relying on.
-        return ManifestGateOutcome(
-            ok=False,
-            code=existing.code,
+        return replace(
+            existing,
             detail=f"precondition failed; not regenerating: {existing.detail}",
         )
+
+    if not _is_saipen_checkpoint(root / saipen_evidence.MEMORY_ROOT):
+        # A lookalike directory with no declaration has no protocol checkpoint.
+        # A PRESENT unsupported/malformed declaration was refused above: missing
+        # STATE.md cannot waive its producer's compatibility policy.
+        return ManifestGateOutcome(ok=False, code=saipen_evidence.STATUS_NOT_SAIPEN)
 
     # Manifest absent on a real checkpoint: generate it
     generated = generate_manifest(
@@ -556,18 +568,15 @@ def prepare(
         return generated
     verified = validate_contract_document(root)
     if not verified.ok:
-        return ManifestGateOutcome(
-            ok=False,
-            code=verified.code,
+        return replace(
+            verified,
             detail=(
                 "saipen audit manifest --write reported success but "
                 f"{verified.code}: {verified.detail}"
             ),
         )
-    return ManifestGateOutcome(
-        ok=True,
-        code=verified.code,
-        detail=verified.detail,
+    return replace(
+        verified,
         generated=True,
         generated_by=generated.generated_by,
     )

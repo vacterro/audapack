@@ -49,10 +49,15 @@ from audapack import saipen_evidence
 from audapack.config import MANDATORY_EXCLUDES
 from audapack.fidelity import (
     REASON_MEDIA_BUDGET,
+    REASON_PRIVACY_POLICY,
     REASON_SIZE_LIMIT,
     _build_matcher,
     _priority_for,
     exclusion_reason_for,
+    is_browser_user_data_dir,
+    is_browser_user_data_path,
+    is_scratch_repro_dir,
+    is_scratch_repro_path,
     is_test_oracle_path,
 )
 from audapack.models import ARCHIVE_SCOPE_COMPLETE_SOURCE, normalize_archive_scope
@@ -66,6 +71,7 @@ __all__ = [
     "RESERVED_ARCHIVE_NAMES",
     "GENERATED_CONTROL_MARKERS",
     "is_generated_archive_control",
+    "REASON_PRIVACY_POLICY",
     "REASON_TRACKED_DELETED",
     "REASON_SUPERSEDED_GENERATED_CONTROL",
     "REASON_UNTRACKED_GIT_DIR",
@@ -572,6 +578,167 @@ def discover_protected_control_plane(source_resolved: Path, cancel_event=None) -
     return found
 
 
+_FORBIDDEN_GLOB_DIR_NAMES = frozenset({
+    ".git",
+    "node_modules",
+    "venv",
+    ".venv",
+    "env",
+    "__pycache__",
+    ".pytest_cache",
+    ".workbuddy-ai",
+    ".freebuff",
+    ".tox",
+    "secrets",
+})
+
+_FORBIDDEN_GLOB_DIR_PATHS = frozenset({
+    ".saipen/recovery",
+    ".saipen/kitchen",
+    ".saipen/locks",
+    ".saipen/saitranslate",
+})
+
+
+def _is_forbidden_glob_dir(rel_dir: str, name_lower: str) -> bool:
+    if name_lower in _FORBIDDEN_GLOB_DIR_NAMES or name_lower.startswith(".git"):
+        return True
+    rel_clean = rel_dir.strip("/").lower()
+    for forbidden in _FORBIDDEN_GLOB_DIR_PATHS:
+        if rel_clean == forbidden or rel_clean.startswith(forbidden + "/"):
+            return True
+    for seg in rel_clean.split("/"):
+        if seg in _FORBIDDEN_GLOB_DIR_NAMES or seg.startswith(".git"):
+            return True
+    return False
+
+
+def _discover_safe_glob_candidates(
+    source_resolved: Path,
+    pattern: str,
+    always_incl_matcher,
+    *,
+    cancel_event=None,
+    nested_components: Optional[Iterable[NestedGitComponent]] = None,
+    mandatory_matcher=None,
+    hard_matcher=None,
+) -> list[str]:
+    """Boundedly discover candidate files matching an always_include glob pattern.
+
+    Protects against runaway walks by:
+    1. Parsing pattern prefix into fixed base directory and wildcard parts.
+    2. Refusing traversal into forbidden roots (.git, venv, secrets, etc.).
+    3. Not following directory symlinks (follow_symlinks=False).
+    4. Limiting traversal depth: 1 level per wildcard part (up to 8 if ** is present).
+    5. Capping total scanned filesystem entries at 2000.
+    6. Checking cancellation token on every iteration.
+    7. Enforcing mandatory and hard safety exclusions on matched files.
+    """
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    pat = (pattern or "").strip().replace("\\", "/")
+    if pat.startswith("./"):
+        pat = pat[2:]
+    if not pat or not any(ch in pat for ch in "*?["):
+        return []
+    parts = [seg for seg in pat.split("/") if seg]
+    if not parts or any(seg in ("..", ".") for seg in parts):
+        return []
+
+    first_glob = next(i for i, seg in enumerate(parts) if any(c in seg for c in "*?["))
+    base_parts = parts[:first_glob]
+    wildcard_parts = parts[first_glob:]
+
+    for seg in base_parts:
+        if seg.lower() in _FORBIDDEN_GLOB_DIR_NAMES or seg.lower().startswith(".git"):
+            return []
+    base_rel = "/".join(base_parts)
+    if base_rel:
+        if _is_forbidden_glob_dir(base_rel, base_parts[-1].lower()):
+            return []
+        if mandatory_matcher and mandatory_matcher(base_rel):
+            return []
+        if hard_matcher and hard_matcher(base_rel):
+            return []
+        if nested_components and component_forbidden_prefix(base_rel, nested_components):
+            return []
+
+    base_path = source_resolved.joinpath(*base_parts) if base_parts else source_resolved
+    try:
+        if not base_path.is_dir():
+            return []
+    except OSError:
+        return []
+
+    has_globstar = any("**" in seg for seg in wildcard_parts)
+    max_levels = 8 if has_globstar else len(wildcard_parts)
+    candidates: list[str] = []
+    stack = [(base_path, 0)]
+    scanned_count = 0
+    MAX_SCANNED = 2000
+
+    while stack and scanned_count < MAX_SCANNED:
+        if _cancelled():
+            raise SourceInventoryError(CODE_INVENTORY_INCONSISTENT, "inventory cancelled")
+        curr_path, level = stack.pop()
+        try:
+            with os.scandir(curr_path) as it:
+                dir_entries = list(it)
+        except OSError:
+            continue
+
+        for entry in dir_entries:
+            scanned_count += 1
+            if scanned_count >= MAX_SCANNED:
+                break
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+                is_sym = entry.is_symlink()
+            except OSError:
+                continue
+
+            if is_dir:
+                if level + 1 < max_levels:
+                    name_lower = entry.name.lower()
+                    try:
+                        rel_dir = Path(entry.path).relative_to(source_resolved).as_posix()
+                    except ValueError:
+                        continue
+                    if _is_forbidden_glob_dir(rel_dir, name_lower):
+                        continue
+                    if is_browser_user_data_dir(rel_dir, name_lower) or is_scratch_repro_dir(rel_dir, name_lower):
+                        continue
+                    if mandatory_matcher and mandatory_matcher(rel_dir):
+                        continue
+                    if hard_matcher and hard_matcher(rel_dir):
+                        continue
+                    if nested_components and component_forbidden_prefix(rel_dir, nested_components):
+                        continue
+                    stack.append((Path(entry.path), level + 1))
+            elif is_file or is_sym:
+                try:
+                    rel_file = Path(entry.path).relative_to(source_resolved).as_posix()
+                except ValueError:
+                    continue
+                if is_browser_user_data_path(rel_file) or is_scratch_repro_path(rel_file):
+                    continue
+                if not always_incl_matcher(rel_file):
+                    continue
+                if mandatory_matcher and mandatory_matcher(rel_file):
+                    continue
+                if hard_matcher and hard_matcher(rel_file):
+                    continue
+                if rel_file in RESERVED_ARCHIVE_NAMES or is_generated_archive_control(Path(entry.path), rel_file):
+                    continue
+                if nested_components and component_forbidden_prefix(rel_file, nested_components):
+                    continue
+                candidates.append(rel_file)
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Nested same-product Git components
 # ---------------------------------------------------------------------------
@@ -746,12 +913,28 @@ def _component_rel_is_never_archived(inner: str) -> bool:
     return False
 
 
+def _component_supersedable_reserved(
+    supersedable_reserved: Optional[frozenset],
+) -> Optional[frozenset]:
+    """The supersedable reserved set THIS pack regenerates, or None for fail-closed.
+
+    Mirrors the root legs' default: when the caller did not supply an explicit
+    set, every reserved control name is supersedable (a genuine generated
+    control wins); when it supplies an empty set, none are and the bare names
+    fail closed -- the same contract ``pack_single`` applies.
+    """
+    if supersedable_reserved is None:
+        return frozenset(RESERVED_ARCHIVE_NAMES)
+    return supersedable_reserved
+
+
 def build_nested_component_entries(
     component: NestedGitComponent,
     excludes: set[str],
     *,
     always_include: Optional[Iterable[str]] = None,
     always_exclude: Optional[Iterable[str]] = None,
+    supersedable_reserved: Optional[frozenset] = None,
     cancel_event=None,
 ) -> dict[str, SourceInventoryEntry]:
     """Inventory one canonical component under its real nested paths.
@@ -807,6 +990,35 @@ def build_nested_component_entries(
         """
         full_rel = f"{component.rel}/{inner}"
         name_lower = inner.rpartition("/")[2].lower()
+        # T-339: the reserved-control verdict runs BEFORE the hard-safety and
+        # generic matchers inside a component, by the same discipline the
+        # tracked/untracked legs use at the root. A reserved archive-control
+        # name is a NAMED collision, not a secret/policy refusal, and must
+        # carry that classification regardless of which leg saw it first -- a
+        # `child/_AUDAPACK_MANIFEST.json` does not become a harder secret
+        # because it arrived inside a nested worktree. A genuine AUDAPACK-
+        # generated stale control on the name supersedes (and is NAMED in the
+        # published inventory) exactly as at the root, instead of being
+        # relabeled as a hard-safety denial.
+        if inner in RESERVED_ARCHIVE_NAMES:
+            # _reserved_control_verdict keys on the bare reserved name held in
+            # RESERVED_ARCHIVE_NAMES; pass `inner` so membership matches. It
+            # either returns a superseded entry (genuine stale generated
+            # control) or raises the fail-closed reserved-name collision --
+            # it never returns None for a reserved name.
+            verdict = _reserved_control_verdict(
+                inner,
+                root,
+                _component_supersedable_reserved(supersedable_reserved),
+                origin=ORIGIN_TRACKED,
+                tracked=True,
+            )
+            if verdict.reason == REASON_SUPERSEDED_GENERATED_CONTROL:
+                return False, REASON_SUPERSEDED_GENERATED_CONTROL
+            # verdict carries a superseded entry only on the supersession
+            # branch above; reaching here means a collision that the verdict
+            # did not raise, which is an invariant breach.
+            raise _tracked_path_conflict(full_rel, tracked=True)
         if hard(full_rel):
             # Hard safety is not a compact-tier opinion: a secret inside a
             # component fails the whole pack exactly as it does at the root.
@@ -1500,6 +1712,10 @@ def _classify_untracked(
     name_lower = rel.rpartition("/")[2].lower()
     if mandatory(rel_lower):
         return False, "secret_policy", 3
+    if is_browser_user_data_path(rel_lower):
+        return False, REASON_PRIVACY_POLICY, 3
+    if is_scratch_repro_path(rel_lower):
+        return False, "generated_output", 3
     if always_excl(rel_lower):
         return False, "configured_ignore", 3
     if always_incl(rel_lower):
@@ -1705,6 +1921,32 @@ def build_git_inventory(
                 "tracked path is not a regular file",
                 rel=rel,
             )
+        if is_browser_user_data_path(rel.lower()):
+            entries[rel] = SourceInventoryEntry(
+                rel=rel,
+                origin=ORIGIN_TRACKED,
+                size=st.st_size,
+                mtime_ns=st.st_mtime_ns,
+                st_ino=st.st_ino,
+                st_dev=st.st_dev,
+                include=False,
+                reason=REASON_PRIVACY_POLICY,
+                priority=3,
+            )
+            continue
+        if is_scratch_repro_path(rel.lower()):
+            entries[rel] = SourceInventoryEntry(
+                rel=rel,
+                origin=ORIGIN_TRACKED,
+                size=st.st_size,
+                mtime_ns=st.st_mtime_ns,
+                st_ino=st.st_ino,
+                st_dev=st.st_dev,
+                include=False,
+                reason="generated_output",
+                priority=3,
+            )
+            continue
         entries[rel] = SourceInventoryEntry(
             rel=rel,
             origin=ORIGIN_TRACKED,
@@ -1729,6 +1971,24 @@ def build_git_inventory(
         if raw_path.endswith("/"):
             rel = validate_rel_path(raw_path.rstrip("/"))
             if rel in entries:
+                continue
+            if is_browser_user_data_dir(rel.lower(), rel.rpartition("/")[2].lower()):
+                _claim_lower(rel)
+                entries[rel] = SourceInventoryEntry(
+                    rel=rel,
+                    origin=ORIGIN_UNTRACKED,
+                    include=False,
+                    reason=REASON_PRIVACY_POLICY,
+                )
+                continue
+            if is_scratch_repro_dir(rel.lower(), rel.rpartition("/")[2].lower()):
+                _claim_lower(rel)
+                entries[rel] = SourceInventoryEntry(
+                    rel=rel,
+                    origin=ORIGIN_UNTRACKED,
+                    include=False,
+                    reason="generated_output",
+                )
                 continue
             if rel in included_components:
                 # Superseded by the component's own ingestion phase below --
@@ -1824,6 +2084,7 @@ def build_git_inventory(
             set(excludes),
             always_include=list(always_include or []),
             always_exclude=list(always_exclude or []),
+            supersedable_reserved=supersedable_reserved,
             cancel_event=cancel_event,
         )
         for member_rel, member in component_entries.items():
@@ -1835,6 +2096,9 @@ def build_git_inventory(
                 )
             _claim_lower(member_rel)
             entries[member_rel] = member
+            if member.reason == REASON_SUPERSEDED_GENERATED_CONTROL:
+                if member_rel not in superseded_control:
+                    superseded_control.append(member_rel)
         component.included = True
         component.file_count = sum(
             1 for m in component_entries.values() if m.include
@@ -1864,12 +2128,25 @@ def build_git_inventory(
     for raw_path in overlay_paths:
         _add_candidate(raw_path, "protected")
 
-    # 5a. Explicit always_include paths Git never enumerated. Only exact,
-    # glob-free patterns can be probed with one stat each; a glob pattern
-    # would require an ignored-tree walk, which stays out of scope.
+    # 5a. Explicit always_include paths Git never enumerated. Exact paths
+    # are probed with one stat each; safe glob patterns (e.g. audit/*.md,
+    # future_gate/*.md) are boundedly expanded via _discover_safe_glob_candidates.
     for pattern in always_include or []:
         pat = (pattern or "").strip().replace("\\", "/")
-        if not pat or any(ch in pat for ch in "*?["):
+        if not pat:
+            continue
+        if any(ch in pat for ch in "*?["):
+            glob_candidates = _discover_safe_glob_candidates(
+                source_resolved,
+                pat,
+                always_incl,
+                cancel_event=cancel_event,
+                nested_components=nested_components,
+                mandatory_matcher=mandatory,
+                hard_matcher=hard,
+            )
+            for g_rel in glob_candidates:
+                _add_candidate(g_rel, "always_include")
             continue
         parts = [seg for seg in pat.split("/") if seg]
         if not parts or any(seg in ("..", ".") for seg in parts):
@@ -1946,6 +2223,32 @@ def build_git_inventory(
             continue
         if not stat_module.S_ISREG(st.st_mode):
             continue
+        # T-339: reserved archive-control verdict BEFORE the generic cascade.
+        # The overlay re-enumerates files Git ignore hid, so a reserved name
+        # here is the untracked twin of the one the tracked/untracked legs
+        # already decide first: project-owned bytes under `_AUDAPACK_MANIFEST.json`
+        # or `.audapack/manifest.json` must fail closed as a NAMED collision,
+        # not be silently swallowed by the secret/scratch/always_exclude matchers
+        # (or the generic matcher, since `_AUDAPACK_MANIFEST.json` is itself in
+        # MANDATORY_EXCLUDES) and packaged as success. A genuine generated stale
+        # control supersedes instead, exactly as at the root legs.
+        if rel in RESERVED_ARCHIVE_NAMES:
+            # _reserved_control_verdict either returns a superseded entry (a
+            # genuine generated stale control) or raises the fail-closed
+            # reserved-name collision -- never returns None for a reserved
+            # name. Mirrors the walk leg (T-333/T-339).
+            verdict = _reserved_control_verdict(
+                rel,
+                source_resolved,
+                supersedable_reserved,
+                origin=ORIGIN_UNTRACKED,
+                tracked=False,
+            )
+            entries[rel] = verdict
+            if verdict.reason == REASON_SUPERSEDED_GENERATED_CONTROL:
+                if rel not in superseded_control:
+                    superseded_control.append(rel)
+            continue
         include, reason, priority = _classify_untracked(
             rel,
             st.st_size,
@@ -1984,7 +2287,10 @@ def build_git_inventory(
     # and ban list -- no new discovery, no new walk. A configured
     # `always_exclude` stays authoritative and is reported by the verdict as a
     # required-evidence omission, as everywhere else.
-    if saipen_collection.contract.detected and saipen_collection.contract.status == saipen_evidence.STATUS_COMPLETE:
+    if saipen_collection.contract.detected and saipen_collection.contract.status in (
+        saipen_evidence.STATUS_COMPLETE,
+        saipen_evidence.STATUS_COMPATIBLE_DEGRADED,
+    ):
         _contract = saipen_collection.contract
         _tier_of = saipen_collection.tier_of
         # CORE-001: the memory root is ALLOWLISTED, not denylisted. A contract
@@ -2248,10 +2554,32 @@ def inventory_from_plan(source: Path, plan, supersedable_reserved: Optional[froz
             include=True,
             priority=decision.priority,
         )
+    saipen_contract = saipen_evidence.read_contract(source_resolved)
+    if saipen_contract.detected and saipen_contract.status in (
+        saipen_evidence.STATUS_COMPLETE,
+        saipen_evidence.STATUS_COMPATIBLE_DEGRADED,
+    ):
+        for _rel, _entry in list(entries.items()):
+            if saipen_evidence.is_non_exportable(_rel, saipen_contract):
+                if _entry.include:
+                    entries[_rel] = SourceInventoryEntry(
+                        rel=_rel,
+                        origin=_entry.origin,
+                        size=_entry.size,
+                        mtime_ns=_entry.mtime_ns,
+                        st_ino=_entry.st_ino,
+                        st_dev=_entry.st_dev,
+                        include=False,
+                        reason=saipen_evidence.REASON_SAIPEN_NON_EXPORTABLE,
+                        priority=_entry.priority,
+                    )
     return SourceInventory(
         mode="filesystem",
         source=source_resolved,
         entries=entries,
+        superseded_control=sorted(
+            rel for rel, entry in entries.items() if entry.reason == REASON_SUPERSEDED_GENERATED_CONTROL
+        ),
         saipen=saipen_verdict(source_resolved, entries),
     )
 
@@ -2272,6 +2600,7 @@ def inventory_from_walk(
     source_resolved = source.resolve()
     matcher = _build_exclusion_matcher(set(excludes) | set(MANDATORY_EXCLUDES))
     entries: dict[str, SourceInventoryEntry] = {}
+    superseded_control: list[str] = []
     walk_errors = 0
 
     def _on_walk_error(err):
@@ -2304,6 +2633,19 @@ def inventory_from_walk(
             except OSError:
                 walk_errors += 1
                 continue
+            # T-333: the reserved-control verdict runs BEFORE the generic
+            # exclusions and before the symlink branch. `_AUDAPACK_MANIFEST.json`
+            # is in MANDATORY_EXCLUDES, so the matcher used to claim the path
+            # first and the reserved-name conflict check never ran: project
+            # content on a name AUDAPACK writes was silently dropped from the
+            # archive instead of failing the pack closed. The Git legs decide
+            # this name first for the same reason.
+            reserved = _reserved_control_verdict(rel, source_resolved, supersedable_reserved)
+            if reserved is not None:
+                entries[rel] = reserved
+                if reserved.reason == REASON_SUPERSEDED_GENERATED_CONTROL:
+                    superseded_control.append(rel)
+                continue
             if stat_module.S_ISLNK(st.st_mode):
                 entries[rel] = SourceInventoryEntry(
                     rel=rel,
@@ -2322,10 +2664,6 @@ def inventory_from_walk(
                     reason=exclusion_reason_for(rel.lower(), name.lower()),
                     priority=3,
                 )
-                continue
-            reserved = _reserved_control_verdict(rel, source_resolved, supersedable_reserved)
-            if reserved is not None:
-                entries[rel] = reserved
                 continue
             entries[rel] = SourceInventoryEntry(
                 rel=rel,
@@ -2346,6 +2684,7 @@ def inventory_from_walk(
         mode="filesystem",
         source=source_resolved,
         entries=entries,
+        superseded_control=sorted(superseded_control),
         saipen=saipen_verdict(source_resolved, entries),
     )
 
@@ -2361,6 +2700,18 @@ def inventory_from_single_file(source: Path, excludes: set[str]) -> SourceInvent
             f"Refusing to package symlink source: {source_resolved}",
             rel=source_resolved.name,
         )
+    # T-333: a single-file source on a reserved archive-control name is a NAME
+    # COLLISION, not an exclusion-rule match. The generic matcher claims
+    # `_AUDAPACK_MANIFEST.json` (it is in MANDATORY_EXCLUDES) and would
+    # report PATH_INVALID/"matches an exclusion rule" -- advice that sends the
+    # operator to their exclude list instead of to the file they must rename.
+    # The packer writes its own control under that name, so the member would
+    # collide; refuse with the reserved-name conflict code, which is what
+    # every other leg reports for this name. A generated stale control is not
+    # supersedable here: it is the ONLY payload, and superseding it would
+    # publish an archive carrying no project content at all.
+    if source_resolved.name in RESERVED_ARCHIVE_NAMES:
+        raise _tracked_path_conflict(source_resolved.name, tracked=False)
     if _path_is_excluded_normalized(source_resolved, _build_exclusion_matcher(set(excludes) | set(MANDATORY_EXCLUDES))):
         raise SourceInventoryError(
             CODE_PATH_INVALID,
@@ -2467,6 +2818,8 @@ def build_pack_inventory(
         return inventory_from_plan(source, plan, supersedable_reserved), plan
 
     return inventory_from_walk(
-        source, excludes, cancel_event=cancel_event,
+        source,
+        excludes,
+        cancel_event=cancel_event,
         supersedable_reserved=supersedable_reserved,
     ), None

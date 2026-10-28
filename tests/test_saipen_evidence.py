@@ -29,6 +29,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from audapack import saipen_evidence as se
 from audapack.config import PackingConfig
@@ -118,7 +119,7 @@ CONTRACT_V2 = contract_fixture("MANIFEST.v2.json")
 #: The published v1 shape, taken from a project a v1-era generator enrolled:
 #: a freshly generated v1 document no longer exists.
 CONTRACT_V1_CANONICAL = contract_fixture("MANIFEST.v1.json")
-#: v3 fixture: forward-compatible superset of v2 (COMPATIBLE_DEGRADED case).
+#: Canonical v3 fixture for the explicit native parser.
 CONTRACT_V3 = contract_fixture("MANIFEST.v3.json")
 
 
@@ -419,25 +420,20 @@ class TestContractHandling(SaipenEvidenceCase):
         self.assertFalse(verdict["authoritative_state"])
         self.assertIn("saipen audit manifest --write", verdict["detail"])
 
-    def test_newer_contract_version_is_forward_compatible_when_structural(self):
-        """MILESTONE K: newer version with present capabilities is not unknown.
-
-        A contract_version beyond the implemented set is not automatically
-        unknown if every required capability is structurally present. The
-        generator/provenance mismatch is a separate gate-level check.
-        """
+    def test_newer_contract_version_is_refused_even_without_an_explicit_policy(self):
+        """Known field shapes alone never grant implementation support."""
         sp = self.write_saipen()
         future = dict(CONTRACT, contract_version=se.SUPPORTED_CONTRACT_VERSION + 1)
         (sp / "MANIFEST.json").write_text(json.dumps(future, indent=1), encoding="utf-8")
         self.ignore(".saipen/*")
         self.commit()
         contract = se.read_contract(self.repo)
-        self.assertEqual(contract.admission, se.ManifestAdmission.COMPATIBLE_DEGRADED)
+        self.assertEqual(contract.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
         self.assertEqual(contract.contract_version, se.SUPPORTED_CONTRACT_VERSION + 1)
-        # The snapshot is authoritative once evidence is present.
+        # Source/evidence presence cannot implement the unknown contract.
         verdict = self.inventory().saipen
-        self.assertEqual(verdict["admission"], se.ManifestAdmission.COMPATIBLE_DEGRADED)
-        self.assertTrue(verdict["authoritative_state"])
+        self.assertEqual(verdict["admission"], se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+        self.assertFalse(verdict["authoritative_state"])
 
     def test_older_contract_version_is_refused_not_guessed(self):
         """An older-than-implemented version is INCOMPATIBLE_UNSAFE: not a
@@ -452,6 +448,94 @@ class TestContractHandling(SaipenEvidenceCase):
         self.assertEqual(contract.status, se.STATUS_CONTRACT_UNKNOWN)
         self.assertEqual(contract.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
         self.assertFalse(contract.mandatory)
+
+
+class TestStrictContractAdmission(SaipenEvidenceCase):
+    """A valid shape cannot waive an unsupported producer's refusal policy."""
+
+    def test_strict_refusal_document_does_not_fall_back(self):
+        # Keep v3 unsupported in this control even after native v3 is added.
+        with mock.patch.object(se, "SUPPORTED_CONTRACT_VERSIONS", (1, 2)), mock.patch.object(
+            se, "SUPPORTED_CONTRACT_VERSION", 2
+        ):
+            for version in (3, 4, 5, 999):
+                document = json.loads(json.dumps(CONTRACT_V3))
+                document["contract_version"] = version
+                document["generator"] = f"saipen-audit-manifest/{version}"
+                with self.subTest(version=version):
+                    contract = se.read_contract_from_document(document)
+                    self.assertEqual(contract.status, se.STATUS_CONTRACT_UNKNOWN)
+                    admission, _ = se.check_capabilities(document)
+                    self.assertEqual(admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+                    self.assertEqual(contract.compatibility_policy, "refuse")
+                    self.assertEqual(contract.mandatory, [])
+                    verdict = se.evaluate(se.collect(self.repo, contract), included=set())
+                    self.assertFalse(verdict["authoritative_state"])
+
+    def test_strict_refusal_filesystem_does_not_fall_back(self):
+        with mock.patch.object(se, "SUPPORTED_CONTRACT_VERSIONS", (1, 2)), mock.patch.object(
+            se, "SUPPORTED_CONTRACT_VERSION", 2
+        ):
+            for version in (3, 4):
+                document = json.loads(json.dumps(CONTRACT_V3))
+                document["contract_version"] = version
+                document["generator"] = f"saipen-audit-manifest/{version}"
+                self.write_saipen(contract=document)
+                with self.subTest(version=version):
+                    contract = se.read_contract(self.repo)
+                    self.assertEqual(contract.status, se.STATUS_CONTRACT_UNKNOWN)
+                    self.assertEqual(contract.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+                    self.assertEqual(contract.compatibility_policy, "refuse")
+                    self.assertEqual(se.collect(self.repo, contract).paths, [])
+
+    def test_supported_v3_has_an_explicit_native_parser(self):
+        contract = se.read_contract_from_document(CONTRACT_V3)
+        self.assertIn(3, se.SUPPORTED_CONTRACT_VERSIONS)
+        self.assertIs(se._CONTRACT_PARSERS[3], se.parse_contract_v3)
+        self.assertEqual(contract.admission, se.ManifestAdmission.NATIVE)
+        self.assertEqual(contract.status, se.STATUS_COMPLETE)
+
+    def test_v3_requires_all_producer_protections(self):
+        for field in (
+            "non_exportable_segments", "non_exportable_filenames", "non_exportable_suffixes",
+            "nested_instance_files", "precedence",
+        ):
+            document = json.loads(json.dumps(CONTRACT_V3))
+            document["evidence"].pop(field)
+            with self.subTest(field=field):
+                contract = se.read_contract_from_document(document)
+                self.assertEqual(contract.status, se.STATUS_MANIFEST_MALFORMED)
+                self.assertFalse(se.evaluate(se.collect(self.repo, contract))["authoritative_state"])
+            document["evidence"][field] = CONTRACT_V3["evidence"][field][1:]
+            with self.subTest(shortened_field=field):
+                self.assertEqual(se.read_contract_from_document(document).status, se.STATUS_MANIFEST_MALFORMED)
+
+    def test_v3_rejects_malformed_evidence_rules(self):
+        for field, value in (
+            ("mandatory", [{"path": "../STATE.md", "kind": "file"}]),
+            ("conditional", [{"path": "recovery/board-compaction", "kind": "future", "recursive": True, "max_files": 10}]),
+            ("conditional", [{"path": "evidence", "kind": "dir", "recursive": "false", "max_files": 10}]),
+            ("conditional", [{"path": "evidence", "kind": "dir", "recursive": True, "max_files": True}]),
+            ("non_exportable", []),
+        ):
+            document = json.loads(json.dumps(CONTRACT_V3))
+            document["evidence"][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertEqual(se.read_contract_from_document(document).status, se.STATUS_MANIFEST_MALFORMED)
+
+    def test_v3_final_snapshot_refuses_exported_nested_instance(self):
+        self.write_saipen(contract=CONTRACT_V3)
+        collection = se.collect(self.repo, se.read_contract(self.repo))
+        verdict = se.evaluate(collection, included=set(collection.paths) | {".saipen/extensions/subs/x/STATE.md"})
+        self.assertFalse(verdict["authoritative_state"])
+        self.assertEqual(verdict["status"], se.STATUS_PROTOCOL_INCOMPLETE)
+        self.assertEqual(verdict["non_exportable_in_archive"][0]["rule"], se.EXPORT_RULE_NESTED_INSTANCE)
+
+    def test_v3_file_ban_is_exact_and_directory_ban_is_recursive(self):
+        contract = se.read_contract_from_document(CONTRACT_V3)
+        self.assertFalse(se.export_decision(".saipen/LOCAL_STATE.json", contract)[0])
+        self.assertTrue(se.export_decision(".saipen/LOCAL_STATE.json/child.md", contract)[0])
+        self.assertFalse(se.export_decision(".saipen/quarantine/child.md", contract)[0])
 
 
 class TestBoundsAndSafety(SaipenEvidenceCase):
@@ -1246,7 +1330,7 @@ class TestContractV2(SaipenEvidenceCase):
         self.assertEqual(contract.generator, "saipen-audit-manifest/2")
         self.assertEqual(contract.compatibility_policy, "refuse")
         self.assertEqual(contract.citations.source, se.RULES_FROM_CONTRACT)
-        self.assertEqual(se.SUPPORTED_CONTRACT_VERSIONS, (1, 2))
+        self.assertEqual(se.SUPPORTED_CONTRACT_VERSIONS, (1, 2, 3))
 
     # -- items 3-4: v2 required material participates ---------------------
 
@@ -1428,33 +1512,25 @@ class TestContractV2(SaipenEvidenceCase):
         omitted = {item["path"] for item in snapshot["omitted_required"]}
         self.assertIn(".saipen/LOG.md", omitted)
 
-    # -- items 10-11: a newer version is forward-compatible if capabilities match --
+    # -- native v3 and unsupported/malformed distinctions --
 
-    def test_case41_v3_admits_as_compatible_degraded(self):
-        """MILESTONE K: v3 with additive metadata.
-
-        A v3 manifest declaring contract_version 3 is newer than implemented (v2)
-        but carries all required capabilities structurally; it is admitted in
-        COMPATIBLE_DEGRADED mode and read through the v2 parser. Unknown
-        additive fields (nested_instance_files, non_exportable_filenames,
-        non_exportable_segments, non_exportable_suffixes, precedence) are
-        preserved, not rewritten.
-        """
+    def test_case41_v3_admits_through_its_native_parser(self):
+        """V3 implements structural exclusions and producer precedence directly."""
         future = json.loads(json.dumps(CONTRACT_V3))
         self.write_saipen(contract=future)
         contract = se.read_contract(self.repo)
         self.assertEqual(contract.status, se.STATUS_COMPLETE)
-        self.assertEqual(contract.admission, se.ManifestAdmission.COMPATIBLE_DEGRADED)
+        self.assertEqual(contract.admission, se.ManifestAdmission.NATIVE)
         self.assertEqual(contract.contract_version, 3)
-        # v3 reads through v2's rules since v3 is compatible.
+        # All declared evidence and citation semantics were parsed natively.
         self.assertTrue(contract.mandatory)  # parsed, not empty
         self.assertTrue(contract.required)
         self.assertTrue(contract.citations is not None)
         # The v2 baseline quarantine/ exclusion carries forward.
         self.assertIn(".saipen/quarantine", contract.non_exportable)
         verdict = self.inventory().saipen
-        self.assertEqual(verdict["status"], se.STATUS_COMPATIBLE_DEGRADED)
-        self.assertEqual(verdict["admission"], se.ManifestAdmission.COMPATIBLE_DEGRADED)
+        self.assertEqual(verdict["status"], se.STATUS_COMPLETE)
+        self.assertEqual(verdict["admission"], se.ManifestAdmission.NATIVE)
         self.assertTrue(verdict["authoritative_state"])
 
     def test_case41b_v3_with_reshaped_exclusion_is_incompatible_unsafe(self):
@@ -1465,9 +1541,9 @@ class TestContractV2(SaipenEvidenceCase):
         ]
         self.write_saipen(contract=future)
         contract = se.read_contract(self.repo)
-        self.assertEqual(contract.status, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertEqual(contract.status, se.STATUS_MANIFEST_MALFORMED)
         self.assertEqual(contract.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
-        self.assertIn("credential_protection_rules_understood", contract.admission_missing)
+        self.assertIn("non_exportable", contract.detail)
 
     def test_case42_incompatible_unsafe_detail_names_the_missing_capability(self):
         """MILESTONE K: hard-block reports the exact missing capability.
@@ -1477,13 +1553,15 @@ class TestContractV2(SaipenEvidenceCase):
         """
         # A v3 that reshapes an exclusion rule is INCOMPATIBLE_UNSAFE.
         future = json.loads(json.dumps(CONTRACT_V3))
+        future["contract_version"] = 4
+        future["generator"] = "saipen-audit-manifest/4"
         future["evidence"]["non_exportable"] = [
             {"path": "locks", "kind": "dir"},
         ]
         admission, missing = se.check_capabilities(future)
         self.assertEqual(admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
         self.assertIn("credential_protection_rules_understood", missing)
-        detail = se.check_capabilities_detail(3, admission, missing)
+        detail = se.check_capabilities_detail(4, admission, missing)
         self.assertIn("credential_protection_rules_understood", detail)
         self.assertIn("INCOMPATIBLE_UNSAFE", detail)
         self.assertNotIn("audit manifest --write", detail)
@@ -1838,6 +1916,7 @@ class TestSaipenContractV3Precedence(SaipenEvidenceCase):
 
     def _v3_contract(self):
         return {
+            "schema_version": 1,
             "contract_version": 3,
             "kind": "saipen_audit_manifest",
             "protocol_version": "8.0.1",
@@ -1855,6 +1934,7 @@ class TestSaipenContractV3Precedence(SaipenEvidenceCase):
                     {"kind": "dir", "path": "recovery/board-compaction", "recursive": True, "max_files": 100},
                     {"kind": "dir", "path": "recovery/log-detail", "recursive": True, "max_files": 100},
                 ],
+                "optional": [],
                 "non_exportable": [
                     "locks/",
                     "recovery/",
@@ -1868,10 +1948,14 @@ class TestSaipenContractV3Precedence(SaipenEvidenceCase):
                     ".in-flight",
                 ],
                 "non_exportable_segments": [
+                    ".prepare-staging",
+                    ".collect-staging",
                     ".staging",
                     ".in-flight",
+                    ".translation-cache",
                     ".cache",
                     "__pycache__",
+                    ".saipen",
                 ],
                 "non_exportable_suffixes": [
                     ".tmp",
@@ -1984,7 +2068,7 @@ class TestSaipenContractV3Precedence(SaipenEvidenceCase):
         self.assertNotIn(unrelated_rel, names)
 
         snap = manifest.get("saipen_snapshot", {})
-        self.assertEqual(snap.get("status"), se.STATUS_COMPATIBLE_DEGRADED)
+        self.assertEqual(snap.get("status"), se.STATUS_COMPLETE)
         self.assertTrue(snap.get("authoritative_state"))
         self.assertFalse(snap.get("required_evidence_omitted"))
         self.assertEqual(snap.get("omitted_required"), [])
@@ -2097,11 +2181,11 @@ class TestSaipenExportDecisionMatrix(unittest.TestCase):
         contract = se.read_contract_from_document(doc)
         return contract
 
-    def test_v3_is_admitted_degraded_not_native(self):
+    def test_v3_is_admitted_native_with_verified_precedence(self):
         contract = self._read(self._v3())
         self.assertEqual(contract.status, se.STATUS_COMPLETE)
-        self.assertEqual(contract.admission, se.ManifestAdmission.COMPATIBLE_DEGRADED)
-        self.assertNotIn(3, se.SUPPORTED_CONTRACT_VERSIONS)
+        self.assertEqual(contract.admission, se.ManifestAdmission.NATIVE)
+        self.assertIn(3, se.SUPPORTED_CONTRACT_VERSIONS)
         self.assertTrue(contract.durable_precedence)
 
     def test_decision_table(self):
@@ -2138,22 +2222,20 @@ class TestSaipenExportDecisionMatrix(unittest.TestCase):
 
     def test_optional_dir_never_outranks_a_ban(self):
         doc = self._v3()
-        doc["evidence"]["optional"] = [doc["evidence"].pop("conditional")[0] | {}]
+        doc["evidence"]["optional"] = [doc["evidence"]["conditional"][0] | {}]
+        doc["evidence"]["conditional"] = []
         contract = self._read(doc)
         self.assertTrue(se.is_non_exportable(".saipen/recovery/board-compaction/T-X/proof.json", contract))
 
-    def test_unknown_or_reordered_precedence_keeps_the_strict_prefix_ban(self):
+    def test_unknown_or_reordered_precedence_refuses_the_contract(self):
         reordered = list(se.EXPORT_PRECEDENCE)
         reordered[2], reordered[3] = reordered[3], reordered[2]
         for precedence in (reordered, se.EXPORT_PRECEDENCE[:3], [*se.EXPORT_PRECEDENCE, "future_rule"]):
             with self.subTest(precedence=precedence):
                 contract = self._read(self._v3(precedence=list(precedence)))
-                self.assertFalse(contract.durable_precedence)
-                self.assertTrue(
-                    se.is_non_exportable(".saipen/recovery/board-compaction/T-X/proof.json", contract)
-                )
-                # Restrictive classes still apply without the loosening rule.
-                self.assertTrue(se.is_non_exportable(".saipen/logs/x.tmp", contract))
+                self.assertEqual(contract.status, se.STATUS_MANIFEST_MALFORMED)
+                self.assertEqual(contract.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+                self.assertFalse(se.evaluate(se.EvidenceCollection(contract))["authoritative_state"])
 
     def test_malformed_class_lists_are_refused_not_ignored(self):
         for key, value in (
@@ -2555,7 +2637,7 @@ class TestSaipenV3HardSafetyOrdering(TestSaipenContractV3Precedence):
         self.assertNotIn(".saipen/recovery/stray.json", names)
         for name in ("STATE.md", "BOARD.md", "LOG.md", "IDENTITY.md"):
             self.assertIn(f".saipen/{name}", names)
-        self.assertEqual(snap.get("status"), se.STATUS_COMPATIBLE_DEGRADED)
+        self.assertEqual(snap.get("status"), se.STATUS_COMPLETE)
         self.assertTrue(snap.get("authoritative_state"))
         self.assertEqual(snap.get("omitted_required"), [])
 

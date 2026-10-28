@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from audapack import fidelity
+from audapack import saipen_evidence as se
 from audapack.config import PackingConfig
 from audapack.fidelity import (
     PROFILE_COMPACT,
@@ -27,6 +28,7 @@ from audapack.fidelity import (
     PROFILE_STANDARD,
     REASON_CONFIGURED_IGNORE,
     REASON_MEDIA_BUDGET,
+    REASON_PRIVACY_POLICY,
     REASON_SECRET_POLICY,
     REASON_SIZE_LIMIT,
     REASON_UNSUPPORTED,
@@ -2168,6 +2170,78 @@ class TestRoleAwareJsonClassification(FidelityBase):
         fresh = probe_archive_freshness(project, packing, output_dir=self.output_dir)
         self.assertEqual(fresh.state, ArchiveFreshness.STALE)
         self.assertTrue(fresh.policy_mismatch)
+
+
+class TestBrowserUserDataFilenamesAreContextBounded(FidelityBase):
+    """T-357: a sensitive FILENAME alone must never drop a project's own file.
+
+    Rule 3 of is_browser_user_data_path() excluded any file whose bare name sits
+    in _BROWSER_SENSITIVE_FILENAMES with no path context at all, while the
+    docstring above it promises the opposite ("avoids broad filename-only
+    exclusions: unrelated source files ... remain included"). A project-owned
+    fixture named `secure preferences` or `network persistent state` therefore
+    vanished from every pack carrying a privacy reason. The fix fences the rule
+    on a Chromium profile ancestor, so the same name inside a profile is still
+    dropped and outside one is still audited.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.contract = se.read_contract(Path("."))
+
+    def test_a_project_file_named_like_a_credential_database_is_included(self):
+        for rel in (
+            "fixtures/secure preferences",
+            "docs/network persistent state",
+            "tests/oracles/login data",
+            "fixtures/deep/nested/cookies-journal",
+        ):
+            with self.subTest(rel=rel):
+                name = rel.rsplit("/", 1)[-1]
+                self.assertFalse(fidelity.is_browser_user_data_path(rel.lower()))
+                self.assertEqual(
+                    fidelity.exclusion_reason_for(rel.lower(), name), REASON_CONFIGURED_IGNORE
+                )
+                self.assertFalse(se.is_security_path(rel))
+                self.assertTrue(se.export_decision(rel, self.contract)[0])
+
+    def test_a_project_file_named_like_a_credential_database_survives_the_pack(self):
+        # The pack path decides on the file's own rel path, so a project fixture
+        # that only rule 3 knew about must reach the plan as an inclusion.
+        self._write("keep.py")
+        self._write("fixtures/secure preferences", 32)
+        self._write("fixtures/network persistent state", 32)
+        self._write("profile-1/chrome/default/login data", 32)
+        self._write("Chrome/User Data/Default/Network Persistent State", 32)
+
+        plan = build_fidelity_plan(self.source, set(), profile=PROFILE_STANDARD)
+        self._assert_invariant(plan)
+
+        for rel in ("keep.py", "fixtures/secure preferences", "fixtures/network persistent state"):
+            with self.subTest(rel=rel):
+                self.assertTrue(plan.decisions[rel].include, rel)
+
+        for rel in (
+            "profile-1/chrome/default/login data",
+            "Chrome/User Data/Default/Network Persistent State",
+        ):
+            with self.subTest(rel=rel):
+                decision = plan.decisions[rel]
+                self.assertFalse(decision.include)
+                self.assertEqual(decision.reason, REASON_PRIVACY_POLICY)
+
+    def test_a_sensitive_filename_inside_a_profile_is_still_excluded(self):
+        for rel in (
+            "Chrome/User Data/Default/Login Data",
+            "Chrome/User Data/Default/Network Persistent State",
+            "profile-1/default/Secure Preferences",
+            "capture/Profile 1/Login Data",
+            "app.ebwebview/EBWebView/Default/Web Data-journal",
+            "app.webview2/default/Cookies-journal",
+        ):
+            with self.subTest(rel=rel):
+                self.assertTrue(fidelity.is_browser_user_data_path(rel.lower()))
+                self.assertTrue(se.is_security_path(rel))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ def contract_fixture(name: str) -> dict:
 
 
 CONTRACT_V2 = contract_fixture("MANIFEST.v2.json")
+CONTRACT_V3 = contract_fixture("MANIFEST.v3.json")
 CONTRACT_V1_CANONICAL = contract_fixture("MANIFEST.v1.json")
 
 # The contract shape the protocol CLI publishes (mirrors the real
@@ -494,9 +495,8 @@ class TestProducerContractRegression(SaipenGateCase):
         Regeneration is NOT prescribed or attempted as a downgrade mechanism.
         """
         future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
-        future["evidence"]["non_exportable"] = [{"path": "locks", "kind": "dir"}]
+        future["contract_version"] = 4
+        future["generator"] = "saipen-audit-manifest/4"
         self.install_contract(future)
         manifest_path = self.repo / ".saipen" / "MANIFEST.json"
         before_bytes = manifest_path.read_bytes()
@@ -516,13 +516,9 @@ class TestProducerContractRegression(SaipenGateCase):
         self.assertEqual(res.error_code, se.STATUS_CONTRACT_UNKNOWN)
         self.assertIn("contract support", res.error_message.lower())
 
-    def test_case_7_compatible_degraded_newer_contract_passes(self):
-        """CASE 7: A newer contract that carries required capabilities passes as
-        COMPATIBLE_DEGRADED without regeneration.
-        """
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+    def test_case_7_native_v3_contract_passes(self):
+        """CASE 7: a supported v3 contract passes without regeneration."""
+        future = json.loads(json.dumps(CONTRACT_V3))
         self.install_contract(future)
 
         with mock.patch.object(sg, "run_hidden") as runner:
@@ -530,7 +526,8 @@ class TestProducerContractRegression(SaipenGateCase):
 
         self.assertTrue(gate.ok, gate.detail)
         self.assertFalse(gate.generated, gate.detail)
-        self.assertEqual(gate.code, se.STATUS_COMPATIBLE_DEGRADED)
+        self.assertEqual(gate.code, se.STATUS_COMPLETE)
+        self.assertEqual(gate.admission, se.ManifestAdmission.NATIVE)
         runner.assert_not_called()
 
     def test_producer_parity_checkpoint_mutation_remains_current(self):
@@ -709,6 +706,78 @@ class TestNonSaipenUnaffected(SaipenGateCase):
         self.assertFalse((self.repo / ".saipen").exists())
 
 
+class TestStrictContractAdmission(SaipenGateCase):
+    def test_unknown_manifest_without_checkpoint_is_still_refused(self):
+        document = json.loads(json.dumps(CONTRACT_V3))
+        document["contract_version"] = 4
+        document["generator"] = "saipen-audit-manifest/4"
+        self.install_contract(document)
+        (self.repo / ".saipen" / "STATE.md").unlink()
+        self.commit()
+        gate = sg.prepare(self.repo)
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.code, se.STATUS_CONTRACT_UNKNOWN)
+        result = self.pack()
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, se.STATUS_CONTRACT_UNKNOWN)
+
+    def test_generated_unknown_contract_keeps_support_diagnostics(self):
+        document = json.loads(json.dumps(CONTRACT_V3))
+        document["contract_version"] = 4
+        document["generator"] = "saipen-audit-manifest/4"
+        self.stub_writes(document)
+        gate = sg.prepare(self.repo)
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.code, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertTrue(gate.manifest_parse_valid)
+        self.assertFalse(gate.contract_supported)
+        self.assertEqual(gate.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+
+    def test_strict_refusal_v4_pack_is_refused(self):
+        document = contract_fixture("MANIFEST.v3.json")
+        document["contract_version"] = 4
+        document["generator"] = "saipen-audit-manifest/4"
+        self.install_contract(document)
+        self.commit()
+        result = self.pack()
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertIsNone(result.output_path)
+
+    def test_strict_refusal_valid_shaped_v4_gate_and_pack_fail_closed(self):
+        document = contract_fixture("MANIFEST.v3.json")
+        document["contract_version"] = 4
+        document["generator"] = "saipen-audit-manifest/4"
+        self.install_contract(document)
+        self.commit()
+        manifest_path = self.repo / ".saipen" / "MANIFEST.json"
+        before = manifest_path.read_bytes()
+        with mock.patch.object(sg, "run_hidden") as runner:
+            validated = sg.validate_contract_document(self.repo)
+            self.assertFalse(validated.ok)
+            self.assertEqual(validated.code, se.STATUS_CONTRACT_UNKNOWN)
+            prepared = sg.prepare(self.repo)
+            self.assertFalse(prepared.ok)
+            result = self.pack()
+            self.assertFalse(result.success)
+            self.assertEqual(result.status, PACK_STATUS_FAILED_INVENTORY)
+            self.assertEqual(result.error_code, se.STATUS_CONTRACT_UNKNOWN)
+            self.assertIsNone(result.output_path)
+            runner.assert_not_called()
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertEqual(list(self.out.glob("*.zip")), [])
+
+    def test_strict_refusal_v3_requires_native_consumer_support(self):
+        self.install_contract(contract_fixture("MANIFEST.v3.json"))
+        with mock.patch.object(se, "SUPPORTED_CONTRACT_VERSIONS", (1, 2)), mock.patch.object(
+            se, "SUPPORTED_CONTRACT_VERSION", 2
+        ), mock.patch.object(sg, "run_hidden") as runner:
+            gate = sg.prepare(self.repo)
+            self.assertFalse(gate.ok)
+            self.assertEqual(gate.code, se.STATUS_CONTRACT_UNKNOWN)
+            runner.assert_not_called()
+
+
 class TestContractVersionGate(SaipenGateCase):
     """TARGET F/G/H: accept what the protocol writes today, refuse only what
     cannot be honoured, and never send the operator in a circle.
@@ -776,31 +845,23 @@ class TestContractVersionGate(SaipenGateCase):
         self.assertEqual(snapshot["contract_version"], 2)
         self.assertTrue(snapshot["authoritative_state"])
 
-    def test_case_v3_forward_compatible_passes_degraded(self):
-        """MILESTONE K Case 2/3: newer contract with all required capabilities.
-
-        A v3 manifest is newer than implemented (v2) but structurally carries
-        every capability AUDAPACK depends on -- the same `required`, `mandatory`,
-        `conditional`, `optional`, `non_exportable`, `references` shape, plus
-        additive metadata. PACK must proceed.
-        """
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+    def test_case_v3_native_contract_passes(self):
+        """The real v3 declaration passes its native parser and gate."""
+        future = json.loads(json.dumps(CONTRACT_V3))
         self.install_contract(future)
         with mock.patch.object(sg, "run_hidden") as runner:
             gate = sg.prepare(self.repo)
         self.assertTrue(gate.ok, gate.detail)
         self.assertFalse(gate.generated, gate.detail)
-        self.assertEqual(gate.code, se.STATUS_COMPATIBLE_DEGRADED)
+        self.assertEqual(gate.code, se.STATUS_COMPLETE)
+        self.assertTrue(gate.manifest_parse_valid)
+        self.assertTrue(gate.contract_supported)
         # A current manifest must never be rewritten.
         runner.assert_not_called()
 
     def test_case_v3_pack_produces_authoritative_archive(self):
-        """Case 3: safe degraded PACK succeeds even for a newer contract."""
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+        """Case 3: native v3 PACK proves the complete implemented contract."""
+        future = json.loads(json.dumps(CONTRACT_V3))
         self.install_contract(future)
         self.commit()
         res = self.pack()
@@ -818,32 +879,23 @@ class TestContractVersionGate(SaipenGateCase):
         self.assertEqual(on_disk["contract_version"], 3)
         self.assertEqual(on_disk["generator"], "saipen-audit-manifest/3")
         snapshot = self.legacy_manifest()["saipen_snapshot"]
-        self.assertEqual(snapshot["admission"], "COMPATIBLE_DEGRADED")
+        self.assertEqual(snapshot["admission"], se.ManifestAdmission.NATIVE)
 
     def test_case_v3_non_exportable_ban_enforced(self):
         """Case 2: v3's non_exportable surfaces are still refused."""
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+        future = json.loads(json.dumps(CONTRACT_V3))
         self.install_contract(future)
         self.commit()
         res = self.pack()
         self.assertTrue(res.success, res.error_message)
         with self.archive() as zf:
             names = set(zf.namelist())
-        # Quarantine is banned in v2 baseline and carries to degraded v3.
+        # The v3 producer's private surfaces remain excluded.
         self.assertNotIn(".saipen/LOCAL_STATE.json", names)
 
     def test_case_v3_with_unknown_security_semantic_fails_closed(self):
-        """Case 4: newer contract with unknown security semantics.
-
-        A v3 document that moves ``non_exportable`` from a list of strings to
-        objects (a shape this consumer cannot interpret) is INCOMPATIBLE_UNSAFE
-        and must hard-block, with the exact missing capability reported.
-        """
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+        """Case 4: a supported version with malformed security declarations refuses."""
+        future = json.loads(json.dumps(CONTRACT_V3))
         future["evidence"]["non_exportable"] = [
             {"path": "locks", "kind": "dir"},
         ]
@@ -851,43 +903,39 @@ class TestContractVersionGate(SaipenGateCase):
         with mock.patch.object(sg, "run_hidden") as runner:
             gate = sg.prepare(self.repo)
         self.assertFalse(gate.ok)
-        self.assertEqual(gate.code, se.STATUS_CONTRACT_UNKNOWN)
-        self.assertIn("credential_protection_rules_understood", gate.detail)
-        self.assertIn("INCOMPATIBLE_UNSAFE", gate.detail)
+        self.assertEqual(gate.code, se.STATUS_MANIFEST_MALFORMED)
+        self.assertIn("non_exportable", gate.detail)
+        self.assertFalse(gate.manifest_parse_valid)
+        self.assertTrue(gate.contract_supported)
         runner.assert_not_called()
 
     def test_case_v3_future_optional_metadata_passthrough(self):
         """Case 6: future optional fields do not cause regression."""
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
-        # Additive unknown fields that v3 introduced.
-        future["evidence"]["nested_instance_files"] = ["STATE.md", "BOARD.md"]
-        future["evidence"]["non_exportable_filenames"] = ["LOCAL_STATE.json"]
-        future["evidence"]["non_exportable_segments"] = [".cache"]
-        future["evidence"]["non_exportable_suffixes"] = [".tmp"]
-        future["evidence"]["precedence"] = ["declared_durable_path"]
-        future["schema_version"] = 1
+        future = json.loads(json.dumps(CONTRACT_V3))
+        future["optional_metadata"] = {"producer_build_note": "opaque metadata"}
         self.install_contract(future)
         with mock.patch.object(sg, "run_hidden") as runner:
             gate = sg.prepare(self.repo)
         self.assertTrue(gate.ok, gate.detail)
-        self.assertEqual(gate.code, se.STATUS_COMPATIBLE_DEGRADED)
+        self.assertEqual(gate.code, se.STATUS_COMPLETE)
+        installed = json.loads((self.repo / ".saipen" / "MANIFEST.json").read_text(encoding="utf-8"))
+        self.assertEqual(installed["optional_metadata"], future["optional_metadata"])
         runner.assert_not_called()
 
-    def test_case_pack_degraded_v3_message_distinguishes_skew_from_unsafe(self):
-        """MILESTONE K UI: distinguish version skew from genuine incompatibility."""
-        future = json.loads(json.dumps(CONTRACT_V2))
-        future["contract_version"] = 3
-        future["generator"] = "saipen-audit-manifest/3"
+    def test_case_pack_native_v3_diagnostics_distinguish_support_from_evidence(self):
+        """Native implementation support and final evidence are separate facts."""
+        future = json.loads(json.dumps(CONTRACT_V3))
         self.install_contract(future)
         self.commit()
         with mock.patch.object(sg, "run_hidden") as runner:
             res = self.pack()
         self.assertTrue(res.success, res.error_message)
-        # The package succeeds; the degraded admission is recorded in the snapshot.
+        # The package succeeds with native support and complete final evidence.
         snapshot = self.legacy_manifest()["saipen_snapshot"]
-        self.assertEqual(snapshot["admission"], "COMPATIBLE_DEGRADED")
+        self.assertEqual(snapshot["admission"], se.ManifestAdmission.NATIVE)
+        self.assertTrue(snapshot["manifest_parse_valid"])
+        self.assertTrue(snapshot["contract_supported"])
+        self.assertTrue(snapshot["evidence_complete"])
         self.assertTrue(snapshot["authoritative_state"])
         runner.assert_not_called()
 

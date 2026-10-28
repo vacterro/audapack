@@ -93,7 +93,7 @@ class TestCanonicalFixtures(unittest.TestCase):
                 document = _load(path)
                 self.assertIn(
                     document["contract_version"],
-                    se.SUPPORTED_CONTRACT_VERSIONS + (3,),
+                    se.SUPPORTED_CONTRACT_VERSIONS,
                     f"the {name} fixture declares a contract AUDAPACK cannot read",
                 )
                 self.assertEqual(
@@ -160,17 +160,12 @@ class TestCanonicalFixtures(unittest.TestCase):
                 )
                 self.assertTrue(parsed.citations is not None)
 
-    def test_v3_fixture_admits_as_compatible_degraded(self):
-        """MILESTONE K: v3 is forward-compatible, not unknown.
-
-        The v3 fixture carries all required capabilities structurally and is
-        read in COMPATIBLE_DEGRADED mode, preserving unknown additive metadata
-        rather than rewriting it.
-        """
+    def test_v3_fixture_admits_through_native_implementation(self):
+        """Native v3 owns the fixture's export, evidence and citation semantics."""
         document = _load(V3_FIXTURE)
         parsed = se.read_contract_from_document(document)
         self.assertEqual(parsed.contract_version, 3)
-        self.assertEqual(parsed.admission, se.ManifestAdmission.COMPATIBLE_DEGRADED)
+        self.assertEqual(parsed.admission, se.ManifestAdmission.NATIVE)
         self.assertEqual(parsed.status, se.STATUS_COMPLETE)
         self.assertTrue(parsed.citations is not None)
         self.assertEqual(
@@ -187,21 +182,63 @@ class TestCanonicalFixtures(unittest.TestCase):
         ]
         parsed = se.read_contract_from_document(document)
         self.assertEqual(parsed.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
-        self.assertEqual(parsed.status, se.STATUS_CONTRACT_UNKNOWN)
+        self.assertEqual(parsed.status, se.STATUS_MANIFEST_MALFORMED)
 
-    def test_v4_with_safe_core_admits_degraded(self):
-        """Case 3: a future v4 with structurally compatible core proceeds."""
+    def test_v4_with_safe_core_refuses_strict_producer_policy(self):
+        """An unknown version remains unsupported regardless of field shape."""
         document = _load(V3_FIXTURE)
         document["contract_version"] = 4
         document["generator"] = "saipen-audit-manifest/4"
         parsed = se.read_contract_from_document(document)
-        self.assertEqual(parsed.admission, se.ManifestAdmission.COMPATIBLE_DEGRADED)
-        self.assertEqual(parsed.status, se.STATUS_COMPLETE)
+        self.assertEqual(parsed.admission, se.ManifestAdmission.INCOMPATIBLE_UNSAFE)
+        self.assertEqual(parsed.status, se.STATUS_CONTRACT_UNKNOWN)
         self.assertEqual(parsed.contract_version, 4)
 
 
 class TestCurrentGeneratorIsSupported(unittest.TestCase):
     """Cross-repo leg: the CURRENT generator's output must be readable here."""
+
+    def test_v3_export_semantics_match_authoritative_producer(self):
+        home = resolve_saipen_authority()
+        if home is None:
+            self.skipTest("no SAIPEN authority on this machine (CI carries none)")
+        # Load the exact bound producer in an isolated process; keep its imports
+        # out of pytest's shared module namespace. These are independent oracles.
+        code = '''import json, sys
+from pathlib import Path
+from audapack import saipen_evidence as se
+sys.path.insert(0, str(Path(sys.argv[1]) / "tools"))
+from saipen_engine import audit_manifest as producer
+assert producer.CONTRACT_VERSION == 3
+document = producer.build(Path.cwd())
+contract = se.read_contract_from_document(document)
+assert contract.status == se.STATUS_COMPLETE, contract.detail
+assert contract.admission == se.ManifestAdmission.NATIVE
+assert tuple(document["evidence"]["precedence"]) == se.EXPORT_PRECEDENCE
+for key, baseline in se.V3_EXPORT_CLASS_BASELINE.items():
+    assert tuple(document["evidence"][key]) == baseline, key
+assert tuple(document["evidence"]["non_exportable"]) == se.V3_NON_EXPORTABLE_BASELINE
+roots = ["evidence/probe", "extensions/subs/probe", "LOCAL_STATE.json"]
+roots += [path for path, *_ in producer.CONDITIONAL_DIRS + producer.OPTIONAL_DIRS]
+paths = set(producer.MANDATORY_FILES)
+paths.update(["LOCAL_STATE.json", "LOCAL_STATE.json/child.md", "quarantine/child.md", "recovery/unrelated.json"])
+for root in roots:
+    for filename in ("proof.json", *producer.NESTED_INSTANCE_FILES, *producer.TRANSIENT_FILENAMES):
+        paths.update((root + "/" + filename, root + "/nested/" + filename))
+    for segment in producer.TRANSIENT_SEGMENTS:
+        paths.add(root + "/" + segment + "/proof.json")
+    for suffix in producer.TRANSIENT_SUFFIXES:
+        paths.add(root + "/proof" + suffix)
+mismatches = [path for path in sorted(paths) if producer.is_exportable(path) != se.export_decision(".saipen/" + path, contract)[0]]
+print(json.dumps({"paths_compared": len(paths), "mismatches": mismatches}))
+assert not mismatches, mismatches
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(home)], cwd=PROJECT_ROOT,
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["mismatches"], [])
 
     def test_current_generator_output_is_accepted_by_parser_and_gate(self):
         home = resolve_saipen_authority()
@@ -246,41 +283,27 @@ class TestCurrentGeneratorIsSupported(unittest.TestCase):
                 timeout=180,
                 env=fixture_env,
             )
-            if proc.returncode != 0:
-                self.skipTest(
-                    "local SAIPEN CLI could not run: "
-                    f"rc={proc.returncode} {(proc.stderr or proc.stdout).strip()[:200]}"
-                )
+            self.assertEqual(
+                proc.returncode, 0,
+                f"local SAIPEN CLI failed: {(proc.stderr or proc.stdout).strip()[:1000]}",
+            )
 
             manifest = memory / "MANIFEST.json"
             self.assertTrue(manifest.is_file(), "the generator reported success but wrote nothing")
             document = _load(manifest)
 
-            # The tripwire proper: SAIPEN's current contract must be one this
-            # consumer can read -- either natively (in SUPPORTED_CONTRACT_VERSIONS)
-            # or in a forward-compatible degraded mode (all capabilities
-            # structurally present). A version that is NEITHER lands here, not
-            # on the operator.
+            # The tripwire requires actual native implementation support.
             version = document["contract_version"]
             parsed = se.read_contract(root)
-            if version in se.SUPPORTED_CONTRACT_VERSIONS:
-                self.assertEqual(parsed.status, se.STATUS_COMPLETE)
-            else:
-                # Newer version: must admit degraded, not unknown.
-                self.assertEqual(
-                    parsed.admission,
-                    se.ManifestAdmission.COMPATIBLE_DEGRADED,
-                )
-                self.assertEqual(parsed.status, se.STATUS_COMPLETE)
+            self.assertIn(version, se.SUPPORTED_CONTRACT_VERSIONS)
+            self.assertEqual(parsed.admission, se.ManifestAdmission.NATIVE)
+            self.assertEqual(parsed.status, se.STATUS_COMPLETE)
 
             # And the document the real generator just wrote must pass the gate
             # that stands in front of every pack.
             outcome = sg.validate_contract_document(root)
             self.assertTrue(outcome.ok, outcome.detail)
-            if version in se.SUPPORTED_CONTRACT_VERSIONS:
-                self.assertEqual(outcome.code, se.STATUS_COMPLETE)
-            else:
-                self.assertEqual(outcome.code, se.STATUS_COMPATIBLE_DEGRADED)
+            self.assertEqual(outcome.code, se.STATUS_COMPLETE)
 
 
 if __name__ == "__main__":  # pragma: no cover

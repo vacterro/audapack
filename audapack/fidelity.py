@@ -308,6 +308,7 @@ REASON_DEPENDENCY_CACHE = "dependency_cache"
 REASON_GENERATED_OUTPUT = "generated_output"
 REASON_SIZE_LIMIT = "size_limit"
 REASON_SECRET_POLICY = "secret_policy"
+REASON_PRIVACY_POLICY = "privacy_policy"
 REASON_UNSUPPORTED = "unsupported_special_file"
 
 REASON_CATEGORIES = (
@@ -317,6 +318,7 @@ REASON_CATEGORIES = (
     REASON_GENERATED_OUTPUT,
     REASON_SIZE_LIMIT,
     REASON_SECRET_POLICY,
+    REASON_PRIVACY_POLICY,
     REASON_UNSUPPORTED,
 )
 
@@ -652,7 +654,7 @@ DEPENDENCY_EXTS = {"whl", "tar.gz"}
 GENERATED_PATTERNS = {
     "dist", "build", "target", ".next", "__pycache__", ".pytest_cache",
     ".ruff_cache", ".mypy_cache", "logs", ".coverage", "htmlcov",
-    "*.egg-info", ".gitignore.bak", ".DS_Store",
+    "*.egg-info", ".gitignore.bak", ".DS_Store", "sai-clean-repro-*",
 }
 GENERATED_EXTS = {
     "pyc", "pyo", "pycx", "log", "sqlite", "sqlite3", "db", "db-shm",
@@ -662,6 +664,124 @@ GENERATED_EXTS = {
     "node", "lock.html", "cache",
 }
 
+#: Browser profile directory names containing reproducible cache or telemetry.
+_BROWSER_CACHE_DIR_NAMES = frozenset({
+    "gpucache",
+    "gpu cache",
+    "shadercache",
+    "grshadercache",
+    "dawncache",
+    "dawngraphitecache",
+    "dawnwebgpucache",
+    "code cache",
+    "browsermetrics",
+    "browser metrics",
+    "crashpad",
+})
+
+#: Exact Chromium/WebView2/Electron credential database filenames.
+_BROWSER_SENSITIVE_FILENAMES = frozenset({
+    "login data",
+    "login data-journal",
+    "cookies-journal",
+    "web data-journal",
+    "network persistent state",
+    "secure preferences",
+})
+
+#: Browser storage directories holding user databases.
+_BROWSER_STORAGE_DIR_NAMES = frozenset({
+    "local storage",
+    "session storage",
+    "indexeddb",
+    "webstorage",
+})
+
+
+def is_scratch_repro_dir(rel_dir: str, name_lower: str) -> bool:
+    """True when directory is a disposable clean-checkout tree (audit/AUDAPACK_20261010_1411.md)."""
+    if fnmatch.fnmatch(name_lower, "sai-clean-repro-*"):
+        return True
+    parts = rel_dir.replace("\\", "/").strip("/").split("/")
+    return any(fnmatch.fnmatch(p.lower(), "sai-clean-repro-*") for p in parts)
+
+
+def is_scratch_repro_path(rel_lower: str) -> bool:
+    """True when file sits inside a disposable clean-checkout scratch tree."""
+    parts = rel_lower.replace("\\", "/").strip("/").split("/")
+    return any(fnmatch.fnmatch(p, "sai-clean-repro-*") for p in parts)
+
+
+def is_browser_user_data_dir(rel_dir: str, name_lower: str) -> bool:
+    """True when directory is a recognized browser user-data root or storage tree."""
+    if name_lower.endswith(".webview2") or name_lower == "ebwebview":
+        return True
+    parts = [p for p in rel_dir.replace("\\", "/").strip("/").split("/") if p]
+    for p in parts:
+        pl = p.lower()
+        if pl.endswith(".webview2") or pl == "ebwebview":
+            return True
+    for idx, p in enumerate(parts):
+        pl = p.lower()
+        if pl == "default" or pl.startswith("profile ") or (pl.startswith("profile") and pl[7:].isdigit()):
+            if name_lower in _BROWSER_CACHE_DIR_NAMES or name_lower in _BROWSER_STORAGE_DIR_NAMES or name_lower == "network":
+                return True
+            if any(part.lower() in _BROWSER_CACHE_DIR_NAMES or part.lower() in _BROWSER_STORAGE_DIR_NAMES for part in parts[idx + 1:]):
+                return True
+    if name_lower in _BROWSER_CACHE_DIR_NAMES:
+        return True
+    return False
+
+
+def _is_chromium_profile_segment(segment: str) -> bool:
+    """True for a Chromium profile directory name: Default, Profile 1, Profile12."""
+    return (
+        segment == "default"
+        or segment.startswith("profile ")
+        or (segment.startswith("profile") and segment[7:].isdigit())
+    )
+
+def is_browser_user_data_path(rel_lower: str) -> bool:
+    """True when file is browser user-data (cookies, login data, local storage, cache).
+
+    Avoids broad filename-only exclusions: unrelated source files (e.g. `src/Cookies`
+    or `Cookies` at root) remain included, and so does a project file that merely
+    shares a credential database's name, such as a captured `secure preferences`
+    fixture -- a sensitive filename is only browser user-data under a Chromium
+    profile directory.
+    """
+    parts = [p.lower() for p in rel_lower.replace("\\", "/").strip("/").split("/") if p]
+    if not parts:
+        return False
+    name = parts[-1]
+
+    # 1. Any segment matching WebView2 / EBWebView
+    for p in parts:
+        if p.endswith(".webview2") or p == "ebwebview":
+            return True
+
+    # 2. Any segment matching browser cache / telemetry directories
+    for p in parts[:-1]:
+        if p in _BROWSER_CACHE_DIR_NAMES:
+            return True
+
+    # 3. Exact Chromium sensitive credential filenames, but only inside a real
+    # Chromium profile: the bare name alone says nothing about provenance.
+    if name in _BROWSER_SENSITIVE_FILENAMES:
+        if any(_is_chromium_profile_segment(p) for p in parts[:-1]):
+            return True
+
+    # 4. Under profile directory: Default, Profile \d+, etc.
+    for idx, p in enumerate(parts[:-1]):
+        if _is_chromium_profile_segment(p):
+            subparts = parts[idx + 1:]
+            if name in ("cookies", "login data", "web data", "preferences", "transportsecurity", "history", "trust tokens"):
+                return True
+            if any(sp in _BROWSER_STORAGE_DIR_NAMES or sp in _BROWSER_CACHE_DIR_NAMES or sp == "network" for sp in subparts):
+                return True
+
+    return False
+
 
 def exclusion_reason_for(rel_lower: str, name_lower: str) -> str:
     """Classify a matched configured/mandatory exclusion into a reason category."""
@@ -669,6 +789,10 @@ def exclusion_reason_for(rel_lower: str, name_lower: str) -> str:
         "token.txt", "secrets", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"
     ) or name_lower.endswith(".pid"):
         return REASON_SECRET_POLICY
+    if is_browser_user_data_path(rel_lower) or is_browser_user_data_dir(rel_lower, name_lower):
+        return REASON_PRIVACY_POLICY
+    if is_scratch_repro_path(rel_lower) or is_scratch_repro_dir(rel_lower, name_lower):
+        return REASON_GENERATED_OUTPUT
     for pat in DEPENDENCY_PATTERNS:
         if pat in rel_lower:
             return REASON_DEPENDENCY_CACHE
@@ -1455,6 +1579,12 @@ def build_fidelity_plan(
                     if mandatory(rel_dir):
                         prune_dir(rel_dir, REASON_SECRET_POLICY, Path(entry.path))
                         continue
+                    if is_browser_user_data_dir(rel_dir, name.lower()):
+                        prune_dir(rel_dir, REASON_PRIVACY_POLICY, Path(entry.path))
+                        continue
+                    if is_scratch_repro_dir(rel_dir, name.lower()):
+                        prune_dir(rel_dir, REASON_GENERATED_OUTPUT, Path(entry.path))
+                        continue
                     if always_excl(rel_dir):
                         plan.extra_excluded_rel.add(rel_dir)
                         prune_dir(rel_dir, REASON_CONFIGURED_IGNORE, Path(entry.path))
@@ -1516,6 +1646,18 @@ def build_fidelity_plan(
                     plan.excluded_bytes += size
                     reason_stat(REASON_SECRET_POLICY, size)
                     raw.append((rel, size, FileDecision(rel, size, False, REASON_SECRET_POLICY)))
+                    continue
+                if is_browser_user_data_path(rel_lower):
+                    plan.excluded += 1
+                    plan.excluded_bytes += size
+                    reason_stat(REASON_PRIVACY_POLICY, size)
+                    raw.append((rel, size, FileDecision(rel, size, False, REASON_PRIVACY_POLICY)))
+                    continue
+                if is_scratch_repro_path(rel_lower):
+                    plan.excluded += 1
+                    plan.excluded_bytes += size
+                    reason_stat(REASON_GENERATED_OUTPUT, size)
+                    raw.append((rel, size, FileDecision(rel, size, False, REASON_GENERATED_OUTPUT)))
                     continue
                 # 2. user always_exclude wins over the profile.
                 if always_excl(rel_lower):

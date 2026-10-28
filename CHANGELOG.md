@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.07]
+### Widget 0.1.07
 
 ### Fixed
 - **P1-A: Send receipt no longer overwrites canonical archive metadata.** `manualArchiveRecordSent()` removed its `setVerifiedProjectArchive()` call — a Send receipt proves transmission only and now performs zero canonical-store writes. The receipt still updates the SEND tracker timestamp via `recordSendObservation()` (provenance: 'receipt'), then schedules a bounded background `refreshProjectArchiveMetadata()` that can adopt canonical metadata only if the Bridge confirms it. Canonical authority remains exclusively with the Bridge-confirmed archive or the automatic archive runtime.

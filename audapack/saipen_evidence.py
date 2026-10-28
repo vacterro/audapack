@@ -76,7 +76,7 @@ CONTRACT VERSIONS (SUPPORTED_CONTRACT_VERSIONS)
 ----------------------------------------------
 The protocol owns the contract and bumps ``contract_version`` when its SHAPE
 changes. This consumer therefore keeps an explicit supported set and one
-parser per version (``parse_contract_v1`` / ``parse_contract_v2``), rather than
+parser per version (``parse_contract_v1`` / ``parse_contract_v2`` / ``parse_contract_v3``), rather than
 a single parser with a magic constant: a version it does not implement is
 refused -- by the contract's own ``compatibility`` policy -- instead of being
 reinterpreted through the newest shape it happens to know.
@@ -90,23 +90,18 @@ both versions are read by shared code and differ only where the contract
 differs. A document that declares one version is never read through the
 other's rules.
 
-FORWARD COMPATIBILITY (MILESTONE K)
------------------------------------
-A newer-than-implemented contract is no longer hard-failed merely for being
-numerically newer. ``check_capabilities`` probes whether every capability this
-consumer depends on for safe inventory and packaging is structurally present:
-project identity, include/exclude rules, credential protection, inventory root,
-evidence requirements, and integrity semantics. A document that passes is
-admitted as ``COMPATIBLE_DEGRADED`` and read through the newest implemented
-parser (additive unknown metadata is tolerated and preserved, never rewritten).
-Only a newer contract that DROPS or RESHAPES a required capability is refused
-as ``INCOMPATIBLE_UNSAFE``, with the exact missing capability reported.
+NATIVE V3 AND FORWARD REFUSAL
+---------------------------
+V3 implements the producer's structural transient classes, nested-instance
+protection, exact file bans and ordered durable exceptions. Its parser validates
+these semantics before admitting the document. Unknown versions are refused;
+matching known field shapes never overrides the producer's strict refusal policy.
 
 A REFUSED version is a CONSUMER defect, not a project defect: the operator's
 project is fine and ``saipen audit manifest --write`` would only rewrite the
 same newer contract. ``contract_unknown_detail`` is the single wording for
-older-than-implemented refusals; ``check_capabilities_detail`` covers the
-forward-compatibility cases. Callers (the packing gate, the operator message)
+unsupported-version refusals; ``check_capabilities_detail`` adds capability
+diagnostics. Callers (the packing gate, the operator message)
 reuse those rather than inventing repair advice that does not repair anything.
 """
 
@@ -129,13 +124,12 @@ MEMORY_ROOT = ".saipen"
 #: The contract shapes this consumer implements, as an EXPLICIT set. A manifest
 #: declaring a version outside it is refused rather than reinterpreted (its own
 #: `compatibility` block asks for exactly that, and `contract_unknown_detail`
-#: is the one place the refusal is worded) -- UNLESS the forward-compatibility
-#: probe admits it in a degraded but safe state.
+#: is the one place the refusal is worded).
 #:
 #: Ownership stays visible per version: `_CONTRACT_PARSERS` dispatches to
-#: `parse_contract_v1` / `parse_contract_v2`, so learning a new shape can never
+#: `parse_contract_v1` / `parse_contract_v2` / `parse_contract_v3`, so learning a new shape can never
 #: silently re-read an old document through the newest parser.
-SUPPORTED_CONTRACT_VERSIONS = (1, 2)
+SUPPORTED_CONTRACT_VERSIONS = (1, 2, 3)
 
 #: The newest implemented contract. Its own name because callers and tests ask
 #: "what is current?" far more often than "what is the whole set?".
@@ -143,21 +137,9 @@ SUPPORTED_CONTRACT_VERSION = max(SUPPORTED_CONTRACT_VERSIONS)
 
 
 class ManifestAdmission:
-    """Outcome of capability-based contract admission.
+    """Native implementation or refusal. Degraded is retained as legacy vocabulary.
 
-    The forward-compatibility probe classifies a newer-than-implemented contract
-    into exactly one of three mutually exclusive states:
-
-    NATIVE: this consumer implements the contract's shape directly.
-    COMPATIBLE_DEGRADED: the contract is newer than implemented, but every
-        capability AUDAPACK depends on for safe inventory and packaging is
-        structurally present and understood, so the document is read through
-        the newest implemented parser that still applies. Unknown additive
-        metadata is tolerated and preserved rather than rewritten.
-    INCOMPATIBLE_UNSAFE: the newer contract contains semantics this consumer
-        cannot safely reconstruct (exclusion rules it did not author,
-        credential-protection changes, identity shifts, integrity alterations)
-        -- hard-fail.
+    A structurally compatible interpretation never grants contract support.
     """
 
     NATIVE = "NATIVE"
@@ -165,11 +147,8 @@ class ManifestAdmission:
     INCOMPATIBLE_UNSAFE = "INCOMPATIBLE_UNSAFE"
 
 
-#: Capabilities this consumer depends on for safe inventory and packaging.
-#: A newer contract that still declares all of these is admitted in a degraded
-#: state; a newer contract that MISSES one (or moves it to a shape this
-#: consumer cannot interpret) is INCOMPATIBLE_UNSAFE. These are the minimum
-#: that must remain derivable without trusting unknown semantics.
+#: Known capabilities used to diagnose an unsupported document's shape.
+#: They never substitute for implementing its contract version.
 REQUIRED_CAPABILITIES = (
     "project_identity_understood",
     "include_exclude_rules_understood",
@@ -188,10 +167,23 @@ REQUIRED_CAPABILITIES = (
 #: read exactly as it declares itself (see `parse_contract_v1`).
 V2_NON_EXPORTABLE_BASELINE = ("quarantine",)
 
+#: Contract-v3 protections verified against the canonical producer's
+#: tools/saipen_engine/audit_manifest.py (CONTRACT_VERSION = 3). A declaration
+#: may add restrictive names, but cannot drop these version-owned protections.
+V3_NON_EXPORTABLE_BASELINE = ("locks/", "recovery/", "quarantine/", "LOCAL_STATE.json")
+V3_EXPORT_CLASS_BASELINE = {
+    "non_exportable_segments": (
+        ".prepare-staging", ".collect-staging", ".staging", ".in-flight",
+        ".translation-cache", ".cache", "__pycache__", ".saipen",
+    ),
+    "non_exportable_filenames": ("LOCAL_STATE.json", "producer_epoch.json", "crew_epoch.json", ".in-flight"),
+    "non_exportable_suffixes": (".tmp", ".lock", ".partial"),
+    "nested_instance_files": ("STATE.md", "BOARD.md", "LOG.md", "IDENTITY.md"),
+}
+
 #: The export precedence this consumer knows how to apply, in order, exactly as
 #: SAIPEN's generator publishes it in `evidence.precedence` (contract v3,
-#: T-1452). Interpreting this ONE known additive declaration is not a claim of
-#: native v3 support: a v3 document is still admitted COMPATIBLE_DEGRADED.
+#: T-1452). Native v3 requires this exact ordering; unknown orderings refuse.
 EXPORT_PRECEDENCE = (
     "transient_segment_or_filename",
     "nested_instance_state",
@@ -230,10 +222,8 @@ STATUS_PROTOCOL_INCOMPLETE = "PROTOCOL_INCOMPLETE"
 STATUS_MANIFEST_ABSENT = "PROTOCOL_MANIFEST_ABSENT"
 STATUS_MANIFEST_MALFORMED = "PROTOCOL_MANIFEST_MALFORMED"
 STATUS_CONTRACT_UNKNOWN = "PROTOCOL_CONTRACT_UNKNOWN"
-#: The contract is newer than implemented but its required capabilities are
-#: still structurally present and understood; the document is read through the
-#: newest applicable parser with additive unknown fields tolerated. PACK may
-#: proceed in a degraded mode.
+#: Legacy status vocabulary, retained for consumers of historical snapshots.
+#: Current admission never produces this state or grants it snapshot authority.
 STATUS_COMPATIBLE_DEGRADED = "COMPATIBLE_DEGRADED"
 STATUS_NOT_SAIPEN = "NOT_SAIPEN"
 
@@ -247,16 +237,14 @@ def contract_unknown_detail(version: Any = None) -> str:
     version the installed protocol implements, so regenerating a newer
     manifest reproduces the newer manifest rather than downgrading it.
 
-    Note: a newer contract whose required capabilities are still present is
-    NOT unknown -- it is admitted via ``check_capabilities`` in a degraded but
-    safe state. This wording is reserved for genuinely unsafe admissions.
+    Known field shapes are not implementation support for an unknown version.
     """
     implemented = ", ".join(f"v{v}" for v in SUPPORTED_CONTRACT_VERSIONS)
     if isinstance(version, int) and not isinstance(version, bool) and version > SUPPORTED_CONTRACT_VERSION:
         return (
             f"SAIPEN manifest contract v{version} is newer than this AUDAPACK "
-            f"collector (implements {implemented}) and contains semantics this "
-            "consumer cannot safely reconstruct. Update AUDAPACK contract "
+            f"collector (implements {implemented}) and has no implemented "
+            "parser. Update AUDAPACK contract "
             "support; regenerating the manifest will not downgrade it."
         )
     return (
@@ -299,6 +287,8 @@ def _cap_credential_protection(document: dict) -> bool:
     """credential_protection_rules_understood: non_exportable is a list of
     refusable paths (strings), never a shape this consumer cannot interpret."""
     evidence = document.get("evidence", {})
+    if not isinstance(evidence, dict):
+        return False
     ne = evidence.get("non_exportable", [])
     if not isinstance(ne, list):
         return False
@@ -327,6 +317,8 @@ def _cap_evidence_requirements(document: dict) -> bool:
         if not isinstance(required, list) or not all(isinstance(x, str) for x in required):
             return False
     evidence = document.get("evidence", {})
+    if not isinstance(evidence, dict):
+        return False
     mandatory = evidence.get("mandatory")
     if mandatory is not None:
         if not isinstance(mandatory, list):
@@ -363,71 +355,38 @@ _CAPABILITY_PROBES = (
 
 
 def check_capabilities(document: dict) -> tuple[str, list[str]]:
-    """Forward-compatibility probe for a newer-than-implemented contract.
+    """Report implementation support; shape probes are refusal diagnostics only.
 
-    Returns ``(ManifestAdmission.NATIVE, [])`` when the document is within the
-    implemented set, ``(ManifestAdmission.COMPATIBLE_DEGRADED, missing)`` when
-    every required capability is structurally present (so the document CAN be
-    safely read degraded), or ``(ManifestAdmission.INCOMPATIBLE_UNSAFE, missing)``
-    when a required capability is missing or takes a shape this consumer
-    cannot interpret.
-
-    The probe never parses evidence rules -- it only checks that the SHAPE the
-    rules would take is one this consumer already knows how to read. A newer
-    contract that moved ``non_exportable`` from a list of strings to, say,
-    objects would fail ``credential_protection_rules_understood`` and be hard
-    blocked, because exclusion semantics changed.
-
-    Forward-compatibility applies only to NEWER versions: an older-than-
-    implemented version is a different shape this consumer does not natively
-    read, and must NOT be silently reinterpreted through the newest parser.
+    A registered parser owns a version. Unknown versions remain non-admitted
+    even when every known capability is structurally present. In particular,
+    compatibility.unknown_contract_version='refuse' permits no fallback.
     """
+    if not isinstance(document, dict):
+        return ManifestAdmission.INCOMPATIBLE_UNSAFE, ["integrity_semantics_understood"]
     version = document.get("contract_version")
     if not (isinstance(version, int) and not isinstance(version, bool)):
         return ManifestAdmission.INCOMPATIBLE_UNSAFE, ["integrity_semantics_understood"]
-    if version in SUPPORTED_CONTRACT_VERSIONS:
+    if version in SUPPORTED_CONTRACT_VERSIONS and version in _CONTRACT_PARSERS:
         return ManifestAdmission.NATIVE, []
-    if version < SUPPORTED_CONTRACT_VERSION:
-        # Older than implemented: not a forward-compat case. The consumer
-        # does not implement this shape and must not reinterpret it.
-        return ManifestAdmission.INCOMPATIBLE_UNSAFE, list(REQUIRED_CAPABILITIES)
-    missing: list[str] = []
-    admission = ManifestAdmission.COMPATIBLE_DEGRADED
+    missing = ["contract_version_supported"]
     for name, probe in _CAPABILITY_PROBES:
         if not probe(document):
             missing.append(name)
-            admission = ManifestAdmission.INCOMPATIBLE_UNSAFE
-    return admission, missing
+    return ManifestAdmission.INCOMPATIBLE_UNSAFE, missing
 
 
 def check_capabilities_detail(version: int, admission: str, missing: list[str]) -> str:
-    """Operator-facing detail for a forward-compatibility admission."""
+    """Operator-facing support/refusal detail, independent of evidence presence."""
     implemented = ", ".join(f"v{v}" for v in SUPPORTED_CONTRACT_VERSIONS)
     if admission == ManifestAdmission.NATIVE:
         return (
             f"SAIPEN manifest contract v{version} is a supported contract; "
             f"AUDAPACK implements {implemented}."
         )
-    if admission == ManifestAdmission.COMPATIBLE_DEGRADED:
-        return (
-            f"SAIPEN manifest contract v{version} is newer than this AUDAPACK "
-            f"collector (implements {implemented}), but all required inventory "
-            "and security capabilities are structurally present; PACK proceeds "
-            "in compatible-degraded mode. Unknown additive metadata is preserved."
-        )
-    if version < SUPPORTED_CONTRACT_VERSION:
-        return (
-            f"SAIPEN manifest declares contract_version {version}; this AUDAPACK "
-            f"collector implements {implemented} and refuses to reinterpret a "
-            "contract shape it does not implement."
-        )
     return (
-        f"SAIPEN manifest contract v{version} is newer than this AUDAPACK "
-        f"collector (implements {implemented}) and lacks the following "
-        f"required capability/capabilities this collector cannot reconstruct "
-        f"without trusting unknown semantics: {', '.join(missing)}. "
-        "Admission: INCOMPATIBLE_UNSAFE. PACK is blocked to avoid violating "
-        "a security or integrity boundary."
+        f"{contract_unknown_detail(version)} Admission: INCOMPATIBLE_UNSAFE; "
+        f"unsupported capability/capabilities: {', '.join(missing)}. "
+        "PACK is blocked; known field shapes do not grant contract support."
     )
 
 # Evidence tiers. Which tier an artifact belongs to decides what its ABSENCE
@@ -589,6 +548,8 @@ class SaipenContract:
     required: list[str] = field(default_factory=list)
     dirs: list[DirRule] = field(default_factory=list)
     non_exportable: list[str] = field(default_factory=list)
+    #: V3 distinguishes exact file bans from directory-prefix bans.
+    non_exportable_files: tuple[str, ...] = ()
     #: Structural transient classes (`evidence.non_exportable_segments`,
     #: `_filenames`, `_suffixes`) and the nested-instance filenames, matched at
     #: ANY depth below the memory root. Empty when the document declares none
@@ -609,15 +570,22 @@ class SaipenContract:
     #: document declares none). Only a policy this consumer can actually
     #: honour is accepted; anything else is malformed, not ignored.
     compatibility_policy: str = ""
-    #: Forward-compatibility admission verdict. NATIVE when the contract is
-    #: within the implemented set, COMPATIBLE_DEGRADED when newer but all
-    #: required capabilities are structurally present, INCOMPATIBLE_UNSAFE when
-    #: it cannot be safely read. (MILESTONE K.)
-    admission: str = ManifestAdmission.NATIVE
-    #: The capabilities that failed the forward-compat probe, when admitted
-    #: degraded or unsafe. Empty when NATIVE or COMPATIBLE_DEGRADED.
+    #: Unknown versions validate only the envelope, never their semantics.
+    manifest_parse_valid: bool = False
+    #: NATIVE only after a supported parser succeeds; otherwise non-admitted.
+    admission: str = ManifestAdmission.INCOMPATIBLE_UNSAFE
+    #: Unsupported version and shape diagnostics; never admission authority.
     admission_missing: list[str] = field(default_factory=list)
     detail: str = ""
+
+    @property
+    def contract_supported(self) -> bool:
+        """Implementation support is independent of this document's validity."""
+        return (
+            isinstance(self.contract_version, int) and not isinstance(self.contract_version, bool)
+            and self.contract_version in SUPPORTED_CONTRACT_VERSIONS
+            and self.contract_version in _CONTRACT_PARSERS
+        )
 
 
 @dataclass
@@ -646,6 +614,9 @@ class EvidenceCollection:
     cited_missing: list[str] = field(default_factory=list)   # cited, absent
     cited_ignored: list[str] = field(default_factory=list)   # absent, no file shape
     cited_required: list[str] = field(default_factory=list)  # files the archive must hold
+    cited_non_exportable: list[str] = field(default_factory=list)  # cited, banned by contract
+    cited_nested_instance: list[str] = field(default_factory=list)  # cited, nested instance state
+    cited_security_excluded: list[str] = field(default_factory=list)  # cited, security/secret policy
     cited_by: dict = field(default_factory=dict)             # rel -> carrier rels
     carriers_scanned: int = 0
     carrier_bytes_scanned: int = 0
@@ -682,8 +653,7 @@ def _norm_rel(raw: Any) -> Optional[str]:
 def read_contract_from_document(document: dict) -> SaipenContract:
     """Parse a contract from an in-memory document dict (test helper).
 
-    This bypasses disk I/O and is useful for testing forward-compatibility
-    without creating temp directories.
+    Both public reader paths use this dispatch and strict version policy.
     """
     if not isinstance(document, dict):
         return SaipenContract(detected=True, status=STATUS_MANIFEST_MALFORMED, detail="document is not a dict")
@@ -692,7 +662,9 @@ def read_contract_from_document(document: dict) -> SaipenContract:
     version = document.get("contract_version")
     if isinstance(version, bool) or not isinstance(version, int):
         return SaipenContract(detected=True, status=STATUS_MANIFEST_MALFORMED, detail="contract_version not an integer")
-    memory_root = _norm_rel(document.get("memory_root")) or MEMORY_ROOT
+    memory_root = _norm_rel(document.get("memory_root", MEMORY_ROOT))
+    if memory_root is None:
+        return SaipenContract(detected=True, status=STATUS_MANIFEST_MALFORMED, detail="memory_root is not a relative path")
     base = SaipenContract(
         detected=True,
         contract_version=version,
@@ -706,20 +678,16 @@ def read_contract_from_document(document: dict) -> SaipenContract:
         base.status = STATUS_MANIFEST_MALFORMED
         base.detail = error
         return base
-    if version in SUPPORTED_CONTRACT_VERSIONS:
+    if version in SUPPORTED_CONTRACT_VERSIONS and version in _CONTRACT_PARSERS:
         return _CONTRACT_PARSERS[version](base, document, memory_root)
     admission, missing = check_capabilities(document)
     base.admission = admission
     base.admission_missing = missing
-    if admission == ManifestAdmission.COMPATIBLE_DEGRADED:
-        newest = SUPPORTED_CONTRACT_VERSION
-        parsed = _CONTRACT_PARSERS[newest](base, document, memory_root)
-        parsed.admission = admission
-        parsed.admission_missing = missing
-        parsed.detail = check_capabilities_detail(version, admission, missing)
-        return parsed
+    base.manifest_parse_valid = True  # Envelope only; this version is not implemented.
     base.status = STATUS_CONTRACT_UNKNOWN
     base.detail = check_capabilities_detail(version, admission, missing)
+    if base.compatibility_policy == "refuse":
+        base.detail += " Producer policy unknown_contract_version='refuse' forbids degraded fallback."
     return base
 
 
@@ -781,57 +749,8 @@ def read_contract(source_root: Path) -> SaipenContract:
             ),
         )
 
-    version = data.get("contract_version")
-    if isinstance(version, bool) or not isinstance(version, int):
-        return SaipenContract(
-            detected=True,
-            status=STATUS_MANIFEST_MALFORMED,
-            detail="contract_version is missing or not an integer",
-        )
-    memory_root = _norm_rel(data.get("memory_root")) or MEMORY_ROOT
-    base = SaipenContract(
-        detected=True,
-        contract_version=version,
-        protocol_version=str(data.get("protocol_version") or ""),
-        generated_at=str(data.get("generated_at") or ""),
-        generator=str(data.get("generator") or ""),
-        memory_root=memory_root,
-    )
-    # Envelope first, dispatch second: version ownership belongs to an explicit
-    # set, and a version outside it is answered by the contract's own
-    # compatibility policy -- never by the newest parser.
-    error = _parse_compatibility(base, data)
-    if error:
-        base.status = STATUS_MANIFEST_MALFORMED
-        base.detail = error
-        return base
-    if version not in SUPPORTED_CONTRACT_VERSIONS:
-        # FORWARD-COMPATIBILITY PROBE (MILESTONE K). A newer contract that still
-        # carries every capability this consumer depends on is admitted in a
-        # degraded but safe state and read through the newest applicable parser;
-        # additive unknown fields are tolerated and preserved. Only a newer
-        # contract that drops or reshapes a required capability is hard-blocked.
-        admission, missing = check_capabilities(data)
-        base.admission = admission
-        base.admission_missing = missing
-        if admission == ManifestAdmission.COMPATIBLE_DEGRADED:
-            # v3 is read through the v2 parser: the v3 shape is a strict
-            # superset of v2 in every field AUDAPACK depends on. Its additive
-            # export classes (non_exportable_segments/_filenames/_suffixes,
-            # nested_instance_files, precedence) are parsed by the shared
-            # `_parse_export_classes` and applied by `export_decision`; the
-            # admission stays COMPATIBLE_DEGRADED because interpreting that one
-            # known declaration is not native v3 support.
-            newest = SUPPORTED_CONTRACT_VERSION
-            parsed = _CONTRACT_PARSERS[newest](base, data, memory_root)
-            parsed.admission = admission
-            parsed.admission_missing = missing
-            parsed.detail = check_capabilities_detail(version, admission, missing)
-            return parsed
-        base.status = STATUS_CONTRACT_UNKNOWN
-        base.detail = check_capabilities_detail(version, admission, missing)
-        return base
-    return _CONTRACT_PARSERS[version](base, data, memory_root)
+    # One dispatch and policy owner for both filesystem and document paths.
+    return read_contract_from_document(data)
 
 
 def _parse_compatibility(base: SaipenContract, data: dict) -> Optional[str]:
@@ -1007,6 +926,8 @@ def _finish_contract(base: SaipenContract, data: dict, memory_root: str) -> Saip
         base.citations = default_citation_rules()
 
     base.status = STATUS_COMPLETE  # provisional; collect() decides the truth
+    base.manifest_parse_valid = True
+    base.admission = ManifestAdmission.NATIVE
     return base
 
 
@@ -1041,11 +962,93 @@ def parse_contract_v2(base: SaipenContract, data: dict, memory_root: str) -> Sai
     return result
 
 
+def parse_contract_v3(base: SaipenContract, data: dict, memory_root: str) -> SaipenContract:
+    """Native v3: validate producer semantics before collecting any evidence.
+
+    The canonical audit_manifest.py defines structural transient classes,
+    nested-instance protection and EXPORT_PRECEDENCE. Unlike a v2 fallback,
+    v3 requires these declarations and distinguishes file and directory bans.
+    Directory/citation rules remain declarative, bounded and path-safe.
+    """
+    def refuse(detail: str) -> SaipenContract:
+        base.status = STATUS_MANIFEST_MALFORMED
+        base.admission = ManifestAdmission.INCOMPATIBLE_UNSAFE
+        base.manifest_parse_valid = False
+        base.detail = detail
+        return base
+
+    if type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
+        return refuse("manifest v3 schema_version must be 1")
+    if data.get("contract_version") != 3 or base.contract_version != 3:
+        return refuse("manifest v3 parser requires contract_version 3")
+    if data.get("memory_root") != MEMORY_ROOT or memory_root != MEMORY_ROOT:
+        return refuse("manifest v3 memory_root must be .saipen")
+    if data.get("generator") != "saipen-audit-manifest/3":
+        return refuse("manifest v3 generator does not match contract_version 3")
+    if base.compatibility_policy != "refuse":
+        return refuse("manifest v3 requires compatibility.unknown_contract_version='refuse'")
+    evidence = data.get("evidence")
+    if not isinstance(evidence, dict):
+        return refuse("manifest has no evidence object")
+    mandatory = evidence.get("mandatory")
+    if not isinstance(mandatory, list):
+        return refuse("manifest evidence.mandatory is not a list")
+    mandatory_paths = set()
+    for item in mandatory:
+        if not isinstance(item, dict) or item.get("kind") != "file" or _norm_rel(item.get("path")) is None:
+            return refuse("manifest v3 mandatory entry must declare a safe file path")
+        mandatory_paths.add(_norm_rel(item["path"]))
+    core_files = set(V3_EXPORT_CLASS_BASELINE["nested_instance_files"])
+    if not core_files.issubset(mandatory_paths):
+        return refuse("manifest v3 mandatory evidence omits a core protocol document")
+    required = data.get("required")
+    if not isinstance(required, list) or any(_norm_rel(item) is None for item in required):
+        return refuse("manifest v3 required must be a list of safe paths")
+    if not core_files.issubset({_norm_rel(item) for item in required}):
+        return refuse("manifest v3 required omits a core protocol document")
+    for tier in ("conditional", "optional"):
+        rules = evidence.get(tier)
+        if not isinstance(rules, list):
+            return refuse(f"manifest evidence.{tier} is not a list")
+        for item in rules:
+            if (
+                not isinstance(item, dict)
+                or item.get("kind") != "dir"
+                or _norm_rel(item.get("path")) is None
+                or not isinstance(item.get("recursive"), bool)
+                or _positive_int(item.get("max_files"), GLOBAL_FILE_CEILING) is None
+            ):
+                return refuse(f"manifest v3 evidence.{tier} entry is not a safe bounded directory rule")
+    banned = evidence.get("non_exportable")
+    if not isinstance(banned, list) or any(_norm_rel(item) is None for item in banned):
+        return refuse("manifest evidence.non_exportable must be a list of safe paths")
+    declarations = {(_norm_rel(item), item.endswith("/")) for item in banned}
+    if any((_norm_rel(item), item.endswith("/")) not in declarations for item in V3_NON_EXPORTABLE_BASELINE):
+        return refuse("manifest v3 non_exportable omits a producer protection or changes its file/directory kind")
+    for key, baseline in V3_EXPORT_CLASS_BASELINE.items():
+        names = _parse_name_list(evidence, key, suffix=key == "non_exportable_suffixes")
+        if isinstance(names, str):
+            return refuse(names)
+        if not set(baseline).issubset(names):
+            return refuse(f"manifest v3 evidence.{key} omits a producer protection")
+    if evidence.get("precedence") != list(EXPORT_PRECEDENCE):
+        return refuse("manifest v3 evidence.precedence is not the implemented producer ordering")
+    if "references" not in data:
+        return refuse("manifest v3 requires references")
+    result = _finish_contract(base, data, memory_root)
+    if result.status != STATUS_COMPLETE:
+        return refuse(result.detail)
+    result.non_exportable_files = tuple(f"{memory_root}/{_norm_rel(item)}" for item in banned if not item.endswith("/"))
+    result.admission = ManifestAdmission.NATIVE
+    return result
+
+
 #: Version -> parser. The single place an implemented contract version is
 #: bound to the code that reads it.
 _CONTRACT_PARSERS = {
     1: parse_contract_v1,
     2: parse_contract_v2,
+    3: parse_contract_v3,
 }
 
 
@@ -1180,7 +1183,7 @@ def export_decision(rel: str, contract: SaipenContract) -> tuple[bool, str]:
         if contract.durable_precedence and _declared_durable(tail, contract):
             return True, EXPORT_RULE_DURABLE
     for banned in contract.non_exportable:
-        if rel == banned or rel.startswith(banned.rstrip("/") + "/"):
+        if rel == banned or (banned not in contract.non_exportable_files and rel.startswith(banned.rstrip("/") + "/")):
             return False, EXPORT_RULE_PREFIX
     return True, ""
 
@@ -1192,6 +1195,27 @@ def _is_non_exportable(rel: str, contract: SaipenContract) -> bool:
 def is_non_exportable(rel: str, contract: SaipenContract) -> bool:
     """Public alias: is *rel* inside a surface the contract bans from export?"""
     return _is_non_exportable(rel, contract)
+
+
+_SECURITY_MATCHER = None
+
+
+def is_security_path(rel: str) -> bool:
+    """True if *rel* matches secret/security or privacy policy exclusions."""
+    global _SECURITY_MATCHER
+    if _SECURITY_MATCHER is None:
+        from audapack.config import MANDATORY_EXCLUDES
+        from audapack.packing import _build_exclusion_matcher
+
+        _SECURITY_MATCHER = _build_exclusion_matcher(MANDATORY_EXCLUDES)
+    from audapack.fidelity import is_browser_user_data_path
+
+    rel_norm = rel.replace("\\", "/").strip("/").lower()
+    if _SECURITY_MATCHER(rel_norm):
+        return True
+    if is_browser_user_data_path(rel_norm):
+        return True
+    return False
 
 
 _CITATION_SEP = r"[\\/]+"
@@ -1451,16 +1475,13 @@ def collect(source_root: Path, contract: SaipenContract, cancel_event=None) -> E
     descended, so collection cannot leave the project tree.
     """
     result = EvidenceCollection(contract=contract)
-    if not contract.detected or contract.status in (
+    if not contract.detected or not contract.contract_supported or not contract.manifest_parse_valid or contract.admission != ManifestAdmission.NATIVE or contract.status in (
         STATUS_MANIFEST_ABSENT,
         STATUS_MANIFEST_MALFORMED,
         STATUS_CONTRACT_UNKNOWN,
         STATUS_NOT_SAIPEN,
     ):
         return result
-    # STATUS_COMPATIBLE_DEGRADED is treated as collectable: the contract was
-    # read through a degraded path but all evidence rules are structurally
-    # present. The snapshot will report admission=COMPATIBLE_DEGRADED.
 
     def cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -1571,10 +1592,23 @@ def collect(source_root: Path, contract: SaipenContract, cancel_event=None) -> E
         def require(rel: str, carriers: list[str]) -> None:
             if rel not in result.cited_by:
                 result.cited_by[rel] = list(carriers)
+            if is_security_path(rel):
+                if rel not in result.cited_security_excluded:
+                    result.cited_security_excluded.append(rel)
+                return
+            exportable, rule = export_decision(rel, contract)
+            if not exportable:
+                if rule == EXPORT_RULE_NESTED_INSTANCE:
+                    if rel not in result.cited_nested_instance:
+                        result.cited_nested_instance.append(rel)
+                else:
+                    if rel not in result.cited_non_exportable:
+                        result.cited_non_exportable.append(rel)
+                return
             if rel not in result.cited_required:
                 result.cited_required.append(rel)
-            if rel in seen or _is_non_exportable(rel, contract):
-                return  # already collected, or refused and reported by the verdict
+            if rel in seen:
+                return  # already collected
             if not add(rel, TIER_CITED):
                 result.citation_truncated = True
 
@@ -1594,6 +1628,19 @@ def collect(source_root: Path, contract: SaipenContract, cancel_event=None) -> E
                 st = full.lstat()
             except OSError:
                 result.cited_by[rel] = list(carriers)
+                if is_security_path(rel):
+                    if rel not in result.cited_security_excluded:
+                        result.cited_security_excluded.append(rel)
+                    continue
+                exportable, rule = export_decision(rel, contract)
+                if not exportable:
+                    if rule == EXPORT_RULE_NESTED_INSTANCE:
+                        if rel not in result.cited_nested_instance:
+                            result.cited_nested_instance.append(rel)
+                    else:
+                        if rel not in result.cited_non_exportable:
+                            result.cited_non_exportable.append(rel)
+                    continue
                 if _names_absent_file(rel):
                     result.cited_missing.append(rel)
                 else:
@@ -1672,13 +1719,18 @@ def evaluate(
         }
 
     status = contract.status
-    # If the contract was admitted as COMPATIBLE_DEGRADED (newer than
-    # implemented but all capabilities structurally present), the status
-    # becomes STATUS_COMPATIBLE_DEGRADED instead of STATUS_COMPLETE. Missing
-    # evidence still degrades to PROTOCOL_INCOMPLETE. (MILESTONE K)
-    if status == STATUS_COMPLETE and contract.admission == ManifestAdmission.COMPATIBLE_DEGRADED:
-        status = STATUS_COMPATIBLE_DEGRADED
+    contract_supported = contract.contract_supported
+    if status == STATUS_COMPLETE and (not contract_supported or contract.admission != ManifestAdmission.NATIVE):
+        status = STATUS_CONTRACT_UNKNOWN
     final_view = included is not None
+    non_exportable_in_archive = []
+    if final_view and contract_supported and contract.manifest_parse_valid:
+        for rel in sorted(included):
+            if not rel.startswith(contract.memory_root + "/"):
+                continue
+            exportable, rule = export_decision(rel, contract)
+            if not exportable:
+                non_exportable_in_archive.append({"path": rel, "rule": rule})
 
     def _reason(rel: str) -> str:
         if reason_for is None:
@@ -1782,24 +1834,36 @@ def evaluate(
             status = STATUS_PROTOCOL_INCOMPLETE
         elif optional_omitted or collection.truncated_optional:
             status = STATUS_COMPLETE_WITH_OPTIONAL_OMISSIONS
-    elif status == STATUS_COMPATIBLE_DEGRADED:
-        # COMPATIBLE_DEGRADED: treated like COMPLETE for the verdict, but the
-        # admission metadata is preserved. If evidence is missing, degrade to
-        # PROTOCOL_INCOMPLETE.
-        if collection.mandatory_missing or collection.unreadable:
-            status = STATUS_PROTOCOL_INCOMPLETE
-        elif collection.truncated_conditional:
-            status = STATUS_PROTOCOL_INCOMPLETE
-        elif collection.citation_truncated or collection.unreadable_carriers:
-            status = STATUS_PROTOCOL_INCOMPLETE
-        elif required:
-            status = STATUS_PROTOCOL_INCOMPLETE
-        # optional_omitted is allowed in COMPATIBLE_DEGRADED
-
-    authoritative = status in (
-        STATUS_COMPLETE,
-        STATUS_COMPLETE_WITH_OPTIONAL_OMISSIONS,
-        STATUS_COMPATIBLE_DEGRADED,
+    evidence_complete = None
+    if contract_supported and contract.manifest_parse_valid and contract.admission == ManifestAdmission.NATIVE:
+        evidence_complete = not (
+            collection.mandatory_missing or collection.unreadable
+            or collection.truncated_conditional or collection.citation_truncated
+            or collection.unreadable_carriers or required
+        )
+    if non_exportable_in_archive:
+        status = STATUS_PROTOCOL_INCOMPLETE
+    authoritative = (
+        contract_supported
+        and contract.manifest_parse_valid
+        and contract.admission == ManifestAdmission.NATIVE
+        and evidence_complete is True
+        and status in (STATUS_COMPLETE, STATUS_COMPLETE_WITH_OPTIONAL_OMISSIONS)
+    )
+    included_required = (
+        sorted(
+            set(mandatory_included)
+            | {rel for rel in collection.conditional_found if rel in final}
+            | ({MANIFEST_REL} if MANIFEST_REL in final else set())
+            | {rel for rel in collection.cited_required if rel in final}
+        )
+        if final_view
+        else sorted(
+            set(collection.mandatory_found)
+            | set(collection.conditional_found)
+            | {MANIFEST_REL}
+            | set(collection.cited_required)
+        )
     )
     final_set = set(included or ())
     evidence_in_archive = (
@@ -1818,6 +1882,14 @@ def evaluate(
         "cited_missing_on_disk": sorted(collection.cited_missing),
         "cited_ignored": sorted(collection.cited_ignored),
         "cited_required": len(collection.cited_required),
+        "cited_included": (
+            sorted(rel for rel in collection.cited_required if rel in final_set)
+            if final_view
+            else sorted(collection.cited_required)
+        ),
+        "cited_non_exportable": sorted(collection.cited_non_exportable),
+        "cited_nested_instance": sorted(collection.cited_nested_instance),
+        "cited_security_excluded": sorted(collection.cited_security_excluded),
         "cited_in_archive": (
             sum(1 for rel in collection.cited_required if rel in final_set)
             if final_view
@@ -1831,6 +1903,14 @@ def evaluate(
         "detected": True,
         "status": status,
         "authoritative_state": authoritative,
+        "manifest_parse_valid": contract.manifest_parse_valid,
+        "manifest_parse_scope": (
+            "implemented_contract" if contract_supported
+            else "envelope_only" if contract.manifest_parse_valid else "unavailable"
+        ),
+        "contract_supported": contract_supported,
+        "evidence_complete": evidence_complete,
+        "non_exportable_in_archive": non_exportable_in_archive,
         "contract_version": contract.contract_version,
         "protocol_version": contract.protocol_version,
         "manifest_generated_at": contract.generated_at,
@@ -1847,6 +1927,20 @@ def evaluate(
         "compatibility": contract.compatibility_policy,
         "mandatory_included": mandatory_included,
         "mandatory_missing": mandatory_missing,
+        "included_required": included_required,
+        "missing_required": [item["path"] for item in required],
+        "cited_non_exportable": sorted(collection.cited_non_exportable),
+        "cited_nested_instance": sorted(collection.cited_nested_instance),
+        "cited_security_excluded": sorted(collection.cited_security_excluded),
+        "cited_missing_on_disk": sorted(collection.cited_missing),
+        "inventory_failures": {
+            "unreadable": list(collection.unreadable),
+            "unreadable_carriers": list(collection.unreadable_carriers),
+            "truncated_dirs": list(collection.truncated_dirs),
+            "citation_truncated": collection.citation_truncated,
+            "budget_exhausted": collection.budget_exhausted,
+        },
+        "compatibility_failures": list(contract.admission_missing),
         "truncated_dirs": list(collection.truncated_dirs),
         "truncated_required_dirs": list(collection.truncated_conditional),
         "truncated_optional_dirs": list(collection.truncated_optional),
@@ -1872,6 +1966,8 @@ __all__ = [
     "SUPPORTED_CONTRACT_VERSION",
     "SUPPORTED_CONTRACT_VERSIONS",
     "V2_NON_EXPORTABLE_BASELINE",
+    "V3_NON_EXPORTABLE_BASELINE",
+    "V3_EXPORT_CLASS_BASELINE",
     "REQUIRED_CAPABILITIES",
     "contract_unknown_detail",
     "check_capabilities",
@@ -1913,6 +2009,7 @@ __all__ = [
     "read_contract_from_document",
     "parse_contract_v1",
     "parse_contract_v2",
+    "parse_contract_v3",
     "collect",
     "collect_for_inventory",
     "evaluate",
