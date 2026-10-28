@@ -16,6 +16,8 @@ from audapack.config import get_state_dir
 from audapack.limits import parse_time
 from audapack.provider_capabilities import ProviderCapabilities, WindowStartSemantics
 
+MAX_SYNC_MEMBERS: int = 32
+
 
 @dataclass(frozen=True)
 class PreparedSyncMember:
@@ -106,6 +108,8 @@ class SyncStore:
             raise ValueError("SYNC group identity, window, and policy required")
         if len(members) < 2 or len({item.account_id for item in members}) != len(members):
             raise ValueError("SYNC requires at least two distinct accounts")
+        if len(members) > MAX_SYNC_MEMBERS:
+            raise ValueError(f"SYNC exceeds maximum allowed members ({MAX_SYNC_MEMBERS})")
         if any(not all((m.account_id, m.launcher_id, m.provider_id, m.payload_sha256))
                for m in members):
             raise ValueError("SYNC member identity and payload required")
@@ -199,6 +203,13 @@ class SyncStore:
             members = self._members(db, group_id)
             if row is None or row[0] != "READY" or len(members) < 2:
                 db.rollback()
+                return None
+            if len(members) > MAX_SYNC_MEMBERS:
+                db.execute(
+                    "UPDATE sync_groups SET state='RECOVERY_REQUIRED', result=? WHERE sync_group_id=?",
+                    (f"oversized sync group: {len(members)} exceeds maximum allowed ({MAX_SYNC_MEMBERS})", group_id),
+                )
+                db.commit()
                 return None
             db.execute("UPDATE sync_groups SET state='RELEASING',barrier_at=? WHERE sync_group_id=?",
                        (barrier_at.astimezone(timezone.utc).isoformat(), group_id))

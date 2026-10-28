@@ -111,6 +111,7 @@ def probe_archive_freshness(
     cancel_event=None,
     budget_s: Optional[float] = None,
     fallback_dir: Optional[Path] = None,
+    use_hot_proof: bool = True,
 ) -> ArchiveFreshnessResult:
     """Read-only freshness verdict for ``project`` under ``packing_config``.
 
@@ -167,7 +168,7 @@ def probe_archive_freshness(
         )
 
     excludes = set(getattr(packing_config, "excludes", None) or [])
-    fingerprint = policy_fingerprint_from_config(packing_config, excludes)
+    fingerprint = policy_fingerprint_from_config(packing_config, excludes, project=project)
     manifest = read_archive_manifest(existing)
     mismatch = archive_policy_mismatch(existing, source, fingerprint, manifest)
     if mismatch is not None:
@@ -180,6 +181,15 @@ def probe_archive_freshness(
             policy_mismatch=True,
             manifest=manifest,
         )
+
+    arm_token = None
+    if use_hot_proof:
+        try:
+            from audapack import hot_freshness
+
+            arm_token = hot_freshness.begin(source, fingerprint)
+        except Exception:
+            arm_token = None
 
     # The source root's own mtime settles the common case before any walk.
     try:
@@ -215,6 +225,7 @@ def probe_archive_freshness(
             # enumerate the excluded weight the census exists to describe.
             census_pruned=False,
             cancel_event=probe_cancel,
+            archive_scope=getattr(project, "archive_scope", "auto"),
         )
     except OSError as exc:
         return ArchiveFreshnessResult(
@@ -266,6 +277,19 @@ def probe_archive_freshness(
             manifest=manifest,
             plan=plan,
         )
+    if arm_token is not None:
+        try:
+            from audapack import hot_freshness
+
+            hot_freshness.confirm(
+                arm_token,
+                existing,
+                fingerprint,
+                fidelity_profile=str(manifest.get("fidelity_profile", "") if manifest else ""),
+                archive_semantics=str(manifest.get("archive_semantics", "") if manifest else ""),
+            )
+        except Exception:
+            pass
     return ArchiveFreshnessResult(
         state=ArchiveFreshness.FRESH,
         reason="archive current for the active packing policy",

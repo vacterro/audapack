@@ -123,6 +123,16 @@ class _BridgeArchiveFixture(unittest.TestCase):
     def _get_archive(self, project_id: str, token: str | None = None):
         return urllib.request.urlopen(self._get_request(project_id, token))
 
+    def _metadata_request(self, project_id: str, token: str | None = None):
+        return urllib.request.Request(
+            self._url(f"/v1/projects/{project_id}/archive/metadata"),
+            method="GET",
+            headers={"X-ACB-Token": token or self._token()},
+        )
+
+    def _get_metadata(self, project_id: str, token: str | None = None):
+        return urllib.request.urlopen(self._metadata_request(project_id, token))
+
     def _http_error(self, request) -> int:
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(request)
@@ -230,6 +240,28 @@ class TestBridgeProjectArchive(_BridgeArchiveFixture):
 
     def test_download_before_ensure_reports_missing(self):
         self.assertEqual(self._error_code(self._get_request("proja")), "archive_missing")
+
+    # ---------------------------------------------------------------- metadata
+
+    def test_metadata_requires_auth(self):
+        req = urllib.request.Request(self._url("/v1/projects/proja/archive/metadata"), method="GET")
+        self.assertEqual(self._http_error(req), 403)
+
+    def test_metadata_before_archive_reports_missing(self):
+        self.assertEqual(self._error_code(self._metadata_request("proja")), "archive_missing")
+
+    def test_metadata_returns_archive_stat_without_packing(self):
+        with self._post_ensure("proja") as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        archive = self.archive_dir / data["filename"]
+        with self._get_metadata("proja") as resp:
+            self.assertEqual(resp.status, 200)
+            meta = json.loads(resp.read().decode("utf-8"))
+        self.assertTrue(meta["ok"])
+        self.assertEqual(meta["project_id"], "proja")
+        self.assertEqual(meta["filename"], archive.name)
+        self.assertEqual(meta["size"], archive.stat().st_size)
+        self.assertAlmostEqual(meta["mtime"], archive.stat().st_mtime, places=2)
 
     def test_download_ignores_arbitrary_path_query(self):
         with self._post_ensure("proja") as resp:

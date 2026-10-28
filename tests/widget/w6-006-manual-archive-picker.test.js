@@ -1767,3 +1767,469 @@ test('W6-006/P1: the whole manual transaction records bounded evidence and no se
   assert.strictEqual(log.length <= api.constants_MANUAL_ARCHIVE_LOG_MAX, true, 'the evidence log is bounded');
 });
 
+// ---------------------------------------------------------------------------
+// Regression tests: manual ZIP picker showing only enabled projects (SRC-125)
+// ---------------------------------------------------------------------------
+
+test('W6-006: filterEnabledProjects strictly checks enabled === true and rejects truthy values', () => {
+  const { api } = manualSetup();
+  const list = [
+    project({ project_id: 'p1', enabled: true }),
+    project({ project_id: 'p2', enabled: 'true' }),
+    project({ project_id: 'p3', enabled: 1 }),
+    project({ project_id: 'p4', enabled: false }),
+    project({ project_id: 'p5', enabled: null }),
+    project({ project_id: 'p6' })
+  ];
+  delete list[5].enabled;
+  const filtered = api.filterEnabledProjects(list);
+  assert.deepStrictEqual(filtered.map(p => p.project_id), ['p1']);
+});
+
+test('W6-006/SRC-125 1: mixed registry shows only enabled projects and preserves order', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  const projC = project({ project_id: 'c', display_name: 'Gamma', enabled: true });
+  installBridge(h, { projects: [projA, projB, projC] });
+  await runPicker(h, api, {});
+  const items = menuItems(h);
+  assert.deepStrictEqual(items.map(i => i.getAttribute('data-project-id')), ['a', 'c']);
+});
+
+test('W6-006/SRC-125 2: all disabled projects renders no selectable projects and empty-state message', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: false });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  installBridge(h, { projects: [projA, projB] });
+  await runPicker(h, api, {});
+  assert.strictEqual(menuProjects(h).length, 0);
+  assert.strictEqual(menuNoteTexts(h).includes('No enabled AUDAPACK projects.'), true);
+});
+
+test('W6-006/SRC-125 3: cached mixed registry does not show disabled entries on reopen', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  const projC = project({ project_id: 'c', display_name: 'Gamma', enabled: true });
+  installBridge(h, { projects: [projA, projB, projC] });
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a', 'c']);
+
+  api.closeManualArchivePicker();
+  assert.strictEqual(h.dom.querySelector('#acb-manual-zip-menu').hidden, true);
+
+  // Reopen using cache
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a', 'c']);
+});
+
+test('W6-006/SRC-125 4: registry refresh removes project that transitioned to disabled', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: true });
+  installBridge(h, { projects: [projA, projB] });
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a', 'b']);
+
+  // Project B becomes disabled
+  const projBDisabled = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  installBridge(h, { projects: [projA, projBDisabled] });
+
+  h.dom.querySelector('#acb-manual-zip-refresh').click();
+  await drain(h);
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+});
+
+test('W6-006/SRC-125 5: delayed registry response never resurrects disabled projects', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+
+  // Generation 1 is delayed; Generation 2 finishes fast with only A
+  h.httpResponder = registryScript([
+    { projects: [projA, projB], delay: 20000 },
+    { projects: [projA] }
+  ]);
+
+  const pending = api.openManualArchivePicker();
+  await step(h, 50);
+  h.advance(api.constants_MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS + 50);
+  await h.settle();
+  await pending;
+
+  // Re-open/refresh to pick up Generation 2
+  api.openManualArchivePicker({ force: true });
+  await drain(h);
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  // Delayed Generation 1 arrives late: must not overwrite
+  h.advance(25000);
+  await h.settle();
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.strictEqual(api.manualArchiveProjectsCache.projects.some(p => p.project_id === 'b'), false);
+});
+
+test('W6-006/SRC-125 6: previously selected or outdated disabled project cannot be attached', async () => {
+  const { h, api } = manualSetup();
+  attachComposer(h);
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: true });
+  installBridge(h, { projects: [projA, projB] });
+  await runPicker(h, api, {});
+
+  // Project B becomes disabled
+  const projBDisabled = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  installBridge(h, {
+    projects: [projA, projBDisabled],
+    ensureStatus: 400,
+    ensureErrorCode: 'project_disabled'
+  });
+  const refreshPromise = api.manualArchiveRefreshProjects();
+  await drain(h);
+  await refreshPromise;
+
+  // Selecting disabled project is rejected
+  const selectResult = await api.selectManualArchiveProject(projBDisabled);
+  assert.strictEqual(selectResult.ok, false);
+  assert.strictEqual(selectResult.code, 'PROJECT_DISABLED');
+  assert.strictEqual(api.manualArchiveBindingFor(), null);
+
+  // If chat was previously bound to B, backend eligibility rejects ensure
+  api.setManualArchiveBinding(projB);
+  const actionResult = await runManual(h, api);
+  assert.strictEqual(actionResult.ok, false);
+  assert.strictEqual(actionResult.errorCode, 'project_disabled');
+  assert.strictEqual(manualControl(h).dataset.stale, 'true');
+});
+
+test('W6-006/SRC-125 7: enabled projects normal selection, ensure, attach and Send remain operational', async () => {
+  const { h, api } = manualSetup();
+  const { input, send, sendRecorder } = attachComposer(h);
+  input.textContent = USER_TEXT;
+  const projA = project({ project_id: 'audapack', display_name: 'AUDAPACK', enabled: true });
+  installBridge(h, { projects: [projA] });
+  manualControl(h).click();
+  await h.settle();
+  menuItems(h)[0].click();
+  await drain(h);
+  assert.strictEqual(api.manualArchiveBindingFor().project_id, 'audapack');
+  assert.strictEqual(ensureRequests(h).length, 1);
+  assert.strictEqual(archiveGets(h).length, 1);
+  assert.strictEqual(send._clicked, true);
+  assert.deepStrictEqual(sendRecorder[0].tiles, [NEW_ARCHIVE]);
+  assert.strictEqual(manualControl(h).textContent, 'AUDAPACK · SENT \u2713');
+});
+
+test('W6-006/SRC-125 8: registry offline preserves fallback/error and never exposes disabled entries', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+  installBridge(h, { projects: [projA, projB] });
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  // Bridge goes offline and refresh is clicked
+  installBridge(h, { offline: true });
+  h.dom.querySelector('#acb-manual-zip-refresh').click();
+  await drain(h);
+
+  assert.strictEqual(menuNoteTexts(h).some(t => t.includes('Bridge offline') || t.includes('unavailable')), true);
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests: manual ZIP picker cache ownership and hard TTL (T-292)
+// ---------------------------------------------------------------------------
+
+test('W6-006: stale success must not resurrect a project disabled in newest response', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: true });
+  const projBDisabled = project({ project_id: 'b', display_name: 'Beta', enabled: false });
+
+  // Generation 1 is delayed (has both A and B enabled)
+  // Generation 2 finishes fast (has only A enabled, B disabled)
+  h.httpResponder = registryScript([
+    { projects: [projA, projB], delay: 20000 },
+    { projects: [projA, projBDisabled] }
+  ]);
+
+  const pending = api.openManualArchivePicker();
+  await step(h, 50);
+  h.advance(api.constants_MANUAL_ARCHIVE_REGISTRY_DEADLINE_MS + 50);
+  await h.settle();
+  await pending;
+
+  // Re-open / refresh with force to run Generation 2
+  api.openManualArchivePicker({ force: true });
+  await drain(h);
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.deepStrictEqual(api.manualArchiveProjectsCache.projects.map(p => p.project_id), ['a']);
+
+  // Delayed Generation 1 arrives late: must not overwrite cache with old A and B!
+  h.advance(25000);
+  await h.settle();
+
+  assert.deepStrictEqual(api.manualArchiveProjectsCache.projects.map(p => p.project_id), ['a']);
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+});
+
+test('W6-006: expired beyond HARD TTL list must not remain selectable when registry offline', async () => {
+  const { h, api } = manualSetup();
+  const projExpired = project({ project_id: 'expired', display_name: 'Expired Project', enabled: true });
+  installBridge(h, { projects: [projExpired] });
+
+  // 1. Initial fetch & cache
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['expired']);
+
+  // 2. Close picker
+  api.closeManualArchivePicker();
+  assert.strictEqual(h.dom.querySelector('#acb-manual-zip-menu').hidden, true);
+
+  // 3. Advance cache timestamp beyond HARD_TTL
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS + 1000);
+  h.advance(1000);
+
+  // 4. Registry goes offline
+  installBridge(h, { offline: true });
+
+  // 5. Reopen picker
+  await runPicker(h, api, {});
+
+  // Hard-expired entries must NOT be selectable
+  assert.deepStrictEqual(menuProjects(h), []);
+  assert.strictEqual(menuNoteTexts(h).some(t => t.includes('Bridge offline') || t.includes('unavailable')), true);
+});
+
+test('W6-006: selectManualArchiveProject rejects candidate when cache is beyond HARD TTL', async () => {
+  const { h, api } = manualSetup();
+  const projExpired = project({ project_id: 'expired', display_name: 'Expired Project', enabled: true });
+  installBridge(h, { projects: [projExpired] });
+
+  // 1. Initial fetch & cache
+  await runPicker(h, api, {});
+  assert.strictEqual(api.manualArchiveProjectIsEnabled(projExpired), true);
+
+  // 2. Advance past HARD_TTL
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS + 1000);
+
+  // Eligibility must fail
+  assert.strictEqual(api.manualArchiveProjectIsEnabled(projExpired), false);
+  const result = await api.selectManualArchiveProject(projExpired);
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.code, 'PROJECT_DISABLED');
+});
+
+test('W6-006: open picker with hard-expired cache removes entries on rejected selection and refresh', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  // 1. Initial open & cache
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  // 2. Picker stays open; cache crosses HARD_TTL
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS + 1000);
+
+  // 3. Selection rejected after hard expiration
+  const result = await api.selectManualArchiveProject(projA);
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.code, 'PROJECT_DISABLED');
+
+  // 4. Re-render removes expired entries
+  assert.deepStrictEqual(menuProjects(h), []);
+  assert.strictEqual(menuNoteTexts(h).some(t => t.includes('expired') || t.includes('Refresh')), true);
+
+  // 5. Explicit Refresh restores entries from fresh registry
+  const refreshPromise = api.manualArchiveRefreshProjects();
+  await drain(h);
+  await refreshPromise;
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  // 6. Offline refresh does not restore expired entries
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS + 1000);
+  installBridge(h, { offline: true });
+  const offlineRefreshPromise = api.manualArchiveRefreshProjects();
+  await drain(h);
+  await offlineRefreshPromise;
+  assert.deepStrictEqual(menuProjects(h), []);
+
+  // 7. Close and reopen does not reuse hard-expired entries
+  api.closeManualArchivePicker();
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), []);
+});
+
+test('W6-006: open picker automatically invalidates visible projects when hard TTL expires without user action', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  // 1. Open picker with fresh projects
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 2. Adjust fetchedAt to 3000ms before HARD_TTL expiry
+  const remainingMs = 3000;
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS - remainingMs);
+  api.syncManualArchiveMenuExpiryTimer();
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 3. Advance time by remainingMs + 500ms
+  h.advance(remainingMs + 500);
+  await h.settle();
+
+  // 4. Without any selection or click, timer invalidated rows
+  assert.deepStrictEqual(menuProjects(h), [], 'expired rows must disappear automatically');
+  assert.strictEqual(menuNoteTexts(h).includes('Registry cache expired. Click Refresh.'), true);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, false);
+});
+
+test('W6-006: open-menu expiry timer lifecycle: cleared on close, replaced on fresh snapshot, no idle leaks', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  // 1. Initial idle state: closed picker must have NO expiry timer
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, false);
+
+  // 2. Open picker: timer is armed
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 3. Close picker: timer must be immediately cancelled
+  api.closeManualArchivePicker();
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, false);
+
+  // 4. Repeated open and close: no timer accumulation
+  for (let i = 0; i < 5; i++) {
+    api.openManualArchivePicker();
+    assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+    api.closeManualArchivePicker();
+    assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, false);
+  }
+
+  // 5. Open and refresh: fresh snapshot replaces timer cleanly
+  await runPicker(h, api, {});
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+  const refreshPromise = api.manualArchiveRefreshProjects();
+  await drain(h);
+  await refreshPromise;
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 6. Close again: perfectly idle
+  api.closeManualArchivePicker();
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, false);
+});
+
+test('W6-006: cache expires during pending Refresh: displayed rows disappear before replacement arrives', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  // 1. Open picker with enabled project A
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 2. Adjust cache age to HARD_TTL minus 3000 ms
+  const remainingMs = 3000;
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS - remainingMs);
+  api.manualArchiveMenuState.fetchedAt = api.manualArchiveProjectsCache.fetchedAt;
+
+  // 3. Re-arm the expiration timer
+  api.syncManualArchiveMenuExpiryTimer();
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+
+  // 4. Start explicit Refresh against a delayed registry response (delay 5000ms < 6000ms deadline)
+  installBridge(h, { projects: [projA], projectsDelay: 5000 });
+  const refreshPromise = api.manualArchiveRefreshProjects();
+
+  // 5. Advance fake clock 3500 ms (past 3000ms hard TTL, before 5000ms response)
+  h.advance(3500);
+
+  // 6. Assert project A has disappeared before replacement arrives
+  assert.deepStrictEqual(menuProjects(h), [], 'expired rows must disappear before replacement response arrives');
+
+  // Let replacement finish within deadline
+  h.advance(2000);
+  await drain(h);
+  await refreshPromise;
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+});
+
+test('W6-006: cache expires during offline Refresh: expired rows disappear and do not revive', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  const remainingMs = 3000;
+  api.manualArchiveProjectsCache.fetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS - remainingMs);
+  api.manualArchiveMenuState.fetchedAt = api.manualArchiveProjectsCache.fetchedAt;
+  api.syncManualArchiveMenuExpiryTimer();
+
+  // Offline refresh starts
+  installBridge(h, { offline: true, projectsDelay: 10000 });
+  const refreshPromise = api.manualArchiveRefreshProjects();
+
+  h.advance(3500);
+
+  // Expired rows must disappear
+  assert.deepStrictEqual(menuProjects(h), []);
+
+  h.advance(10000);
+  await drain(h);
+  await refreshPromise;
+  assert.deepStrictEqual(menuProjects(h), []);
+});
+
+test('W6-006: old timer cannot erase newer data delivered before expiration', async () => {
+  const { h, api } = manualSetup();
+  const projA = project({ project_id: 'a', display_name: 'Alpha', enabled: true });
+  const projB = project({ project_id: 'b', display_name: 'Beta', enabled: true });
+  installBridge(h, { projects: [projA] });
+
+  // 1. Open picker with project A
+  await runPicker(h, api, {});
+  assert.deepStrictEqual(menuProjects(h), ['a']);
+
+  // 2. Set fetchedAt to 3000ms before hard TTL and arm timer
+  const remainingMs = 3000;
+  const oldFetchedAt = Date.now() - (api.constants_MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS - remainingMs);
+  api.manualArchiveProjectsCache.fetchedAt = oldFetchedAt;
+  api.manualArchiveMenuState.fetchedAt = oldFetchedAt;
+  api.syncManualArchiveMenuExpiryTimer();
+
+  // 3. Fast fresh response arrives before timer expires (delivers project B)
+  installBridge(h, { projects: [projB], projectsDelay: 500 });
+  const refreshPromise = api.manualArchiveRefreshProjects();
+  h.advance(600);
+  await drain(h);
+  await refreshPromise;
+  assert.deepStrictEqual(menuProjects(h), ['b']);
+
+  // 4. Time advances past the original 3000ms mark
+  h.advance(3000);
+  await h.settle();
+
+  // Newer data must NOT be erased by the older timer
+  assert.deepStrictEqual(menuProjects(h), ['b']);
+  assert.strictEqual(api.manualArchiveMenuExpiryTimerActive, true);
+});
+
+
+
+
+
+
+
+

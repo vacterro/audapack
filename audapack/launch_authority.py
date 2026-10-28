@@ -63,7 +63,12 @@ def create_agent_process(argv: Sequence[str], target: LaunchTarget, *,
 def register_agent_process(monitor: InstanceMonitor, process: Any,
                            target: LaunchTarget, *, correlation_token: str = "",
                            saipen_binding: dict[str, str] | None = None) -> bool:
+    pid = (
+        process
+        if isinstance(process, int) and not isinstance(process, bool)
+        else getattr(process, "pid", 0)
+    )
     return monitor.track_launch(
-        getattr(process, "pid", 0), target.launcher.id, target.project,
+        pid, target.launcher.id, target.project,
         correlation_token=correlation_token, saipen_binding=saipen_binding,
     )

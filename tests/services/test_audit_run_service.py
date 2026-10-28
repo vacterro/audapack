@@ -2000,15 +2000,16 @@ class TestTerminalSourceIntentsCompactToTombstones:
             intent = store.find_for_source(f"exec-{index}")
             store.update(intent["intent_id"], status="FAILED",
                          error="a diagnostic string " * 20, completed_at=1.0 + index)
-        assert len(store.list()) == 40, "a source key was dropped"
-
-        compacted = store._trim_intents(store.list())
-        assert len(compacted) == 40, "compaction lost an idempotency record"
-        assert sum(1 for item in compacted if item.get("compacted")) >= 34
-        for item in compacted:
-            if item.get("compacted"):
-                assert item["error"] == ""
-                assert item["source_execution_id"]
+        # PERF-002 (audit/13.md): the hot journal is bounded to recent history;
+        # older settled source records move to durable indexed tombstones.
+        assert len(store.list()) <= 6 * 4
+        # Every source key remains durably recorded and resolvable.
+        for index in range(40):
+            record = store.find_for_source(f"exec-{index}")
+            assert record is not None, f"source record exec-{index} was lost"
+            assert record["source_execution_id"] == f"exec-{index}"
+            if record.get("compacted"):
+                assert record["error"] == ""
 
     def test_a_replay_of_a_compacted_source_is_still_rejected_truthfully(self, tmp_path):
         store = self._source_intents(tmp_path, 12)

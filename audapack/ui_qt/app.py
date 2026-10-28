@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _force_show_native(hwnd: int) -> bool:
@@ -187,6 +190,47 @@ def _apply_native_window_icon(hwnd: int) -> bool:
         return sent
     except Exception:
         return False
+
+
+def _sync_launcher_inventory(service) -> None:
+    """Reconcile the effective launcher inventory onto the canonical registry.
+
+    ONE owner per process, and it lives here rather than in a widget: no surface
+    may spawn its own ``sai-accounts list``, and the Qt thread must not run a
+    child-process read per paint. On a machine with no control plane this
+    returns immediately without touching the config, so a standalone install is
+    bit-for-bit what it always was.
+    """
+    from audapack.config import scoped_config_write
+    from audapack.launch_federation import PROVIDERS, acquire_listing, reconcile_listing, sai_accounts
+
+    if not sai_accounts.engine_path():
+        return
+
+    try:
+        listing = acquire_listing(PROVIDERS)
+        result = reconcile_listing(service.config, listing)
+    except Exception as exc:               # never let discovery block startup
+        logger.warning("launcher federation unavailable: %s", exc)
+        return
+    if not result.fresh:
+        logger.info("launcher federation: %s", result.state)
+        return
+    logger.info(
+        "launcher federation: generation %d, +%d -%d, %d migrated",
+        result.generation, len(result.added), len(result.removed), len(result.migrated),
+    )
+
+    def _persist(latest):
+        # Reconciling the freshly loaded object onto the already-acquired listing
+        # keeps the write truthful without performing a second read of the control plane.
+        reconcile_listing(latest, listing)
+        service.config.launchers = latest.launchers
+        service.config.federation = latest.federation
+
+    if result.added or result.removed or result.migrated or result.generation:
+        if not scoped_config_write(_persist):
+            logger.warning("could not persist the launcher federation projection")
 
 
 def run_qt_gui(service=None) -> int:

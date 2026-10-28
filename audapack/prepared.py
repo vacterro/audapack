@@ -15,7 +15,7 @@ from typing import Callable
 
 from audapack.config import get_state_dir
 from audapack.limits import Availability, LimitSnapshot, parse_time, utc_now
-from audapack.prepared_sync import PreparedSyncMember
+from audapack.prepared_sync import MAX_SYNC_MEMBERS, PreparedSyncMember
 
 
 class Trigger(str, Enum):
@@ -51,6 +51,11 @@ class JobState(str, Enum):
     MISSED = "MISSED"
     CANCELLED = "CANCELLED"
     DISABLED = "DISABLED"
+    #: The job is intact and its history is kept, but it cannot run: its account
+    #: binding no longer resolves to ONE canonical account. It waits for the
+    #: operator, because launching a different account instead is worse than not
+    #: launching at all.
+    BLOCKED = "BLOCKED"
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,13 @@ def reconcile_reset(job: PreparedJob, snapshot: LimitSnapshot | None, now: datet
 #: their diagnostic payload may be compacted. FAILED_RETRYABLE and
 #: RECOVERY_REQUIRED are deliberately absent.
 PREPARED_TERMINAL_STATES = ("DONE", "FAILED_TERMINAL", "MISSED", "CANCELLED")
+
+#: The same answer as job states, plus DISABLED. A job in one of these is
+#: history: the federation migration never re-points or re-labels it, because
+#: rewriting what a finished job says it did is rewriting evidence.
+TERMINAL_STATES = frozenset(JobState[name] for name in PREPARED_TERMINAL_STATES) | {
+    JobState.DISABLED,
+}
 
 #: Terminal executions kept in full PER JOB for diagnostics; older ones become
 #: identity tombstones.
@@ -346,6 +358,8 @@ class PreparedStore:
             raise ValueError("prepared_id required")
         if len(members) < 2:
             raise ValueError("SYNC requires at least two distinct accounts")
+        if len(members) > MAX_SYNC_MEMBERS:
+            raise ValueError(f"SYNC exceeds maximum allowed members ({MAX_SYNC_MEMBERS})")
         account_ids = [m.account_id for m in members]
         if len(account_ids) != len(set(account_ids)):
             raise ValueError("SYNC requires distinct accounts")

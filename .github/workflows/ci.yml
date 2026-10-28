@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [18, 20, 22, 24]
 
     steps:
       - uses: actions/checkout@v4
@@ -56,4 +56,4 @@ jobs:
 
       - name: Run Node test runner
         run: |
-          node --test tests/widget/*.test.js
+          for f in tests/widget/*.test.js; do node --test "$f" || exit 1; done

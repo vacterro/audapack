@@ -192,6 +192,32 @@ def qapp():
 
 
 @pytest.fixture
+def qtbot(qapp):
+    """Minimal qtbot fixture for widget tests when pytest-qt is absent."""
+    class _QtBot:
+        def addWidget(self, widget):
+            pass
+
+        def waitUntil(self, callback, timeout=5000):
+            import time
+
+            from PySide6.QtWidgets import QApplication
+            deadline = time.time() + (timeout / 1000.0)
+            while time.time() < deadline:
+                QApplication.processEvents()
+                try:
+                    if callback():
+                        return
+                except Exception:
+                    pass
+                time.sleep(0.01)
+            if not callback():
+                raise TimeoutError("waitUntil timed out")
+
+    return _QtBot()
+
+
+@pytest.fixture
 def bridge_server():
     """In-memory Bridge HTTP server for integration tests.
 

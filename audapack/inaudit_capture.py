@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
@@ -41,6 +42,48 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 _LOCAL_LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
+
+
+class CapturePresentationBucket(str, Enum):
+    """Which INAUDIT view a durable capture belongs in (T-276).
+
+    Presentation only.  Nothing here mutates a record: the same stored status
+    can be shown in one view and, after an operator action, the other.
+    """
+
+    INBOX = "INBOX"
+    HISTORY = "HISTORY"
+
+
+#: Statuses whose work is finished or handed off, so they are History, not a
+#: pending decision.  Every other status -- including NEW, SUGGESTED, RECOVERY
+#: and one this build has never heard of -- stays actionable in the Inbox:
+#: hiding real work is the failure mode that matters, so the default fails safe.
+CAPTURE_HISTORY_STATUSES = frozenset({"ASSIGNED", "DUPLICATE", "ARCHIVED"})
+
+
+def classify_capture_view(record: Any) -> CapturePresentationBucket:
+    """The ONE presentation classification every counter, row and button reads.
+
+    Fails safe toward the Inbox: an unknown, empty, missing or malformed status
+    is treated as actionable rather than silently filed away as history.
+    """
+    status = ""
+    if isinstance(record, dict):
+        status = record.get("status") or ""
+    if isinstance(status, str) and status.strip().upper() in CAPTURE_HISTORY_STATUSES:
+        return CapturePresentationBucket.HISTORY
+    return CapturePresentationBucket.INBOX
+
+
+def is_inbox_actionable(record: Any) -> bool:
+    """True when the record still needs an operator decision (T-276)."""
+    return classify_capture_view(record) is CapturePresentationBucket.INBOX
+
+
+#: The public name T-276's contract uses; ``classify_capture_view`` is the
+#: behaviour, this alias keeps both spellings pointing at one implementation.
+capture_presentation_bucket = classify_capture_view
 
 
 class InauditCaptureError(RuntimeError):

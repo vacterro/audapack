@@ -35,6 +35,16 @@ class AuditTemperature(str, Enum):
     NONE = "NONE"      # No audit found
 
 
+ARCHIVE_SCOPE_AUTO = "auto"
+ARCHIVE_SCOPE_COMPLETE_SOURCE = "complete_source"
+VALID_ARCHIVE_SCOPES = frozenset({ARCHIVE_SCOPE_AUTO, ARCHIVE_SCOPE_COMPLETE_SOURCE})
+
+
+def normalize_archive_scope(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return ARCHIVE_SCOPE_COMPLETE_SOURCE if raw == ARCHIVE_SCOPE_COMPLETE_SOURCE else ARCHIVE_SCOPE_AUTO
+
+
 @dataclass
 class Project:
     id: str
@@ -55,6 +65,10 @@ class Project:
     ignore_archive: bool = False
     audit_copy_count: int = 0
     inaudit_aliases: list[str] = field(default_factory=list)
+    archive_scope: str = ARCHIVE_SCOPE_AUTO
+
+    def __post_init__(self) -> None:
+        self.archive_scope = normalize_archive_scope(self.archive_scope)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +90,7 @@ class Project:
             "ignore_archive": self.ignore_archive,
             "audit_copy_count": self.audit_copy_count,
             "inaudit_aliases": list(self.inaudit_aliases),
+            "archive_scope": self.archive_scope,
         }
 
     @classmethod
@@ -102,6 +117,7 @@ class Project:
             ignore_archive=bool(data.get("ignore_archive", False)),
             audit_copy_count=int(data.get("audit_copy_count", 0) or 0),
             inaudit_aliases=[str(value).strip() for value in raw_inaudit_aliases if str(value).strip()],
+            archive_scope=normalize_archive_scope(data.get("archive_scope")),
         )
 
 
@@ -206,3 +222,19 @@ class PackResult:
     #: ensure endpoint reports it so the dominant phase is provable rather than
     #: guessed. Never tokens, never archive bytes, never source content.
     timings: dict = field(default_factory=dict)
+    #: T-274: post-pack source truth, so the pack surface can report what the
+    #: archive actually carries instead of a green "packed" that says nothing
+    #: about whether the project's own source is in it. `source_review_ready`
+    #: is False only when a pack somehow committed without its source (the
+    #: writer fails closed first, so a False here is a defect, not a policy).
+    source_review_ready: bool = True
+    #: Nested same-product components (direct-child Git worktrees) that were
+    #: included in this archive, and their combined source file count.
+    nested_components_included: int = 0
+    nested_component_files: int = 0
+    #: Source-first byte split: first-party source that is never trimmed, the
+    #: disposable remainder, and the archive bytes above which the operator is
+    #: warned (see packing.ARCHIVE_WARNING_BYTES).
+    mandatory_bytes: int = 0
+    discretionary_bytes: int = 0
+    archive_warning_bytes: int = 0

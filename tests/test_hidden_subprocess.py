@@ -141,6 +141,102 @@ class TestGitInventorySpawnIsHidden(unittest.TestCase):
             for call in run_mock.call_args_list:
                 self.assert_hidden(call)
 
+@unittest.skipUnless(WIN32, "console-flash flags are Windows-only")
+class TestRuntimeIdentitySpawnIsHidden(unittest.TestCase):
+    """Runtime identity Git calls must use the canonical hidden-spawn boundary.
+
+    audapack.runtime_identity.source_revision() runs `git rev-parse HEAD` and
+    `git status --porcelain` during producer_identity() computation on every
+    pack. In windowless execution (pythonw), bare subprocess.run flashes black
+    console windows. All git spawns must route through procutil.run_hidden and
+    carry CREATE_NO_WINDOW and SW_HIDE.
+    """
+
+    def assert_hidden(self, call) -> None:
+        self.assertIn("startupinfo", call.kwargs, f"Call missing startupinfo: {call}")
+        si = call.kwargs["startupinfo"]
+        self.assertEqual(si.dwFlags, subprocess.STARTF_USESHOWWINDOW)
+        self.assertEqual(si.wShowWindow, subprocess.SW_HIDE)
+        self.assertTrue(
+            call.kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW,
+            f"Call missing CREATE_NO_WINDOW: {call}",
+        )
+
+    def test_source_revision_spawns_git_hidden(self):
+        from audapack import runtime_identity
+
+        responses = [
+            subprocess.CompletedProcess(args=["git", "rev-parse", "HEAD"], returncode=0, stdout="deadbeef\n", stderr=""),
+            subprocess.CompletedProcess(args=["git", "status", "--porcelain"], returncode=0, stdout="", stderr=""),
+        ]
+        with patch("subprocess.run", side_effect=responses) as run_mock:
+            rev = runtime_identity.source_revision()
+            self.assertEqual(rev["kind"], "git")
+            self.assertEqual(rev["head"], "deadbeef")
+            self.assertFalse(rev["dirty"])
+            self.assertEqual(run_mock.call_count, 2)
+            for call in run_mock.call_args_list:
+                self.assert_hidden(call)
+
+    def test_producer_identity_spawns_git_hidden(self):
+        from audapack import runtime_identity
+
+        responses = [
+            subprocess.CompletedProcess(args=["git", "rev-parse", "HEAD"], returncode=0, stdout="c0ffee\n", stderr=""),
+            subprocess.CompletedProcess(args=["git", "status", "--porcelain"], returncode=0, stdout=" M file.py\n", stderr=""),
+        ]
+        with patch("subprocess.run", side_effect=responses) as run_mock:
+            ident = runtime_identity.producer_identity()
+            self.assertEqual(ident["source_revision"]["kind"], "git")
+            self.assertEqual(ident["source_revision"]["head"], "c0ffee")
+            self.assertTrue(ident["source_revision"]["dirty"])
+            self.assertEqual(run_mock.call_count, 2)
+            for call in run_mock.call_args_list:
+                self.assert_hidden(call)
+
+    def test_source_revision_non_zero_exit_hidden_fallback(self):
+        from audapack import runtime_identity
+
+        responses = [
+            subprocess.CompletedProcess(args=["git", "rev-parse", "HEAD"], returncode=128, stdout="", stderr="fatal: not a git repo"),
+        ]
+        with patch("subprocess.run", side_effect=responses) as run_mock:
+            rev = runtime_identity.source_revision()
+            self.assertEqual(rev["kind"], "fingerprint")
+            self.assertEqual(run_mock.call_count, 1)
+            self.assert_hidden(run_mock.call_args_list[0])
+
+    def test_source_revision_timeout_hidden_fallback(self):
+        from audapack import runtime_identity
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=10)) as run_mock:
+            rev = runtime_identity.source_revision()
+            self.assertEqual(rev["kind"], "fingerprint")
+            self.assertEqual(run_mock.call_count, 1)
+            self.assert_hidden(run_mock.call_args_list[0])
+
+    def test_source_revision_missing_git_fallback(self):
+        from audapack import runtime_identity
+
+        with patch("subprocess.run", side_effect=FileNotFoundError("git not found")) as run_mock:
+            rev = runtime_identity.source_revision()
+            self.assertEqual(rev["kind"], "fingerprint")
+            self.assertEqual(run_mock.call_count, 1)
+            self.assert_hidden(run_mock.call_args_list[0])
+
+    def test_source_revision_real_non_git_dir(self):
+        import tempfile
+
+        from audapack import runtime_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "audapack"
+            pkg.mkdir()
+            with patch.object(runtime_identity, "_package_root", return_value=pkg):
+                rev = runtime_identity.source_revision()
+                self.assertEqual(rev["kind"], "fingerprint")
+                self.assertTrue(rev.get("packing_implementation_sha256"))
+
 
 class TestHiddenSpawnKwargs(unittest.TestCase):
     def test_flags_or_with_caller_creationflags(self):

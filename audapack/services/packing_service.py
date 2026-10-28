@@ -6,12 +6,17 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from audapack import hot_freshness
+from audapack import hot_freshness, runtime_identity
 from audapack.config import AppConfig, app_dir, load_config
-from audapack.fidelity import policy_fingerprint_from_config
+from audapack.fidelity import policy_fingerprint_for_project
 from audapack.freshness import probe_archive_freshness
 from audapack.models import PackResult
-from audapack.packing import find_archive_for_project, pack_single, resolve_output_dir
+from audapack.packing import (
+    PACK_STATUS_FAILED_STALE_RUNTIME,
+    find_archive_for_project,
+    pack_single,
+    resolve_output_dir,
+)
 from audapack.projects import ProjectRegistry
 from audapack.saipen import get_saipen_info
 
@@ -22,10 +27,43 @@ class PackingService:
         self.config = config or load_config(base_dir)
         self.registry = ProjectRegistry(self.config, base_dir=base_dir, transactional=True)
 
-    def _policy_fingerprint(self) -> str:
+    def _policy_fingerprint(self, proj=None) -> str:
         """The ONE fingerprint a hot proof is keyed by, for pack and ensure alike."""
-        return policy_fingerprint_from_config(
-            self.config.packing, set(self.config.packing.excludes or [])
+        return policy_fingerprint_for_project(
+            self.config.packing,
+            set(self.config.packing.excludes or []),
+            project=proj,
+        )
+
+    def _stale_runtime_refusal(self, project_id: str, source_path: str, proj=None) -> Optional[PackResult]:
+        """T-274: refuse through a superseded process instead of serving old packing code.
+
+        `pack_single` refuses the pack itself, which covers every caller that
+        packs. This one catches the caller that never reaches it: a hot reuse
+        proof lets `ensure_fresh_archive` answer WITHOUT packing, so a resident
+        process whose packing code no longer matches the checkout could hand
+        back an archive its own superseded walk judged fresh. Both facades ask
+        the same question, and the answer is a named diagnostic, never a
+        delegation this process is not entitled to make.
+        """
+        stale_digest = runtime_identity.stale_packing_subsystem()
+        if stale_digest is None:
+            return None
+        name = getattr(proj, "display_name", None) or project_id
+        return PackResult(
+            project_id=project_id,
+            name=name,
+            source_path=source_path,
+            success=False,
+            status=PACK_STATUS_FAILED_STALE_RUNTIME,
+            error_code=runtime_identity.CODE_STALE_PACKER_RUNTIME,
+            error_message=(
+                f"[{runtime_identity.CODE_STALE_PACKER_RUNTIME}] this AUDAPACK process "
+                f"loaded packing code {runtime_identity.LOADED_PACKING_DIGEST[:12]} but the "
+                f"checkout now has {stale_digest[:12]}; the archive it would write is not the "
+                "archive this source describes. Restart AUDAPACK and pack again; no archive "
+                "was produced."
+            ),
         )
 
     def pack_project(
@@ -63,7 +101,10 @@ class PackingService:
             return pack()
         proj = self.registry.get_project_by_id(project_id)
         source_path = getattr(proj, "source_path", "") if proj else ""
-        fingerprint = self._policy_fingerprint() if source_path else ""
+        refusal = self._stale_runtime_refusal(project_id, source_path, proj)
+        if refusal is not None:
+            return refusal
+        fingerprint = self._policy_fingerprint(proj=proj) if source_path else ""
         arm_token = hot_freshness.begin(source_path, fingerprint) if source_path else None
         result = pack()
         cancelled = cancel_event is not None and cancel_event.is_set()
@@ -120,6 +161,7 @@ class PackingService:
             manifest_meta={"project_name": proj.display_name, "extra_meta": extra_meta} if self.config.packing.manifest_enabled else None,
             packing=self.config.packing,
             prebuilt_plan=prebuilt_plan,
+            project_archive_scope=getattr(proj, "archive_scope", "auto"),
         )
 
     def ensure_fresh_archive(self, project_id: str, *, cancel_event=None, log_callback=None):
@@ -141,6 +183,10 @@ class PackingService:
         if not source.exists():
             return PackResult(project_id=project_id, name=proj.display_name, source_path=str(source), success=False, error_message="Project source path is missing")
 
+        refusal = self._stale_runtime_refusal(project_id, str(source), proj)
+        if refusal is not None:
+            return refusal
+
         output_dir = resolve_output_dir(
             proj.source_path,
             self.config.packing,
@@ -148,7 +194,7 @@ class PackingService:
             group=proj.priority_group,
             project=proj,
         )
-        fingerprint = self._policy_fingerprint()
+        fingerprint = self._policy_fingerprint(proj=proj)
         existing = find_archive_for_project(proj, output_dir)
         hot = hot_freshness.lookup(proj.source_path, fingerprint, existing)
         if hot is not None:

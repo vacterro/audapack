@@ -42,7 +42,13 @@ from audapack.inaudit import (
     set_inaudit_selected,
     validate_inaudit_path,
 )
-from audapack.inaudit_capture import InauditCaptureError, InauditCaptureStore
+from audapack.inaudit_capture import (
+    CapturePresentationBucket,
+    InauditCaptureError,
+    InauditCaptureStore,
+    capture_presentation_bucket,
+    is_inbox_actionable,
+)
 from audapack.inaudit_commit import (
     CHANGED_EXTERNALLY,
     COMMITTED,
@@ -112,6 +118,13 @@ class InauditWidget(QWidget):
         self._config_provider = config_provider or load_config
         self._project: Project | None = None
         self._inbox_records: list[dict] = []
+        #: The subset of `_inbox_records` the current view shows, in row order.
+        #: Rebuilt by every refresh, so a row index can never outlive its record.
+        self._inbox_rows: list[dict] = []
+        #: Which of the two durable-capture views is shown (T-276). Presentation
+        #: only: switching never mutates a record. A fresh session opens on the
+        #: Inbox, where the work that still needs a decision lives.
+        self.inbox_view = "INBOX"
         self._capture_store = capture_store or InauditCaptureStore()
         self._task_runner = TaskRunner(max_threads=0, parent=self)
         self._watcher = QFileSystemWatcher(self)
@@ -237,11 +250,26 @@ class InauditWidget(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(2)
         self.inbox_header = QLabel("INAUDIT INBOX 0 · ?0", top)
+        self.btn_view_inbox = QPushButton("Inbox", top)
+        self.btn_view_inbox.setToolTip("Captures that still need a decision")
+        self.btn_view_history = QPushButton("History", top)
+        self.btn_view_history.setToolTip(
+            "Durable record of captures already assigned, duplicated or archived"
+        )
+        for button in (self.btn_view_inbox, self.btn_view_history):
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setMaximumWidth(72)
+        self.btn_view_inbox.clicked.connect(lambda: self.set_inbox_view("INBOX"))
+        self.btn_view_history.clicked.connect(lambda: self.set_inbox_view("HISTORY"))
+        self.set_inbox_view_buttons()
         self.btn_clipboard_capture = QPushButton("IA+ Clipboard", top)
         self.btn_clipboard_capture.setToolTip("Capture clipboard text into the durable global INAUDIT Inbox")
         self.btn_clipboard_capture.clicked.connect(self._on_clipboard_capture)
         self.btn_inbox_refresh = QPushButton("Refresh Inbox", top)
         self.btn_inbox_refresh.clicked.connect(self.refresh_inbox)
+        top_layout.addWidget(self.btn_view_inbox)
+        top_layout.addWidget(self.btn_view_history)
         top_layout.addWidget(self.inbox_header, 1)
         top_layout.addWidget(self.btn_clipboard_capture)
         top_layout.addWidget(self.btn_inbox_refresh)
@@ -336,9 +364,24 @@ class InauditWidget(QWidget):
 
     def _selected_capture(self) -> dict | None:
         row = self.inbox_list.currentRow()
-        if 0 <= row < len(self._inbox_records):
-            return self._inbox_records[row]
+        if 0 <= row < len(self._inbox_rows):
+            return self._inbox_rows[row]
         return None
+
+    def set_inbox_view_buttons(self):
+        """Reflect `inbox_view` on the compact Inbox/History toggle."""
+        self.btn_view_inbox.setChecked(self.inbox_view != "HISTORY")
+        self.btn_view_history.setChecked(self.inbox_view == "HISTORY")
+
+    def set_inbox_view(self, view: str):
+        """Show the Inbox or the durable History (T-276).
+
+        Presentation only: this never writes to the store, so a record cannot
+        change status just because the operator looked at the other view.
+        """
+        self.inbox_view = "HISTORY" if str(view).strip().upper() == "HISTORY" else "INBOX"
+        self.set_inbox_view_buttons()
+        self.refresh_inbox()
 
     @staticmethod
     def _copy_text(text: str) -> bool:
@@ -365,17 +408,37 @@ class InauditWidget(QWidget):
         selected = self._selected_capture()
         selected_id = str(selected.get("capture_id") or "") if selected else ""
         try:
-            self._inbox_records = self._capture_store.list_records()
+            # T-276: one read of the durable store feeds both views. Archived
+            # records are included so History can be honest about them; the
+            # Inbox never shows them because the classification below does the
+            # filtering, not the query.
+            self._inbox_records = self._capture_store.list_records(include_archived=True)
         except OSError as exc:
             self._inbox_records = []
             self.inbox_status.setText(f"Inbox refresh failed: {exc}")
-        pending = sum(1 for item in self._inbox_records if not item.get("assigned_project_id"))
-        unassigned = sum(1 for item in self._inbox_records if not item.get("suggested_project_id") and not item.get("assigned_project_id"))
-        self.inbox_header.setText(f"INAUDIT INBOX {pending} · ?{unassigned}")
+        show_inbox = self.inbox_view != "HISTORY"
+        wanted = CapturePresentationBucket.INBOX if show_inbox else CapturePresentationBucket.HISTORY
+        rows = [record for record in self._inbox_records if capture_presentation_bucket(record) is wanted]
+        self._inbox_rows = rows
+        if show_inbox:
+            pending = sum(1 for item in rows if not item.get("assigned_project_id"))
+            unassigned = sum(
+                1 for item in rows
+                if not item.get("suggested_project_id") and not item.get("assigned_project_id")
+            )
+            self.inbox_header.setText(f"INAUDIT INBOX {pending} · ?{unassigned}")
+        else:
+            self.inbox_header.setText(f"INAUDIT HISTORY {len(rows)}")
         self.inbox_list.blockSignals(True)
         self.inbox_list.clear()
         selected_row = -1
-        for row, record in enumerate(self._inbox_records):
+        if not rows:
+            # An empty Inbox is success, not a prompt to fill it with old
+            # records: say so quietly instead of listing history here.
+            self._add_inbox_placeholder(
+                "No pending INAUDIT captures." if show_inbox else "No capture history."
+            )
+        for row, record in enumerate(rows):
             confidence = float(record.get("classification_confidence") or 0.0)
             confidence_text = f"{round(confidence * 100):02d}%" if confidence else " ? "
             # A pin is the operator's answer; mark it so the row does not read as
@@ -387,13 +450,19 @@ class InauditWidget(QWidget):
             self.inbox_list.addItem(item)
             if record.get("capture_id") == selected_id:
                 selected_row = row
-        if selected_row < 0 and self._inbox_records:
+        if selected_row < 0 and rows:
             selected_row = 0
         if selected_row >= 0:
             self.inbox_list.setCurrentRow(selected_row)
         self.inbox_list.blockSignals(False)
         self._on_inbox_row_changed(selected_row)
         self._rewatch_inbox()
+
+    def _add_inbox_placeholder(self, text: str):
+        """One unselectable grey line: this view is empty, and that is fine."""
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.inbox_list.addItem(item)
 
     def _on_inbox_row_changed(self, row: int):
         record = self._selected_capture() if row >= 0 else None
@@ -665,15 +734,19 @@ class InauditWidget(QWidget):
     def _update_inbox_actions(self):
         record = self._selected_capture()
         has = record is not None
+        # T-276: the same classification that put the record in a view decides
+        # whether the Inbox actions apply. A record shown in History keeps only
+        # the actions that are legal for a finished capture.
+        actionable = bool(record is not None and is_inbox_actionable(record))
         assigned = bool(record and record.get("assigned_path"))
         archived = bool(record and record.get("status") == "ARCHIVED")
         has_project = bool(self.inbox_project.currentData())
         for button in (self.btn_assign, self.btn_assign_gg, self.btn_assign_cc):
-            button.setEnabled(has and not assigned and not archived and has_project)
+            button.setEnabled(actionable and not assigned and not archived and has_project)
         self.btn_capture_copy.setEnabled(has)
         # Pinning is allowed while the capture is still unassigned, including
         # with no project selected -- that is how a pin is cleared.
-        self.btn_pin.setEnabled(has and not assigned)
+        self.btn_pin.setEnabled(actionable and not assigned)
         self.btn_rename_capture.setEnabled(has)
         self.btn_open_source.setEnabled(bool(record and record.get("source_url")))
         self.btn_archive_capture.setEnabled(has and not archived)
@@ -1567,3 +1640,34 @@ class InauditWidget(QWidget):
                     w.model.refresh_inaudit(self._project.id)
         except Exception:
             pass
+
+    def shutdown(self) -> None:
+        """Deterministic teardown for timers, watchers and tasks on close."""
+        try:
+            self._debounce.stop()
+        except Exception:
+            pass
+        try:
+            self._inbox_debounce.stop()
+        except Exception:
+            pass
+        try:
+            paths = list(self._watcher.directories()) + list(self._watcher.files())
+            if paths:
+                self._watcher.removePaths(paths)
+        except Exception:
+            pass
+        try:
+            inbox_paths = list(self._inbox_watcher.directories()) + list(self._inbox_watcher.files())
+            if inbox_paths:
+                self._inbox_watcher.removePaths(inbox_paths)
+        except Exception:
+            pass
+        try:
+            self._task_runner.close()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)

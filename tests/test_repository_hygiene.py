@@ -167,3 +167,35 @@ def test_no_live_token_in_source():
     if example.exists():
         data = json.loads(example.read_text(encoding="utf-8"))
         assert data.get("bridge", {}).get("token", "") == ""
+
+
+def test_product_python_sources_are_tracked_by_git():
+    """Every audapack/**/*.py in the working tree must be in the Git index.
+
+    Guards against verified product logic living only as untracked files
+    (destroyable by git clean / reset). Skips outside a Git checkout
+    (archive/sdist environments) or when git is unavailable.
+    """
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if not (REPO / ".git").exists() or shutil.which("git") is None:
+        pytest.skip("not a git checkout")
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "--", "audapack"],
+        cwd=REPO,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        pytest.skip("git ls-files unavailable")
+    tracked = {p for p in proc.stdout.decode("utf-8").split("\0") if p}
+    on_disk = {
+        _repo_relative(p)
+        for p in (REPO / "audapack").rglob("*.py")
+        if "__pycache__" not in p.parts
+    }
+    missing = sorted(on_disk - tracked)
+    assert not missing, f"untracked product modules: {missing}"

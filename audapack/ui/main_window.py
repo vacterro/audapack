@@ -841,6 +841,11 @@ class MainWindow:
                 cancel_event=self.cancel_event,
                 progress_callback=lambda a, b, cur: self.ui_queue.put(("progress", a, b, cur)),
                 manifest_meta={"project_name": p.display_name, "extra_meta": extra_meta} if self.config.packing.manifest_enabled else None,
+                # T-288: without this the fallback GUI wrote FULL-semantics archives
+                # whose policy fingerprint never matched the configured profile, so
+                # every reuse decision judged them STALE. Every live pack path runs
+                # the configured policy, not an implicit default.
+                packing=self.config.packing,
             )
 
             if res.success:

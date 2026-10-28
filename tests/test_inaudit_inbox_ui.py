@@ -190,20 +190,259 @@ def test_unassigned_capture_requires_explicit_project_choice(qapp, tmp_path: Pat
     assert str(Path(project.source_path) / "audit" / "1.md") in widget.inbox_detail.toPlainText()
     widget.deleteLater()
 
+def _new_capture(store, text: str, projects: list[Project] | None = None) -> str:
+    """One real durable capture; the status comes from the store's own rules."""
+    capture_id = str(uuid.uuid4())
+    store.capture(
+        {
+            "capture_id": capture_id,
+            "text": text,
+            "capture_kind": "response",
+            "source": "t276",
+            "project_hints": [],
+        },
+        projects or [],
+    )
+    return capture_id
+
+def _rows(widget) -> list[str]:
+    return [widget.inbox_list.item(row).text() for row in range(widget.inbox_list.count())]
+
+def _assigned_capture(store, project) -> str:
+    capture_id = _new_capture(store, "# AUDAPACK assignment", [project])
+    store.assign(capture_id, project.id, [project])
+    return capture_id
+
 def test_inbox_counter_excludes_assigned_history(qapp, tmp_path: Path):
+    """T-276 replaces the old contract: excluded from the count AND from the rows.
+
+    The old assertion pinned the clutter as intended behaviour -- the counter
+    said zero while the list showed the ASSIGNED record forever. The recovery
+    guarantee the old test also carried (the durable record survives) is kept
+    and asserted here, in the store, not only in the view.
+    """
     widget, store, project = _widget(tmp_path)
-    payload = {
-        "capture_id": str(uuid.uuid4()),
-        "text": "# AUDAPACK assignment",
-        "capture_kind": "response",
-        "source": "ChatGPT",
-    }
-    store.capture(payload, [project])
-    store.assign(payload["capture_id"], project.id, [project])
+    capture_id = _assigned_capture(store, project)
     widget.refresh_inbox()
     assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
-    assert "ASSIGNED" in widget.inbox_list.item(0).text()
+    assert _rows(widget) == ["No pending INAUDIT captures."]
+    assert [record["capture_id"] for record in store.list_records()] == [capture_id]
     widget.deleteLater()
+
+def test_history_shows_the_assigned_capture_and_keeps_it_durable(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    capture_id = _assigned_capture(store, project)
+    widget.set_inbox_view("HISTORY")
+
+    assert widget.inbox_header.text() == "INAUDIT HISTORY 1"
+    assert len(_rows(widget)) == 1
+    assert "ASSIGNED" in _rows(widget)[0]
+    assert [record["capture_id"] for record in store.list_records()] == [capture_id]
+    body = store.get(capture_id)
+    assert body["record"]["status"] == "ASSIGNED"
+    assert "AUDAPACK assignment" in body["text"]
+    widget.deleteLater()
+
+def test_a_duplicate_leaves_the_inbox_and_stays_in_history(qapp, tmp_path: Path):
+    widget, _store, _project = _widget(tmp_path)
+    store = widget._capture_store
+    _new_capture(store, "# the same bytes twice")
+    duplicate_id = _new_capture(store, "# the same bytes twice")
+
+    assert store.get(duplicate_id)["record"]["status"] == "DUPLICATE"
+    widget.refresh_inbox()
+    assert widget.inbox_header.text() == "INAUDIT INBOX 1 · ?1"
+    assert all("DUPLICATE" not in row for row in _rows(widget))
+
+    widget.set_inbox_view("HISTORY")
+    assert widget.inbox_header.text() == "INAUDIT HISTORY 1"
+    assert "DUPLICATE" in _rows(widget)[0]
+    assert store.get(duplicate_id)["record"]["status"] == "DUPLICATE"
+    widget.deleteLater()
+
+def test_actionable_captures_stay_in_the_inbox_and_in_its_count(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    _new_capture(store, "# unclassified new capture")
+    _new_capture(store, "# AUDAPACK suggested capture", [project])
+    _assigned_capture(store, project)
+    widget.refresh_inbox()
+
+    statuses = [record["status"] for record in store.list_records()]
+    assert "NEW" in statuses and "ASSIGNED" in statuses
+    assert widget.inbox_header.text() == "INAUDIT INBOX 2 · ?1"
+    assert len(_rows(widget)) == 2
+    assert all("ASSIGNED" not in row.split()[0] for row in _rows(widget))
+    widget.deleteLater()
+
+def test_both_counters_count_their_own_classification(qapp, tmp_path: Path):
+    from audapack.inaudit_capture import capture_presentation_bucket
+
+    widget, store, project = _widget(tmp_path)
+    _new_capture(store, "# one actionable")
+    _assigned_capture(store, project)
+    _new_capture(store, "# duplicate me")
+    _new_capture(store, "# duplicate me")
+    records = store.list_records()
+    active = [r for r in records if capture_presentation_bucket(r).value == "INBOX"]
+    history = [r for r in records if capture_presentation_bucket(r).value == "HISTORY"]
+
+    widget.refresh_inbox()
+    assert widget.inbox_header.text() == f"INAUDIT INBOX {len(active)} · ?{len(active)}"
+    assert widget.inbox_list.count() == len(active)
+    widget.set_inbox_view("HISTORY")
+    assert widget.inbox_header.text() == f"INAUDIT HISTORY {len(history)}"
+    assert widget.inbox_list.count() == len(history)
+    widget.deleteLater()
+
+def test_switching_views_never_touches_a_record(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    _new_capture(store, "# stays")
+    _assigned_capture(store, project)
+    before = store.list_records()
+
+    widget.set_inbox_view("HISTORY")
+    widget.set_inbox_view("INBOX")
+    widget.set_inbox_view("HISTORY")
+    after = store.list_records()
+
+    assert [(r["capture_id"], r["status"]) for r in before] == [
+        (r["capture_id"], r["status"]) for r in after
+    ]
+    widget.deleteLater()
+
+def test_a_refresh_keeps_the_view_the_operator_chose(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    _assigned_capture(store, project)
+    widget.set_inbox_view("HISTORY")
+    assert widget.inbox_view == "HISTORY"
+
+    _new_capture(store, "# arrives while history is open")
+    widget.refresh_inbox()
+
+    assert widget.inbox_view == "HISTORY", "refresh jumped the operator back to the inbox"
+    assert widget.inbox_header.text() == "INAUDIT HISTORY 1"
+    widget.set_inbox_view("INBOX")
+    assert len(_rows(widget)) == 1
+    widget.deleteLater()
+
+def test_assigning_the_selected_record_moves_it_out_without_stale_actions(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    capture_id = _new_capture(store, "# AUDAPACK assign me")
+    widget.refresh_inbox()
+    assert widget.inbox_list.count() == 1
+    widget.inbox_list.setCurrentRow(0)
+    widget.inbox_project.setCurrentIndex(1)
+    assert widget.btn_assign.isEnabled()
+
+    widget._on_assign_capture("")
+
+    assert store.get(capture_id)["record"]["status"] == "ASSIGNED"
+    assert _rows(widget) == ["No pending INAUDIT captures."]
+    assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
+    assert widget._selected_capture() is None
+    assert not widget.btn_assign.isEnabled(), "assign stayed bound to a record no longer in the inbox"
+    assert not widget.btn_pin.isEnabled()
+    assert widget.inbox_detail.toPlainText() == ""
+    widget.set_inbox_view("HISTORY")
+    assert len(_rows(widget)) == 1
+    widget.deleteLater()
+
+def test_a_history_record_cannot_be_assigned_again(qapp, tmp_path: Path):
+    """Visibility in History must not enable an action that is invalid there."""
+    widget, store, project = _widget(tmp_path)
+    _assigned_capture(store, project)
+    widget.set_inbox_view("HISTORY")
+    widget.inbox_list.setCurrentRow(0)
+    widget.inbox_project.setCurrentIndex(1)
+
+    assert not widget.btn_assign.isEnabled()
+    assert not widget.btn_assign_gg.isEnabled()
+    assert not widget.btn_pin.isEnabled()
+    assert widget.btn_capture_copy.isEnabled(), "reading a historical record stays legal"
+    widget.deleteLater()
+
+def test_the_inbox_empty_state_is_quiet_and_not_archaeology(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    _assigned_capture(store, project)
+    widget.refresh_inbox()
+
+    assert _rows(widget) == ["No pending INAUDIT captures."]
+    # The placeholder is a message, not a selectable record.
+    widget.inbox_list.setCurrentRow(0)
+    assert widget._selected_capture() is None
+    assert not widget.btn_assign.isEnabled()
+    widget.set_inbox_view("HISTORY")
+    assert "ASSIGNED" in _rows(widget)[0]
+    widget.deleteLater()
+
+def test_an_archived_capture_is_history_not_inbox_and_survives(qapp, tmp_path: Path):
+    widget, store, project = _widget(tmp_path)
+    capture_id = _assigned_capture(store, project)
+    store.archive(capture_id)
+
+    widget.refresh_inbox()
+    assert widget.inbox_header.text() == "INAUDIT INBOX 0 · ?0"
+    assert _rows(widget) == ["No pending INAUDIT captures."]
+
+    widget.set_inbox_view("HISTORY")
+    assert widget.inbox_header.text() == "INAUDIT HISTORY 1"
+    assert "ARCHIVED" in _rows(widget)[0]
+    assert store.get(capture_id)["record"]["status"] == "ARCHIVED"
+    widget.deleteLater()
+
+def test_an_empty_history_says_so(qapp, tmp_path: Path):
+    widget, store, _project = _widget(tmp_path)
+    _new_capture(store, "# actionable only")
+    widget.set_inbox_view("HISTORY")
+
+    assert _rows(widget) == ["No capture history."]
+    assert widget.inbox_header.text() == "INAUDIT HISTORY 0"
+    widget.deleteLater()
+
+def test_every_lifecycle_status_has_a_presentation_bucket():
+    """The one classification contract, checked against the real status set."""
+    from audapack.inaudit_capture import (
+        CAPTURE_STATUSES,
+        CapturePresentationBucket,
+        capture_presentation_bucket,
+        is_inbox_actionable,
+    )
+
+    assert CAPTURE_STATUSES == {"NEW", "SUGGESTED", "ASSIGNED", "ARCHIVED", "DUPLICATE", "RECOVERY"}
+    for status in CAPTURE_STATUSES:
+        assert isinstance(capture_presentation_bucket({"status": status}), CapturePresentationBucket)
+    history = {
+        status for status in CAPTURE_STATUSES
+        if capture_presentation_bucket({"status": status}) is CapturePresentationBucket.HISTORY
+    }
+    inbox = {
+        status for status in CAPTURE_STATUSES
+        if capture_presentation_bucket({"status": status}) is CapturePresentationBucket.INBOX
+    }
+    assert history | inbox == CAPTURE_STATUSES, "a status has no presentation bucket"
+    assert not history & inbox, "a status is in both views"
+    assert history == {"ASSIGNED", "DUPLICATE", "ARCHIVED"}, history
+    assert inbox == {"NEW", "SUGGESTED", "RECOVERY"}, inbox
+    assert all(is_inbox_actionable({"status": status}) == (status in inbox) for status in CAPTURE_STATUSES)
+
+def test_an_unknown_or_missing_status_fails_safe_into_the_inbox():
+    from audapack.inaudit_capture import CapturePresentationBucket, capture_presentation_bucket, is_inbox_actionable
+
+    for record in (
+        {"status": "COMPLETED_LATER"},
+        {"status": ""},
+        {},
+        None,
+        {"status": "recovery"},
+    ):
+        assert capture_presentation_bucket(record) == CapturePresentationBucket.INBOX
+        assert is_inbox_actionable(record) is True
+
+def test_recovery_records_are_actionable_not_history():
+    from audapack.inaudit_capture import capture_presentation_bucket, is_inbox_actionable
+
+    assert capture_presentation_bucket({"status": "RECOVERY"}).value == "INBOX"
+    assert is_inbox_actionable({"status": "RECOVERY"}) is True
 
 def _capture(widget, store, text="# pinned capture"):
     widget.inbox_project.setCurrentIndex(0)
@@ -365,6 +604,14 @@ def test_a_pin_is_refused_once_the_capture_is_assigned(qapp, tmp_path: Path):
     widget._on_assign_capture("")
     assert store.get(capture_id)["record"].get("assigned_path")
 
+    # T-276: the assigned capture has left the Inbox, so the only place it can
+    # even be selected is History -- and pinning it there must still be refused
+    # by the store, not merely hidden behind a disabled button.
+    widget.set_inbox_view("HISTORY")
+    widget.inbox_list.setCurrentRow(0)
+    assert widget._selected_capture()["capture_id"] == capture_id
+    assert not widget.btn_pin.isEnabled(), "a history record still offered a pin"
     widget._on_pin_project()
     assert "failed" in widget.inbox_status.text().lower(), widget.inbox_status.text()
+    assert not store.get(capture_id)["record"].get("target_project_id")
     widget.deleteLater()

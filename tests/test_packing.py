@@ -770,6 +770,7 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
         import json as _json
         import os as _os
 
+        from audapack import runtime_identity
         from audapack.fidelity import policy_fingerprint_from_config
         from audapack.packing import MANIFEST_FILENAME, MANIFEST_SCHEMA_VERSION
 
@@ -787,6 +788,13 @@ class TestFreshnessOnlyLooksAtPackableFiles(unittest.TestCase):
                     "policy_fingerprint": policy_fingerprint_from_config(
                         config.packing, set(config.packing.excludes)
                     ),
+                    # T-288: reuse identity also names the implementation that
+                    # wrote the archive and its own source-review verdict, so a
+                    # traversal test here is not mistaken for an old writer.
+                    "producer": {
+                        "packing_implementation_sha256": runtime_identity.LOADED_PACKING_DIGEST,
+                    },
+                    "source_review_ready": True,
                 }))
         newest = max(path.stat().st_mtime for path in self.source.rglob("*") if path.is_file())
         stamp = newest + newer_by

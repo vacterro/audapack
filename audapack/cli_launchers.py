@@ -53,6 +53,13 @@ STAGE_CLI = "cli"
 STAGE_FALLBACK = "fallback"
 STAGE_PROFILE = "profile"
 STAGE_UNRESOLVED = "unresolved"
+#: The invocation is the control plane's own launch contract, not a provider CLI.
+STAGE_PLANE_LAUNCH = "plane_launch"
+
+#: Execution backends and providers whose context the control plane resolves
+#: ITSELF via ``sai-accounts launch <account_id> --workdir <dir>``.
+_PLANE_SESSION_BACKENDS = frozenset({"windows_user", "managed_windows_user"})
+_PLANE_LAUNCH_PROVIDERS = frozenset({"antigravity"})
 
 #: Claude profile directories already established on this machine. Ordered:
 #: the first one with its own credential/config evidence wins.
@@ -94,7 +101,8 @@ class CliResolution:
     #: Which resolution stage produced this answer (TARGET M).
     stage: str
     #: PowerShell snippet executed inside the project-root console. Empty when
-    #: ``ok`` is False. Never contains credentials.
+    #: ``ok`` is False or when execution is delegated to the control plane.
+    #: Never contains credentials.
     console_command: str = ""
     #: True for a real CLI/TUI path; False only for an honest GUI fallback.
     is_cli: bool = True
@@ -110,6 +118,19 @@ class CliResolution:
     missing: str = ""
     #: The next useful operator action (TARGET M).
     next_action: str = ""
+    #: Canonical SAI Accounts account_id when execution is delegated to the plane.
+    account_id: str = ""
+
+    @property
+    def is_plane_launch(self) -> bool:
+        return bool(
+            self.ok
+            and self.account_id
+            and (
+                self.stage == STAGE_PLANE_LAUNCH
+                or self.stage == f"{STAGE_PERSISTED}({STAGE_PLANE_LAUNCH})"
+            )
+        )
 
     def diagnostic(self, launcher_name: str, project_name: str) -> str:
         """One bounded launcher-specific status line (TARGET M)."""
@@ -498,6 +519,144 @@ def codex_console_command(account: str, project_root: str, title: str = "",
     return "; ".join(parts)
 
 
+#: provider -> (env var, CLI name, YOLO args) for an account whose canonical
+#: identity locator IS the execution context the installed CLI already honours.
+#: A provider absent from this table has no execution context AUDAPACK may
+#: select, so its accounts are reported UNAVAILABLE rather than launched as
+#: whichever profile happens to be current.
+_ACCOUNT_PROFILE_LAUNCH: dict[str, tuple[str, str, str]] = {
+    "claude": (_CLAUDE_CONFIG_ENV, "claude", CLAUDE_YOLO_ARGS),
+    "codex": ("CODEX_HOME", "codex", CODEX_YOLO_ARGS),
+}
+
+
+def account_launch_resolution(
+    provider: str,
+    backend: str,
+    locator: str,
+    *,
+    account_id: str = "",
+    environ: Optional[Mapping[str, str]] = None,
+    exists: Optional[Callable[[str], bool]] = None,
+) -> CliResolution:
+    """How one canonical SAI Accounts account is invoked, or why it cannot be.
+
+    A provider adapter, not an identity source: the account this answers for was
+    chosen by the registry, and the only thing read here is the provider's own
+    documented profile selector. Wrong-account launch is worse than no launch,
+    so an account the plane executes as a Windows logon session is either handed
+    to the PLANE's own launch contract by its canonical id, or it has NO
+    invocation at all -- never a fallback to whichever profile happens to be
+    current.
+    """
+    provider_id = str(provider or "").strip().lower()
+    backend_id = str(backend or "").strip().lower()
+    profile = str(locator or "").strip()
+    account = str(account_id or "").strip()
+    target_launcher_id = f"sai:{account}" if account else f"sai:{provider_id or '?'}"
+    spec = _ACCOUNT_PROFILE_LAUNCH.get(provider_id)
+
+    if backend_id in _PLANE_SESSION_BACKENDS and provider_id in _PLANE_LAUNCH_PROVIDERS:
+        from audapack import sai_accounts
+
+        engine = sai_accounts.engine_path()
+        if account and engine:
+            return CliResolution(
+                launcher_id=target_launcher_id,
+                ok=True,
+                stage=STAGE_PLANE_LAUNCH,
+                console_command="",
+                raw_command="",
+                is_cli=True,
+                profile=f"SAI Accounts ({account})",
+                probe=str(engine),
+                account_id=account,
+            )
+        return CliResolution(
+            launcher_id=target_launcher_id,
+            ok=False,
+            stage=STAGE_UNRESOLVED,
+            missing=(
+                "control plane launch contract for a "
+                f"{backend_id} account of provider {provider_id or '?'}"
+            ),
+            next_action=(
+                "launch this account from SAI Accounts; audapack launches a "
+                "session-owned account through the plane's own "
+                "'sai-accounts launch <account_id> --workdir <dir>' contract, "
+                "so it needs a working control plane and that canonical id"
+            ),
+        )
+
+    if backend_id != "profile_directory" or spec is None:
+        return CliResolution(
+            launcher_id=target_launcher_id,
+            ok=False,
+            stage=STAGE_UNRESOLVED,
+            missing=(
+                "execution context not exposed by SAI Accounts for provider "
+                f"{provider_id or '?'} (execution_backend={backend_id or 'unspecified'})"
+            ),
+            next_action=(
+                "launch this account from SAI Accounts; the minimum upstream contract "
+                "audapack needs is an official launch/resolve-context command it can "
+                "call for a managed account -- the plane's own "
+                "'sai-accounts launch <account_id> --workdir <dir>' is that contract "
+                "for windows_user accounts"
+            ),
+        )
+    if not profile:
+        return CliResolution(
+            launcher_id=f"sai:{provider_id}",
+            ok=False,
+            stage=STAGE_PROFILE,
+            missing=f"{provider_id} profile locator (the registry reported none)",
+            next_action="repair this account's profile in SAI Accounts",
+        )
+    env = environ if environ is not None else os.environ
+    probe: Callable[[str], bool] = exists if exists is not None else os.path.exists
+    env_var, cli_name, yolo = spec
+    profile_ps = ps_quote(profile)
+
+    if provider_id == "claude":
+        exe = _claude_exe(_default_home(env), env, probe)
+        if exe is None:
+            return CliResolution(
+                launcher_id="sai:claude",
+                ok=False,
+                stage=STAGE_UNRESOLVED,
+                missing="claude CLI (claude.exe)",
+                next_action=(
+                    "install the Claude Code CLI on PATH or under "
+                    "%USERPROFILE%\\.local\\bin"
+                ),
+            )
+        command = f"$env:{env_var} = {profile_ps}; & {ps_quote(str(exe))} {yolo}"
+        return CliResolution(
+            launcher_id="sai:claude", ok=True, stage=STAGE_CLI,
+            console_command=command, raw_command=command, is_cli=True,
+            profile=f"SAI Accounts ({profile})", probe=str(exe),
+        )
+
+    # Codex: the account is selected by CODEX_HOME inside this console only, and
+    # a missing installation prints its install hint instead of a bare
+    # CommandNotFoundException -- the same shape the built-in Codex consoles use.
+    scrub = ",".join(f"Env:{name}" for name in _CODEX_SCRUBBED_ENV)
+    command = (
+        f"$env:{env_var} = {profile_ps}; "
+        f"Remove-Item {scrub} -ErrorAction SilentlyContinue; "
+        f"New-Item -ItemType Directory -Force -Path $env:{env_var} | Out-Null; "
+        f"if (Get-Command {cli_name} -ErrorAction SilentlyContinue) {{ "
+        f"{cli_name} {yolo} }} else {{ Write-Host '{cli_name} not found on PATH. "
+        f"Install: npm install -g @openai/codex' -ForegroundColor Yellow }}"
+    )
+    return CliResolution(
+        launcher_id="sai:codex", ok=True, stage=STAGE_CLI,
+        console_command=command, raw_command=command, is_cli=True,
+        profile=f"SAI Accounts ({profile})", probe=profile,
+    )
+
+
 def _discover(
     launcher_id: str,
     home: Path,
@@ -505,6 +664,31 @@ def _discover(
     environ: Mapping[str, str],
     exists: Callable[[str], bool],
 ) -> CliResolution:
+    if launcher_id.startswith("sai:"):
+        from audapack import sai_accounts
+
+        cached = sai_accounts.cached_account(launcher_id[4:])
+        if cached is not None:
+            return account_launch_resolution(
+                cached.provider_id,
+                cached.backend,
+                cached.locator,
+                account_id=cached.account_id,
+                environ=environ,
+                exists=exists,
+            )
+        # An account-backed target whose runtime resolution no longer applies.
+        # Managed rows are read-only projections, so the honest next step is a
+        # refresh in the manager, never a hand-typed template.
+        return CliResolution(
+            launcher_id=launcher_id,
+            ok=False,
+            stage=STAGE_UNRESOLVED,
+            missing=f"launch context for account target {launcher_id!r}",
+            next_action=(
+                "Refresh in Settings -> Launchers; manage the account in SAI Accounts"
+            ),
+        )
     if launcher_id in ("claude1", "claude2"):
         return _resolve_claude(launcher_id, home, environ, exists)
     if launcher_id == "antigravity":
@@ -557,10 +741,31 @@ def resolve_cli_launcher(
     # 2. a previously persisted stable resolution, revalidated by probe.
     persisted = str(getattr(launcher, "resolved_command", "") or "").strip()
     persisted_probe = str(getattr(launcher, "resolved_probe", "") or "").strip()
-    if persisted and (not persisted_probe or probe(persisted_probe)):
+    persisted_stage = str(getattr(launcher, "resolved_stage", "") or "").strip()
+    if persisted_stage == STAGE_PLANE_LAUNCH and launcher_id.startswith("sai:"):
+        from audapack import sai_accounts
+
+        account = launcher_id[4:].strip()
+        engine = sai_accounts.engine_path()
+        if account and engine and (not persisted_probe or probe(persisted_probe)):
+            return CliResolution(
+                launcher_id=launcher_id,
+                ok=True,
+                stage=f"{STAGE_PERSISTED}({STAGE_PLANE_LAUNCH})",
+                console_command="",
+                raw_command="",
+                is_cli=True,
+                profile=str(
+                    getattr(launcher, "resolved_profile", "")
+                    or f"SAI Accounts ({account})"
+                ),
+                probe=persisted_probe or str(engine),
+                account_id=account,
+            )
+    elif persisted and (not persisted_probe or probe(persisted_probe)):
         stage = STAGE_PERSISTED
-        if str(getattr(launcher, "resolved_stage", "") or "").strip():
-            stage = f"{STAGE_PERSISTED}({str(launcher.resolved_stage).strip()})"
+        if persisted_stage:
+            stage = f"{STAGE_PERSISTED}({persisted_stage})"
         return CliResolution(
             launcher_id=launcher_id,
             ok=True,
@@ -579,7 +784,7 @@ def resolve_cli_launcher(
         env,
         probe,
     )
-    if resolution.ok:
+    if resolution.ok and not resolution.is_plane_launch:
         resolution = replace(
             resolution,
             raw_command=resolution.console_command,

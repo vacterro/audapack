@@ -265,3 +265,121 @@ def test_prepared_store_reown_sync(tmp_path):
     # Re-owning non-existent execution returns None
     assert store.reown_sync("non-existent", "owner-3", NOW) is None
 
+
+# ── T-281 PREPARED SYNC MEMBER RECONCILIATION & FAIL-CLOSED BINDINGS ────────
+
+
+def test_migrate_prepared_sync_members_unambiguous(tmp_path):
+    from audapack.launch_federation import migrate_prepared_bindings
+    store = PreparedStore(tmp_path / "resources.sqlite3")
+    job = PreparedJob("sync-job-mig", "sync job mig", "project", "SYNC", "SYNC",
+                      Trigger.SYNC, Payload.USER_COMMAND, {"text": "cc"},
+                      {"at": NOW.isoformat()}, enabled=True, state=JobState.ARMED)
+    store.save(job)
+    m0 = PreparedSyncMember("sync-job-mig", 0, "claude1", "claude1", "m", "h", "", {}, True)
+    m1 = PreparedSyncMember("sync-job-mig", 1, "account-1", "launcher-1", "m", "h", "", {}, True)
+    store.save_sync_members("sync-job-mig", [m0, m1])
+
+    donors = {"claude1": "claude:pdir:c1"}
+    proven = {"claude:pdir:c1"}
+    res = migrate_prepared_bindings(store, donors=donors, proven=proven)
+
+    assert "sync-job-mig" in res.migrated
+    members = store.get_sync_members("sync-job-mig")
+    assert members[0].account_id == "claude:pdir:c1"
+    assert members[0].launcher_id == "sai:claude:pdir:c1"
+    assert members[1].account_id == "account-1"
+    reloaded_job = store.get("sync-job-mig")
+    assert reloaded_job.state == JobState.ARMED
+
+
+def test_migrate_prepared_sync_members_unmappable_blocks_with_reason(tmp_path):
+    from audapack.launch_federation import migrate_prepared_bindings
+    store = PreparedStore(tmp_path / "resources.sqlite3")
+    job = PreparedJob("sync-job-unmap", "sync unmap", "project", "SYNC", "SYNC",
+                      Trigger.SYNC, Payload.USER_COMMAND, {"text": "cc"},
+                      {"at": NOW.isoformat()}, enabled=True, state=JobState.ARMED)
+    store.save(job)
+    m0 = PreparedSyncMember("sync-job-unmap", 0, "claude1", "claude1", "m", "h", "", {}, True)
+    m1 = PreparedSyncMember("sync-job-unmap", 1, "account-2", "launcher-2", "m", "h", "", {}, True)
+    store.save_sync_members("sync-job-unmap", [m0, m1])
+
+    # No donors or empty proven list -> unprovable legacy identity
+    res = migrate_prepared_bindings(store, donors={}, proven=set())
+    assert "sync-job-unmap" in res.blocked
+    reloaded = store.get("sync-job-unmap")
+    assert reloaded.state == JobState.BLOCKED
+    assert "ACCOUNT_MAPPING_REQUIRED" in reloaded.waiting_reason
+    assert "member 0" in reloaded.waiting_reason
+
+
+def test_migrate_prepared_sync_members_no_cross_identity_substitution(tmp_path):
+    from audapack.launch_federation import migrate_prepared_bindings
+    store = PreparedStore(tmp_path / "resources.sqlite3")
+    job = PreparedJob("sync-job-nocross", "sync nocross", "project", "SYNC", "SYNC",
+                      Trigger.SYNC, Payload.USER_COMMAND, {"text": "cc"},
+                      {"at": NOW.isoformat()}, enabled=True, state=JobState.ARMED)
+    store.save(job)
+    # claude1 member, but only claude2 is known in donors
+    m0 = PreparedSyncMember("sync-job-nocross", 0, "claude1", "claude1", "m", "h", "", {}, True)
+    m1 = PreparedSyncMember("sync-job-nocross", 1, "account-2", "launcher-2", "m", "h", "", {}, True)
+    store.save_sync_members("sync-job-nocross", [m0, m1])
+
+    donors = {"claude2": "claude:pdir:c2"}
+    proven = {"claude:pdir:c2"}
+    res = migrate_prepared_bindings(store, donors=donors, proven=proven)
+
+    assert "sync-job-nocross" in res.blocked
+    reloaded = store.get("sync-job-nocross")
+    assert reloaded.state == JobState.BLOCKED
+    assert "ACCOUNT_MAPPING_REQUIRED" in reloaded.waiting_reason
+    # Ensure members were NOT mutated to claude2
+    members = store.get_sync_members("sync-job-nocross")
+    assert members[0].account_id == "claude1"
+
+
+def test_prepared_worker_sync_member_wait_reason_and_settle(tmp_path):
+    from audapack.account_registry import AccountIdentity
+    from audapack.prepared_worker import PreparedWorker
+    store = PreparedStore(tmp_path / "resources.sqlite3")
+    job = PreparedJob("sync-worker-job", "sync worker job", "project", "SYNC", "SYNC",
+                      Trigger.SYNC, Payload.USER_COMMAND, {"text": "cc"},
+                      {"at": NOW.isoformat()}, enabled=True, state=JobState.ARMED)
+    store.save(job)
+    m0 = PreparedSyncMember("sync-worker-job", 0, "claude:pdir:c1", "sai:claude:pdir:c1", "m", "h", "", {}, True)
+    m1 = PreparedSyncMember("sync-worker-job", 1, "codex:pdir:cx", "sai:codex:pdir:cx", "m", "h", "", {}, True)
+    store.save_sync_members("sync-worker-job", [m0, m1])
+
+    worker = PreparedWorker(prepared_store=store)
+
+    # 1. When member account is NOT in discovered accounts, wait reason is set
+    discovered_empty = {}
+    reason = worker._workflow_wait_reason(job, discovered_empty)
+    assert "ACCOUNT_MAPPING_REQUIRED" in reason
+    assert "claude:pdir:c1 not discovered" in reason
+
+    # 2. When member account is discovered, wait reason is cleared
+    acc0 = AccountIdentity(
+        account_id="claude:pdir:c1",
+        provider_id="claude",
+        display_name="Claude 1",
+        profile_locator="loc1",
+        launcher_ids=("sai:claude:pdir:c1",),
+        discovery_source="sai_accounts_shared",
+        last_seen_at="",
+        enabled=True,
+    )
+    acc1 = AccountIdentity(
+        account_id="codex:pdir:cx",
+        provider_id="codex",
+        display_name="Codex 1",
+        profile_locator="loc2",
+        launcher_ids=("sai:codex:pdir:cx",),
+        discovery_source="sai_accounts_shared",
+        last_seen_at="",
+        enabled=True,
+    )
+    discovered_map = {acc0.account_id: acc0, acc1.account_id: acc1}
+    reason_ok = worker._workflow_wait_reason(job, discovered_map)
+    assert "ACCOUNT_MAPPING_REQUIRED" not in reason_ok
+

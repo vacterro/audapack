@@ -255,6 +255,39 @@ def _live_bridge_token() -> str:
         return ""
 
 
+#: Lightweight registry-revision cache: (mtime_ns, size, project_count).
+_REGISTRY_REVISION_CACHE: tuple[int, int, int] = (0, 0, 0)
+_REGISTRY_REVISION_LOCK = threading.Lock()
+
+
+def _get_registry_revision(handler: Any) -> int:
+    """Read registered project count without full config loading or path healing (PERF-003)."""
+    global _REGISTRY_REVISION_CACHE
+    if getattr(handler, "test_base_dir", None):
+        cfg = getattr(handler, "config", None)
+        return len(cfg.projects) if cfg and hasattr(cfg, "projects") else 0
+    try:
+        from audapack.config import config_path
+        cfg_path = config_path()
+        if not cfg_path.exists():
+            cfg = getattr(handler, "config", None)
+            return len(cfg.projects) if cfg and hasattr(cfg, "projects") else 0
+        stat = cfg_path.stat()
+        mtime_ns, size = int(stat.st_mtime_ns), int(stat.st_size)
+        with _REGISTRY_REVISION_LOCK:
+            if _REGISTRY_REVISION_CACHE[0] == mtime_ns and _REGISTRY_REVISION_CACHE[1] == size:
+                return _REGISTRY_REVISION_CACHE[2]
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        projects = raw.get("projects", [])
+        count = len(projects) if isinstance(projects, list) else 0
+        with _REGISTRY_REVISION_LOCK:
+            _REGISTRY_REVISION_CACHE = (mtime_ns, size, count)
+        return count
+    except Exception:
+        cfg = getattr(handler, "config", None)
+        return len(cfg.projects) if cfg and hasattr(cfg, "projects") else 0
+
+
 # Global callback for notifying UI of new audits or auto-registered projects
 _ON_AUDIT_WRITTEN: Optional[Callable[[str, str], None]] = None
 
@@ -769,7 +802,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         if parsed.path in ("/health", "/v1/health"):
-            live_cfg = self.get_live_config()
+            reg_revision = _get_registry_revision(self)
             profs = load_profiles()
             build_id, source_revision = _get_build_identity()
             widget_bundle_version, widget_bundle_sha256 = _get_widget_bundle_info()
@@ -788,7 +821,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
                 # from a LIVE /health, so this must carry the PID as well as the
                 # nonce.
                 "pid": os.getpid(),
-                "registry_revision": len(live_cfg.projects),
+                "registry_revision": reg_revision,
                 "build_id": build_id,
                 "source_revision": source_revision,
                 "widget_bundle_version": widget_bundle_version,
@@ -1034,6 +1067,9 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, **self._browser_slots_status()})
         elif self._project_archive_route(parsed.path) is not None:
             project_id, action = self._project_archive_route(parsed.path)
+            if action == "metadata":
+                self.handle_project_archive_metadata(project_id)
+                return
             if action:
                 self.send_json(404, {"ok": False, "error": "Endpoint not found"})
                 return
@@ -1421,7 +1457,7 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
         if parts[0] != "v1" or parts[1] != "projects" or parts[3] != "archive":
             return None
         action = parts[4] if len(parts) == 5 else ""
-        if action not in ("", "ensure"):
+        if action not in ("", "ensure", "metadata"):
             return None
         return unquote(parts[2]), action
 
@@ -1586,6 +1622,33 @@ class AudapackBridgeHandler(BaseHTTPRequestHandler):
             return policy_fingerprint_from_config(packing, set(getattr(packing, "excludes", None) or []))
         except Exception:  # noqa: BLE001 - no policy identity means no receipt
             return ""
+
+    def handle_project_archive_metadata(self, project_id: str) -> None:
+        """Lightweight metadata read: stat-only, no archive packing, hashing, or byte transfer."""
+        if not self.check_auth():
+            return
+        live_cfg, proj, error = self._archive_project_eligibility(project_id)
+        if error is not None:
+            status, code, message = error
+            self.send_json(status, {"ok": False, "error": {"code": code, "message": message, "retriable": False}})
+            return
+        archive = self._canonical_archive_path(proj, live_cfg)
+        if archive is None:
+            self.send_json(404, {"ok": False, "error": {"code": "archive_missing", "message": "No canonical archive for this project", "retriable": False}})
+            return
+        try:
+            stat = archive.stat()
+        except OSError as exc:
+            self.send_json(503, {"ok": False, "error": {"code": "archive_unreadable", "message": str(exc), "retriable": True}})
+            return
+        self.send_json(200, {
+            "ok": True,
+            "project_id": proj.id,
+            "display_name": proj.display_name,
+            "filename": archive.name,
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+        })
 
     def handle_project_archive_download(self, project_id: str) -> None:
         # SRC-083 TARGET C: the pre-stream work is timed per step so a slow GET

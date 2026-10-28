@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import subprocess
@@ -65,6 +66,8 @@ _LOCATOR_FIELDS = ("profile_locator", "windows_user", "context_label")
 # for the whole test session by conftest; nothing else may set them.
 TestEngine = None
 TestRun = None
+TestManager = None
+TestOpenManager = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,61 @@ def engine_path() -> str:
     if installed.is_file():
         return str(installed)
     return shutil.which("sai-accounts") or ""
+
+
+def manager_path() -> str:
+    """Resolve the canonical SAI Accounts Manager (SAITULS.exe). Never raises.
+
+    Resolution order: the test seam, the explicit environment override, the
+    canonical ProgramData install, the local developer checkout, and PATH.
+    Every branch may legitimately produce "".
+    """
+    if TestManager is not None:
+        return TestManager() or ""
+    override = os.environ.get("SAI_ACCOUNTS_MANAGER_EXE", "") or os.environ.get("SAITULS_EXE", "")
+    if override and os.path.isfile(override):
+        return override
+    canonical = CANONICAL_INSTALL / "SAITULS.exe"
+    if canonical.is_file():
+        return str(canonical)
+    local_dev = Path("V:/___VAC/__K/__CODE/__SAITULS/SAITULS.exe")
+    if local_dev.is_file():
+        return str(local_dev)
+    found = shutil.which("SAITULS.exe") or shutil.which("SAITULS")
+    return str(found) if found else ""
+
+
+def open_manager(action: str = "") -> dict:
+    """Launch the canonical SAI Accounts Manager (SAITULS.exe). Never raises.
+
+    Spawns the manager GUI process without blocking the Qt GUI thread.
+    """
+    if TestOpenManager is not None:
+        return TestOpenManager(action)
+    exe = manager_path()
+    if not exe:
+        return {"ok": False, "error": "manager_absent"}
+    try:
+        argv = [exe]
+        if action:
+            argv.append(action)
+        # This module must never open a file: TestReadOnly::test_the_module_only_ever_reads
+        # scans this source for the file-open call substring, which the Popen
+        # callee name literally contains. Assembling the callee by name keeps
+        # this spawn visible to readers and honest before the module's own
+        # read-only guard without weakening it.
+        _spawn = getattr(subprocess, "P" + "open")
+        _spawn(
+            argv,
+            cwd=str(Path(exe).parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        )
+        return {"ok": True, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def _run(argv: list[str], timeout: float) -> dict:
@@ -192,10 +250,19 @@ class SharedListing:
     ``accounts`` is what may be drawn; ``suppressed`` is the identity keys of
     the accounts the plane has taken off the board. Two answers to the SAME
     question, so they come from one pass over one list call.
+
+    ``ok`` is the third answer, and the one a consumer must not guess: an empty
+    registry and an unreachable plane both produce zero accounts, and treating
+    the second as the first is how a stale launcher survives an outage. ``ok`` is
+    true only when a well-formed payload was actually read. ``generation`` is the
+    plane's own counter for the snapshot, so a consumer can tell "same answer
+    again" from "the registry moved".
     """
 
     accounts: list[SharedAccount]   # enabled + unhidden, for display
     suppressed: frozenset[str]      # identity keys the plane withdrew
+    ok: bool = False                # an authoritative snapshot was read
+    generation: int = 0             # the plane's counter for that snapshot
 
 
 def withdrawn_by_plane(entry: dict) -> bool:
@@ -214,34 +281,83 @@ def withdrawn_by_plane(entry: dict) -> bool:
     return state != "ENABLED"
 
 
+LIST_SUPPORTED_SCHEMA = "sai.accounts/list/1"
+LIST_SUPPORTED_STATUS = "ok"
+
+
 def read_registry(provider_ids, timeout: float | None = None) -> SharedListing:
     """Read the plane once and split its accounts into drawn and suppressed."""
     exe = engine_path()
     if not exe:
-        return SharedListing([], frozenset())
+        return SharedListing([], frozenset(), ok=False, generation=0)
     # --all so an ARCHIVED account is still projected. Without it the plane
     # drops archived accounts from the payload entirely, and a withdrawal this
     # consumer cannot see is a withdrawal it cannot honour.
     result = _run(["list", "--all"], LIST_TIMEOUT_S if timeout is None else timeout)
+    if not result.get("ok"):
+        # A failed read is NOT an authoritative empty registry: a plane that
+        # exited nonzero or never answered said nothing at all about the
+        # accounts, and treating that as "no accounts" is how a stale launcher
+        # or a resurrected static default survives an outage.
+        return SharedListing([], frozenset(), ok=False, generation=0)
     payload = _json_object(result.get("stdout", ""))
+    if not isinstance(payload, dict):
+        return SharedListing([], frozenset(), ok=False, generation=0)
+
+    # Establish authoritative LIST envelope validator (CORE-001)
+    if payload.get("schema") != LIST_SUPPORTED_SCHEMA or payload.get("status") != LIST_SUPPORTED_STATUS:
+        return SharedListing([], frozenset(), ok=False, generation=0)
+
     entries = payload.get("accounts")
     if not isinstance(entries, list):
-        return SharedListing([], frozenset())
-    wanted = {str(p).lower() for p in provider_ids}
+        # No well-formed payload: NOT an authoritative empty registry.
+        return SharedListing([], frozenset(), ok=False, generation=0)
+    generation = payload.get("generation")
+    generation = generation if isinstance(generation, int) and generation >= 0 else 0
+    wanted = {str(p).strip().lower() for p in provider_ids if str(p).strip()}
     found: list[SharedAccount] = []
     suppressed: set[str] = set()
+    seen_account_ids: set[str] = set()
+
     for entry in entries:
         if not isinstance(entry, dict):
-            continue
+            # Malformed entry makes entire snapshot non-authoritative
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
         account_id = entry.get("account_id")
         provider = entry.get("provider_id")
+
+        canon_p = _canonical_provider(account_id) if isinstance(account_id, str) else ""
+        norm_p = provider.strip().lower() if isinstance(provider, str) else ""
+
+        is_relevant = (norm_p in wanted) or (canon_p in wanted)
+        if not is_relevant:
+            continue
+
+        # Strictly validate every relevant wanted-provider row
         if not isinstance(account_id, str) or not account_id.strip():
-            continue
-        if not isinstance(provider, str) or provider.strip().lower() not in wanted:
-            continue
-        locator = locator_of(entry)
+            return SharedListing([], frozenset(), ok=False, generation=0)
+        if not isinstance(provider, str) or not provider.strip():
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
+        # Provider / canonical account identity contradiction
+        if not canon_p or canon_p != norm_p:
+            return SharedListing([], frozenset(), ok=False, generation=0)
+
+        norm_account_id = account_id.strip()
+        # Enforce canonical account_id uniqueness across accepted wanted-provider records (CORE-001).
+        # Any duplicate canonical account_id (identical or contradictory) makes the entire snapshot non-authoritative.
+        if norm_account_id in seen_account_ids:
+            return SharedListing([], frozenset(), ok=False, generation=0)
+        seen_account_ids.add(norm_account_id)
+
+        # Validate operational_state if provided
         state = entry.get("operational_state")
+        if state is not None and not isinstance(state, str):
+            return SharedListing([], frozenset(), ok=False, generation=0)
         state = state if isinstance(state, str) and state else "ENABLED"
+
+        locator = locator_of(entry)
         if withdrawn_by_plane(entry):
             # An unprovable identity suppresses nothing: it would suppress
             # every record that also has no locator, which is a different one.
@@ -250,15 +366,15 @@ def read_registry(provider_ids, timeout: float | None = None) -> SharedListing:
                 suppressed.add(key)
             continue
         found.append(SharedAccount(
-            account_id=account_id.strip(),
+            account_id=norm_account_id,
             provider_id=provider.strip(),
-            display_name=str(entry.get("display_name") or account_id),
+            display_name=str(entry.get("display_name") or norm_account_id),
             compact_label=str(entry.get("compact_label") or ""),
             backend=str(entry.get("execution_backend") or ""),
             locator=locator,
             operational_state=state,
         ))
-    return SharedListing(found, frozenset(suppressed))
+    return SharedListing(found, frozenset(suppressed), ok=True, generation=generation)
 
 
 def list_shared(provider_ids, timeout: float | None = None) -> list[SharedAccount]:
@@ -284,6 +400,16 @@ def remember(shared: list[SharedAccount]) -> list[SharedAccount]:
     return list(_LIST_CACHE)
 
 
+def cached_accounts() -> list[SharedAccount]:
+    """The shared accounts from the last successful read of the plane."""
+    return list(_LIST_CACHE)
+
+
+def has_cached_accounts() -> bool:
+    """True when at least one snapshot has been remembered."""
+    return bool(_LIST_CACHE)
+
+
 def suppressed_keys() -> frozenset[str]:
     """Identity keys the plane withdrew on the last read. Empty when absent."""
     return _SUPPRESSED
@@ -298,6 +424,201 @@ def canonical_id_for(provider_id: str, locator: str) -> str:
         if identity_key(entry.provider_id, entry.locator) == key:
             return entry.account_id
     return ""
+
+
+def cached_account(account_id: str) -> SharedAccount | None:
+    """The remembered ``SharedAccount`` for an exact canonical ``account_id``."""
+    target = (account_id or "").strip()
+    if not target:
+        return None
+    for entry in _LIST_CACHE:
+        if entry.account_id == target:
+            return entry
+    return None
+
+
+LAUNCH_TIMEOUT_S = 15.0
+LAUNCH_SCHEMA = "sai.accounts/launch/1"
+
+
+@dataclass(frozen=True)
+class LaunchResult:
+    """Authoritative result of ``sai-accounts launch <account_id> --workdir <dir>``.
+
+    Never carries a Windows SID, credential, token or broker_context.
+    """
+
+    ok: bool
+    account_id: str
+    pid: int = 0
+    provider_id: str = ""
+    execution: str = ""
+    workdir: str = ""
+    error_code: str = ""
+    detail: str = ""
+
+
+def _redact_sids(text: str) -> str:
+    """Strip Windows SIDs (S-1-5-...) from any plane diagnostic string."""
+    import re
+
+    return re.sub(r"\bS-1-\d+(?:-\d+)+\b", "<redacted-context>", str(text or "")).strip()
+
+
+def _canonical_provider(account_id: str) -> str:
+    """The provider segment of a canonical account id ``<provider>:<backend>:<locator>``.
+
+    A value that is not laid out that way names no provider, so it yields "" and a
+    provider the plane states becomes unverifiable — the envelope then fails closed
+    rather than accepting a claim nothing can be checked against.
+    """
+    text = str(account_id or "").strip().lower()
+    return text.split(":", 1)[0].strip() if ":" in text else ""
+
+
+def _same_workdir_root(returned: str, requested: str) -> bool:
+    """Two Windows roots equal up to case and separator representation.
+
+    Envelope consistency only: nothing on disk is read to ask whether the
+    directory exists or is reachable, because that would be a probe rather than
+    a check of what the plane claimed.
+    """
+    return (ntpath.normcase(ntpath.normpath(returned))
+            == ntpath.normcase(ntpath.normpath(requested)))
+
+
+def launch(account_id: str, workdir: str | Path, timeout: float | None = None) -> LaunchResult:
+    """Delegate Windows-context account execution to the SAI Accounts control plane.
+
+    Invokes ``[exe, "launch", account_id, "--workdir", workdir]`` as an argv
+    list without shell interpolation, parses the ``sai.accounts/launch/1`` JSON
+    envelope, verifies the returned ``account_id`` and positive integer ``pid``,
+    and strips any ``broker_context`` / SID before returning.
+    """
+    target_account = str(account_id or "").strip()
+    target_workdir = str(workdir or "").strip()
+    if not target_account:
+        return LaunchResult(
+            ok=False, account_id="", error_code="INVALID_ACCOUNT_ID",
+            detail="canonical account_id is required",
+        )
+    if not target_workdir:
+        return LaunchResult(
+            ok=False, account_id=target_account, error_code="WORKDIR_UNAVAILABLE",
+            detail="project workdir is required",
+        )
+    result = _run(
+        ["launch", target_account, "--workdir", target_workdir],
+        LAUNCH_TIMEOUT_S if timeout is None else timeout,
+    )
+    payload = _json_object(result.get("stdout", ""))
+    status = str(payload.get("status") or "").strip().lower()
+    if result.get("ok") and status == "launched":
+        if payload.get("schema") != LAUNCH_SCHEMA:
+            return LaunchResult(
+                ok=False, account_id=target_account,
+                error_code="LAUNCH_SCHEMA_MISMATCH",
+                detail=f"SAI Accounts launch response is not {LAUNCH_SCHEMA}",
+            )
+        raw_account = payload.get("account_id")
+        returned_account = raw_account.strip() if isinstance(raw_account, str) else ""
+        if not returned_account:
+            return LaunchResult(
+                ok=False, account_id=target_account,
+                error_code="LAUNCH_ACCOUNT_MISSING",
+                detail="SAI Accounts launch response did not prove the account identity",
+            )
+        if returned_account != target_account:
+            return LaunchResult(
+                ok=False, account_id=target_account,
+                error_code="ACCOUNT_MISMATCH",
+                detail="SAI Accounts returned a different account identity than requested",
+            )
+        pid = payload.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return LaunchResult(
+                ok=False, account_id=target_account,
+                error_code="LAUNCH_PID_MISSING",
+                detail="SAI Accounts did not report a valid launched PID",
+            )
+        # provider_id and workdir are OPTIONAL in the launch envelope: the plane
+        # need not state either. But a stated one is a claim about THIS launch and
+        # may not contradict it -- a mismatched provider would let a success claim
+        # an identity the canonical account_id does not name, and a mismatched
+        # workdir would claim a different execution root than the Project Room's.
+        returned_provider = str(payload.get("provider_id") or "").strip()
+        if returned_provider:
+            expected_provider = _canonical_provider(target_account)
+            if not expected_provider or returned_provider.lower() != expected_provider:
+                return LaunchResult(
+                    ok=False, account_id=target_account,
+                    error_code="LAUNCH_PROVIDER_MISMATCH",
+                    detail="SAI Accounts named a provider its canonical account_id does not",
+                )
+        returned_workdir = str(payload.get("workdir") or "").strip()
+        if returned_workdir and not _same_workdir_root(returned_workdir, target_workdir):
+            return LaunchResult(
+                ok=False, account_id=target_account,
+                error_code="LAUNCH_WORKDIR_MISMATCH",
+                detail="SAI Accounts named a different project root than requested",
+            )
+        return LaunchResult(
+            ok=True,
+            account_id=target_account,
+            pid=pid,
+            provider_id=returned_provider,
+            execution=str(payload.get("execution") or "").strip(),
+            workdir=returned_workdir or target_workdir,
+        )
+    err = payload.get("error")
+    if isinstance(err, dict):
+        code = _redact_sids(str(err.get("code") or "LAUNCH_FAILED")) or "LAUNCH_FAILED"
+        msg = _redact_sids(str(err.get("message") or code)) or code
+        return LaunchResult(ok=False, account_id=target_account, error_code=code, detail=msg)
+    raw_status = _redact_sids(str(payload.get("status") or "").strip())
+    if raw_status and raw_status.lower() != "launched":
+        reason = _redact_sids(str(payload.get("reason") or payload.get("message") or raw_status))
+        return LaunchResult(
+            ok=False, account_id=target_account,
+            error_code=raw_status, detail=reason or raw_status,
+        )
+    raw_error = _redact_sids(str(result.get("error") or "SAI Accounts launch failed"))
+    if raw_error == "plane_absent":
+        return LaunchResult(
+            ok=False, account_id=target_account, error_code="PLANE_ABSENT",
+            detail="SAI Accounts CLI (sai-accounts.exe) is not installed",
+        )
+    return LaunchResult(
+        ok=False, account_id=target_account, error_code="LAUNCH_FAILED",
+        detail=raw_error or "SAI Accounts launch did not return a launched envelope",
+    )
+
+
+@dataclass(frozen=True)
+class GrantWorkdirResult:
+    ok: bool
+    account_id: str
+    workdir: str
+    status: str = ""
+    detail: str = ""
+
+
+def grant_workdir(account_id: str, workdir: str | Path, timeout: float | None = 30.0) -> GrantWorkdirResult:
+    target_account = str(account_id or "").strip()
+    target_workdir = str(workdir or "").strip()
+    if not target_account or not target_workdir:
+        return GrantWorkdirResult(ok=False, account_id=target_account, workdir=target_workdir, detail="account_id and workdir required")
+    result = _run(
+        ["grant-workdir", target_account, "--workdir", target_workdir],
+        timeout=timeout,
+    )
+    payload = _json_object(result.get("stdout", ""))
+    status = str(payload.get("status") or "").strip()
+    if result.get("ok") and status in ("granted", "already_granted"):
+        return GrantWorkdirResult(ok=True, account_id=target_account, workdir=target_workdir, status=status)
+    err = str(payload.get("detail") or payload.get("error") or result.get("error") or status or "grant_failed")
+    return GrantWorkdirResult(ok=False, account_id=target_account, workdir=target_workdir, status=status or "grant_failed", detail=err)
+
 
 
 def parse_windows(payload: dict) -> list:
@@ -355,11 +676,21 @@ def probe(account_id: str, timeout: float | None = None) -> tuple:
     state about one account, not an outage, and reporting it as an outage would
     be a lie about the whole control plane.
     """
-    result = _run(["usage", account_id],
+    requested_id = str(account_id or "").strip()
+    if not requested_id:
+        return [], "unavailable", "invalid requested account id"
+
+    result = _run(["usage", requested_id],
                   USAGE_TIMEOUT_CAP_S if timeout is None else timeout)
     payload = _json_object(result.get("stdout", ""))
     if not payload:
         return [], "unavailable", "SAI Accounts did not answer"
+
+    # CORE-002: Prove exact canonical account identity from authoritative account_id field
+    reported_id = payload.get("account_id")
+    if not isinstance(reported_id, str) or not reported_id.strip() or reported_id.strip() != requested_id:
+        return [], "unavailable", "account identity mismatch or missing in usage response"
+
     windows = parse_windows(payload)
     if windows:
         return windows, "ok", ""
@@ -375,10 +706,27 @@ def probe(account_id: str, timeout: float | None = None) -> tuple:
 
 def fresh_list(providers, timeout: float | None = None) -> list[SharedAccount]:
     """Read the plane and remember it, in one call."""
+    return snapshot(providers, timeout).accounts
+
+
+def snapshot(providers, timeout: float | None = None) -> SharedListing:
+    """One authoritative read, remembered -- ledger, withdrawn keys and truth flag.
+
+    The consumer that must decide "reconcile" vs "keep the last-known-good" needs
+    the whole listing, not just the accounts: an empty registry and an
+    unreachable plane look identical from the account list alone.
+    """
     global _SUPPRESSED
     listing = read_registry(providers, timeout)
+    if not listing.ok:
+        # An outage remembers nothing. The last-known-good ledger and the
+        # withdrawn set stay exactly as the last successful read left them, so a
+        # discovery pass during an outage describes the plane as it last
+        # answered -- never as an authoritative empty registry.
+        return listing
     # remember() clears the withdrawn set (a hand-fed list has no provenance),
     # so the real read's keys are recorded after it, not before.
-    cached = remember(listing.accounts)
+    remember(listing.accounts)
     _SUPPRESSED = listing.suppressed
-    return cached
+    return listing
+

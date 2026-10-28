@@ -190,6 +190,8 @@ class SettingsWidget(QWidget):
         self.auto_copy_gg.toggled.connect(lambda: self._save())
         self.show_tooltips.toggled.connect(lambda: self._save())
         self.compact_rows.toggled.connect(lambda: self._save())
+        self.show_metrics_strip.toggled.connect(lambda: self._save())
+        self.compact_metrics.toggled.connect(lambda: self._save())
         self.project_double_click_action.currentIndexChanged.connect(
             self._on_double_click_action_changed
         )
@@ -239,6 +241,16 @@ class SettingsWidget(QWidget):
         self.compact_rows.setChecked(getattr(self._config.ui, "compact_rows", False))
         f.addRow("Project rows", self.compact_rows)
 
+        self.show_metrics_strip = QCheckBox("Show metrics strip above actions")
+        self.show_metrics_strip.setChecked(getattr(self._config.ui, "show_metrics_strip", True))
+        self.show_metrics_strip.setToolTip("Show compact audit metrics strip above action buttons.")
+        f.addRow("Metrics strip", self.show_metrics_strip)
+
+        self.compact_metrics = QCheckBox("Compact metrics (smaller padding)")
+        self.compact_metrics.setChecked(getattr(self._config.ui, "compact_metrics", False))
+        self.compact_metrics.setToolTip("Render metrics strip with compact padding.")
+        f.addRow("Metrics size", self.compact_metrics)
+
         # T-209: what a double-click on a POPULATED project row does. Groups
         # still expand/collapse; empty slots still add a project.
         self.project_double_click_action = QComboBox(w)
@@ -253,8 +265,7 @@ class SettingsWidget(QWidget):
             max(0, self.project_double_click_action.findData(configured_action))
         )
         self.project_double_click_action.setToolTip(
-            "Choose what happens when a populated project row is double-clicked.\n"
-            "Groups still expand/collapse and empty slots still add a project."
+            "Action performed when double-clicking a project row."
         )
         f.addRow("Project row double-click", self.project_double_click_action)
 
@@ -265,8 +276,7 @@ class SettingsWidget(QWidget):
         )
         self._populate_double_click_launchers()
         self.project_double_click_launcher.setToolTip(
-            "The launcher a project-row double-click opens. Stored by launcher id,\n"
-            "so reordering the launcher list does not change it."
+            "Preferred launcher opened on project double-click."
         )
         f.addRow("Double-click launcher", self.project_double_click_launcher)
         self._sync_double_click_launcher_enabled()
@@ -398,8 +408,7 @@ class SettingsWidget(QWidget):
             bool(getattr(self._config.packing, "auto_pack_on_project_click_enabled", True))
         )
         self.auto_pack_on_click.setToolTip(
-            "Clicking a project row in Project Room packs it in the background.\n"
-            "Selection changes, startup auto-select and drags never pack."
+            "Pack the project automatically in background when clicking its row."
         )
         f.addRow("Pack on row click", self.auto_pack_on_click)
         return w
@@ -414,29 +423,25 @@ class SettingsWidget(QWidget):
         self.mirror_into_project = QCheckBox("Also copy each finished audit into the project")
         self.mirror_into_project.setChecked(bool(getattr(self._config.audits, "mirror_into_project", False)))
         self.mirror_into_project.setToolTip(
-            "A copy, not a move: the audit root stays the index this app reads.\n"
-            "An agent working inside the repo finds the audit without being told where it lives."
+            "Copy completed audit files into the project folder."
         )
         f.addRow("Copy to project", self.mirror_into_project)
         self.mirror_dir_name = QLineEdit(str(getattr(self._config.audits, "mirror_dir_name", "audit")))
         self.mirror_dir_name.setPlaceholderText("audit")
         self.mirror_dir_name.setToolTip(
-            "Folder created inside the project source path.\n"
-            "Agent inboxes read 'audit' specifically: rename it and `cc` finds nothing."
+            "Target subfolder name inside the project (defaults to 'audit')."
         )
         f.addRow("Project folder", self.mirror_dir_name)
         self.mirror_include_waves = QCheckBox("Also copy the per-wave files beside it")
         self.mirror_include_waves.setChecked(bool(getattr(self._config.audits, "mirror_include_waves", False)))
         self.mirror_include_waves.setToolTip(
-            "The agent inbox reads only 1.md, 2.md ... Everything else is residue:\n"
-            "never read, never cleaned up, so a settled inbox still reports dirty."
+            "Also copy individual wave audit files beside the main audit."
         )
         f.addRow("Per-wave copies", self.mirror_include_waves)
         self.autopack_before_audit = QCheckBox("Autopack zip before audit")
         self.autopack_before_audit.setChecked(bool(getattr(self._config.audits, "autopack_before_audit", True)))
         self.autopack_before_audit.setToolTip(
-            "Always repack, instead of trusting the archive's mtime.\n"
-            "A stale zip means auditing code you have already moved past."
+            "Automatically repack archive before starting an audit."
         )
         f.addRow("Fresh archive", self.autopack_before_audit)
         self.dedicated_profile_only = QCheckBox("Work only in specialized Chromium instances with widget")
@@ -444,8 +449,7 @@ class SettingsWidget(QWidget):
             bool(getattr(self._config.audits, "dedicated_profile_only", False))
         )
         self.dedicated_profile_only.setToolTip(
-            "Off, any Chromium browser holding the widget and the token joins the pool\n"
-            "and can claim an audit -- including your own Brave or Chrome tab."
+            "Restrict worker audits to the dedicated Chromium profile."
         )
         f.addRow("Worker pool", self.dedicated_profile_only)
 
@@ -481,16 +485,14 @@ class SettingsWidget(QWidget):
         self.worker_minimized = QCheckBox("Minimize them after arranging")
         self.worker_minimized.setChecked(bool(getattr(self._config.ui, "worker_windows_minimized", True)))
         self.worker_minimized.setToolTip(
-            "Safe for a worker: the dedicated profile runs with occlusion detection\n"
-            "and every backgrounding throttle off, so a minimized audit keeps running."
+            "Minimize worker windows after arranging them."
         )
         f.addRow("Minimized", self.worker_minimized)
 
         self.close_idle_workers = QCheckBox("Close them when the queue is empty and nothing is running")
         self.close_idle_workers.setChecked(bool(getattr(self._config.ui, "close_idle_worker_windows", True)))
         self.close_idle_workers.setToolTip(
-            "Six idle windows are six windows in the way; the next audit reopens what it needs.\n"
-            "A window you opened yourself with NEW is never closed, and neither is one holding a run."
+            "Close idle worker windows when the queue is empty."
         )
         f.addRow("When idle", self.close_idle_workers)
 
@@ -793,40 +795,100 @@ class SettingsWidget(QWidget):
         self.launcher_letters_chk.toggled.connect(self._on_launcher_letters_toggled)
         layout.addWidget(self.launcher_letters_chk)
 
-        self.launcher_list = QListWidget(w)
-        self.launcher_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
-        self.launcher_list.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.launcher_list.model().rowsMoved.connect(self._on_launcher_rows_moved)
-        self.launcher_list.itemChanged.connect(self._on_launcher_item_changed)
-        layout.addWidget(self.launcher_list)
+        # LOCAL TOOLS group
+        self.grp_local = QGroupBox("LOCAL TOOLS", w)
+        self.grp_local.setObjectName("grp_local_tools")
+        local_layout = QVBoxLayout(self.grp_local)
+        local_layout.setContentsMargins(4, 4, 4, 4)
+        local_layout.setSpacing(4)
+
+        self.local_launcher_list = QListWidget(self.grp_local)
+        self.local_launcher_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.local_launcher_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.local_launcher_list.model().rowsMoved.connect(self._on_launcher_rows_moved)
+        self.local_launcher_list.itemChanged.connect(self._on_launcher_item_changed)
+        local_layout.addWidget(self.local_launcher_list)
+
+        # Backwards compatibility alias for tests expecting launcher_list
+        self.launcher_list = self.local_launcher_list
+
+        local_btn_row = QWidget(self.grp_local)
+        local_btn_layout = QHBoxLayout(local_btn_row)
+        local_btn_layout.setContentsMargins(0, 0, 0, 0)
+        local_btn_layout.setSpacing(4)
+
+        self.btn_add = QPushButton("Add", self.grp_local)
+        self.btn_add.clicked.connect(self._on_add_launcher)
+        self.btn_edit = QPushButton("Edit", self.grp_local)
+        self.btn_edit.clicked.connect(self._on_edit_launcher)
+        self.btn_remove = QPushButton("Remove", self.grp_local)
+        self.btn_remove.clicked.connect(self._on_remove_launcher)
+        self.btn_up = QPushButton("▲ Up", self.grp_local)
+        self.btn_up.clicked.connect(self._on_move_launcher_up)
+        self.btn_down = QPushButton("▼ Down", self.grp_local)
+        self.btn_down.clicked.connect(self._on_move_launcher_down)
+
+        local_btn_layout.addWidget(self.btn_add)
+        local_btn_layout.addWidget(self.btn_edit)
+        local_btn_layout.addWidget(self.btn_remove)
+        local_btn_layout.addStretch()
+        local_btn_layout.addWidget(self.btn_up)
+        local_btn_layout.addWidget(self.btn_down)
+        local_layout.addWidget(local_btn_row)
+
+        layout.addWidget(self.grp_local)
+
+        # SAI ACCOUNTS group
+        self.grp_sai = QGroupBox("SAI ACCOUNTS", w)
+        self.grp_sai.setObjectName("grp_sai_accounts")
+        sai_layout = QVBoxLayout(self.grp_sai)
+        sai_layout.setContentsMargins(4, 4, 4, 4)
+        sai_layout.setSpacing(4)
+
+        status_row = QWidget(self.grp_sai)
+        status_layout = QHBoxLayout(status_row)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(4)
+
+        self.lbl_federation_status = QLabel("Status: STANDALONE", self.grp_sai)
+        self.lbl_federation_status.setStyleSheet("color: #9C9371; font-weight: bold; font-size: 10px;")
+        status_layout.addWidget(self.lbl_federation_status)
+        status_layout.addStretch()
+
+        self.btn_refresh_federation = QPushButton("Refresh", self.grp_sai)
+        self.btn_refresh_federation.clicked.connect(self._on_refresh_federation)
+        status_layout.addWidget(self.btn_refresh_federation)
+        sai_layout.addWidget(status_row)
+
+        self.sai_launcher_list = QListWidget(self.grp_sai)
+        self.sai_launcher_list.itemChanged.connect(self._on_sai_launcher_item_changed)
+        sai_layout.addWidget(self.sai_launcher_list)
+
+        sai_btn_row = QWidget(self.grp_sai)
+        sai_btn_layout = QHBoxLayout(sai_btn_row)
+        sai_btn_layout.setContentsMargins(0, 0, 0, 0)
+        sai_btn_layout.setSpacing(4)
+
+        self.btn_add_sai = QPushButton("Add", self.grp_sai)
+        self.btn_add_sai.setToolTip("Open SAI Accounts Manager to add an account")
+        self.btn_add_sai.clicked.connect(self._on_add_sai_launcher)
+
+        self.btn_remove_sai = QPushButton("Remove", self.grp_sai)
+        self.btn_remove_sai.setToolTip("Open SAI Accounts Manager to manage accounts")
+        self.btn_remove_sai.clicked.connect(self._on_remove_sai_launcher)
+
+        self.btn_manage_sai = QPushButton("Manage in SAI Accounts...", self.grp_sai)
+        self.btn_manage_sai.clicked.connect(self._on_open_sai_manager)
+
+        sai_btn_layout.addWidget(self.btn_add_sai)
+        sai_btn_layout.addWidget(self.btn_remove_sai)
+        sai_btn_layout.addWidget(self.btn_manage_sai)
+        sai_btn_layout.addStretch()
+        sai_layout.addWidget(sai_btn_row)
+
+        layout.addWidget(self.grp_sai)
 
         self._refresh_launcher_list()
-
-        # Button row
-        btn_row = QWidget(w)
-        btn_layout = QHBoxLayout(btn_row)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(4)
-
-        btn_add = QPushButton("Add", w)
-        btn_add.clicked.connect(self._on_add_launcher)
-        btn_edit = QPushButton("Edit", w)
-        btn_edit.clicked.connect(self._on_edit_launcher)
-        btn_remove = QPushButton("Remove", w)
-        btn_remove.clicked.connect(self._on_remove_launcher)
-        btn_up = QPushButton("▲ Up", w)
-        btn_up.clicked.connect(self._on_move_launcher_up)
-        btn_down = QPushButton("▼ Down", w)
-        btn_down.clicked.connect(self._on_move_launcher_down)
-
-        btn_layout.addWidget(btn_add)
-        btn_layout.addWidget(btn_edit)
-        btn_layout.addWidget(btn_remove)
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_up)
-        btn_layout.addWidget(btn_down)
-
-        layout.addWidget(btn_row)
         return w
 
     def _on_arrange_worker_windows(self):
@@ -859,31 +921,105 @@ class SettingsWidget(QWidget):
         self._refresh_launcher_list()
 
     def _refresh_launcher_list(self):
-        # Repopulating sets check states, and every one of those emits
-        # itemChanged. Without the guard the first refresh would write the
-        # config back over itself launcher by launcher.
+        from audapack.launch_federation import is_account_target
+
         self._launcher_list_loading = True
         try:
-            self.launcher_list.clear()
+            self.local_launcher_list.clear()
+            self.sai_launcher_list.clear()
             for lc in self._config.launchers:
                 limit = int(getattr(lc, "max_instances", 0) or 0)
                 limit_text = f" · max {limit}" if limit else " · unlimited"
-                item = QListWidgetItem(f"[{lc.short_label}] {lc.name}  ({lc.id}){limit_text}")
-                item.setData(Qt.ItemDataRole.UserRole, lc.id)
-                # A tick is how you turn a launcher off and back on. Remove used
-                # to be the only way, and it left no way back to the button.
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked if lc.enabled else Qt.CheckState.Unchecked
-                )
-                self.launcher_list.addItem(item)
+                if is_account_target(lc.id):
+                    text = f"[{lc.short_label}] {lc.name} ({lc.id}) · managed by SAI Accounts"
+                    item = QListWidgetItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, lc.id)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if lc.enabled else Qt.CheckState.Unchecked
+                    )
+                    self.sai_launcher_list.addItem(item)
+                else:
+                    text = f"[{lc.short_label}] {lc.name}  ({lc.id}){limit_text}"
+                    item = QListWidgetItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, lc.id)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(
+                        Qt.CheckState.Checked if lc.enabled else Qt.CheckState.Unchecked
+                    )
+                    self.local_launcher_list.addItem(item)
         finally:
             self._launcher_list_loading = False
-        # T-209: the double-click launcher combo mirrors the SAME list, so
-        # adding, removing, renaming or reordering a launcher keeps the
-        # selector honest. Selection is preserved by ID, never by index.
+
+        self._update_federation_status_label()
         self._populate_double_click_launchers()
         self._sync_double_click_launcher_enabled()
+
+    def _update_federation_status_label(self):
+        fed = getattr(self._config, "federation", None)
+        if not fed or not fed.active:
+            self.lbl_federation_status.setText("Status: STANDALONE")
+            self.lbl_federation_status.setStyleSheet("color: #9C9371; font-weight: bold; font-size: 10px;")
+            return
+        last_sync = fed.last_sync or "never"
+        if fed.stale:
+            self.lbl_federation_status.setText(f"Status: STALE / CONTROL PLANE OFFLINE  ·  Last sync: {last_sync}")
+            self.lbl_federation_status.setStyleSheet("color: #D9534F; font-weight: bold; font-size: 10px;")
+        else:
+            self.lbl_federation_status.setText(f"Status: FRESH  ·  Last sync: {last_sync}")
+            self.lbl_federation_status.setStyleSheet("color: #4A7A20; font-weight: bold; font-size: 10px;")
+
+    def update_federation_state(self, sync_result=None):
+        self._refresh_launcher_list()
+        if sync_result is not None and not sync_result.fresh and sync_result.state == "stale":
+            last_sync = getattr(self._config.federation, "last_sync", "") or "never"
+            self.lbl_federation_status.setText(f"Status: STALE / CONTROL PLANE OFFLINE  ·  Last sync: {last_sync}")
+            self.lbl_federation_status.setStyleSheet("color: #D9534F; font-weight: bold; font-size: 10px;")
+
+    def _on_refresh_federation(self):
+        self.refresh_federation()
+
+    def refresh_federation(self):
+        owner = getattr(self.window(), "request_federation_refresh", None)
+        if callable(owner):
+            owner(reason="settings_button")
+            return
+        parent_owner = getattr(self.parent(), "request_federation_refresh", None)
+        if callable(parent_owner):
+            parent_owner(reason="settings_button")
+            return
+        from audapack.launch_federation import PROVIDERS, acquire_listing, reconcile_listing
+        listing = acquire_listing(PROVIDERS)
+        res = reconcile_listing(self._config, listing)
+        self.update_federation_state(res)
+
+    def _on_add_sai_launcher(self):
+        self._on_open_sai_manager()
+
+    def _on_remove_sai_launcher(self):
+        self._on_open_sai_manager()
+
+    def _on_open_sai_manager(self):
+        from audapack import sai_accounts
+        res = sai_accounts.open_manager()
+        if not res.get("ok"):
+            err = res.get("error", "unknown")
+            self.lbl_federation_status.setText(f"SAI Accounts Manager unavailable ({err})")
+            self.lbl_federation_status.setStyleSheet("color: #D9534F; font-size: 10px;")
+
+    def _on_sai_launcher_item_changed(self, item):
+        if getattr(self, "_launcher_list_loading", False):
+            return
+        lid = item.data(Qt.ItemDataRole.UserRole)
+        lc = next((launcher for launcher in self._config.launchers if launcher.id == lid), None)
+        if lc is None:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        if bool(lc.enabled) == enabled:
+            return
+        lc.enabled = enabled
+        self._launchers_dirty = True
+        self._save()
 
     def _populate_double_click_launchers(self) -> None:
         """Rebuild the launcher selector from ``config.launchers``, by id."""
@@ -949,14 +1085,17 @@ class SettingsWidget(QWidget):
 
     def _on_launcher_rows_moved(self, *_args):
         """Sync config.launchers order after InternalMove drag-drop in QListWidget."""
-        new_order: list = []
-        for i in range(self.launcher_list.count()):
-            item = self.launcher_list.item(i)
+        from audapack.launch_federation import is_account_target
+
+        local_order = []
+        for i in range(self.local_launcher_list.count()):
+            item = self.local_launcher_list.item(i)
             lid = item.data(Qt.ItemDataRole.UserRole)
             lc = next((launcher for launcher in self._config.launchers if launcher.id == lid), None)
-            if lc:
-                new_order.append(lc)
-        self._config.launchers = new_order
+            if lc and not is_account_target(lc.id):
+                local_order.append(lc)
+        sai_rows = [lc for lc in self._config.launchers if is_account_target(lc.id)]
+        self._config.launchers = local_order + sai_rows
         self._launchers_dirty = True
         self._refresh_launcher_list()
         self._save()
@@ -980,10 +1119,13 @@ class SettingsWidget(QWidget):
             self._save()
 
     def _on_edit_launcher(self):
-        item = self.launcher_list.currentItem()
+        item = self.local_launcher_list.currentItem()
         if not item:
             return
         lid = item.data(Qt.ItemDataRole.UserRole)
+        from audapack.launch_federation import is_account_target
+        if is_account_target(lid):
+            return
         lc = next((launcher for launcher in self._config.launchers if launcher.id == lid), None)
         if not lc:
             return
@@ -1002,39 +1144,46 @@ class SettingsWidget(QWidget):
             self._save()
 
     def _on_remove_launcher(self):
-        item = self.launcher_list.currentItem()
+        item = self.local_launcher_list.currentItem()
         if not item:
             return
         lid = item.data(Qt.ItemDataRole.UserRole)
+        from audapack.launch_federation import is_account_target
+        if is_account_target(lid):
+            self._on_open_sai_manager()
+            return
         self._config.launchers = [launcher for launcher in self._config.launchers if launcher.id != lid]
         self._launchers_dirty = True
         self._refresh_launcher_list()
         self._save()
 
     def _on_move_launcher_up(self):
-        row = self.launcher_list.currentRow()
+        row = self.local_launcher_list.currentRow()
         if row <= 0:
             return
-        self._config.launchers[row], self._config.launchers[row - 1] = (
-            self._config.launchers[row - 1],
-            self._config.launchers[row],
-        )
-        self._launchers_dirty = True
-        self._refresh_launcher_list()
-        self.launcher_list.setCurrentRow(row - 1)
-        self._save()
+        from audapack.launch_federation import is_account_target
+        local_launchers = [lc for lc in self._config.launchers if not is_account_target(lc.id)]
+        sai_launchers = [lc for lc in self._config.launchers if is_account_target(lc.id)]
+        if row < len(local_launchers):
+            local_launchers[row], local_launchers[row - 1] = local_launchers[row - 1], local_launchers[row]
+            self._config.launchers = local_launchers + sai_launchers
+            self._launchers_dirty = True
+            self._refresh_launcher_list()
+            self.local_launcher_list.setCurrentRow(row - 1)
+            self._save()
 
     def _on_move_launcher_down(self):
-        row = self.launcher_list.currentRow()
-        if row < 0 or row >= len(self._config.launchers) - 1:
+        row = self.local_launcher_list.currentRow()
+        from audapack.launch_federation import is_account_target
+        local_launchers = [lc for lc in self._config.launchers if not is_account_target(lc.id)]
+        sai_launchers = [lc for lc in self._config.launchers if is_account_target(lc.id)]
+        if row < 0 or row >= len(local_launchers) - 1:
             return
-        self._config.launchers[row], self._config.launchers[row + 1] = (
-            self._config.launchers[row + 1],
-            self._config.launchers[row],
-        )
+        local_launchers[row], local_launchers[row + 1] = local_launchers[row + 1], local_launchers[row]
+        self._config.launchers = local_launchers + sai_launchers
         self._launchers_dirty = True
         self._refresh_launcher_list()
-        self.launcher_list.setCurrentRow(row + 1)
+        self.local_launcher_list.setCurrentRow(row + 1)
         self._save()
 
     def _owned_values(self) -> list[tuple[str, str, object]]:
@@ -1098,6 +1247,8 @@ class SettingsWidget(QWidget):
         owned.append(("ui", "auto_copy_gg_on_launch", self.auto_copy_gg.isChecked()))
         owned.append(("ui", "show_tooltips", self.show_tooltips.isChecked()))
         owned.append(("ui", "compact_rows", self.compact_rows.isChecked()))
+        owned.append(("ui", "show_metrics_strip", self.show_metrics_strip.isChecked()))
+        owned.append(("ui", "compact_metrics", self.compact_metrics.isChecked()))
         owned.append(("ui", "tooltip_duration_ms", self.tooltip_duration.value()))
         owned.append(("ui", "flash_duration_ms", self.flash_duration.value()))
         owned.append((
@@ -1235,6 +1386,8 @@ class SettingsDialog(QDialog):
         self.port = self.widget.port
         self.autostart = self.widget.autostart
         self.compact_rows = self.widget.compact_rows
+        self.show_metrics_strip = self.widget.show_metrics_strip
+        self.compact_metrics = self.widget.compact_metrics
 
     def _save(self):
         self.widget._save()

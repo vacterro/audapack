@@ -343,6 +343,10 @@ class ProjectRoomModel(QAbstractItemModel):
         if idx.isValid():
             self.dataChanged.emit(idx, idx)
 
+    def get_pack_state(self, project_id: str) -> tuple[str, str]:
+        """Current pack state and detail message for a project."""
+        return self._pack_states.get(project_id, ("IDLE", ""))
+
     def update_pack_state(self, project_id: str, state: str, message: str = ""):
         """Updates packing progress/completion status for a project row.
 
@@ -946,6 +950,7 @@ class ProjectRoomModel(QAbstractItemModel):
                     policy_fingerprint_from_config(
                         self._service.config.packing,
                         set(self._service.config.packing.excludes or []),
+                        project=proj,
                     ),
                     arc,
                 )
@@ -1049,6 +1054,20 @@ class ProjectRoomModel(QAbstractItemModel):
     def _archive_freshness(self, proj: Project) -> str:
         """"FRESH" | "STALE" | "UNKNOWN" for the compact/full archive cells."""
         return self._get_archive_fresh(proj)["archive_freshness"]
+
+    def get_cached_archive_freshness(self, project_id: str) -> Optional[str]:
+        """Return the cached archive freshness value ('FRESH', 'STALE', 'UNKNOWN') if present.
+
+        Pure memory read of the cache. Never performs filesystem I/O on the GUI thread.
+        """
+        entry = self._archive_fresh_cache.get(str(project_id))
+        if entry is not None:
+            return entry.get("archive_freshness")
+        return None
+
+    def get_archive_freshness(self, proj: Project) -> str:
+        """Return canonical archive freshness ('FRESH', 'STALE', 'UNKNOWN') for project."""
+        return self._archive_freshness(proj)
 
     def _get_archive_freshness_short(self, proj: Project) -> str:
         return self._get_archive_fresh(proj)["freshness_short"]

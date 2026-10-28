@@ -15,6 +15,7 @@ way, and no README is parsed to guess where the source lives.
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -434,9 +435,9 @@ def test_visible_same_origin_component_is_ingested_exactly_once(root, monkeypatc
     calls: list[str] = []
     real = si.build_nested_component_entries
 
-    def counting(component_obj, excludes, *, cancel_event=None):
+    def counting(component_obj, excludes, **kwargs):
         calls.append(component_obj.rel)
-        return real(component_obj, excludes, cancel_event=cancel_event)
+        return real(component_obj, excludes, **kwargs)
 
     monkeypatch.setattr(si, "build_nested_component_entries", counting)
 
@@ -481,3 +482,354 @@ def test_no_successful_inventory_leaves_same_origin_included_false_and_reasonles
         if item.origin and item.origin == si.normalize_origin_url(PRODUCT_ORIGIN):
             assert item.included is True
             assert item.reason, "same-origin component must carry a real reason"
+
+
+# --------------------------------------------- complete_source authority tests
+
+
+def test_complete_source_includes_different_origin_component(root):
+    """complete_source scope packages foreign-origin nested git worktree."""
+    _outer_ignores(root, "vendor-thing")
+    component(root, "vendor-thing", "https://github.com/other/tool.git",
+              {"src/tool.ts": b"export const T = 1;\n"})
+
+    # auto scope omits it
+    inv_auto = si.build_git_inventory(root, set(), project_archive_scope="auto")
+    assert not any(rel.startswith("vendor-thing/") for rel in _rels(inv_auto))
+
+    # complete_source scope includes it
+    inv_complete = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert "vendor-thing/src/tool.ts" in _rels(inv_complete)
+    record = {item.rel: item for item in inv_complete.nested_git_components}["vendor-thing"]
+    assert record.included is True
+    assert record.authority == "project_complete_source"
+    payload = si.nested_component_manifest_section(inv_complete)
+    assert payload[0]["included"] is True
+    assert payload[0]["authority"] == "project_complete_source"
+
+
+def test_complete_source_includes_child_without_origin_remote(root):
+    """complete_source scope packages nested git worktree with no remote."""
+    _outer_ignores(root, "local-child")
+    component(root, "local-child", "",
+              {"src/local.ts": b"export const L = 1;\n"})
+
+    # auto scope omits it
+    inv_auto = si.build_git_inventory(root, set(), project_archive_scope="auto")
+    assert not any(rel.startswith("local-child/") for rel in _rels(inv_auto))
+
+    # complete_source scope includes it
+    inv_complete = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert "local-child/src/local.ts" in _rels(inv_complete)
+    record = {item.rel: item for item in inv_complete.nested_git_components}["local-child"]
+    assert record.included is True
+    assert record.authority == "project_complete_source"
+
+
+def test_complete_source_still_excludes_bulk(root):
+    """complete_source still drops build caches, node_modules, dist, and .git."""
+    _outer_ignores(root, "vendor-thing")
+    component(root, "vendor-thing", "https://github.com/other/tool.git", {
+        "src/tool.ts": b"export const T = 1;\n",
+        "node_modules/pkg/index.js": b"generated\n",
+        "dist/app.js": b"generated\n",
+        "build/out.js": b"generated\n",
+        "assets/sfx.wav": b"RIFF" + b"\0" * 1024,
+    })
+
+    inv = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    rels = _rels(inv)
+    assert "vendor-thing/src/tool.ts" in rels
+    assert "vendor-thing/node_modules/pkg/index.js" not in rels
+    assert "vendor-thing/dist/app.js" not in rels
+    assert "vendor-thing/build/out.js" not in rels
+    assert "vendor-thing/assets/sfx.wav" not in rels
+    assert not any(".git/objects" in rel for rel in inv.entries)
+
+
+def test_complete_source_still_rejects_hard_safety_secrets(root):
+    """complete_source does not bypass hard safety policies like tracked SSH keys."""
+    _outer_ignores(root, "vendor-thing")
+    component(root, "vendor-thing", "https://github.com/other/tool.git",
+              {"src/tool.ts": b"export const T = 1;\n", "id_ed25519": b"PRIVATE KEY\n"})
+
+    with pytest.raises(SourceInventoryError) as caught:
+        si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert caught.value.code == si.CODE_TRACKED_HARD_DENY_CONFLICT
+
+
+# ----------------------------------------- archive_scope normalization (T-290)
+#
+# Defect 1: the policy fingerprint canonicalized ``archive_scope`` by lowercasing
+# it, while the inventory compared the RAW string. "COMPLETE_SOURCE" therefore
+# produced the canonical complete_source FINGERPRINT over AUTO MEMBERSHIP -- one
+# fingerprint describing two different archives. One canonicalizer
+# (``models.normalize_archive_scope``) now decides behaviour, manifest and
+# fingerprint alike, and an invalid value is AUTO in all three.
+
+
+def _scope_payload(inventory, spelling: str) -> dict:
+    from audapack import packing
+
+    return packing._fidelity_payload_for_inventory(
+        inventory, None, set(), project_archive_scope=spelling
+    )
+
+
+def test_complete_source_spellings_are_one_canonical_scope(root):
+    component(root, "vendor-thing", "https://github.com/other/tool.git",
+              {"src/tool.ts": b"export const T = 1;\n"})
+
+    memberships = []
+    payloads = []
+    for spelling in ("complete_source", "COMPLETE_SOURCE", " complete_source "):
+        inventory = si.build_git_inventory(root, set(), project_archive_scope=spelling)
+        memberships.append(_rels(inventory))
+        payloads.append(_scope_payload(inventory, spelling))
+
+    assert memberships[0] == memberships[1] == memberships[2]
+    assert "vendor-thing/src/tool.ts" in memberships[0]
+    assert [p["archive_scope"] for p in payloads] == ["complete_source"] * 3
+    assert len({p["policy_fingerprint"] for p in payloads}) == 1
+    assert all(p["large_archive_authorized"] is True for p in payloads)
+
+
+def test_an_invalid_archive_scope_falls_back_to_auto_everywhere(root):
+    component(root, "vendor-thing", "https://github.com/other/tool.git",
+              {"src/tool.ts": b"export const T = 1;\n"})
+
+    auto = si.build_git_inventory(root, set(), project_archive_scope="auto")
+    junk = si.build_git_inventory(root, set(), project_archive_scope="please archive everything")
+
+    assert _rels(junk) == _rels(auto)
+    assert not any(rel.startswith("vendor-thing/") for rel in _rels(junk))
+    auto_payload = _scope_payload(auto, "auto")
+    junk_payload = _scope_payload(junk, "please archive everything")
+    assert junk_payload["archive_scope"] == "auto"
+    assert junk_payload["large_archive_authorized"] is False
+    assert junk_payload["policy_fingerprint"] == auto_payload["policy_fingerprint"]
+
+
+# -------------------------------------------------- nested symlink safety (T-290)
+#
+# Defect 2: a tracked nested path was classified as a symlink BEFORE the
+# membership/safety tier ran, so a path that fails closed as a regular file could
+# enter the archive merely by being represented as a link -- the writer resolves
+# the link and writes the target's bytes.
+
+
+def _track_symlink(repo: Path, rel: str, target: str) -> None:
+    """Stage ``rel`` as a Git symlink (mode 120000) without creating a real link.
+
+    Git's ``core.symlinks`` is false where the host cannot create links (Windows
+    without the privilege); there the working tree holds a plain file whose
+    CONTENT is the link target -- exactly the shape the packer's mode-120000
+    branch must classify. Staging the index entry directly keeps this regression
+    runnable on every host.
+    """
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(target, encoding="utf-8")
+    sha = _git("hash-object", "-w", str(path), cwd=repo)
+    _git("update-index", "--add", "--cacheinfo", f"120000,{sha},{rel}", cwd=repo)
+
+
+def _commit_index(path: Path, message: str = "c") -> None:
+    """Commit the index AS IS; ``git add -A`` would re-stage a symlink as a file."""
+    _git("commit", "-q", "-m", message, cwd=path)
+
+
+def _host_supports_symlinks() -> bool:
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp).joinpath("probe").symlink_to("target")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+SYMLINKS_SUPPORTED = _host_supports_symlinks()
+
+
+def test_a_tracked_nested_symlink_named_like_a_key_still_fails_closed(root):
+    """A hard-safety NAME cannot be smuggled in by spelling it as a link."""
+    child = component(root, "vendor-thing", "https://github.com/other/tool.git",
+                      {"secret_material.txt": b"PRIVATE KEY\n"})
+    _track_symlink(child, "id_ed25519", "secret_material.txt")
+    _commit_index(child)
+
+    with pytest.raises(SourceInventoryError) as caught:
+        si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert caught.value.code == si.CODE_TRACKED_HARD_DENY_CONFLICT
+
+
+def test_a_safe_tracked_nested_symlink_to_component_source_is_kept(root):
+    """The feature itself survives: a contained link to ordinary source is source."""
+    child = component(root, "vendor-thing", "https://github.com/other/tool.git",
+                      {"src/generated-current.ts": b"export const g = 1;\n"})
+    _track_symlink(child, "src/current.ts", "src/generated-current.ts")
+    _commit_index(child)
+
+    inventory = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+
+    entry = inventory.entries["vendor-thing/src/current.ts"]
+    assert entry.include is True
+    assert entry.symlink is True
+    assert entry.priority == 1
+
+
+def test_a_nested_symlink_under_a_never_archive_tree_stays_excluded(root):
+    """A link cannot smuggle a path past component_reproducible_tree."""
+    child = component(root, "vendor-thing", "https://github.com/other/tool.git",
+                      {"src/current.js": b"export const c = 1;\n"})
+    _track_symlink(child, "dist/current.js", "../src/current.js")
+    _commit_index(child)
+
+    inventory = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+
+    assert "vendor-thing/src/current.js" in _rels(inventory)
+    assert "vendor-thing/dist/current.js" not in _rels(inventory)
+    entry = inventory.entries["vendor-thing/dist/current.js"]
+    assert entry.include is False
+    assert entry.reason == "component_reproducible_tree"
+
+
+@pytest.mark.skipif(not SYMLINKS_SUPPORTED, reason="host cannot create symlinks")
+def test_a_nested_symlink_escaping_the_component_root_is_refused(root, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside the component\n", encoding="utf-8")
+    child = component(root, "vendor-thing", "https://github.com/other/tool.git",
+                      {"src/current.js": b"export const c = 1;\n"})
+    (child / "src" / "escape.js").symlink_to(outside)
+    _git("add", "src/escape.js", cwd=child)
+    _commit_index(child)
+
+    with pytest.raises(SourceInventoryError) as caught:
+        si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert caught.value.code == si.CODE_SYMLINK_UNSAFE
+
+
+# ------------------------------------- nested components consume the policy (T-290)
+#
+# Defect 3: nested ingestion received only ``excludes`` -- always_exclude was
+# ignored, a root-relative configured pattern was matched against the wrong path,
+# and always_include never reached the component at all. The policy fingerprint
+# the manifest records already included all three, so the archive declared a
+# policy its nested membership could ignore.
+
+
+@pytest.fixture
+def foreign_child(root: Path) -> Path:
+    """A foreign-origin direct child: source, notes, a private tree, an asset."""
+    return component(root, "child", "https://github.com/other/tool.git", {
+        "src/y.ts": b"export const Y = 1;\n",
+        "src/notes.md": b"# notes\n",
+        "private/x.ts": b"export const X = 1;\n",
+        "assets/logo.png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 64,
+    })
+
+
+def test_always_exclude_reaches_nested_component_source(root, foreign_child):
+    inventory = si.build_git_inventory(
+        root, set(), always_exclude=["*.ts"], project_archive_scope="complete_source"
+    )
+
+    rels = _rels(inventory)
+    assert "child/src/y.ts" not in rels
+    assert "child/private/x.ts" not in rels
+    assert "child/src/notes.md" in rels
+
+
+def test_a_root_relative_exclude_matches_the_real_archive_path(root, foreign_child):
+    inventory = si.build_git_inventory(
+        root, {"child/private/**"}, project_archive_scope="complete_source"
+    )
+
+    rels = _rels(inventory)
+    assert "child/private/x.ts" not in rels
+    assert "child/src/y.ts" in rels
+    # A generic pattern keeps matching by path component exactly as it does at the
+    # root -- living in a nested component must not change what a pattern means.
+    generic = si.build_git_inventory(
+        root, {"private/**"}, project_archive_scope="complete_source"
+    )
+    assert "child/private/x.ts" not in _rels(generic)
+
+
+def test_always_include_can_carry_an_ordinary_optional_component_asset(root, foreign_child):
+    without = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert "child/assets/logo.png" not in _rels(without), (
+        "the asset is optional by default; always_include is what carries it"
+    )
+
+    inventory = si.build_git_inventory(
+        root, set(), always_include=["child/assets/logo.png"],
+        project_archive_scope="complete_source",
+    )
+    assert "child/assets/logo.png" in _rels(inventory)
+
+
+def test_always_include_cannot_resurrect_component_reproducible_bulk(root):
+    component(root, "child", "https://github.com/other/tool.git", {
+        "src/y.ts": b"export const Y = 1;\n",
+        "node_modules/pkg/index.js": b"generated\n",
+    })
+
+    inventory = si.build_git_inventory(
+        root, set(),
+        always_include=["child/node_modules/pkg/index.js", "child/.git/config"],
+        project_archive_scope="complete_source",
+    )
+
+    rels = _rels(inventory)
+    assert "child/node_modules/pkg/index.js" not in rels
+    assert "child/.git/config" not in rels
+    assert "child/src/y.ts" in rels
+
+
+def test_always_include_cannot_outrank_hard_safety(root):
+    component(root, "child", "https://github.com/other/tool.git",
+              {"src/y.ts": b"export const Y = 1;\n", "id_ed25519": b"PRIVATE KEY\n"})
+
+    with pytest.raises(SourceInventoryError) as caught:
+        si.build_git_inventory(
+            root, set(), always_include=["child/id_ed25519"],
+            project_archive_scope="complete_source",
+        )
+    assert caught.value.code == si.CODE_TRACKED_HARD_DENY_CONFLICT
+
+
+# --------------------------------------- nested component safety bound (T-290)
+#
+# Defect 4: exceeding MAX_NESTED_COMPONENTS silently truncated discovery -- the
+# extra component was absent from nested_git_components with no omission record,
+# invisible to both the manifest and source-review reconciliation, while the pack
+# still reported itself complete. The bound stays; exceeding it now refuses.
+
+
+def _many_components(root: Path, count: int) -> None:
+    for index in range(count):
+        component(root, f"child{index}", "https://github.com/other/tool.git",
+                  {"src/tool.ts": b"export const T = 1;\n"})
+
+
+def test_exceeding_the_nested_component_bound_refuses_the_pack(root, monkeypatch):
+    _many_components(root, 3)
+    monkeypatch.setattr(si, "MAX_NESTED_COMPONENTS", 2)
+
+    with pytest.raises(SourceInventoryError) as caught:
+        si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+
+    assert caught.value.code == si.CODE_NESTED_COMPONENT_LIMIT
+    message = str(caught.value)
+    assert "2" in message, "the configured safety limit must be stated"
+    assert "not inventoried" in message
+    assert "complete source" in message, "the refusal names what it refused to claim"
+
+
+def test_the_component_bound_itself_still_succeeds(root, monkeypatch):
+    _many_components(root, 2)
+    monkeypatch.setattr(si, "MAX_NESTED_COMPONENTS", 2)
+
+    inventory = si.build_git_inventory(root, set(), project_archive_scope="complete_source")
+    assert sorted(c.rel for c in inventory.nested_git_components) == ["child0", "child1"]

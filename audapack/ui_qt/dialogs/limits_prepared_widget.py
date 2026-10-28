@@ -535,9 +535,15 @@ class LimitsPreparedWidget(QWidget):
         self.timer.setInterval(60000)
         self.timer.timeout.connect(self.refresh_view)
         self.timer.start()
-        self.refresh_view()
+        self.refresh_view(force=True)
 
-    def refresh_view(self) -> None:
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_view(force=True)
+
+    def refresh_view(self, force: bool = False) -> None:
+        if not force and not self.isVisible():
+            return
         def load():
             registry = AccountRegistry()
             discovered = discover_accounts(self.config.launchers)
@@ -774,3 +780,19 @@ class LimitsPreparedWidget(QWidget):
         self.runner.submit_coalesced(f"prepared:test:{job.prepared_id}", run,
                                      on_success=lambda result: (self.status.setText(f"Test now: {result.state.value}"), self.refresh_view()),
                                      on_error=lambda error: self.status.setText(f"Test now failed: {type(error).__name__}"))
+
+    def shutdown(self) -> None:
+        """Deterministic teardown on close."""
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            self.runner.close()
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
+

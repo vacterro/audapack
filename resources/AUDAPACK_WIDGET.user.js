@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AUDAPACK Widget
 // @namespace    https://github.com/vacterro/audapack
-// @version      0.0.98
+// @version      0.1.07
 // @description  Universal AI prompt buttons & Auto3 audit engine — AUDAPACK Widget
 // @author       AUDAPACK
 // @match        https://chat.openai.com/*
@@ -1213,6 +1213,39 @@ ordinal/name of the entrypoint file.`;
   text-overflow: ellipsis !important;
 }
 
+#acb-title-indicators {
+  display: inline-flex !important;
+  align-items: center !important;
+  flex: 0 0 auto !important;
+  gap: 4px !important;
+  height: 18px !important;
+  font-size: 10px !important;
+  line-height: 18px !important;
+  color: var(--textSecondary) !important;
+  white-space: nowrap !important;
+  user-select: none !important;
+  cursor: default !important;
+}
+
+#acb-send-age,
+#acb-archive-timestamp {
+  display: inline-block !important;
+  font-size: 10px !important;
+  line-height: 18px !important;
+  color: var(--textSecondary) !important;
+  white-space: nowrap !important;
+  user-select: none !important;
+  cursor: default !important;
+}
+
+#acb-indicator-sep {
+  display: inline-block !important;
+  font-size: 10px !important;
+  line-height: 18px !important;
+  color: var(--borderDark) !important;
+  opacity: 0.6 !important;
+  user-select: none !important;
+}
 
 #acb-settings-btn {
   flex: 0 0 auto !important;
@@ -1397,6 +1430,17 @@ ordinal/name of the entrypoint file.`;
 #acb-popup[data-supercompact="true"] #acb-content,
 #acb-popup[data-supercompact="true"] #acb-status {
   display: none !important;
+}
+
+#acb-popup[data-supercompact="true"] #acb-title-indicators {
+  display: inline-flex !important;
+  gap: 3px !important;
+  font-size: 9.5px !important;
+}
+
+#acb-popup[data-supercompact="true"] #acb-send-age,
+#acb-popup[data-supercompact="true"] #acb-archive-timestamp {
+  font-size: 9.5px !important;
 }
 
 #acb-popup[data-supercompact="true"] #acb-super-controls {
@@ -2632,6 +2676,13 @@ ordinal/name of the entrypoint file.`;
 .acb-inaudit-action[data-state="saved"] { color: #F0D060 !important; }
 .acb-inaudit-action[data-state="queued"] { color: #D4C89A !important; }
 .acb-inaudit-action[data-state="error"] { color: #D66464 !important; }
+@media (max-width: 480px) {
+  #acb-title-indicators {
+    max-width: 130px !important;
+    overflow: hidden !important;
+    font-size: 9px !important;
+  }
+}
 `;
 
   let state = null;
@@ -2760,6 +2811,7 @@ ordinal/name of the entrypoint file.`;
   let widgetBootstrapTimers = [];
   let composerFileCaptureInstalled = false;
   let preparedStartSendGuardInstalled = false;
+  let chatGPTSendTrackingInstalled = false;
   let managedWorkerHousekeepingInstalled = false;
   let lastStatusMessage = { text: '', kind: 'info', at: 0 };
 
@@ -3781,8 +3833,17 @@ ordinal/name of the entrypoint file.`;
       second = Number(match[6] || 0);
     }
 
+    if (
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      second < 0 || second > 59
+    ) return 0;
+
     const parsed = new Date(year, month - 1, day, hour, minute, second, 0);
     if (
+      isNaN(parsed.getTime()) ||
       parsed.getFullYear() !== year ||
       parsed.getMonth() !== month - 1 ||
       parsed.getDate() !== day ||
@@ -3795,10 +3856,54 @@ ordinal/name of the entrypoint file.`;
 
   function compactElapsedAge(ageMs) {
     const age = Math.max(0, Number(ageMs) || 0);
-    if (age < 60000) return '<1m';
-    if (age < 3600000) return `${Math.floor(age / 60000)}m`;
-    if (age < 86400000) return `${Math.floor(age / 3600000)}h`;
-    return `${Math.floor(age / 86400000)}d`;
+    const totalSec = Math.floor(age / 1000);
+    const sec = totalSec % 60;
+    const min = Math.floor(totalSec / 60) % 60;
+    const pad = n => String(n).padStart(2, '0');
+
+    if (totalSec < 86400) {
+      const hr = Math.floor(totalSec / 3600);
+      return `${pad(hr)}:${pad(min)}:${pad(sec)}`;
+    }
+
+    const days = Math.floor(totalSec / 86400);
+    const hr = Math.floor((totalSec % 86400) / 3600);
+    return `${days}d ${pad(hr)}:${pad(min)}:${pad(sec)}`;
+  }
+
+  function formatArchiveTimestampClock(ts) {
+    if (!ts || isNaN(ts)) return 'ZIP \u2014';
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return 'ZIP \u2014';
+    const pad = n => String(n).padStart(2, '0');
+    return `ZIP ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function formatArchiveTimestampDateTime(ts) {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return '\u2014';
+    const pad = n => String(n).padStart(2, '0');
+    const day = pad(d.getDate());
+    const month = pad(d.getMonth() + 1);
+    const year = d.getFullYear();
+    const hours = pad(d.getHours());
+    const minutes = pad(d.getMinutes());
+    const seconds = pad(d.getSeconds());
+    return `${day}.${month}.${year} ${hours}:${minutes}:${seconds}`;
+  }
+
+  function formatTooltipAge(ageMs) {
+    const age = Math.max(0, Number(ageMs) || 0);
+    if (age < 60000) {
+      const secs = Math.floor(age / 1000);
+      return secs <= 1 ? '1 second' : `${secs} seconds`;
+    }
+    const mins = Math.floor(age / 60000);
+    if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'}`;
+    const hours = Math.floor(age / 3600000);
+    if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+    const days = Math.floor(age / 86400000);
+    return `${days} day${days === 1 ? '' : 's'}`;
   }
 
   function composerArchiveFreshness(now = Date.now(), root = chatGPTComposerRoot()) {
@@ -3827,8 +3932,8 @@ ordinal/name of the entrypoint file.`;
       return {
         name,
         size: Math.max(0, Number(metadata?.size) || 0),
-        modifiedAt: fileTimestamp || filenameTimestamp,
-        source: fileTimestamp ? 'file' : filenameTimestamp ? 'filename' : 'unknown'
+        modifiedAt: filenameTimestamp || fileTimestamp,
+        source: filenameTimestamp ? 'archive filename' : fileTimestamp ? 'browser file mtime' : 'unknown'
       };
     });
     candidates.sort((left, right) => Number(right.modifiedAt || 0) - Number(left.modifiedAt || 0));
@@ -5105,6 +5210,10 @@ ordinal/name of the entrypoint file.`;
     const size = panel.querySelector('#acb-size');
     if (size) size.value = state.panelSize;
 
+    if (typeof renderTitlebarIndicators === 'function') {
+      try { renderTitlebarIndicators(); } catch (_) { }
+    }
+
     return geometry;
   }
 
@@ -5603,23 +5712,26 @@ ordinal/name of the entrypoint file.`;
 
   function dispatchElementClick(element) {
     if (!element) return;
-    try {
-      if (typeof PointerEvent === 'function') {
-        element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+    // Widget-initiated clicks are automatic Sends, never operator intent.
+    withoutManualSendIntent(() => {
+      try {
+        if (typeof PointerEvent === 'function') {
+          element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+        }
+        if (typeof MouseEvent === 'function') {
+          element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        }
+        if (typeof PointerEvent === 'function') {
+          element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+        }
+        if (typeof MouseEvent === 'function') {
+          element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        }
+        element.click();
+      } catch (_) {
+        try { element.click(); } catch (_) { }
       }
-      if (typeof MouseEvent === 'function') {
-        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-      }
-      if (typeof PointerEvent === 'function') {
-        element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
-      }
-      if (typeof MouseEvent === 'function') {
-        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-      }
-      element.click();
-    } catch (_) {
-      try { element.click(); } catch (_) { }
-    }
+    });
   }
 
   // T-260: the composer form is the platform's own submit unit, and
@@ -5652,7 +5764,7 @@ ordinal/name of the entrypoint file.`;
       || chatGPTComposerAttachmentTiles().some(tile => tile.isConnected);
     if (!beforePayloadPresent) return false;
 
-    try { form.requestSubmit(); } catch (_) { return false; }
+    try { withoutManualSendIntent(() => form.requestSubmit()); } catch (_) { return false; }
     return chatGPTSendAccepted(
       String(options.receipt || ''), beforeText, 2500, beforePayloadPresent
     );
@@ -5678,7 +5790,7 @@ ordinal/name of the entrypoint file.`;
     if (ownership && !(await ownership.verify())) return false;
     if (fence && !(await fence())) return false;
     if (options.singleAttempt) {
-      try { button.click(); } catch (_) { return false; }
+      try { withoutManualSendIntent(() => button.click()); } catch (_) { return false; }
       if (button._sendFails && typeof __ACB_TEST__ !== 'undefined') return false;
       return chatGPTSendAccepted(receipt, beforeText, 2500, beforePayloadPresent);
     }
@@ -5713,19 +5825,23 @@ ordinal/name of the entrypoint file.`;
     const form = button.closest('form') || liveInput?.closest('form');
     if (form && typeof form.requestSubmit === 'function') {
       try {
-        if (button.closest('form') === form && button.getAttribute('type') === 'submit') {
-          form.requestSubmit(button);
-        } else {
-          form.requestSubmit();
-        }
+        withoutManualSendIntent(() => {
+          if (button.closest('form') === form && button.getAttribute('type') === 'submit') {
+            form.requestSubmit(button);
+          } else {
+            form.requestSubmit();
+          }
+        });
       } catch (_) { }
       if (await chatGPTSendAccepted(receipt, beforeText, 2500, beforePayloadPresent)) return true;
     }
 
     if (liveInput) {
       try {
-        liveInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-        liveInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        withoutManualSendIntent(() => {
+          liveInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+          liveInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        });
       } catch (_) { }
       if (await chatGPTSendAccepted(receipt, beforeText, 2000, beforePayloadPresent)) return true;
     }
@@ -5773,6 +5889,14 @@ ordinal/name of the entrypoint file.`;
         const accepted = site?.key === 'chatgpt'
           ? await clickChatGPTSendVerified(ready, input, { receipt: options.receipt, fence: fenceCheck })
           : (ready.click(), true);
+        if (accepted && site?.key === 'chatgpt') {
+          try {
+            recordSendObservation(currentConversationKey(), {
+              timestamp: Date.now(),
+              provenance: 'widget-send'
+            });
+          } catch (_) { }
+        }
         return accepted
           ? { ok: true, mode: 'button' }
           : { ok: false, mode: 'click-unverified' };
@@ -5788,6 +5912,14 @@ ordinal/name of the entrypoint file.`;
           const accepted = site?.key === 'chatgpt'
             ? await clickChatGPTSendVerified(button, input, { receipt: options.receipt, fence: fenceCheck })
             : (button.click(), true);
+          if (accepted && site?.key === 'chatgpt') {
+            try {
+              recordSendObservation(currentConversationKey(), {
+                timestamp: Date.now(),
+                provenance: 'widget-send'
+              });
+            } catch (_) { }
+          }
           return accepted
             ? { ok: true, mode: 'button' }
             : { ok: false, mode: 'click-unverified' };
@@ -5821,7 +5953,15 @@ ordinal/name of the entrypoint file.`;
           receipt: options.receipt,
           fence: fenceCheck
         });
-        if (submitted) return { ok: true, mode: 'form-submit' };
+        if (submitted) {
+          try {
+            recordSendObservation(currentConversationKey(), {
+              timestamp: Date.now(),
+              provenance: 'widget-send'
+            });
+          } catch (_) { }
+          return { ok: true, mode: 'form-submit' };
+        }
       }
     }
 
@@ -5833,24 +5973,26 @@ ordinal/name of the entrypoint file.`;
     if (!(await beforeClickCheck())) return { ok: false, mode: 'pre-click-checkpoint-failed' };
 
     try {
-      input.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true,
-        shiftKey: false
-      }));
-      input.dispatchEvent(new KeyboardEvent('keyup', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true,
-        shiftKey: false
-      }));
+      withoutManualSendIntent(() => {
+        input.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+          shiftKey: false
+        }));
+        input.dispatchEvent(new KeyboardEvent('keyup', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+          shiftKey: false
+        }));
+      });
       return { ok: false, mode: 'enter-fallback' };
     } catch (_) {
       return { ok: false, mode: 'failed' };
@@ -12019,7 +12161,7 @@ if (cls !== 'RETRY_TRANSPORT' && cls !== 'RETRY_AFTER_AUTH') {
   // genuinely cares about while idle. Bounded to the changed nodes and their
   // shallow descendants; never a global scan.
   const CONVERSATION_TURN_SELECTOR =
-    '[data-message-author-role], [data-testid^="conversation-turn-"]';
+    '[data-message-author-role], [data-testid^="conversation-turn-"], [data-user-message-bubble], [data-chatgpt-search-message-ids], [data-turn]';
 
   function mutationTouchesConversationTurn(record) {
     const nodes = [
@@ -13027,10 +13169,14 @@ if (cls !== 'RETRY_TRANSPORT' && cls !== 'RETRY_AFTER_AUTH') {
     else if (!nextRuntime) nextRuntime = loadAutoRuntime(key);
 
     autoBoundConversationKey = key;
-    // T-193: a manual project binding follows the same draft -> stable
-    // conversation transition as the Auto runtime; a temporary identity never
-    // leaks a binding into a later real conversation.
-    if (previousKey && previousKey !== key) migrateManualArchiveBinding(previousKey, key);
+    // T-193 / T-294: draft -> stable conversation transition propagates both
+    // send tracking continuity and manual archive bindings independently.
+    if (previousKey && previousKey !== key) {
+      if (previousKey.startsWith('draft:') && key.startsWith('c:')) {
+        migrateSendTracker(previousKey, key);
+      }
+      migrateManualArchiveBinding(previousKey, key);
+    }
     if (key.startsWith('auth:')) {
       autoRuntimeCorruptKey = '';
       autoRuntime = emptyAutoRuntime({ enabled: false });
@@ -18702,6 +18848,11 @@ async function recoverArmedStartSend(options = {}) {
     });
   }
 
+  function filterEnabledProjects(projects) {
+    if (!Array.isArray(projects)) return [];
+    return projects.filter(project => Boolean(project && project.enabled === true));
+  }
+
   function listRegisteredProjects() {
     return bridgeRequest('GET', '/v1/projects', null, { timeout: 7000 }).then(response => {
       // TARGET B: bounded diagnostics need the real HTTP status even when the
@@ -18719,7 +18870,7 @@ async function recoverArmedStartSend(options = {}) {
       return {
         ok: true,
         status,
-        projects: response.data.projects.filter(project => project && project.enabled !== false),
+        projects: filterEnabledProjects(response.data.projects),
         // P1 TARGET C: the Bridge's CONTENT revision of this list, so a
         // revalidation can say "nothing changed" instead of forcing a re-render.
         revision: String(response.data.revision || '')
@@ -19092,6 +19243,18 @@ async function recoverArmedStartSend(options = {}) {
     autoRuntime.archiveSize = Math.max(0, Number(meta.size) || 0);
     autoRuntime.archiveModifiedAt = Math.max(0, Number(meta.mtime) || 0) * 1000;
     autoRuntime.archiveTimestampSource = 'bridge';
+    const filenameTs = archiveTimestampFromFilename(meta.filename);
+    const mtimeTs = meta.mtime ? (meta.mtime > 1000000000000 ? meta.mtime : meta.mtime * 1000) : 0;
+    const pid = autoRuntime?.projectName || projectNameFromArtifactFilename(meta.filename);
+    if (pid) {
+      setVerifiedProjectArchive(pid, {
+        filename: meta.filename,
+        timestamp: filenameTs || mtimeTs,
+        source: filenameTs ? 'archive filename' : (mtimeTs ? 'bridge mtime' : 'unknown'),
+        mtime: meta.mtime
+      });
+    }
+    renderTitlebarIndicators();
     return saveAutoRuntime({ pauseOnFailure: false });
   }
 
@@ -19227,6 +19390,9 @@ async function recoverArmedStartSend(options = {}) {
   let manualArchiveRegistryFlight = null;
   let manualArchiveRegistryFlightGeneration = 0;
   let manualArchiveRegistryTimer = 0;
+  let manualArchiveMenuExpiryTimer = 0;
+  let manualArchiveMenuExpiryTimestamp = 0;
+  let manualArchiveMenuExpiryOpenToken = 0;
   let manualArchiveDebug = null;
   let manualArchiveTransactionGeneration = 0;
   let manualArchiveFlight = null;
@@ -19613,6 +19779,7 @@ async function recoverArmedStartSend(options = {}) {
       at: Date.now()
     };
     renderManualArchiveControl();
+    renderTitlebarIndicators();
     return true;
   }
 
@@ -19627,6 +19794,7 @@ async function recoverArmedStartSend(options = {}) {
     clearManualArchiveStaleMarker(conversationKey);
     manualArchiveUiState = { phase: 'idle', detail: '', projectId: '', projectName: '', code: '', conversationKey, at: Date.now() };
     renderManualArchiveControl();
+    renderTitlebarIndicators();
     return existed;
   }
 
@@ -19642,7 +19810,9 @@ async function recoverArmedStartSend(options = {}) {
     if (!store.bindings[to]) store.bindings[to] = { ...binding, updatedAt: Date.now() };
     delete store.bindings[from];
     if (!persistManualArchiveBindings(store.bindings)) return false;
+    migrateSendTracker(from, to);
     renderManualArchiveControl();
+    renderTitlebarIndicators();
     return true;
   }
 
@@ -19713,9 +19883,6 @@ async function recoverArmedStartSend(options = {}) {
     const publish = result => {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       if (!live || !manualArchiveRegistryGenerationIsCurrent(generation)) {
-        if (result?.ok && Array.isArray(result.projects) && result.projects.length) {
-          manualArchiveProjectsCache = { projects: result.projects, fetchedAt: Date.now() };
-        }
         manualArchiveDebug = { ...(manualArchiveDebug || {}), staleGeneration: generation, staleElapsedMs: elapsedMs };
         return;
       }
@@ -19733,13 +19900,14 @@ async function recoverArmedStartSend(options = {}) {
         fromCache: Boolean(result?.fromCache),
         pickerOpenAtCompletion: manualArchiveRegistryActive()
       };
+      const enabledProjects = filterEnabledProjects(result?.projects);
       manualArchiveMenuState = {
         loading: false,
         refreshing: false,
         error: '',
         errorCode: '',
         deadlined: false,
-        projects: Array.isArray(result?.projects) ? result.projects : [],
+        projects: enabledProjects,
         fetchedAt: Date.now(),
         generation,
         openToken: manualArchiveMenuState.openToken
@@ -19747,19 +19915,18 @@ async function recoverArmedStartSend(options = {}) {
       // TARGET F: on failure keep the cached list usable AND surface the real
       // bounded state instead of a blank spinner.
       if (!result?.ok) {
-        const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+        const hardExpired = manualArchiveProjectsCacheHardExpired();
+        const cached = hardExpired ? [] : filterEnabledProjects(manualArchiveProjectsCache.projects);
         manualArchiveMenuState.projects = cached;
+        manualArchiveMenuState.fetchedAt = hardExpired ? 0 : (manualArchiveProjectsCache.fetchedAt || 0);
         manualArchiveMenuState.error = manualArchiveOfflineMessage(result);
         manualArchiveMenuState.errorCode = String(result?.errorCode || 'projects-unavailable');
         manualArchiveMenuState.deadlined = result?.errorCode === 'registry-deadline';
-      } else if (result.projects.length) {
+      } else {
         const revision = String(result?.revision || '');
-        // P1 TARGET C: with a CONTENT revision a revalidation can state that the
-        // registry is unchanged, so the cached list keeps its authority instead
-        // of being retired on a clock alone.
         const revisionChanged = Boolean(manualArchiveProjectsCache.revision)
           && revision !== String(manualArchiveProjectsCache.revision);
-        manualArchiveProjectsCache = { projects: result.projects, fetchedAt: Date.now(), revision };
+        manualArchiveProjectsCache = { projects: enabledProjects, fetchedAt: Date.now(), revision };
         manualArchiveDebug = { ...(manualArchiveDebug || {}), registryRevision: revision, registryRevisionChanged: revisionChanged };
       }
       renderManualArchiveMenu();
@@ -19813,23 +19980,53 @@ async function recoverArmedStartSend(options = {}) {
   // P1 TARGET C: ONE owner for "may the cached picker list be used as is?".
   // Both the explicit registry read and the picker open consult it, so the two
   // can no longer disagree about how stale is too stale.
+  function manualArchiveProjectsCacheHardExpired(cache = manualArchiveProjectsCache) {
+    const fetchedAt = Number(cache?.fetchedAt || 0);
+    if (!fetchedAt) return false;
+    return (Date.now() - fetchedAt) > MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS;
+  }
+
   function manualArchiveProjectsCacheUsable(options = {}) {
     if (options.force) return false;
-    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    if (manualArchiveProjectsCacheHardExpired()) return false;
+    const cached = filterEnabledProjects(manualArchiveProjectsCache.projects);
     if (!cached.length) return false;
     const age = Date.now() - Number(manualArchiveProjectsCache.fetchedAt || 0);
     return age <= MANUAL_ARCHIVE_PROJECTS_TTL_MS;
   }
 
   function manualArchiveProjectsCacheFreshEmpty() {
-    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    if (manualArchiveProjectsCacheHardExpired()) return false;
+    const cached = filterEnabledProjects(manualArchiveProjectsCache.projects);
     if (cached.length) return false;
     if (!(Number(manualArchiveMenuState.generation || 0) > 0)) return false;
     return (Date.now() - Number(manualArchiveProjectsCache.fetchedAt || 0)) <= MANUAL_ARCHIVE_PROJECTS_TTL_MS;
   }
 
+  function manualArchiveProjectIsEnabled(candidate) {
+    if (!candidate) return false;
+    const project = typeof candidate === 'object' ? candidate : null;
+    if (project && project.enabled !== true) return false;
+    const projectId = String(project?.project_id || candidate || '');
+    if (!projectId) return false;
+
+    if (manualArchiveProjectsCache && Array.isArray(manualArchiveProjectsCache.projects)) {
+      if (Number(manualArchiveProjectsCache.fetchedAt || 0) > 0 || manualArchiveProjectsCache.projects.length > 0) {
+        if (manualArchiveProjectsCacheHardExpired()) {
+          return false;
+        }
+        const cached = filterEnabledProjects(manualArchiveProjectsCache.projects).find(p => p && String(p.project_id || '') === projectId);
+        if (!cached || cached.enabled !== true) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   function readManualArchiveRegistry(options = {}) {
-    const cached = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    const hardExpired = manualArchiveProjectsCacheHardExpired();
+    const cached = hardExpired ? [] : filterEnabledProjects(manualArchiveProjectsCache.projects);
     if (manualArchiveProjectsCacheUsable(options)) {
       // No request, no registry I/O: the cached list is still current for this
       // policy window, and the Bridge's archive endpoints remain authoritative
@@ -19985,6 +20182,71 @@ async function recoverArmedStartSend(options = {}) {
     return `…${tail}`;
   }
 
+  function cancelManualArchiveMenuExpiryTimer() {
+    if (manualArchiveMenuExpiryTimer) {
+      clearTimeout(manualArchiveMenuExpiryTimer);
+      manualArchiveMenuExpiryTimer = 0;
+    }
+    manualArchiveMenuExpiryTimestamp = 0;
+    manualArchiveMenuExpiryOpenToken = 0;
+  }
+
+  function triggerManualArchiveMenuExpiry(openToken, expectedFetchedAt) {
+    manualArchiveMenuExpiryTimer = 0;
+    manualArchiveMenuExpiryTimestamp = 0;
+    manualArchiveMenuExpiryOpenToken = 0;
+    if (!manualArchiveRegistryActive()) return;
+    if (manualArchiveMenuState.openToken !== openToken) return;
+    const currentFetchedAt = Number(manualArchiveProjectsCache.fetchedAt || manualArchiveMenuState.fetchedAt || 0);
+    if (expectedFetchedAt && currentFetchedAt > expectedFetchedAt && !manualArchiveProjectsCacheHardExpired()) {
+      return;
+    }
+
+    manualArchiveProjectsCache.fetchedAt = Math.min(
+      Number(manualArchiveProjectsCache.fetchedAt || 0),
+      Date.now() - MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS - 1
+    );
+    manualArchiveMenuState.projects = [];
+    manualArchiveMenuState.fetchedAt = manualArchiveProjectsCache.fetchedAt;
+    manualArchiveMenuState.loading = false;
+    manualArchiveMenuState.refreshing = Boolean(manualArchiveRegistryFlight);
+    renderManualArchiveMenu();
+    positionManualArchiveMenu();
+  }
+
+  function syncManualArchiveMenuExpiryTimer() {
+    if (!manualArchiveRegistryActive()) {
+      cancelManualArchiveMenuExpiryTimer();
+      return;
+    }
+    const hardExpired = manualArchiveProjectsCacheHardExpired();
+    if (hardExpired) {
+      cancelManualArchiveMenuExpiryTimer();
+      return;
+    }
+    const enabledProjects = filterEnabledProjects(manualArchiveMenuState.projects);
+    if (!enabledProjects.length) {
+      cancelManualArchiveMenuExpiryTimer();
+      return;
+    }
+    const fetchedAt = Number(manualArchiveProjectsCache.fetchedAt || manualArchiveMenuState.fetchedAt || 0);
+    if (!fetchedAt) {
+      cancelManualArchiveMenuExpiryTimer();
+      return;
+    }
+    const openToken = manualArchiveMenuState.openToken;
+    if (manualArchiveMenuExpiryTimer && manualArchiveMenuExpiryOpenToken === openToken && manualArchiveMenuExpiryTimestamp === fetchedAt) {
+      return;
+    }
+    cancelManualArchiveMenuExpiryTimer();
+    const remainingMs = Math.max(1, (fetchedAt + MANUAL_ARCHIVE_PROJECTS_HARD_TTL_MS) - Date.now());
+    manualArchiveMenuExpiryOpenToken = openToken;
+    manualArchiveMenuExpiryTimestamp = fetchedAt;
+    manualArchiveMenuExpiryTimer = setTimeout(() => {
+      triggerManualArchiveMenuExpiry(openToken, fetchedAt);
+    }, remainingMs);
+  }
+
   function renderManualArchiveMenu() {
     const menu = panel ? panel.querySelector('#acb-manual-zip-menu') : null;
     const list = menu ? menu.querySelector('#acb-manual-zip-menu-list') : null;
@@ -20000,7 +20262,14 @@ async function recoverArmedStartSend(options = {}) {
       row.textContent = text;
       list.appendChild(row);
     };
-    const hasProjects = manualArchiveMenuState.projects.length > 0;
+    const hardExpired = manualArchiveProjectsCacheHardExpired();
+    if (hardExpired) {
+      manualArchiveMenuState.projects = [];
+    }
+    const enabledProjects = hardExpired
+      ? []
+      : filterEnabledProjects(manualArchiveMenuState.projects);
+    const hasProjects = enabledProjects.length > 0;
     let emptyNote = '';
     // TARGET D: stale-while-revalidate. A usable cached list is shown
     // immediately with a compact refreshing indicator; it is never replaced by
@@ -20011,12 +20280,14 @@ async function recoverArmedStartSend(options = {}) {
     } else if (manualArchiveMenuState.error) {
       note(manualArchiveMenuState.error, 'error');
     } else if (!hasProjects) {
-      emptyNote = 'No registered AUDAPACK projects.';
+      emptyNote = hardExpired
+        ? 'Registry cache expired. Click Refresh.'
+        : 'No enabled AUDAPACK projects.';
     }
     if (manualArchiveMenuState.refreshing) note('Refreshing...', 'refreshing');
     if (emptyNote && !manualArchiveMenuState.error) note(emptyNote);
     if (hasProjects) {
-      for (const project of manualArchiveMenuState.projects) {
+      for (const project of enabledProjects) {
         const projectId = String(project.project_id || '');
         if (!projectId) continue;
         const item = document.createElement('button');
@@ -20048,6 +20319,7 @@ async function recoverArmedStartSend(options = {}) {
       refreshButton.disabled = Boolean(manualArchiveMenuState.refreshing);
       refreshButton.textContent = manualArchiveMenuState.refreshing ? 'Refreshing...' : 'Refresh list';
     }
+    syncManualArchiveMenuExpiryTimer();
   }
 
   function renderManualArchiveControl() {
@@ -20121,7 +20393,9 @@ async function recoverArmedStartSend(options = {}) {
     menu.hidden = false;
     if (panel) panel.dataset.menuOpen = 'true';
     positionManualArchiveMenu();
-    const cachedProjects = Array.isArray(manualArchiveProjectsCache.projects) ? manualArchiveProjectsCache.projects : [];
+    cancelManualArchiveMenuExpiryTimer();
+    const hardExpired = manualArchiveProjectsCacheHardExpired();
+    const cachedProjects = hardExpired ? [] : filterEnabledProjects(manualArchiveProjectsCache.projects);
     // P1 TARGET C: the SAME cache policy the registry read uses, so a picker
     // open can never contradict it. With a usable list the picker paints it
     // immediately and revalidates in the background; with none it paints
@@ -20136,7 +20410,7 @@ async function recoverArmedStartSend(options = {}) {
       errorCode: needsRequest ? '' : manualArchiveMenuState.errorCode,
       deadlined: false,
       projects: cachedProjects,
-      fetchedAt: manualArchiveProjectsCache.fetchedAt || 0,
+      fetchedAt: hardExpired ? 0 : (manualArchiveProjectsCache.fetchedAt || 0),
       generation: manualArchiveMenuState.generation,
       openToken: (Number(manualArchiveMenuState.openToken) || 0) + 1
     };
@@ -20159,8 +20433,10 @@ async function recoverArmedStartSend(options = {}) {
 
   function manualArchiveRefreshProjects() {
     if (manualArchiveRegistryFlight) return manualArchiveRegistryFlight;
-    manualArchiveMenuState.refreshing = Boolean(manualArchiveMenuState.projects.length);
-    manualArchiveMenuState.loading = !manualArchiveMenuState.projects.length;
+    const hardExpired = manualArchiveProjectsCacheHardExpired();
+    const currentEnabled = hardExpired ? [] : filterEnabledProjects(manualArchiveMenuState.projects);
+    manualArchiveMenuState.refreshing = Boolean(currentEnabled.length);
+    manualArchiveMenuState.loading = !currentEnabled.length;
     manualArchiveMenuState.error = '';
     manualArchiveMenuState.errorCode = '';
     renderManualArchiveMenu();
@@ -20176,6 +20452,7 @@ async function recoverArmedStartSend(options = {}) {
     manualArchiveMenuState.loading = false;
     manualArchiveMenuState.refreshing = false;
     setManualArchiveAttachOnly(false);
+    cancelManualArchiveMenuExpiryTimer();
   }
 
   // TARGET T: a deliberate, discoverable attach-without-send escape hatch for
@@ -20640,10 +20917,1078 @@ async function recoverArmedStartSend(options = {}) {
     const bounded = entries.slice(-MANUAL_ARCHIVE_SENT_MAX);
     try {
       GM_setValue(MANUAL_ARCHIVE_SENT_KEY, JSON.stringify({ version: 1, entries: bounded }));
+      // P1-A (T-299): a Send receipt confirms transmission only. It NEVER
+      // overwrites the Bridge-confirmed canonical archive. Canonical authority
+      // comes from explicit Bridge confirmation (refreshProjectArchiveMetadata)
+      // or from the automatic archive runtime (applyArchiveRuntime), never from
+      // a receipt filename. The transmitted archive remains available through
+      // its own receipt identity (manualArchiveSentEntry). The bounded refresh
+      // below still validates canonical state, but the receipt itself performs
+      // zero canonical-store writes.
+      recordSendObservation(key, { timestamp: entry.at, provenance: 'receipt' });
+      try { refreshProjectArchiveMetadata(project, { background: true }); } catch (_) { }
       return true;
     } catch (_) {
       return false;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Compact Send Age & Archive Timestamp Indicators Subsystems
+  // ---------------------------------------------------------------------------
+  const SEND_TRACKER_STORE_KEY = 'audapack_send_tracker_v1';
+  const SEND_TRACKER_MAX_ENTRIES = 100;
+  const ARCHIVE_METADATA_STORE_KEY = 'audapack_verified_archive_metadata_v1';
+  const SEND_AGE_TICK_INTERVAL_MS = 1000;
+  const SEND_TRACKER_EMPTY_BASELINE = '__empty_conversation__';
+  // T-296: conversation and turn identifiers are opaque identities, never
+  // semantic flags. No substring of an id may classify hydration vs send.
+  // A stable route that shows turns we have never seen is route hydration
+  // until positive Send evidence says otherwise; unknown stays unknown.
+  const MANUAL_SEND_INTENT_WINDOW_MS = 30000;
+
+  const sendTrackerHydratedTurnId = new Map();
+  let sendAgeTimer = 0;
+  let lastManualSendAttempt = null;
+  let attachmentRemovalIntentInstalled = false;
+  // Widget-initiated dispatches (automatic Send clicks, form submits, Enter
+  // fallbacks) must not arm manual-send intent: only the operator's own
+  // composer interaction is local submission evidence.
+  let widgetSendDispatchDepth = 0;
+
+  let _cachedSendTrackerStore = null;
+  let _cachedVerifiedArchiveStore = null;
+  // T-298 ATTACHED_OBSERVED memory: session-local continuity for an observed
+  // composer attachment after detach. Never persisted, never canonical: the
+  // verified GM store is written only from the Bridge canonical endpoint.
+  const observedArchiveByProject = new Map();
+  let _cachedResolvedArchiveMetadata = null;
+  let _cachedResolvedArchiveKey = '';
+  let _cachedResolvedArchiveAt = 0;
+  let _cachedSendAgeEl = null;
+  let _cachedArchiveTimestampEl = null;
+
+  function withoutManualSendIntent(fn) {
+    widgetSendDispatchDepth += 1;
+    try {
+      return fn();
+    } finally {
+      widgetSendDispatchDepth -= 1;
+    }
+  }
+
+  function snapshotComposerForSendIntent() {
+    try {
+      const input = getChatGPTInput();
+      const text = input ? cleanTurnText(composerPlainText(input)) : '';
+      const tiles = chatGPTComposerAttachmentTiles().filter(tile => tile && tile.isConnected).length;
+      return { text, tiles };
+    } catch (_) {
+      return { text: '', tiles: 0 };
+    }
+  }
+
+  // P1-B same-transaction boundary (T-298): text equality alone never proves
+  // acceptance, because real messages repeat (continue, cc, yes, ok, retry).
+  // A user-driven composer edit after arming (typing, deleting, manually
+  // clearing a rejected draft) breaks the submission chain: the payload the
+  // intent refers to no longer exists as authored, so only a FRESH intent (a
+  // new click/Enter) may corroborate a later turn. Page-controlled
+  // submission consumption clears the composer programmatically without an
+  // input event, so genuine acceptance never poisons its own intent.
+  function noteComposerUserEditAfterIntent(event) {
+    if (!lastManualSendAttempt) return;
+    try {
+      const root = chatGPTComposerRoot();
+      const target = event?.target;
+      if (!root || !target || !root.contains(target)) return;
+      const intent = lastManualSendAttempt;
+      const liveInput = getChatGPTInput();
+      const liveText = liveInput ? cleanTurnText(composerPlainText(liveInput)) : '';
+      const liveTiles = chatGPTComposerAttachmentTiles().filter(tile => tile && tile.isConnected).length;
+      if (liveText !== String(intent.composerText || '') || liveTiles !== Number(intent.composerTiles || 0)) {
+        intent.userEdited = true;
+      }
+    } catch (_) { }
+  }
+
+  // P1-B (T-299): a user-driven attachment tile removal (mouse click on the
+  // Remove control, or keyboard activation) breaks the same-transaction chain.
+  // Attachment-only submissions carry no text correlation, so tile absence is
+  // the only user-driven signal; delayed history must never be reconstructed
+  // as that signal. Positive evidence: the operator clicked the removal
+  // control or activated it by keyboard. Negative evidence: React remount,
+  // navigation teardown, or programmatic consumption during an accepted Send.
+  function noteComposerAttachmentRemoved(removeButton) {
+    if (!lastManualSendAttempt) return;
+    try {
+      // Only mark the intent edited when the operator actually interacted
+      // with a removal control in the composer. A programmatic .remove() of
+      // the tile (page-controlled consumption during an accepted Send) does
+      // NOT dispatch a removal-click event, so acceptance stays unpoisoned.
+      const intent = lastManualSendAttempt;
+      intent.userEdited = true;
+    } catch (_) { }
+  }
+
+  function trackManualSendAttempt(source = 'unknown') {
+    if (widgetSendDispatchDepth > 0) return;
+    const currentKey = currentConversationKey();
+    if (!currentKey) return;
+    // The composer baseline is captured BEFORE ChatGPT consumes the payload:
+    // the document capture listener runs ahead of the page's own submit
+    // handling, so this is the authored payload the intent refers to.
+    const composer = snapshotComposerForSendIntent();
+    lastManualSendAttempt = {
+      key: currentKey,
+      at: Date.now(),
+      source,
+      composerText: composer.text,
+      composerTiles: composer.tiles
+    };
+  }
+
+  function peekManualSendIntent(conversationKey) {
+    const intent = lastManualSendAttempt;
+    if (!intent || String(intent.key || '') !== String(conversationKey || '')) return null;
+    if (Date.now() - Number(intent.at || 0) >= MANUAL_SEND_INTENT_WINDOW_MS) return null;
+    return intent;
+  }
+
+  function consumeManualSendIntent(conversationKey) {
+    if (lastManualSendAttempt && String(lastManualSendAttempt.key || '') === String(conversationKey || '')) {
+      lastManualSendAttempt = null;
+    }
+  }
+
+  function liveComposerPayloadDeparted(intent) {
+    // Correlate the intent with an accepted turn/composer transition: the
+    // payload the operator authored must have left the composer. A click or
+    // Enter alone is never proof of successful submission.
+    try {
+      const liveInput = getChatGPTInput();
+      const liveText = liveInput ? cleanTurnText(composerPlainText(liveInput)) : '';
+      const liveTiles = chatGPTComposerAttachmentTiles().filter(tile => tile && tile.isConnected).length;
+      if (liveText !== String(intent.composerText || '')) return true;
+      if (liveTiles !== Number(intent.composerTiles || 0)) return true;
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // P1-B: positive correlation between the submitted payload and the
+  // accepted user turn, using the existing user-turn text extraction. A
+  // click/Enter event, a turn id change, or a composer edit is never
+  // acceptance evidence on its own.
+  function turnTextMatchesSubmittedPayload(turn, submittedText) {
+    const submitted = cleanTurnText(submittedText);
+    if (!submitted || !turn) return false;
+    let candidates = [];
+    try {
+      candidates = userTurnTextCandidates(turn) || [];
+    } catch (_) {
+      candidates = [];
+    }
+    if (candidates.includes(submitted)) return true;
+    // Harmless DOM formatting normalization: collapse whitespace runs
+    // before comparing, so visual-only reflow never rejects a real Send.
+    const squashedSubmitted = submitted.replace(/\s+/g, ' ').trim();
+    for (const candidate of candidates) {
+      if (String(candidate || '').replace(/\s+/g, ' ').trim() === squashedSubmitted) return true;
+    }
+    return false;
+  }
+
+  function manualSendIntentCorroborated(intent, turnId, baseline, turn) {
+    if (!intent) return false;
+    // P1-B (T-298): a user edit after arming breaks the same-transaction
+    // chain even when the composer later matches again (manually cleared
+    // draft plus delayed history carrying identical text). Only a fresh
+    // intent may corroborate.
+    if (intent.userEdited) return false;
+    // An intent armed on an empty composer proves nothing: there was nothing
+    // to submit, so no accepted transition can corroborate it.
+    const intentText = String(intent.composerText || '');
+    const hadPayload = Boolean(intentText) || Number(intent.composerTiles || 0) > 0;
+    if (!hadPayload) return false;
+    // The accepted submission must surface as a turn we have not seen AND the
+    // authored payload must have left the composer. Either fact alone is
+    // ambiguous (late history, streaming, rerendering, virtualized turns).
+    const turnIsNew = Boolean(turnId)
+      && (!baseline || baseline === SEND_TRACKER_EMPTY_BASELINE || turnId !== baseline);
+    if (!turnIsNew) return false;
+    if (intentText) {
+      // Text submission: the newly observed turn must carry the submitted
+      // payload. An edited draft plus unrelated delayed history corroborates
+      // nothing, so the failed Send stays unrecorded.
+      if (!turnTextMatchesSubmittedPayload(turn, intentText)) return false;
+    }
+    // Attachment-only submissions carry no visible text to correlate: the
+    // payload leaving the composer (tiles consumed) together with a new turn
+    // is the acceptance signal. Verified receipts and authoritative
+    // timestamps are adopted through their own paths; anything unproven
+    // stays unknown.
+    return liveComposerPayloadDeparted(intent);
+  }
+
+  function retireStaleManualSendIntent(intent) {
+    // P1-B (T-298/T-299): a user-edited/cancelled intent can never corroborate, so
+    // drop it outright -- delayed same-text history then finds no intent to
+    // satisfy. A page-consumed (programmatically cleared) composer carries no
+    // input event and stays armed while its turn is pending.
+    if (!intent) return;
+    if (intent.userEdited) {
+      consumeManualSendIntent(intent.key);
+      return;
+    }
+    // An intent whose payload was edited away without acceptance can never
+    // be corroborated: the composer holds a different non-empty draft.
+    let liveText = '';
+    try {
+      const liveInput = getChatGPTInput();
+      liveText = liveInput ? cleanTurnText(composerPlainText(liveInput)) : '';
+    } catch (_) {
+      return;
+    }
+    if (liveText && liveText !== String(intent.composerText || '')) {
+      consumeManualSendIntent(intent.key);
+      return;
+    }
+    // P1-B (T-299): for attachment-only intents the text never changes, so
+    // the above text check is silent. A tile that disappeared WITHOUT a user
+    // removal interaction (React remount, navigation teardown, etc.) is not
+    // positive acceptance evidence. However, a page-controlled consumption
+    // during a genuine accepted Send removes tiles too; that path is consumed
+    // by syncSendTrackerFromDOM's corroboration check before reaching here.
+    // If we reach this point with changed tiles and no userEdited flag, the
+    // departure was not a verified acceptance, so retire the intent to prevent
+    // delayed history from fabricating a Send.
+    if (!String(intent.composerText || '')) {
+      let liveTiles = -1;
+      try {
+        liveTiles = chatGPTComposerAttachmentTiles().filter(t => t && t.isConnected).length;
+      } catch (_) {
+        return;
+      }
+      if (liveTiles !== Number(intent.composerTiles || 0)) {
+        consumeManualSendIntent(intent.key);
+      }
+    }
+  }
+
+  function sendTrackerStore() {
+    if (_cachedSendTrackerStore) return _cachedSendTrackerStore;
+    try {
+      const raw = GM_getValue(SEND_TRACKER_STORE_KEY, '');
+      if (!raw) {
+        _cachedSendTrackerStore = { version: 1, entries: {} };
+        return _cachedSendTrackerStore;
+      }
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || !parsed.entries || typeof parsed.entries !== 'object') {
+        _cachedSendTrackerStore = { version: 1, entries: {} };
+        return _cachedSendTrackerStore;
+      }
+      _cachedSendTrackerStore = { version: 1, entries: parsed.entries };
+      return _cachedSendTrackerStore;
+    } catch (_) {
+      _cachedSendTrackerStore = { version: 1, entries: {} };
+      return _cachedSendTrackerStore;
+    }
+  }
+
+  function persistSendTrackerStore(store) {
+    try {
+      const entries = store?.entries || {};
+      const keys = Object.keys(entries);
+      let targetEntries = entries;
+      if (keys.length > SEND_TRACKER_MAX_ENTRIES) {
+        const sortedKeys = keys.sort((a, b) => (Number(entries[b]?.timestamp || 0) - Number(entries[a]?.timestamp || 0)));
+        const trimmed = {};
+        for (const k of sortedKeys.slice(0, SEND_TRACKER_MAX_ENTRIES)) {
+          trimmed[k] = entries[k];
+        }
+        targetEntries = trimmed;
+      }
+      _cachedSendTrackerStore = { version: 1, entries: targetEntries };
+      GM_setValue(SEND_TRACKER_STORE_KEY, JSON.stringify(_cachedSendTrackerStore));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearSendTrackerStore() {
+    _cachedSendTrackerStore = null;
+    sendTrackerHydratedTurnId.clear();
+    lastManualSendAttempt = null;
+    try {
+      GM_deleteValue(SEND_TRACKER_STORE_KEY);
+    } catch (_) {
+      try { GM_setValue(SEND_TRACKER_STORE_KEY, ''); } catch (_) { }
+    }
+  }
+
+  function getSendTrackerEntry(conversationKey = currentConversationKey()) {
+    const key = String(conversationKey || '');
+    if (!key) return null;
+    const store = sendTrackerStore();
+    const entry = store.entries[key];
+    if (!entry) return null;
+    const ts = Math.max(0, Number(entry.timestamp) || 0);
+    if (!ts) return null;
+    return {
+      timestamp: ts,
+      turnId: String(entry.turnId || ''),
+      provenance: String(entry.provenance || 'observed')
+    };
+  }
+
+  function setSendTrackerEntry(conversationKey, metadata) {
+    const key = String(conversationKey || currentConversationKey() || '');
+    const ts = Math.max(0, Number(metadata?.timestamp) || 0);
+    if (!key || !ts) return false;
+    const store = sendTrackerStore();
+    store.entries[key] = {
+      timestamp: ts,
+      turnId: String(metadata?.turnId || ''),
+      provenance: String(metadata?.provenance || 'observed'),
+      at: Date.now()
+    };
+    return persistSendTrackerStore(store);
+  }
+
+  function migrateSendTracker(fromKey, toKey) {
+    const from = String(fromKey || '');
+    const to = String(toKey || '');
+    if (!from || !to || from === to) return false;
+    if (!from.startsWith('draft:') || !to.startsWith('c:')) return false;
+
+    const store = sendTrackerStore();
+    const fromEntry = store.entries[from];
+    const toEntry = store.entries[to];
+
+    if (sendTrackerHydratedTurnId.has(from)) {
+      const fromHydrated = sendTrackerHydratedTurnId.get(from);
+      if (!sendTrackerHydratedTurnId.has(to) || sendTrackerHydratedTurnId.get(to) === SEND_TRACKER_EMPTY_BASELINE || sendTrackerHydratedTurnId.get(to) === null) {
+        sendTrackerHydratedTurnId.set(to, fromHydrated);
+      }
+      sendTrackerHydratedTurnId.delete(from);
+    }
+
+    // A draft -> stable continuation carries the armed payload with the
+    // conversation. Correlation is still required before any acceptance.
+    if (lastManualSendAttempt && String(lastManualSendAttempt.key || '') === from) {
+      lastManualSendAttempt = { ...lastManualSendAttempt, key: to };
+    }
+
+    if (!fromEntry) return false;
+
+    let shouldMigrate = false;
+    if (!toEntry) {
+      shouldMigrate = true;
+    } else {
+      const toIsAuth = toEntry.provenance === 'authoritative';
+      const fromIsAuth = fromEntry.provenance === 'authoritative';
+      if (toIsAuth && !fromIsAuth) {
+        shouldMigrate = false;
+      } else if (toIsAuth && fromIsAuth) {
+        shouldMigrate = Number(fromEntry.timestamp || 0) > Number(toEntry.timestamp || 0);
+      } else if (!toIsAuth && fromIsAuth) {
+        shouldMigrate = true;
+      } else {
+        shouldMigrate = Number(fromEntry.timestamp || 0) > Number(toEntry.timestamp || 0);
+      }
+    }
+
+    if (shouldMigrate) {
+      store.entries[to] = { ...fromEntry };
+    }
+    delete store.entries[from];
+    persistSendTrackerStore(store);
+    return true;
+  }
+
+  function getTurnAuthoritativeTimestamp(turn) {
+    if (!turn) return 0;
+    const parseAttr = el => {
+      if (!el || !el.getAttribute) return 0;
+      const candidates = [
+        el.getAttribute('data-timestamp'),
+        el.getAttribute('data-created-at'),
+        el.getAttribute('data-message-time'),
+        el.getAttribute('data-time')
+      ];
+      for (const val of candidates) {
+        if (!val) continue;
+        const num = Number(val);
+        if (!isNaN(num) && num > 1000000000) {
+          return num > 1000000000000 ? num : num * 1000;
+        }
+        const parsed = Date.parse(val);
+        if (!isNaN(parsed) && parsed > 1000000000000) return parsed;
+      }
+      return 0;
+    };
+
+    const selfTs = parseAttr(turn);
+    if (selfTs) return selfTs;
+
+    const timeEl = turn.querySelector?.('time[datetime], [data-timestamp], [data-created-at]');
+    if (timeEl) {
+      const dt = timeEl.getAttribute?.('datetime');
+      if (dt) {
+        const parsed = Date.parse(dt);
+        if (!isNaN(parsed) && parsed > 1000000000000) return parsed;
+      }
+      const childTs = parseAttr(timeEl);
+      if (childTs) return childTs;
+    }
+    return 0;
+  }
+
+  function recordSendObservation(conversationKey = currentConversationKey(), metadata = {}) {
+    const key = String(conversationKey || currentConversationKey() || '');
+    if (!key) return false;
+    // T-296: never fall back to Date.now() for an unverified Send. Verified
+    // callers (widget-send acceptance, archive receipts) always carry an
+    // explicit timestamp; a missing one means acceptance was never proven.
+    const ts = Math.max(0, Number(metadata?.timestamp) || 0);
+    if (!ts) return false;
+    const turnId = String(metadata.turnId || '');
+    const provenance = String(metadata.provenance || 'observed');
+    const ok = setSendTrackerEntry(key, { timestamp: ts, turnId, provenance });
+    renderTitlebarIndicators();
+    return ok;
+  }
+
+  // T-296 trust contract: the tracker measures actual accepted Sends.
+  // - Turn/conversation ids are opaque: no substring may imply hydration.
+  // - A persisted authoritative/receipt timestamp is preserved unless a NEWER
+  //   accepted Send is proven (authoritative ts, verified receipt, or
+  //   corroborated local submission intent).
+  // - Late history, streaming, rerendering, or virtualized turns without
+  //   positive evidence only advance the in-memory baseline; unknown stays
+  //   unknown and Date.now() is never a fallback for an unverified Send.
+  function syncSendTrackerFromDOM() {
+    const currentKey = currentConversationKey();
+    if (!currentKey) return;
+
+    // P1-B: a manual intent belongs to its conversation. Observing a
+    // different route retires the stale intent instead of letting a return
+    // visit resurrect it inside its 30-second window.
+    if (lastManualSendAttempt && String(lastManualSendAttempt.key || '') !== String(currentKey)) {
+      lastManualSendAttempt = null;
+    }
+
+    const turns = getChatGPTTurns();
+    const latestUser = latestChatGPTUserTurn(turns);
+
+    if (!latestUser) {
+      if (!sendTrackerHydratedTurnId.has(currentKey)) {
+        sendTrackerHydratedTurnId.set(currentKey, SEND_TRACKER_EMPTY_BASELINE);
+      }
+      return;
+    }
+
+    const turnId = getTurnId(latestUser);
+    if (!turnId) {
+      if (!sendTrackerHydratedTurnId.has(currentKey)) {
+        sendTrackerHydratedTurnId.set(currentKey, SEND_TRACKER_EMPTY_BASELINE);
+      }
+      return;
+    }
+
+    const existingEntry = getSendTrackerEntry(currentKey);
+    const baseline = sendTrackerHydratedTurnId.get(currentKey);
+    const authTs = getTurnAuthoritativeTimestamp(latestUser);
+    const receipts = manualArchiveSentEntries();
+    const receipt = receipts.find(e => String(e.key || '') === currentKey);
+    const receiptTs = Math.max(0, Number(receipt?.at) || 0);
+    const intent = peekManualSendIntent(currentKey);
+
+    const adoptSend = (timestamp, provenance) => {
+      setSendTrackerEntry(currentKey, { timestamp, turnId, provenance });
+      sendTrackerHydratedTurnId.set(currentKey, turnId);
+    };
+
+    // 1. No persisted Send yet: only positive evidence creates one.
+    if (!existingEntry) {
+      if (authTs > 0) {
+        adoptSend(authTs, 'authoritative');
+        return;
+      }
+      if (receiptTs > 0) {
+        adoptSend(receiptTs, 'receipt');
+        return;
+      }
+      if (manualSendIntentCorroborated(intent, turnId, baseline, latestUser)) {
+        adoptSend(intent.at, 'observed');
+        consumeManualSendIntent(currentKey);
+        return;
+      }
+      retireStaleManualSendIntent(intent);
+      // Unproven turn (late history, streaming, rerender): remember it so a
+      // later genuine Send still reads as new, but persist nothing.
+      sendTrackerHydratedTurnId.set(currentKey, turnId);
+      return;
+    }
+
+    // 2. Steady state: the latest turn is the recorded Send turn.
+    if (turnId === existingEntry.turnId) {
+      sendTrackerHydratedTurnId.set(currentKey, turnId);
+      return;
+    }
+
+    // 3. A different turn with a persisted entry: only a NEWER accepted Send
+    // proves an update. Anything else is hydration/ordering noise.
+    if (authTs > existingEntry.timestamp) {
+      adoptSend(authTs, 'authoritative');
+      return;
+    }
+    if (receiptTs > existingEntry.timestamp) {
+      adoptSend(receiptTs, 'receipt');
+      return;
+    }
+    if (manualSendIntentCorroborated(intent, turnId, baseline, latestUser)) {
+      adoptSend(intent.at, 'observed');
+      consumeManualSendIntent(currentKey);
+      return;
+    }
+    retireStaleManualSendIntent(intent);
+
+    // 4. Preserve: keep the persisted timestamp and provenance intact. The
+    // in-memory baseline still advances so repeated hydration chunks stay
+    // quiet, and an entry recorded without a turn id binds the currently
+    // visible turn without touching its timestamp.
+    sendTrackerHydratedTurnId.set(currentKey, turnId);
+    if (!existingEntry.turnId) {
+      setSendTrackerEntry(currentKey, { ...existingEntry, turnId });
+    }
+  }
+
+  function verifiedArchiveStore() {
+    if (_cachedVerifiedArchiveStore) return _cachedVerifiedArchiveStore;
+    try {
+      const raw = GM_getValue(ARCHIVE_METADATA_STORE_KEY, '');
+      if (!raw) {
+        _cachedVerifiedArchiveStore = { version: 1, projects: {} };
+        return _cachedVerifiedArchiveStore;
+      }
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || !parsed.projects || typeof parsed.projects !== 'object') {
+        _cachedVerifiedArchiveStore = { version: 1, projects: {} };
+        return _cachedVerifiedArchiveStore;
+      }
+      _cachedVerifiedArchiveStore = { version: 1, projects: parsed.projects };
+      return _cachedVerifiedArchiveStore;
+    } catch (_) {
+      _cachedVerifiedArchiveStore = { version: 1, projects: {} };
+      return _cachedVerifiedArchiveStore;
+    }
+  }
+
+  function persistVerifiedArchiveStore(store) {
+    try {
+      _cachedVerifiedArchiveStore = { version: 1, projects: store?.projects || {} };
+      _cachedResolvedArchiveMetadata = null;
+      GM_setValue(ARCHIVE_METADATA_STORE_KEY, JSON.stringify(_cachedVerifiedArchiveStore));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearVerifiedProjectArchives() {
+    _cachedVerifiedArchiveStore = null;
+    _cachedResolvedArchiveMetadata = null;
+    try {
+      GM_deleteValue(ARCHIVE_METADATA_STORE_KEY);
+    } catch (_) {
+      try { GM_setValue(ARCHIVE_METADATA_STORE_KEY, ''); } catch (_) { }
+    }
+  }
+
+  function getVerifiedProjectArchive(projectId) {
+    const pid = String(projectId || '').trim();
+    if (!pid) return null;
+    const store = verifiedArchiveStore();
+    return store.projects[pid] || null;
+  }
+
+  // P1-A: persistent archive writes are change-driven. Normalized metadata
+  // that is identical to the stored record persists nothing: indicator
+  // renders must never rewrite storage merely by observing it.
+  function setVerifiedProjectArchive(projectId, meta) {
+    const pid = String(projectId || '').trim();
+    if (!pid || !meta) return false;
+    const store = verifiedArchiveStore();
+    const filename = String(meta.filename || meta.name || '');
+    const filenameTs = archiveTimestampFromFilename(filename);
+    const rawMtime = Math.max(0, Number(meta.mtime) || 0);
+    const mtimeTs = rawMtime ? (rawMtime > 1000000000000 ? rawMtime : rawMtime * 1000) : 0;
+    const ts = filenameTs || Math.max(0, Number(meta.timestamp || meta.modifiedAt || mtimeTs) || 0);
+    const source = filenameTs ? 'archive filename' : meta.source === 'browser file mtime' ? 'browser file mtime' : (mtimeTs || meta.source === 'bridge mtime' || meta.source === 'bridge') ? 'bridge mtime' : String(meta.source || 'unknown');
+    const existing = store.projects[pid];
+    if (existing
+      && String(existing.filename || '') === filename
+      && Number(existing.timestamp || 0) === ts
+      && String(existing.source || '') === source
+      && Number(existing.mtime || 0) === rawMtime) {
+      return true;
+    }
+    store.projects[pid] = {
+      projectId: pid,
+      filename,
+      timestamp: ts,
+      source,
+      mtime: rawMtime,
+      updatedAt: Date.now()
+    };
+    return persistVerifiedArchiveStore(store);
+  }
+
+  const archiveMetadataRefreshInFlight = new Set();
+  const archiveMetadataPromises = new Map();
+  const archiveMetadataLastRefresh = new Map();
+  const archiveMetadataRequestGeneration = new Map();
+  const ARCHIVE_METADATA_REFRESH_COOLDOWN_MS = 10000;
+  const ARCHIVE_METADATA_ERROR_COOLDOWN_MS = 30000;
+
+  async function refreshProjectArchiveMetadata(projectId, options = {}) {
+    const pid = String(projectId || '').trim();
+    if (!pid) return;
+    if (archiveMetadataPromises.has(pid)) {
+      return archiveMetadataPromises.get(pid);
+    }
+    const now = Date.now();
+    const last = archiveMetadataLastRefresh.get(pid) || 0;
+    if (options.background && (now - last < ARCHIVE_METADATA_REFRESH_COOLDOWN_MS)) return;
+
+    const reqGen = (archiveMetadataRequestGeneration.get(pid) || 0) + 1;
+    archiveMetadataRequestGeneration.set(pid, reqGen);
+
+    archiveMetadataRefreshInFlight.add(pid);
+    archiveMetadataLastRefresh.set(pid, now);
+
+    const promise = (async () => {
+      try {
+        const response = await bridgeRequest('GET', `/v1/projects/${encodeURIComponent(pid)}/archive/metadata`, null, { timeout: 4000 });
+        if (archiveMetadataRequestGeneration.get(pid) !== reqGen) return;
+
+        if (response && response.ok && response.data && response.data.filename) {
+          const filename = String(response.data.filename);
+          const mtime = Number(response.data.mtime) || 0;
+          const filenameTs = archiveTimestampFromFilename(filename);
+          const mtimeTs = mtime ? (mtime > 1000000000000 ? mtime : mtime * 1000) : 0;
+          const ts = filenameTs || mtimeTs;
+          const source = filenameTs ? 'archive filename' : (mtime ? 'bridge mtime' : 'unknown');
+          if (ts > 0) {
+            const current = getVerifiedProjectArchive(pid);
+            // T-296: equal data is not an update -- an idle poller must not
+            // rewrite persistent storage every interval when nothing changed.
+            if (!current || ts > current.timestamp || filename !== current.filename) {
+              setVerifiedProjectArchive(pid, {
+                filename,
+                timestamp: ts,
+                source,
+                mtime
+              });
+              _cachedResolvedArchiveMetadata = null;
+              renderArchiveTimestampIndicator();
+            }
+          }
+        }
+      } catch (_) {
+        archiveMetadataLastRefresh.set(pid, now + (ARCHIVE_METADATA_ERROR_COOLDOWN_MS - ARCHIVE_METADATA_REFRESH_COOLDOWN_MS));
+      } finally {
+        archiveMetadataRefreshInFlight.delete(pid);
+        archiveMetadataPromises.delete(pid);
+      }
+    })();
+
+    archiveMetadataPromises.set(pid, promise);
+    return promise;
+  }
+
+  function resolveCurrentArchiveMetadata(now = Date.now(), options = {}) {
+    const currentKey = currentConversationKey();
+    const binding = manualArchiveBindingFor(currentKey);
+    const boundProjectId = binding ? String(binding.project_id || '') : '';
+    const boundDisplayName = binding ? String(binding.display_name || boundProjectId) : '';
+
+    let result = null;
+
+    if (boundProjectId) {
+      // P1-A authority boundary (T-298): CANONICAL_VERIFIED (Bridge-confirmed
+      // via the canonical metadata endpoint, the only writer to the verified
+      // store) outranks ATTACHED_OBSERVED (a parseable composer filename is
+      // an observed timestamp, never canonical ownership). No attachment is
+      // ever persisted into the verified store, newer or not: with canonical
+      // data present the clock shows canonical and the attachment stays
+      // separately identifiable via attachedFilename/attachedTimestamp. With
+      // no canonical authority the observed attachment may display (flagged
+      // observedAttachment) so its creation time stays visible. A
+      // Bridge-confirmed canonical replacement is always accepted by the
+      // refresh path even when its timestamp is older (identity change).
+      const canonical = getVerifiedProjectArchive(boundProjectId);
+      const canonicalTs = canonical && Number(canonical.timestamp || 0) > 0
+        ? Number(canonical.timestamp || 0) : 0;
+
+      let attached = null;
+      const composerFreshness = composerArchiveFreshness(now);
+      if (composerFreshness.present) {
+        const candidateProj = projectNameFromArtifactFilename(composerFreshness.name);
+        if (!candidateProj || candidateProj.toLowerCase() === boundProjectId.toLowerCase()) {
+          const fnTs = archiveTimestampFromFilename(composerFreshness.name);
+          const ts = fnTs || (composerFreshness.source === 'browser file mtime' || composerFreshness.source === 'file' ? composerFreshness.modifiedAt : 0);
+          const source = fnTs ? 'archive filename' : (composerFreshness.source === 'browser file mtime' || composerFreshness.source === 'file') ? 'browser file mtime' : ts ? 'bridge mtime' : 'unknown';
+          if (ts > 0) {
+            attached = {
+              projectId: boundProjectId,
+              displayName: boundDisplayName,
+              filename: composerFreshness.name,
+              timestamp: ts,
+              source,
+              ageMs: Math.max(0, now - ts)
+            };
+          }
+        }
+        // A foreign-project archive attached to this conversation is ignored
+        // entirely: it neither displays as nor persists over bound metadata.
+      }
+
+      if (attached && !canonicalTs) {
+        // Observed only: display without persisting into canonical authority.
+        // Remembered session-locally (never in the verified store) so the
+        // observed creation time survives detach within this session.
+        attached.observedAttachment = true;
+        observedArchiveByProject.set(boundProjectId.toLowerCase(), {
+          filename: attached.filename,
+          timestamp: attached.timestamp,
+          source: attached.source
+        });
+        result = attached;
+      }
+
+      if (!result && autoRuntime && autoRuntime.archiveName &&
+          (String(autoRuntime.projectName || '').toLowerCase() === boundProjectId.toLowerCase() ||
+           projectNameFromArtifactFilename(autoRuntime.archiveName).toLowerCase() === boundProjectId.toLowerCase())) {
+        const fnTs = archiveTimestampFromFilename(autoRuntime.archiveName);
+        const mtimeTs = Math.max(0, Number(autoRuntime.archiveModifiedAt) || 0);
+        const ts = fnTs || mtimeTs || 0;
+        const source = fnTs ? 'archive filename' : mtimeTs ? 'bridge mtime' : 'unknown';
+        if (ts > 0) {
+          result = {
+            projectId: boundProjectId,
+            displayName: boundDisplayName,
+            filename: autoRuntime.archiveName,
+            timestamp: ts,
+            source,
+            ageMs: Math.max(0, now - ts)
+          };
+        }
+      }
+
+      if (!result && canonicalTs) {
+        const lastRef = archiveMetadataLastRefresh.get(boundProjectId) || 0;
+        const isVisibleTab = typeof document === 'undefined' || !document.hidden;
+        if (isVisibleTab && (now - lastRef >= ARCHIVE_METADATA_REFRESH_COOLDOWN_MS)) {
+          refreshProjectArchiveMetadata(boundProjectId, { background: true });
+        }
+        result = {
+          projectId: boundProjectId,
+          displayName: boundDisplayName,
+          filename: canonical.filename,
+          timestamp: canonicalTs,
+          source: canonical.source,
+          ageMs: Math.max(0, now - canonicalTs)
+        };
+      }
+
+      if (!result && !canonicalTs) {
+        // Post-detach continuity from observed memory only: canonical data,
+        // when present, always wins above and this branch never runs.
+        const remembered = observedArchiveByProject.get(boundProjectId.toLowerCase());
+        if (remembered && Number(remembered.timestamp || 0) > 0) {
+          result = {
+            projectId: boundProjectId,
+            displayName: boundDisplayName,
+            filename: remembered.filename,
+            timestamp: Number(remembered.timestamp),
+            source: remembered.source,
+            ageMs: Math.max(0, now - Number(remembered.timestamp)),
+            observedAttachment: true
+          };
+        }
+      }
+
+      if (!result) {
+        refreshProjectArchiveMetadata(boundProjectId, { background: true });
+        result = {
+          projectId: boundProjectId,
+          displayName: boundDisplayName,
+          filename: '',
+          timestamp: 0,
+          source: 'none',
+          ageMs: 0
+        };
+      }
+
+      // The attached archive stays separately identifiable in the tooltip
+      // instead of silently replacing the canonical timestamp.
+      if (result && attached && attached.filename !== result.filename) {
+        result.attachedFilename = attached.filename;
+        result.attachedTimestamp = attached.timestamp;
+      }
+    } else {
+      const auditProject = autoRuntime?.projectName ? String(autoRuntime.projectName) : '';
+      if (auditProject) {
+        const auditFreshness = currentAuditArchiveFreshness(now);
+        if (auditFreshness.present && auditFreshness.name) {
+          const fnTs = archiveTimestampFromFilename(auditFreshness.name);
+          const mtimeTs = auditFreshness.modifiedAt;
+          const ts = fnTs || mtimeTs || 0;
+          const source = fnTs ? 'archive filename' : mtimeTs ? 'bridge mtime' : 'unknown';
+          if (ts > 0) {
+            result = {
+              projectId: auditProject,
+              displayName: auditProject,
+              filename: auditFreshness.name,
+              timestamp: ts,
+              source,
+              ageMs: Math.max(0, now - ts)
+            };
+          }
+        }
+        if (!result) {
+          const verified = getVerifiedProjectArchive(auditProject);
+          if (verified && verified.timestamp > 0) {
+            result = {
+              projectId: auditProject,
+              displayName: auditProject,
+              filename: verified.filename,
+              timestamp: verified.timestamp,
+              source: verified.source,
+              ageMs: Math.max(0, now - verified.timestamp)
+            };
+          }
+        }
+      }
+
+      if (!result) {
+        const composerFreshness = composerArchiveFreshness(now);
+        if (composerFreshness.present && composerFreshness.name) {
+          const projName = projectNameFromArtifactFilename(composerFreshness.name);
+          const fnTs = archiveTimestampFromFilename(composerFreshness.name);
+          const ts = fnTs || (composerFreshness.source === 'browser file mtime' || composerFreshness.source === 'file' ? composerFreshness.modifiedAt : 0);
+          const source = fnTs ? 'archive filename' : (composerFreshness.source === 'browser file mtime' || composerFreshness.source === 'file') ? 'browser file mtime' : ts ? 'bridge mtime' : 'unknown';
+          if (ts > 0) {
+            result = {
+              projectId: projName || composerFreshness.name,
+              displayName: projName || composerFreshness.name,
+              filename: composerFreshness.name,
+              timestamp: ts,
+              source,
+              ageMs: Math.max(0, now - ts),
+              // Unbound composer sighting: observed, never canonical.
+              observedAttachment: true
+            };
+          }
+        }
+      }
+
+      if (!result) {
+        result = {
+          projectId: '',
+          displayName: '',
+          filename: '',
+          timestamp: 0,
+          source: 'none',
+          ageMs: 0
+        };
+      }
+    }
+
+    _cachedResolvedArchiveMetadata = result;
+    return result;
+  }
+
+  function setElementTooltip(el, text) {
+    if (!el) return;
+    const str = String(text || '');
+    el.title = str;
+    try { el.setAttribute('title', str); } catch (_) { }
+  }
+
+  function renderSendAgeIndicator(now = Date.now()) {
+    if (!_cachedSendAgeEl || !_cachedSendAgeEl.isConnected) {
+      _cachedSendAgeEl = panel ? panel.querySelector('#acb-send-age') : null;
+    }
+    const el = _cachedSendAgeEl;
+    if (!el) return;
+    const currentKey = currentConversationKey();
+    const entry = getSendTrackerEntry(currentKey);
+    if (!entry || !entry.timestamp) {
+      if (el.textContent !== 'SEND \u2014') el.textContent = 'SEND \u2014';
+      const tooltip = 'No send recorded for this conversation.';
+      if (el.title !== tooltip) setElementTooltip(el, tooltip);
+      return;
+    }
+
+    const ageMs = Math.max(0, now - entry.timestamp);
+    const ageStr = compactElapsedAge(ageMs);
+    const text = `SEND ${ageStr}`;
+    if (el.textContent !== text) {
+      el.textContent = text;
+    }
+
+    const formattedDate = formatArchiveTimestampDateTime(entry.timestamp);
+    const ageTooltip = formatTooltipAge(ageMs);
+    const tooltip = `Last send: ${formattedDate}\nProvenance: ${entry.provenance}\nTurn ID: ${entry.turnId || '\u2014'}\nAge: ${ageTooltip}`;
+    if (el.title !== tooltip) {
+      setElementTooltip(el, tooltip);
+    }
+  }
+
+  function renderArchiveTimestampIndicator(now = Date.now()) {
+    if (!_cachedArchiveTimestampEl || !_cachedArchiveTimestampEl.isConnected) {
+      _cachedArchiveTimestampEl = panel ? panel.querySelector('#acb-archive-timestamp') : null;
+    }
+    const el = _cachedArchiveTimestampEl;
+    if (!el) return;
+
+    const meta = resolveCurrentArchiveMetadata(now);
+    if (!meta || !meta.timestamp) {
+      if (el.textContent !== 'ZIP \u2014') el.textContent = 'ZIP \u2014';
+      const tooltip = meta?.projectId
+        ? `Project: ${meta.displayName || meta.projectId}\nNo archive timestamp available.`
+        : 'No archive timestamp available.';
+      if (el.title !== tooltip) setElementTooltip(el, tooltip);
+      return;
+    }
+
+    const ageMs = Math.max(0, now - meta.timestamp);
+    const clockText = formatArchiveTimestampClock(meta.timestamp);
+    if (el.textContent !== clockText) {
+      el.textContent = clockText;
+    }
+
+    const formattedDate = formatArchiveTimestampDateTime(meta.timestamp);
+    const ageTooltip = formatTooltipAge(ageMs);
+    const archiveLabel = meta.displayName || meta.projectId || projectNameFromArtifactFilename(meta.filename) || meta.filename || 'AUDAPACK';
+
+    const isCreation = meta.source === 'archive filename';
+    const timeLabel = isCreation ? 'Timestamp' : 'Last modified';
+
+    const projectLine = (meta.displayName || meta.projectId)
+      ? `Project: ${meta.displayName || meta.projectId}\n`
+      : '';
+    const attachedLine = (meta.attachedFilename && meta.attachedFilename !== meta.filename)
+      ? `\nAttached: ${meta.attachedFilename}`
+      : '';
+    // T-298: an observed (non-canonical) attachment is labeled as such so it
+    // is never silently misread as verified canonical metadata.
+    const sourceLine = meta.observedAttachment
+      ? `${meta.source} (attached, unverified)`
+      : meta.source;
+    const tooltip = `${projectLine}Archive: ${archiveLabel}\n${timeLabel}: ${formattedDate}\nSource: ${sourceLine}${attachedLine}\nAge: ${ageTooltip}`;
+    if (el.title !== tooltip) {
+      setElementTooltip(el, tooltip);
+    }
+  }
+
+  function renderTitlebarIndicators(now = Date.now()) {
+    if (!panel) return;
+    try { syncSendTrackerFromDOM(); } catch (_) { }
+    try { renderSendAgeIndicator(now); } catch (_) { }
+    try { renderArchiveTimestampIndicator(now); } catch (_) { }
+  }
+
+  function cancelSendAgeTimer() {
+    if (sendAgeTimer) {
+      clearTimeout(sendAgeTimer);
+      sendAgeTimer = 0;
+    }
+  }
+
+  function scheduleSendAgeTick(delayMs = null) {
+    cancelSendAgeTimer();
+    if (typeof document !== 'undefined' && document.hidden) return;
+    const now = Date.now();
+    const delay = delayMs !== null ? Math.max(10, Number(delayMs) || 1000) : Math.max(200, 1000 - (now % 1000));
+    sendAgeTimer = setTimeout(() => {
+      sendAgeTimer = 0;
+      try {
+        const tickNow = Date.now();
+        renderSendAgeIndicator(tickNow);
+      } catch (_) { }
+      scheduleSendAgeTick();
+    }, delay);
+  }
+
+  function startSendAgeTimer() {
+    cancelSendAgeTimer();
+    scheduleSendAgeTick();
+  }
+
+  // T-296 Target B: dedicated lightweight canonical-archive metadata
+  // scheduler. Indicator rendering alone cannot guarantee freshness because
+  // the per-second Send ticker renders only the Send indicator. This poller
+  // owns the freshness schedule independently:
+  // - visible and reliably project-bound Widget only;
+  // - ~20 s between normal checks (never per-second);
+  // - single-flight + generation fencing via refreshProjectArchiveMetadata;
+  // - Bridge errors back off through the existing error cooldown;
+  // - the tick performs no DOM traversal and no archive-byte download, only
+  //   a route-key + binding lookup and one bounded metadata request;
+  // - hidden tabs never poll; foreground return refreshes on catch-up;
+  // - exactly one timer: start cancels first, teardown cancels.
+  const ARCHIVE_METADATA_POLL_INTERVAL_MS = 20000;
+  let archiveMetadataPollTimer = 0;
+
+  function currentBoundProjectIdForMetadataPoll() {
+    try {
+      const key = currentConversationKey();
+      if (!key) return '';
+      const binding = manualArchiveBindingFor(key);
+      return String(binding?.project_id || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function maybeRefreshArchiveMetadataBackground() {
+    if (typeof document !== 'undefined' && document.hidden) return false;
+    const pid = currentBoundProjectIdForMetadataPoll();
+    if (!pid) return false;
+    const now = Date.now();
+    const last = archiveMetadataLastRefresh.get(pid) || 0;
+    if (now - last < ARCHIVE_METADATA_POLL_INTERVAL_MS) return false;
+    refreshProjectArchiveMetadata(pid, { background: true });
+    return true;
+  }
+
+  function cancelArchiveMetadataPoll() {
+    if (archiveMetadataPollTimer) {
+      clearTimeout(archiveMetadataPollTimer);
+      archiveMetadataPollTimer = 0;
+    }
+  }
+
+  function scheduleArchiveMetadataPoll() {
+    cancelArchiveMetadataPoll();
+    archiveMetadataPollTimer = setTimeout(() => {
+      archiveMetadataPollTimer = 0;
+      try { maybeRefreshArchiveMetadataBackground(); } catch (_) { }
+      scheduleArchiveMetadataPoll();
+    }, ARCHIVE_METADATA_POLL_INTERVAL_MS);
+  }
+
+  function startArchiveMetadataPoll() {
+    cancelArchiveMetadataPoll();
+    scheduleArchiveMetadataPoll();
   }
 
   function manualArchiveAttachmentIdentity(tile) {
@@ -21490,6 +22835,11 @@ async function recoverArmedStartSend(options = {}) {
 
   async function selectManualArchiveProject(project, options = {}) {
     const originKey = currentConversationKey();
+    if (!manualArchiveProjectIsEnabled(project)) {
+      setStatus(`Project "${project?.display_name || project?.project_id || ''}" is disabled.`, 'error');
+      renderManualArchiveMenu();
+      return { ok: false, code: 'PROJECT_DISABLED', errorCode: 'project_disabled', message: 'Project is disabled' };
+    }
     if (!setManualArchiveBinding(project)) {
       setStatus('ZIP: conversation binding could not be saved.', 'error');
       return { ok: false, code: 'FAILED' };
@@ -21511,6 +22861,7 @@ async function recoverArmedStartSend(options = {}) {
   function renderAutoAuditState() {
     if (!panel || !state) return;
     try { renderManualArchiveControl(); } catch (_) {}
+    try { renderTitlebarIndicators(); } catch (_) {}
     try {
       const saihandoff = panel.querySelector('#acb-saihandoff-state');
       if (saihandoff) {
@@ -24323,6 +25674,13 @@ async function recoverArmedStartSend(options = {}) {
         }
       }
 
+      if (turnMutation || routeChanged || authMayHaveChanged) {
+        try {
+          syncSendTrackerFromDOM();
+          renderTitlebarIndicators();
+        } catch (_) { }
+      }
+
       if (autoRuntime?.projectName && state?.autoRenameChat) {
         applyPersistentLocalProjectTitle(autoRuntime.projectName);
       }
@@ -25690,7 +27048,13 @@ async function recoverArmedStartSend(options = {}) {
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         finishDrag(null, 'hidden');
+        cancelSendAgeTimer();
+        cancelArchiveMetadataPoll();
       } else {
+        renderTitlebarIndicators();
+        startSendAgeTimer();
+        startArchiveMetadataPoll();
+        try { maybeRefreshArchiveMetadataBackground(); } catch (_) { }
         scheduleBridgeFlush(100);
       }
     });
@@ -25886,6 +27250,12 @@ async function recoverArmedStartSend(options = {}) {
               <button id="acb-manual-zip-clear" type="button" title="Forget the project bound to THIS chat. Project files are never touched.">Clear</button>
             </div>
           </div>
+        </div>
+
+        <div id="acb-title-indicators" role="status" aria-label="Activity indicators">
+          <span id="acb-send-age" title="No send recorded for this conversation.">SEND —</span>
+          <span id="acb-indicator-sep" aria-hidden="true">|</span>
+          <span id="acb-archive-timestamp" title="No archive timestamp available.">ZIP —</span>
         </div>
 
         <div id="acb-super-controls" aria-label="Super compact campaign monitor">
@@ -26169,6 +27539,11 @@ async function recoverArmedStartSend(options = {}) {
     renderConfirm();
     bindAutoRuntimeToCurrentConversation({ claim: false });
     renderAutoAuditState();
+    renderTitlebarIndicators();
+    if (!globalThis.__ACB_ENABLE_TEST_HOOK__) {
+      startSendAgeTimer();
+      startArchiveMetadataPoll();
+    }
     applyDisplayState();
     clampPanelPosition({ report: true });
     updateLockState();
@@ -26270,6 +27645,62 @@ async function recoverArmedStartSend(options = {}) {
       document.addEventListener('click', event => {
         preservePreparedStartBeforeManualSend(event?.target);
       }, true);
+    }
+    if (!chatGPTSendTrackingInstalled) {
+      chatGPTSendTrackingInstalled = true;
+      document.addEventListener('click', event => {
+        const send = event?.target?.closest?.('button') || event?.target;
+        if (isChatGPTSend(send)) {
+          trackManualSendAttempt('click');
+        }
+      }, true);
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+          const target = event.target;
+          if (target && (target.id === 'prompt-textarea' || target.getAttribute?.('contenteditable') === 'true' || target.getAttribute?.('role') === 'textbox')) {
+            const root = chatGPTComposerRoot();
+            if (!root || root.contains(target)) {
+              trackManualSendAttempt('keyboard');
+            }
+          }
+        }
+      }, true);
+      // P1-B (T-298): observe user-driven composer edits so a manually
+      // edited/cleared draft retires the armed intent (same-transaction
+      // boundary). Capture phase: user edits must poison the intent even if
+      // page handlers later touch the composer.
+      document.addEventListener('input', event => {
+        noteComposerUserEditAfterIntent(event);
+      }, true);
+      // P1-B (T-299): attachment tile removal (mouse click on the Remove control,
+      // or keyboard activation) does NOT dispatch an `input` event. Detect these
+      // removal interactions directly so a rejected attachment-only Send cannot
+      // be reconstructed as accepted by delayed history. Programmatic tile
+      // consumption during a genuine accepted Send never dispatches its own
+      // removal click here, so true acceptance stays unaffected.
+      if (!attachmentRemovalIntentInstalled) {
+        attachmentRemovalIntentInstalled = true;
+        document.addEventListener('click', event => {
+          const target = event?.target;
+          if (!target || typeof target.closest !== 'function') return;
+          const removeBtn = target.closest('button[aria-label^="Remove" i], button[name="remove-file"], button[name="remove-file-tile"]');
+          if (!removeBtn) return;
+          const root = chatGPTComposerRoot();
+          if (!root || !root.contains(removeBtn)) return;
+          noteComposerAttachmentRemoved(removeBtn);
+        }, true);
+        document.addEventListener('keydown', event => {
+          if (!event || !lastManualSendAttempt) return;
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          const target = event?.target;
+          if (!target || typeof target.closest !== 'function') return;
+          const removeBtn = target.closest('button[aria-label^="Remove" i], button[name="remove-file"], button[name="remove-file-tile"]');
+          if (!removeBtn) return;
+          const root = chatGPTComposerRoot();
+          if (!root || !root.contains(removeBtn)) return;
+          noteComposerAttachmentRemoved(removeBtn);
+        }, true);
+      }
     }
     installComposerArchiveDropSanitizer();
     if (!managedWorkerHousekeepingInstalled && browserWorkerManagedIdentity()?.slot) {
@@ -28183,7 +29614,14 @@ let browserWorkerBraveConfirmed = false;
         get canonicalArchiveFlightCount() { return canonicalArchiveFlights.size; },
         clearManualArchiveProjectsCache() { manualArchiveProjectsCache = { projects: [], fetchedAt: 0, revision: '' }; },
         get manualArchiveProjectsCache() { return manualArchiveProjectsCache; },
+        filterEnabledProjects,
+        manualArchiveProjectIsEnabled,
         manualArchiveProjectsCacheUsable,
+        manualArchiveProjectsCacheHardExpired,
+        get manualArchiveMenuExpiryTimerActive() { return manualArchiveMenuExpiryTimer > 0; },
+        cancelManualArchiveMenuExpiryTimer,
+        triggerManualArchiveMenuExpiry,
+        syncManualArchiveMenuExpiryTimer,
         get manualArchiveLastTimings() { return manualArchiveLastTimings; },
         manualArchiveTimingBegin,
         manualArchivePaintFrame,
@@ -28329,7 +29767,35 @@ let browserWorkerBraveConfirmed = false;
         setWaveUserId,
         EMBEDDED_AUDIT_PROFILES,
         AUDIT_PROFILES_MANIFEST_SHA256,
-        setStatus
+        setStatus,
+        renderTitlebarIndicators,
+        renderSendAgeIndicator,
+        renderArchiveTimestampIndicator,
+        getSendTrackerEntry,
+        setSendTrackerEntry,
+        syncSendTrackerFromDOM,
+        recordSendObservation,
+        getVerifiedProjectArchive,
+        setVerifiedProjectArchive,
+        resolveCurrentArchiveMetadata,
+        refreshProjectArchiveMetadata,
+        formatArchiveTimestampDateTime,
+        formatArchiveTimestampClock,
+        formatTooltipAge,
+        startSendAgeTimer,
+        cancelSendAgeTimer,
+        get isSendAgeTimerActive() { return sendAgeTimer > 0; },
+        startArchiveMetadataPoll,
+        cancelArchiveMetadataPoll,
+        maybeRefreshArchiveMetadataBackground,
+        currentBoundProjectIdForMetadataPoll,
+        get isArchiveMetadataPollActive() { return archiveMetadataPollTimer > 0; },
+        constants_ARCHIVE_METADATA_POLL_INTERVAL_MS: ARCHIVE_METADATA_POLL_INTERVAL_MS,
+        clearSendTrackerStore,
+        clearVerifiedProjectArchives,
+        migrateSendTracker,
+        compactElapsedAge,
+        archiveTimestampFromFilename
       }
     });
   }

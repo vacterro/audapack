@@ -35,11 +35,11 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 from audapack.agent_inbox import DEFAULT_ALLOCATOR_REL, DEFAULT_BINDING_REL
-from audapack.models import Project
+from audapack.models import Project, normalize_archive_scope
 
 CONFIG_FILE_NAME = "config.json"
 LEGACY_REPO_CONFIG_NAME = "audapack.json"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Schema at which DEFAULT_EXCLUDES stopped owning media/font patterns. A
 #: config persisted below this is upgraded exactly once, on the next load.
@@ -78,6 +78,13 @@ _YOLO_CLI_SCHEMA = 7
 
 #: The four multi-agent CLI launcher ids added by schema 6 (TARGET A).
 _MULTI_CLI_LAUNCHER_IDS: tuple[str, ...] = ("claude1", "claude2", "antigravity", "zcode")
+
+#: Schema at which the account-backed launcher inventory became a PROJECTION of
+#: the canonical SAI Accounts registry instead of a second static list. Purely
+#: additive: it records whether this installation has ever read an authoritative
+#: snapshot, so a later control-plane outage can answer "stale" rather than
+#: resurrect the retired static Codex/Claude/Antigravity rows.
+_FEDERATED_LAUNCHER_SCHEMA = 8
 
 DEFAULT_AUDIT_ROOT = r"V:\___VAC\__K\__CODE\_AI_STUFF_AGENTIC\__TO_AUDIT\AUDITING_IMPLEMENTATION"
 
@@ -1126,6 +1133,55 @@ class UIConfig:
     #: ID, never by list index, so reordering launchers cannot change it.
     project_double_click_launcher_id: str = PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
 
+    #: Compact metrics strip above primary actions
+    show_metrics_strip: bool = True
+    compact_metrics: bool = False
+
+
+@dataclass
+class FederationConfig:
+    """Whether this installation consumes the canonical SAI Accounts registry.
+
+    Consent is one-way and durable. ``active`` becomes true the first time an
+    authoritative snapshot is read, and it is never cleared: an installation that
+    has federated once keeps its last-known-good account projection when the
+    control plane goes away, instead of silently falling back to the retired
+    static Codex/Claude/Antigravity rows. ``stale`` is the live truth about the
+    LAST read, not about the registry -- a failed read is never an authoritative
+    empty account list, so ``stale`` is set and nothing is deleted.
+
+    This block is the whole of AUDAPACK's account-authority bookkeeping. It holds
+    no account identity: identities come from the registry on every read.
+    """
+
+    active: bool = False
+    last_sync: str = ""
+    generation: int = 0
+    stale: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "last_sync": self.last_sync,
+            "generation": self.generation,
+            "stale": self.stale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> FederationConfig:
+        if not isinstance(data, dict):
+            return cls()
+        try:
+            generation = max(0, int(data.get("generation", 0)))
+        except (TypeError, ValueError):
+            generation = 0
+        return cls(
+            active=bool(data.get("active", False)),
+            last_sync=str(data.get("last_sync", "") or "").strip(),
+            generation=generation,
+            stale=bool(data.get("stale", False)),
+        )
+
 
 @dataclass
 class AppConfig:
@@ -1137,6 +1193,7 @@ class AppConfig:
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     launchers: list[LauncherConfig] = field(default_factory=create_default_launchers)
+    federation: FederationConfig = field(default_factory=FederationConfig)
 
     def normalize_paths(self) -> bool:
         """Normalize every persisted path string to OS-native separators in place.
@@ -1264,6 +1321,7 @@ class AppConfig:
             "bridge": self.bridge.to_safe_dict(),
             "ui": asdict(self.ui),
             "launchers": [launcher.to_dict() for launcher in self.launchers],
+            "federation": self.federation.to_dict(),
         }
 
     def get_project_by_id(self, project_id: str) -> Optional[Project]:
@@ -1527,6 +1585,13 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                         enabled=bool(p_data.get("enabled", True)),
                         ignored=bool(p_data.get("ignored", False)),
                         ignore_archive=bool(p_data.get("ignore_archive", False)),
+                        # T-290: this rebuild runs on EVERY load, so an omitted
+                        # key would silently revert a complete_source toggle
+                        # to auto on the next start or registry transaction.
+                        archive_scope=normalize_archive_scope(p_data.get("archive_scope")),
+                        # T-290: this rebuild runs on EVERY load, so an omitted
+                        # key would silently revert a complete_source toggle
+                        # to auto on the next start or registry transaction.
                         audit_copy_count=int(p_data.get("audit_copy_count", 0) or 0),
                         inaudit_aliases=[
                             str(value).strip()
@@ -1654,6 +1719,8 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
             str(ui_raw.get("project_double_click_launcher_id", PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT)).strip()
             or PROJECT_DOUBLE_CLICK_LAUNCHER_DEFAULT
         ),
+        show_metrics_strip=bool(ui_raw.get("show_metrics_strip", True)),
+        compact_metrics=bool(ui_raw.get("compact_metrics", False)),
     )
 
     launchers_raw = data.get("launchers")
@@ -1714,6 +1781,13 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
                     _FREEBUFF_MULTI_INSTANCE_SCHEMA,
                 )
 
+    # Schema 8 is additive for launchers on purpose: retiring the static
+    # account-backed rows is NOT a property of the file being old, it is a
+    # property of an authoritative snapshot having been read (see
+    # ``launch_federation``). A config below this schema therefore only gains the
+    # empty bookkeeping block, and re-loading it twice changes nothing.
+    federation_cfg = FederationConfig.from_dict(data.get("federation"))
+
     return AppConfig(
         schema_version=SCHEMA_VERSION,
         projects=projects,
@@ -1722,6 +1796,7 @@ def migrate_legacy_data(data: dict[str, Any]) -> AppConfig:
         bridge=bridge_cfg,
         ui=ui_cfg,
         launchers=launchers,
+        federation=federation_cfg,
     )
 
 

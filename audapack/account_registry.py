@@ -30,10 +30,29 @@ class AccountIdentity:
     discovery_source: str
     last_seen_at: str
     enabled: bool = True
+    #: The plane's GLOBAL lifecycle state for this account ("" for a purely local
+    #: record). Kept apart from ``enabled`` on purpose: ``enabled`` is AUDAPACK's
+    #: local visibility, this is the registry's own verdict, and conflating the
+    #: two is what let a withdrawn account stay launchable.
+    operational_state: str = ""
 
     @property
     def bound(self) -> bool:
         return bool(self.launcher_ids)
+
+    @property
+    def shared(self) -> bool:
+        return self.discovery_source == sai_accounts.SHARED_SOURCE
+
+    @property
+    def operational(self) -> bool:
+        """Globally usable according to the plane (a local record always is)."""
+        return self.operational_state in ("", "ENABLED")
+
+    @property
+    def launchable(self) -> bool:
+        """Has a local launch target AND is locally visible AND is operational."""
+        return self.bound and self.enabled and self.operational
 
 
 def _identity(provider: str, profile: Path) -> str:
@@ -70,8 +89,27 @@ def _auth_marker_exists(provider: str, profile: Path) -> bool:
     return any((profile / name).is_file() for name in markers)
 
 
+def local_candidates(home: Path) -> list[tuple[str, str, str, Path]]:
+    """The local identities AUDAPACK can discover, as data.
+
+    One table, two consumers: discovery builds records from it, and the launcher
+    federation maps a retired static launcher id onto the canonical account that
+    is provably the same identity. A second copy of this table is exactly how the
+    two lists drift apart, so there is none.
+    """
+    return [
+        ("codex", "main_codex", "Codex 1", home / CODEX_ACCOUNT_HOMES["main_codex"]),
+        ("codex", "main_codex2", "Codex 2", home / CODEX_ACCOUNT_HOMES["main_codex2"]),
+        ("codex", "main_codex3_free", "Codex Free", home / CODEX_ACCOUNT_HOMES["main_codex3_free"]),
+        ("claude", "claude1", "Claude 1", home / ".claude"),
+        ("claude", "claude2", "Claude 2", home / ".claude-account2"),
+        ("antigravity", "antigravity", "Antigravity", home / ".gemini" / "antigravity"),
+    ]
+
+
 def discover_accounts(
-    launchers: Iterable[object], *, home: Path | None = None, now: datetime | None = None
+    launchers: Iterable[object], *, home: Path | None = None, now: datetime | None = None,
+    shared_accounts: list[sai_accounts.SharedAccount] | None = None,
 ) -> list[AccountIdentity]:
     """Inspect only known profile locations and configured launcher identities.
 
@@ -87,64 +125,82 @@ def discover_accounts(
     home = Path(home) if home is not None else Path.home()
     stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     configured: Mapping[str, object] = {str(getattr(item, "id", "")): item for item in launchers}
-    candidates: list[tuple[str, str, str, Path]] = [
-        ("codex", "main_codex", "Codex 1", home / CODEX_ACCOUNT_HOMES["main_codex"]),
-        ("codex", "main_codex2", "Codex 2", home / CODEX_ACCOUNT_HOMES["main_codex2"]),
-        ("codex", "main_codex3_free", "Codex Free", home / CODEX_ACCOUNT_HOMES["main_codex3_free"]),
-        ("claude", "claude1", "Claude 1", home / ".claude"),
-        ("claude", "claude2", "Claude 2", home / ".claude-account2"),
-        ("antigravity", "antigravity", "Antigravity", home / ".gemini" / "antigravity"),
-    ]
-    result: list[tuple[AccountIdentity, str]] = []
-    claimed: set[str] = set()
+    candidates = local_candidates(home)
+    found: list[tuple[str, AccountIdentity]] = []
+    local_by_key: dict[str, AccountIdentity] = {}
     for provider, launcher_id, label, profile in candidates:
         if not _auth_marker_exists(provider, profile):
             continue
         launcher = configured.get(launcher_id)
         key = sai_accounts.identity_key(provider, identity_locator(provider, profile, home))
+        record = AccountIdentity(
+            account_id=_identity(provider, profile),
+            provider_id=provider,
+            display_name=label,
+            profile_locator=str(profile.resolve()),
+            launcher_ids=(launcher_id,) if launcher is not None else (),
+            discovery_source=("known_provider_data_dir" if provider == "antigravity"
+                              else "known_profile_auth_marker"),
+            last_seen_at=stamp,
+            enabled=bool(getattr(launcher, "enabled", True)),
+        )
+        found.append((key, record))
         if key:
-            claimed.add(key)
-        result.append((
-            AccountIdentity(
-                account_id=_identity(provider, profile),
-                provider_id=provider,
-                display_name=label,
-                profile_locator=str(profile.resolve()),
-                launcher_ids=(launcher_id,) if launcher is not None else (),
-                discovery_source=("known_provider_data_dir" if provider == "antigravity"
-                                  else "known_profile_auth_marker"),
-                last_seen_at=stamp,
-                enabled=bool(getattr(launcher, "enabled", True)),
-            ),
-            key,
-        ))
-    shared = _shared_accounts(candidates, claimed, stamp)
+            local_by_key[key] = record
+    fresh_shared, replaced = _shared_accounts(
+        candidates, local_by_key, stamp, configured, shared_accounts=shared_accounts,
+    )
     withdrawn = sai_accounts.suppressed_keys()
-    if not withdrawn:
-        return [record for record, _key in result] + shared
-    # A record found above is the same physical account the registry already
-    # knows, so honouring a global hide only on the shared half would let every
-    # account AUDAPACK already knew survive the very hide the operator asked
-    # for. An unprovable key suppresses nothing, and a machine with no plane
-    # read has an empty withdrawn set — so a standalone install is unchanged.
-    return [record for record, key in result if key not in withdrawn] + shared
+    out: list[AccountIdentity] = []
+    for key, record in found:
+        # A record found here is the same physical account the registry already
+        # knows, so honouring a global hide only on the shared half would let
+        # every account AUDAPACK already knew survive the very hide the operator
+        # asked for. An unprovable key suppresses nothing, and a machine with no
+        # plane read has an empty withdrawn set — a standalone install is
+        # unchanged.
+        if key and key in withdrawn:
+            continue
+        # One identity, one row: a proven duplicate is represented by whichever
+        # side carries an actual launch target, so the projection follows the
+        # binding instead of the order the two lists happen to be built in.
+        out.append(replaced.get(key, record) if key else record)
+    return out + fresh_shared
 
 
 def _shared_accounts(
-    candidates: list[tuple[str, str, str, Path]], claimed: set[str], stamp: str
-) -> list[AccountIdentity]:
-    """Shared accounts this installation does not already have, as local records.
+    candidates: list[tuple[str, str, str, Path]],
+    local_by_key: Mapping[str, AccountIdentity],
+    stamp: str,
+    configured: Mapping[str, object],
+    shared_accounts: list[sai_accounts.SharedAccount] | None = None,
+) -> tuple[list[AccountIdentity], dict[str, AccountIdentity]]:
+    """Shared accounts, split into new identities and proven duplicates.
 
-    A shared record carries no launcher: nothing here can decide which tool a
-    remote account belongs to, and inventing a binding would be worse than an
-    honest UNBOUND account the operator can bind explicitly.
+    Returns the shared records that are NO local record's projection, plus the
+    ones that replace an unbound local projection of the same identity.
+
+    A shared record is bound to the effective launch target derived from its OWN
+    canonical ``account_id`` -- never to a static launcher the operator had to
+    pick by hand. That binding is derived on every read, so an account added,
+    renamed or removed in the registry needs no AUDAPACK rebinding step at all;
+    when no target row exists (a fresh install that has not synced yet) the
+    account is honestly UNBOUND rather than pointed at a stranger's launcher.
     """
-    shared = sai_accounts.fresh_list({provider for provider, _l, _n, _p in candidates})
-    out: list[AccountIdentity] = []
+    from audapack.launch_federation import target_id
+
+    if shared_accounts is not None:
+        shared = list(shared_accounts)
+    elif sai_accounts.has_cached_accounts():
+        shared = sai_accounts.cached_accounts()
+    else:
+        shared = sai_accounts.fresh_list({provider for provider, _l, _n, _p in candidates})
+    fresh: list[AccountIdentity] = []
+    replaced: dict[str, AccountIdentity] = {}
+    seen: set[str] = set()
     for entry in shared:
         key = sai_accounts.identity_key(entry.provider_id, entry.locator)
-        if key and key in claimed:
-            # A claimed locator means this IS one of ours: one record, not two.
+        if key and key in seen:
             continue
         # A record with no locator is unprovable, not worthless. It is still the
         # operator's account, and dropping it would lose an account identity
@@ -155,20 +211,30 @@ def _shared_accounts(
         if not account_id:
             continue
         if key:
-            claimed.add(key)
-        out.append(
-            AccountIdentity(
-                account_id=account_id,
-                provider_id=entry.provider_id,
-                display_name=entry.display_name,
-                profile_locator=entry.locator,
-                launcher_ids=(),
-                discovery_source=sai_accounts.SHARED_SOURCE,
-                last_seen_at=stamp,
-                enabled=True,
-            )
+            seen.add(key)
+        tid = target_id(entry.account_id)
+        row = configured.get(tid)
+        record = AccountIdentity(
+            account_id=account_id,
+            provider_id=entry.provider_id,
+            display_name=entry.display_name,
+            profile_locator=entry.locator,
+            launcher_ids=(tid,) if row is not None else (),
+            discovery_source=sai_accounts.SHARED_SOURCE,
+            last_seen_at=stamp,
+            enabled=bool(getattr(row, "enabled", True)),
+            operational_state=entry.operational_state,
         )
-    return out
+        local = local_by_key.get(key) if key else None
+        if local is None:
+            fresh.append(record)
+        elif record.bound and not local.bound:
+            # The canonical account has a real target and the local residue has
+            # none, so the registry's projection is the truthful one.
+            replaced[key] = record
+        # Otherwise the local record already IS the effective projection of this
+        # identity (it has the binding, or neither side has one).
+    return fresh, replaced
 
 
 class AccountRegistry:

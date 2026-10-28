@@ -80,7 +80,8 @@ from audapack.launch_authority import (
     register_agent_process,
     resolve_launch_target,
 )
-from audapack.models import Project
+from audapack.launch_federation import account_id_of, is_account_target
+from audapack.models import ARCHIVE_SCOPE_AUTO, ARCHIVE_SCOPE_COMPLETE_SOURCE, Project
 from audapack.opencode_launch import (
     LaunchAdmissionError,
     OpenCodeAdmission,
@@ -687,6 +688,45 @@ def pack_failure_detail(result) -> str:
     return detail
 
 
+#: T-274: the one line a SUCCESSFUL pack adds beyond the archive name. Compact
+#: on purpose -- an ordinary pack must not print a diagnostic report -- but it
+#: answers the question a green tick never did: is the project's own source in
+#: this archive? ``SOURCE MISSING`` is the red-flag token the row and the status
+#: bar both key on, so a pack that committed without its source can never read
+#: as an ordinary success.
+PACK_SOURCE_MISSING = "SOURCE MISSING"
+
+
+def pack_success_detail(result) -> str:
+    """The compact post-pack truth: size, source files, components, omissions."""
+    parts: list[str] = []
+    size = int(getattr(result, "archive_bytes", 0) or 0)
+    if size:
+        parts.append(human_mb(size))
+    included = int(getattr(result, "files_included", 0) or 0)
+    if included:
+        parts.append(f"{included} source files")
+    components = int(getattr(result, "nested_components_included", 0) or 0)
+    if components:
+        files = int(getattr(result, "nested_component_files", 0) or 0)
+        parts.append(f"{components} nested component(s), {files} files")
+    excluded = int(getattr(result, "excluded_bytes", 0) or 0)
+    if excluded:
+        parts.append(f"{human_mb(excluded)} omitted")
+    ready = bool(getattr(result, "source_review_ready", True))
+    parts.append("source ready" if ready else PACK_SOURCE_MISSING)
+    return ", ".join(parts)
+
+
+def pack_success_message(name: str, result, out_name: str) -> str:
+    """The status-bar line for a successful pack, in one place for every entry point."""
+    git_part = f" ({result.git_summary})" if getattr(result, "git_summary", "") else ""
+    detail = pack_success_detail(result)
+    if getattr(result, "source_review_ready", True):
+        return f"✓ Packed {name} -> {out_name}{git_part} — {detail}"
+    return f"⚠ Packed {name} -> {out_name} but {PACK_SOURCE_MISSING} — {detail}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, service: ProjectService, audit_service: Optional[AuditService] = None):
         super().__init__()
@@ -814,6 +854,16 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(0, 0))
         self.addToolBar(Qt.BottomToolBarArea, toolbar)
 
+        # Dedicated horizontal metrics strip (directly above primary actions)
+        from audapack.ui_qt.metrics_strip import MetricsStripWidget
+        self.addToolBarBreak(Qt.BottomToolBarArea)
+        self._metrics_toolbar = QToolBar("Metrics", self)
+        self._metrics_toolbar.setMovable(False)
+        self._metrics_toolbar.setFloatable(False)
+        self.metrics_strip = MetricsStripWidget(self)
+        self._metrics_toolbar.addWidget(self.metrics_strip)
+        self.addToolBar(Qt.BottomToolBarArea, self._metrics_toolbar)
+
         # Every action is registered under the label the operator sees, which
         # is also the key the visibility setting stores.
         self.toolbar_actions: dict[str, Any] = {}
@@ -828,9 +878,9 @@ class MainWindow(QMainWindow):
             self.toolbar_actions[key] = action
             return action
 
-        add("PACK", self._on_pack, "Pack the selected project")
-        add("START", self._on_send_audit, "Start the audit with the marked profile")
-        add("GRP", self._on_start_audit_group, "Start audits for up to six projects in the group")
+        add("PACK", self._on_pack, "Pack the current project.")
+        add("START", self._on_send_audit, "Start audit workflow with marked profile.")
+        add("GRP", self._on_start_audit_group, "Start audits for projects in group.")
 
         # Audit profile selector: A3 | A10 | CM as peers. START AUDIT used to
         # fall back to quick3 with no way to choose anything else from here.
@@ -840,30 +890,22 @@ class MainWindow(QMainWindow):
             act = toolbar.addAction(label)
             act.setCheckable(True)
             act.setChecked(profile_id == active_profile)
-            try:
-                detail = get_profile(profile_id).description or get_profile(profile_id).display_name
-            except Exception:
-                detail = label
-            # A profile description is a paragraph; a tooltip is one line.
-            summary = " ".join(str(detail).split())
-            if len(summary) > 70:
-                summary = summary[:69].rstrip() + "…"
-            act.setToolTip(f"Audit profile {label} — {summary}" if summary else f"Audit profile {label}")
+            act.setToolTip(f"Audit profile: {label}")
             act.triggered.connect(lambda _checked=False, pid=profile_id: self._on_select_audit_profile(pid))
             act.setProperty("toolbar_key", label)
             self.profile_actions[profile_id] = act
             self.toolbar_actions[label] = act
         toolbar.addSeparator()
 
-        add("WRK", self._on_reopen_workers, "Reopen worker windows that are gone")
-        add("NEW", self._on_new_manual_window, "Open a spare window for a hand-run audit")
-        add("ALL", self._on_pack_all, "Pack every configured project")
-        add("COPY", self._on_copy_audit, "Copy the verified audit text")
-        add("GG", self._on_copy_audit_file_path, "Copy the saipen gg command (Ctrl+C)")
-        add("IA", self._on_ia_copy, "Copy the INAUDIT path — Shift: gg, Ctrl: cc")
-        add("IA+", self._on_ia_plus_capture, "Capture the clipboard into the INAUDIT inbox")
-        add("ZIP", self._on_copy_archive, "Copy the packed .zip file")
-        add("MRK", self._on_reset_project_marks, "Clear Done/Ignore marks and copy counters")
+        add("WRK", self._on_reopen_workers, "Reopen missing worker windows.")
+        add("NEW", self._on_new_manual_window, "Open window for manual audit.")
+        add("ALL", self._on_pack_all, "Pack all configured projects.")
+        add("COPY", self._on_copy_audit, "Copy verified audit text.")
+        add("GG", self._on_copy_audit_file_path, "Copy saipen gg command.")
+        add("IA", self._on_ia_copy, "Copy INAUDIT path (Shift: gg, Ctrl: cc).")
+        add("IA+", self._on_ia_plus_capture, "Capture clipboard to INAUDIT inbox.")
+        add("ZIP", self._on_copy_archive, "Copy packed archive.")
+        add("MRK", self._on_reset_project_marks, "Clear Done/Ignore marks.")
 
         self._action_toolbar = toolbar
         self._apply_toolbar_visibility()
@@ -953,6 +995,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.limits_prepared_widget, "Limits · Prepared")
         self.tabs.addTab(self.settings_widget, "Settings")
         self.tabs.setCurrentIndex(0)
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
+        if hasattr(self.settings_widget, "sub_tabs"):
+            self.settings_widget.sub_tabs.currentChanged.connect(self._on_settings_subtab_changed)
 
         self.setCentralWidget(self.tabs)
         self.setStyleSheet(GoldenDefault.qss())
@@ -1111,6 +1156,8 @@ QToolTip QLabel {
         # T-216 TARGET R: the initial instance picture is discovered on the
         # coalesced background lane, never before the event loop can paint.
         QTimer.singleShot(0, lambda: self.request_instance_refresh("startup"))
+        QTimer.singleShot(0, self._refresh_metrics)
+        QTimer.singleShot(0, lambda: self.request_federation_refresh("startup"))
 
     # ---------------------------------------------------------------- Startup Flow
 
@@ -1166,6 +1213,52 @@ QToolTip QLabel {
             # T-205: release the WinEvent hook/watchers; no stale callback may
             # outlive this GUI and rename a window it no longer owns.
             self._title_guardian.shutdown()
+        except Exception:
+            pass
+        try:
+            self.temp_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.bridge_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "auto_pack_timer") and self.auto_pack_timer is not None:
+                self.auto_pack_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._generation_debounce.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_title_guardian_timer", None) is not None:
+                self._title_guardian_timer.stop()
+                self._title_guardian_timer.deleteLater()
+                self._title_guardian_timer = None
+        except Exception:
+            pass
+        try:
+            paths = list(self._generation_watcher.directories()) + list(self._generation_watcher.files())
+            if paths:
+                self._generation_watcher.removePaths(paths)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "inaudit_widget") and hasattr(self.inaudit_widget, "shutdown"):
+                self.inaudit_widget.shutdown()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "limits_prepared_widget") and hasattr(self.limits_prepared_widget, "shutdown"):
+                self.limits_prepared_widget.shutdown()
+        except Exception:
+            pass
+        try:
+            from audapack import hot_freshness
+
+            hot_freshness.reset()
         except Exception:
             pass
         try:
@@ -1306,18 +1399,21 @@ QToolTip QLabel {
             self._active_project = None
             if hasattr(self, "inaudit_widget"):
                 self.inaudit_widget.set_project(None)
+            self._refresh_metrics()
             return
         node_type = self.model.data(current, self.model.ROLES["node_type"])
         if node_type != "slot":
             self._active_project = None
             if hasattr(self, "inaudit_widget"):
                 self.inaudit_widget.set_project(None)
+            self._refresh_metrics()
             return
         group = self.model.data(current, self.model.ROLES["group"])
         slot = self.model.data(current, self.model.ROLES["slot"])
         self._active_project = self.model.project_at(group, slot)
         if hasattr(self, "inaudit_widget"):
             self.inaudit_widget.set_project(self._active_project)
+        self._refresh_metrics()
 
     def _selected_project(self) -> Optional[Project]:
         """Resolves the currently targeted project with multi-layered fallback."""
@@ -1441,6 +1537,75 @@ QToolTip QLabel {
         self._bind_title_guardian_hwnds()
         self._sync_title_guardian_timer()
         if hasattr(self, "tree"):
+            self.tree.viewport().update()
+
+    # ---------------------------------------------------------------- Launcher Federation
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget == getattr(self, "limits_prepared_widget", None):
+            self.request_federation_refresh(reason="tab:limits")
+        elif widget == getattr(self, "settings_widget", None):
+            sub = getattr(self.settings_widget, "sub_tabs", None)
+            launchers_w = getattr(self.settings_widget, "launchers_widget", None)
+            if sub is not None and launchers_w is not None and sub.currentWidget() == launchers_w:
+                self.request_federation_refresh(reason="tab:settings_launchers")
+
+    def _on_settings_subtab_changed(self, index: int) -> None:
+        sub = getattr(self.settings_widget, "sub_tabs", None)
+        launchers_w = getattr(self.settings_widget, "launchers_widget", None)
+        if sub is not None and launchers_w is not None and sub.widget(index) == launchers_w:
+            self.request_federation_refresh(reason="subtab:launchers")
+
+    def request_federation_refresh(self, reason: str = "unspecified") -> int:
+        """Enqueue ONE coalesced background federation refresh (T-278).
+
+        The Qt GUI thread may NEVER run synchronous CLI operations. All surfaces
+        (Settings -> Launchers, Limits · Prepared, MainWindow startup, and tab switches)
+        funnel here; TaskRunner.submit_coalesced ensures that rapid triggers coalesce
+        into a single in-flight run.
+        """
+        self._last_federation_refresh_reason = str(reason or "")
+        return self.task_runner.submit_coalesced(
+            "federation:refresh",
+            self._acquire_federation_snapshot,
+            on_success=self._apply_federation_snapshot,
+        )
+
+    def _acquire_federation_snapshot(self):
+        """Worker stage: run external discovery / reconcile on background lane."""
+        from audapack.config import scoped_config_write
+        from audapack.launch_federation import PROVIDERS, acquire_listing, reconcile_listing, sai_accounts
+
+        if not sai_accounts.engine_path():
+            return None, None, "standalone"
+
+        try:
+            listing = acquire_listing(PROVIDERS)
+            result = reconcile_listing(self._service.config, listing)
+            if result.fresh and (result.added or result.removed or result.migrated or result.generation):
+                def _persist(latest):
+                    reconcile_listing(latest, listing)
+                    self._service.config.launchers = latest.launchers
+                    self._service.config.federation = latest.federation
+                scoped_config_write(_persist)
+            return listing, result, "ok"
+        except Exception as exc:
+            logger.warning("federation refresh failed: %s", exc)
+            return None, None, str(exc)
+
+    def _apply_federation_snapshot(self, payload) -> None:
+        """GUI stage: update settings and limits UI with reconciled state."""
+        listing, result, status = payload
+        if hasattr(self, "settings_widget") and self.settings_widget is not None:
+            if hasattr(self.settings_widget, "update_federation_state"):
+                self.settings_widget.update_federation_state(result)
+            elif hasattr(self.settings_widget, "_refresh_launcher_list"):
+                self.settings_widget._refresh_launcher_list()
+        if hasattr(self, "limits_prepared_widget") and self.limits_prepared_widget is not None:
+            if hasattr(self.limits_prepared_widget, "refresh_view"):
+                self.limits_prepared_widget.refresh_view(force=True)
+        if hasattr(self, "tree") and self.tree is not None:
             self.tree.viewport().update()
 
     def _bind_title_guardian_hwnds(self) -> None:
@@ -1622,6 +1787,7 @@ QToolTip QLabel {
             last_copied_at=proj.last_copied_at,
             last_copied_archive_path=proj.last_copied_archive_path,
             last_copied_archive_at=proj.last_copied_archive_at,
+            archive_scope=proj.archive_scope,
         )
 
         optimistic_swap = None
@@ -1641,6 +1807,7 @@ QToolTip QLabel {
                 last_copied_at=swap_proj.last_copied_at,
                 last_copied_archive_path=swap_proj.last_copied_archive_path,
                 last_copied_archive_at=swap_proj.last_copied_archive_at,
+            archive_scope=swap_proj.archive_scope,
             )
 
         self.model.apply_project_move(
@@ -2102,6 +2269,77 @@ QToolTip QLabel {
             action.setVisible(str(key).upper() not in hidden)
         if getattr(self, "_action_toolbar", None) is not None:
             _fit_toolbar_to_text(self._action_toolbar)
+        if getattr(self, "_metrics_toolbar", None) is not None:
+            show_strip = bool(getattr(self._service.config.ui, "show_metrics_strip", True))
+            self._metrics_toolbar.setVisible(show_strip)
+
+    def _refresh_metrics(self) -> None:
+        """Deterministically refresh the compact metrics strip for the active project."""
+        if not hasattr(self, "metrics_strip"):
+            return
+
+        show_strip = bool(getattr(self._service.config.ui, "show_metrics_strip", True))
+        if hasattr(self, "_metrics_toolbar"):
+            self._metrics_toolbar.setVisible(show_strip)
+        if not show_strip:
+            return
+
+        compact = bool(getattr(self._service.config.ui, "compact_metrics", False))
+        self.metrics_strip.set_compact(compact)
+
+        show_tips = bool(getattr(self._service.config.ui, "show_tooltips", True))
+        tip_duration = int(getattr(self._service.config.ui, "tooltip_duration_ms", 10000))
+        self.metrics_strip.set_tooltip_policy(show_tips, tip_duration)
+
+        proj = getattr(self, "_active_project", None) or self._selected_project()
+
+        # Check active batch / pack execution state
+        is_batch_busy = False
+        if hasattr(self, "_pack_batch_runner") and self._pack_batch_runner is not None:
+            is_batch_busy = bool(self._pack_batch_runner.busy())
+
+        pack_state = ("IDLE", "")
+        is_packing = False
+        canonical_freshness = None
+        if proj:
+            pack_state = self.model.get_pack_state(proj.id)
+            run_key = f"pack:{proj.id}"
+            is_packing = bool(self.task_runner and self.task_runner.is_running(run_key))
+            cached = self.model.get_cached_archive_freshness(proj.id)
+            if cached is not None:
+                canonical_freshness = cached
+            else:
+                self._schedule_freshness_probe(proj)
+
+        from audapack.ui_qt.metrics_strip import evaluate_project_metrics
+        snap = evaluate_project_metrics(
+            project=proj,
+            config=self._service.config,
+            current_pack_state=pack_state,
+            is_packing=is_packing,
+            is_batch_busy=is_batch_busy,
+            canonical_freshness=canonical_freshness,
+        )
+        self.metrics_strip.update_snapshot(snap)
+
+    def _schedule_freshness_probe(self, proj: Project) -> None:
+        """Schedule an async freshness probe if not already cached or running."""
+        if not proj or not proj.id or not getattr(self, "task_runner", None):
+            return
+        pid = str(proj.id)
+        key = f"freshness:{pid}"
+
+        def _work():
+            return self.model.compute_archive_fresh(pid)
+
+        def _done(entry):
+            if entry:
+                self.model.apply_archive_fresh(pid, entry)
+                current = getattr(self, "_active_project", None) or self._selected_project()
+                if current and str(current.id) == pid:
+                    self._refresh_metrics()
+
+        self.task_runner.submit_coalesced(key, _work, on_success=_done, on_error=lambda _e: None)
 
     def resizeEvent(self, event):
         """The action row is sized to the width it has, so it is re-sized here.
@@ -2680,6 +2918,7 @@ QToolTip QLabel {
             return False
 
         self.model.update_pack_state(proj.id, "PACKING")
+        self._refresh_metrics()
         if flash:
             self._flash_status(f"\u25B6 PACK: {proj.display_name}", "#D4A840")
         else:
@@ -2701,21 +2940,33 @@ QToolTip QLabel {
             self._flush_pack_progress()
             if res.success:
                 out_name = res.output_path.name if res.output_path else "archive.zip"
-                self.model.update_pack_state(proj.id, "COMPLETE", out_name)
-                # T-190: compact terminal state + Git inventory summary.
-                git_part = f" ({res.git_summary})" if getattr(res, "git_summary", "") else ""
-                self.statusBar().showMessage(f"✓ Packed {proj.display_name} -> {out_name}{git_part}")
+                # T-274: the row's own terminal text carries the post-pack truth,
+                # so the Project Room answers "what is in this archive?" without
+                # the operator opening it. A pack that somehow committed without
+                # its source takes the FAILED state and a red line instead of a
+                # green tick over a missing component.
+                detail = pack_success_detail(res)
+                if getattr(res, "source_review_ready", True):
+                    self.model.update_pack_state(proj.id, "COMPLETE", f"{out_name} — {detail}")
+                    self.statusBar().showMessage(pack_success_message(proj.display_name, res, out_name))
+                else:
+                    self.model.update_pack_state(proj.id, "FAILED", f"{PACK_SOURCE_MISSING}: {detail}")
+                    self.statusBar().showMessage(
+                        f"⚠ PACKED WITHOUT SOURCE ({proj.display_name}): {detail}", 15000
+                    )
             else:
                 detail = pack_failure_detail(res)
                 self.model.update_pack_state(proj.id, "FAILED", detail)
                 self.statusBar().showMessage(f"PACK FAILED ({proj.display_name}): {detail}")
             self._pack_progress_run_settled(run_key)
+            self._refresh_metrics()
 
         def _on_pack_error(err):
             self._flush_pack_progress()
             self.model.update_pack_state(proj.id, "FAILED", str(err))
             self.statusBar().showMessage(f"PACK ERROR ({proj.display_name}): {err}")
             self._pack_progress_run_settled(run_key)
+            self._refresh_metrics()
 
         self.task_runner.submit(run_key, _do_pack, on_success=_on_pack_done, on_error=_on_pack_error)
         return True
@@ -2791,6 +3042,7 @@ QToolTip QLabel {
             self.statusBar().showMessage(
                 f"✓ {batch.label} COMPLETE: {batch.summary()}"
             )
+            self._refresh_metrics()
 
         batch = self._pack_batch_runner.start_batch(
             batch_projects,
@@ -2806,6 +3058,7 @@ QToolTip QLabel {
         self.statusBar().showMessage(
             f"{batch_label}: {total} projects submitted concurrently{skipped_note}"
         )
+        self._refresh_metrics()
         return True
 
     def _on_batch_job_started(self, project_id: str):
@@ -2818,6 +3071,7 @@ QToolTip QLabel {
         # whose QUEUED entry predated the batch (or was coalesced in); arming
         # twice on the same key is idempotent.
         self._pack_progress_run_active(f"pack:{project_id}")
+        self._refresh_metrics()
 
     def _apply_batch_job_result(self, result):
         """Apply one project's terminal state (GUI thread, queued signal)."""
@@ -2828,16 +3082,26 @@ QToolTip QLabel {
         if result.success:
             res = result.payload
             out_name = "archive.zip"
-            git_part = ""
             if res is not None:
                 out_name = res.output_path.name if res.output_path else out_name
-                git_part = f" ({res.git_summary})" if getattr(res, "git_summary", "") else ""
-                self.model.update_pack_state(result.project_id, "COMPLETE", out_name)
+                # T-274: same post-pack truth and the same red flag on the batch
+                # path, so AUTO PACK ALL cannot report a green row for an archive
+                # that carries no source either.
+                detail = pack_success_detail(res)
+                if getattr(res, "source_review_ready", True):
+                    self.model.update_pack_state(result.project_id, "COMPLETE", f"{out_name} — {detail}")
+                else:
+                    self.model.update_pack_state(
+                        result.project_id, "FAILED", f"{PACK_SOURCE_MISSING}: {detail}"
+                    )
             else:
                 self.model.update_pack_state(result.project_id, "COMPLETE", out_name)
             proj = self.model.project_by_id(result.project_id)
             name = proj.display_name if proj else result.project_id
-            self.statusBar().showMessage(f"✓ Packed {name} -> {out_name}{git_part}")
+            if res is not None:
+                self.statusBar().showMessage(pack_success_message(name, res, out_name))
+            else:
+                self.statusBar().showMessage(f"✓ Packed {name} -> {out_name}")
         else:
             message = result.error_message or "pack failed"
             res = result.payload
@@ -2848,6 +3112,7 @@ QToolTip QLabel {
             name = proj.display_name if proj else result.project_id
             self.statusBar().showMessage(f"PACK FAILED ({name}): {message}")
         self._pack_progress_run_settled(f"pack:{result.project_id}")
+        self._refresh_metrics()
 
     def _on_batch_job_finished(self, result):
         # Kept as the signal slot; the callback already applied the result.
@@ -2856,7 +3121,7 @@ QToolTip QLabel {
     def _on_batch_finished(self, batch_id: int, label: str, summary: str):
         # Aggregate final state is reported by the runner callback; this slot
         # exists so tests and future consumers can observe batch completion.
-        pass
+        self._refresh_metrics()
 
     def _configure_auto_pack_timer(self):
         """Apply the automatic PACK ALL config to the one periodic timer.
@@ -3335,7 +3600,7 @@ QToolTip QLabel {
         # non-empty command_template FIRST (TARGET F), so an operator wrapper
         # always wins over built-in discovery -- and the launch still gets the
         # managed title and exact registration (TARGET K).
-        if launcher_id in BUILTIN_CLI_LAUNCHERS:
+        if launcher_id in BUILTIN_CLI_LAUNCHERS or is_account_target(launcher_id):
             self._launch_cli_launcher(target, launcher_id)
             return
 
@@ -3471,6 +3736,10 @@ QToolTip QLabel {
             if not scoped_config_write(_persist):
                 logger.warning("could not persist launcher resolution for %s", launcher_id)
 
+        if resolution.is_plane_launch:
+            self._launch_plane_account(cfg, target, launch_target, resolution)
+            return
+
         token = new_correlation_token()
         title = managed_console_title(target.display_name, cfg.name, target_path, token)
         script = apply_console_style(
@@ -3499,6 +3768,122 @@ QToolTip QLabel {
         self.statusBar().showMessage(
             f"✓ Launched {cfg.name} for {target.display_name} {note}"
         )
+
+    def _launch_plane_account(
+        self, cfg: Any, target: Project, launch_target: Any, resolution: Any
+    ) -> None:
+        """Delegate a session-owned canonical account launch to SAI Accounts.
+
+        Never invokes agy.exe or powershell.exe directly, never exposes a SID or
+        credential, and registers the plane's authoritative launched PID under
+        ``cfg.id`` (``sai:<account_id>``).
+
+        T-284: ``sai_accounts.launch`` is a bounded subprocess
+        (``LAUNCH_TIMEOUT_S = 15.0``), so running it here froze the whole window
+        on a stalled or offline control plane. The GUI thread now does only the
+        bounded preparation and hands the blocking call to the shared
+        :class:`TaskRunner`; :meth:`_apply_plane_launch_verdict` runs back on the
+        GUI thread. The identity contract is untouched -- the plane is invoked
+        with the exact canonical id and the project root, and its envelope is
+        validated before anything is registered.
+
+        Ownership (T-284): the TaskRunner key is one in-flight request per
+        canonical account/project, so a repeated click is reported rather than
+        turned into a second uncontrolled plane call. The key is scoped, so an
+        unrelated project or account is never blocked by this one.
+        """
+        from audapack import sai_accounts
+
+        account_id = str(
+            getattr(resolution, "account_id", "") or account_id_of(cfg.id)
+        ).strip()
+        target_path = str(launch_target.cwd)
+        key = f"plane-launch:{target.id}:{cfg.id}"
+        if self.task_runner.is_running(key):
+            self.statusBar().showMessage(
+                f"{cfg.name} is already launching for {target.display_name}"
+            )
+            return
+
+        def _work():
+            # The blocking control-plane call. Never touches Qt: the TaskRunner
+            # delivers the verdict to the GUI thread through its own signal.
+            verdict = sai_accounts.launch(account_id, target_path)
+            if (not verdict.ok and verdict.error_code == "WORKDIR_UNAVAILABLE"
+                    and "ACCESS_DENIED" in (getattr(verdict, "detail", "") or "")
+                    and Path(target_path).exists()):
+                g_res = sai_accounts.grant_workdir(account_id, target_path)
+                if g_res.ok:
+                    verdict = sai_accounts.launch(account_id, target_path)
+            return verdict
+
+        def _done(verdict):
+            if self._service.get_project(target.id) is None:
+                # The project was removed while the plane was starting; the
+                # launch has no owner left to attribute it to.
+                logger.info("plane launch for %s dropped: project removed", target.id)
+                return
+            self._apply_plane_launch_verdict(verdict, cfg, target, resolution)
+
+        def _error(exc):
+            if self._service.get_project(target.id) is None:
+                return
+            self._report_plane_launch_failure(
+                cfg, target, resolution, "LAUNCH_FAILED",
+                self._sanitize_diagnostic(str(exc), 140),
+            )
+
+        # Claim the in-flight state before dispatch. The completion callback is
+        # delivered by the event loop, so this message can never be overwritten
+        # by a verdict that has already been applied.
+        self.statusBar().showMessage(
+            f"Launching {cfg.name} for {target.display_name}… (SAI Accounts)"
+        )
+        if not self.task_runner.submit(key, _work, on_success=_done, on_error=_error):
+            # A closing runner refused the work; nothing was submitted, so the
+            # window must not claim a launch is under way.
+            logger.debug("plane launch refused: task runner is closing")
+            self.statusBar().showMessage(
+                f"{cfg.name} not launched: AUDAPACK is closing"
+            )
+
+    def _apply_plane_launch_verdict(
+        self, verdict: Any, cfg: Any, target: Any, resolution: Any
+    ) -> None:
+        """GUI thread: the plane answered. Register the proven launch or report.
+
+        Never a fallback and never a partial success: a verdict that is not
+        ``ok`` reaches failure reporting and the registration below is not reached.
+        """
+        if not verdict.ok:
+            self._report_plane_launch_failure(
+                cfg, target, resolution,
+                verdict.error_code or "LAUNCH_FAILED",
+                getattr(verdict, "detail", "") or "",
+            )
+            return
+        self._register_agent_launch(verdict.pid, cfg.id, target)
+        self.statusBar().showMessage(
+            f"✓ Launched {cfg.name} for {target.display_name} "
+            f"[{resolution.stage} · PID {verdict.pid}]"
+        )
+
+    def _report_plane_launch_failure(
+        self, cfg: Any, target: Any, resolution: Any, reason: str, detail: str
+    ) -> None:
+        detail = self._sanitize_diagnostic(detail or reason, 140)
+        target_name = getattr(target, "display_name", "") or str(target or "")
+        if reason == "WORKDIR_UNAVAILABLE":
+            next_step = f"check folder permissions for {target_name} in Windows Explorer"
+        else:
+            next_step = "verify the account context in SAI Accounts"
+        message = (
+            f"{cfg.name} unavailable for {target_name} | "
+            f"stage={resolution.stage} | error={reason}: {detail} | "
+            f"next: {next_step}"
+        )
+        logger.warning("control-plane launch diagnostic: %s", message)
+        self.statusBar().showMessage(message)
 
     def _report_cli_launch_unavailable(
         self, cfg: Any, target: Project, resolution: Any
@@ -3986,6 +4371,20 @@ QToolTip QLabel {
         label = "Ignore to archive: ON" if new_state else "Ignore to archive: OFF"
         self.statusBar().showMessage(f"✓ {proj.display_name} — {label}")
 
+    def _on_toggle_archive_scope(self, proj: Project):
+        """Toggles project archive scope between AUTO and COMPLETE_SOURCE."""
+        current = getattr(proj, "archive_scope", ARCHIVE_SCOPE_AUTO)
+        new_scope = ARCHIVE_SCOPE_AUTO if current == ARCHIVE_SCOPE_COMPLETE_SOURCE else ARCHIVE_SCOPE_COMPLETE_SOURCE
+        self._service.update_project(proj.id, lambda p: setattr(p, "archive_scope", new_scope))
+        updated = self._service.get_project(proj.id)
+        if updated:
+            self.model.update_project_metadata(updated)
+            self.model.invalidate_archive_fresh(proj.id)
+            if hasattr(self, "_refresh_metrics"):
+                self._refresh_metrics()
+        label = "Complete source: ON" if new_scope == ARCHIVE_SCOPE_COMPLETE_SOURCE else "Complete source: OFF"
+        self.statusBar().showMessage(f"✓ {proj.display_name} — {label}")
+
     def _on_reset_copy_counter(self, proj: Project):
         """Manual reset of audit copy counter — also used on fresh audit auto-reset."""
         try:
@@ -4291,11 +4690,7 @@ QToolTip QLabel {
                     _act.triggered.connect(lambda _checked=False, _p=proj, _id=_lid: self._on_open_with_launcher(_p, _id))
             menu_open_with.addSeparator()
             reserve_action = menu_open_with.addAction("[LR] Luna / Reserve fallback")
-            reserve_action.setToolTip(
-                "Launches GPT-6 Luna. Codex controls Luna Reserve automatically "
-                "when the normal allocation is exhausted/eligible; AUDAPACK "
-                "cannot directly select the Reserve pool."
-            )
+            reserve_action.setToolTip("Launch GPT-6 Luna fallback.")
             reserve_action.triggered.connect(
                 lambda _checked=False, _p=proj: self._on_open_with_codex_luna(_p)
             )
@@ -4327,6 +4722,13 @@ QToolTip QLabel {
             act_arch.setCheckable(True)
             act_arch.setChecked(bool(getattr(proj, "ignore_archive", False)))
             act_arch.triggered.connect(lambda: self._on_toggle_archive_ignored(proj))
+
+            is_complete_source = getattr(proj, "archive_scope", ARCHIVE_SCOPE_AUTO) == ARCHIVE_SCOPE_COMPLETE_SOURCE
+            act_complete_src = menu.addAction("Complete source archive")
+            act_complete_src.setCheckable(True)
+            act_complete_src.setChecked(is_complete_source)
+            act_complete_src.setToolTip("Include direct nested source repositories. Larger ZIP allowed.")
+            act_complete_src.triggered.connect(lambda _c=False, p=proj: self._on_toggle_archive_scope(p))
 
             act_reset_copy = menu.addAction(f"Reset copy counter (×{getattr(proj, 'audit_copy_count', 0) or 0})")
             act_reset_copy.triggered.connect(lambda: self._on_reset_copy_counter(proj))
@@ -4613,6 +5015,8 @@ QToolTip QLabel {
         the in-flight widget state), so a failed save never triggers a refresh.
         """
         self.statusBar().showMessage("✓ Settings saved successfully")
+        self._apply_toolbar_visibility()
+        self._refresh_metrics()
         self.tree.scheduleDelayedItemsLayout()
         self.tree.viewport().update()
         # T-167: the auto-pack timer must follow its config even when nothing
@@ -4694,8 +5098,10 @@ QToolTip QLabel {
             on_success=lambda snaps: (
                 [self.model.update_audit_snapshot(pid, s) for pid, s in snaps.items()],
                 self.statusBar().showMessage("✓ Audits refreshed"),
+                self._refresh_metrics(),
             ),
         )
+        self._refresh_metrics()
 
     def refresh(self):
         """Full model reload (used only when structural reload is explicitly requested)."""

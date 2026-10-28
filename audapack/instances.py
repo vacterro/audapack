@@ -726,7 +726,13 @@ class InstanceMonitor:
         workdir = cls._declared_workdir(identity)
         if workdir:
             return not workdir.startswith(root)
-        found = [match.group(0).casefold().replace("/", "\\") for match in cls._ROOTED_PATH_RE.finditer(str(identity))]
+        found = [
+            path
+            for match in cls._ROOTED_PATH_RE.finditer(str(identity))
+            if not (path := match.group(0).strip().casefold().replace("/", "\\")).endswith(
+                (".exe", ".cmd", ".bat", ".ps1", ".cjs", ".js")
+            )
+        ]
         if not found:
             return False
         return not any(path.startswith(root) for path in found)
@@ -796,6 +802,7 @@ class InstanceMonitor:
             # a record, a correlation token or a managed title saying so.
             "claude.exe": "claude",
             "zcode.exe": "zcode",
+            "agy.exe": "antigravity",
             "antigravity.exe": "antigravity",
             "antigravity ide.exe": "antigravity",
         }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "projects": [],
   "packing": {
     "output_dir": "",
@@ -174,5 +174,11 @@
       "enabled": true,
       "max_instances": 0
     }
-  ]
+  ],
+  "federation": {
+    "active": false,
+    "last_sync": "",
+    "generation": 0,
+    "stale": false
+  }
 }

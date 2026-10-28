@@ -9,6 +9,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from audapack.account_registry import AccountIdentity, AccountRegistry, discover_accounts
 from audapack.auto_account import AutoCandidate, AutoSelection, rank_auto_accounts
@@ -17,6 +18,7 @@ from audapack.instances import InstanceMonitor
 from audapack.limit_adapters import AntigravityLimitAdapter, ClaudeLimitAdapter, CodexLimitAdapter
 from audapack.limits import Availability, LimitCoordinator, LimitSnapshot, LimitStore, parse_time, utc_now
 from audapack.prepared import (
+    TERMINAL_STATES,
     JobState,
     Payload,
     PreparedJob,
@@ -97,14 +99,23 @@ class PreparedWorker:
         return self._lifecycle
 
     def start(self) -> None:
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            return
-        self._lifecycle = "OPEN"
-        self._stop.clear()
-        self._wake.clear()
-        self._thread = threading.Thread(target=self._loop, name="audapack-prepared", daemon=True)
-        self._thread.start()
+        with self._admission:
+            if self._lifecycle == "CLOSING":
+                logger.warning("cannot start prepared worker while lifecycle is CLOSING")
+                return
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                return
+            if self._lifecycle == "CLOSED":
+                self._pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="prepared-launch")
+                self._probe_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="limit-probe")
+                self._probe_futures.clear()
+                self._inflight.clear()
+            self._lifecycle = "OPEN"
+            self._stop.clear()
+            self._wake.clear()
+            self._thread = threading.Thread(target=self._loop, name="audapack-prepared", daemon=True)
+            self._thread.start()
 
     def _submit(self, pool: ThreadPoolExecutor, fn, *args, **kwargs):
         """The ONLY path to an executor from this worker.
@@ -190,6 +201,84 @@ class PreparedWorker:
 
     def wake(self) -> None:
         self._wake.set()
+
+    def _settle_binding(self, job: PreparedJob, donors: dict[str, str],
+                        proven: set[str]) -> PreparedJob | None:
+        """Settle one persisted row against the canonical registry before it runs.
+
+        Returns the row to schedule, or None when the row is BLOCKED. A row whose
+        binding cannot be resolved to ONE canonical account is marked BLOCKED and
+        never launched: silently running it against a different account of the
+        same provider would be exactly the wrong-account launch the registry
+        exists to prevent, and account correctness outranks automatic
+        continuation.
+
+        The BLOCKED mark is cleared by the same pass once the account is proven
+        again, so an account that is merely withdrawn for a while does not need
+        the operator to rebuild the job.
+        """
+        from audapack.launch_federation import (
+            ACCOUNT_MAPPING_REQUIRED,
+            MIGRATED,
+            block_job,
+            rebind_job,
+            resolve_prepared_binding,
+        )
+
+        if job.state in TERMINAL_STATES:
+            # A finished row is history, not a candidate: correcting what it says
+            # it did, or blocking it after the fact, rewrites evidence.
+            return job
+        binding = resolve_prepared_binding(job.account_id, job.launcher_id,
+                                          donors=donors, proven=proven)
+        if binding.state == ACCOUNT_MAPPING_REQUIRED:
+            reason = "%s: %s" % (ACCOUNT_MAPPING_REQUIRED, binding.reason)
+            if job.state != JobState.BLOCKED or job.waiting_reason != reason:
+                self.jobs.save(block_job(job, reason))
+                logger.warning("prepared job %s blocked: %s", job.prepared_id, reason)
+            return None
+        elif binding.state == MIGRATED:
+            rebound = rebind_job(job, binding)
+            self.jobs.save(rebound)
+            logger.info("prepared job %s re-pointed to %s", job.prepared_id,
+                        binding.launcher_id)
+            job = rebound
+
+        if job.trigger == Trigger.SYNC or getattr(job, "account_id", "") == "SYNC":
+            sync_members = self.jobs.get_sync_members(job.prepared_id)
+            if sync_members:
+                updated_members = []
+                members_migrated = False
+                for m in sync_members:
+                    mbinding = resolve_prepared_binding(m.account_id, m.launcher_id,
+                                                       donors=donors, proven=proven)
+                    if mbinding.state == ACCOUNT_MAPPING_REQUIRED:
+                        reason = "%s: member %d (%s): %s" % (
+                            ACCOUNT_MAPPING_REQUIRED, m.member_index,
+                            m.account_id or m.launcher_id, mbinding.reason
+                        )
+                        if job.state != JobState.BLOCKED or job.waiting_reason != reason:
+                            self.jobs.save(block_job(job, reason))
+                            logger.warning("prepared sync job %s blocked: %s", job.prepared_id, reason)
+                        return None
+                    elif mbinding.state == MIGRATED:
+                        if (m.account_id, m.launcher_id) != (mbinding.account_id, mbinding.launcher_id):
+                            members_migrated = True
+                            updated_members.append(replace(m, account_id=mbinding.account_id,
+                                                           launcher_id=mbinding.launcher_id))
+                        else:
+                            updated_members.append(m)
+                    else:
+                        updated_members.append(m)
+
+                if members_migrated:
+                    self.jobs.save_sync_members(job.prepared_id, updated_members)
+                    logger.info("prepared sync job %s members re-pointed", job.prepared_id)
+                    if job.state == JobState.BLOCKED and job.enabled:
+                        job = replace(job, state=JobState.ARMED, waiting_reason="")
+                        self.jobs.save(job)
+
+        return job
 
     def _known_accounts(self) -> dict[str, AccountIdentity]:
         found = discover_accounts(self.config.launchers, now=self.clock())
@@ -511,6 +600,9 @@ class PreparedWorker:
                 for m in sync_members:
                     acc = accounts.get(m.account_id)
                     if acc is None:
+                        from audapack.launch_federation import ACCOUNT_BACKED_LEGACY_IDS, is_account_target
+                        if is_account_target(m.launcher_id) or m.launcher_id in ACCOUNT_BACKED_LEGACY_IDS or m.account_id in ACCOUNT_BACKED_LEGACY_IDS:
+                            return f"ACCOUNT_MAPPING_REQUIRED: account {m.account_id} not discovered"
                         return "SYNC unavailable: provider capability unknown"
                     caps = PROVIDERS.get(acc.provider_id)
                     if caps is None:
@@ -559,7 +651,11 @@ class PreparedWorker:
         for m in sync_members:
             account = accounts.get(m.account_id)
             if account is None:
-                reason = "SYNC unavailable: provider capability unknown"
+                from audapack.launch_federation import ACCOUNT_BACKED_LEGACY_IDS, is_account_target
+                if is_account_target(m.launcher_id) or m.launcher_id in ACCOUNT_BACKED_LEGACY_IDS or m.account_id in ACCOUNT_BACKED_LEGACY_IDS:
+                    reason = f"ACCOUNT_MAPPING_REQUIRED: account {m.account_id} not discovered"
+                else:
+                    reason = "SYNC unavailable: provider capability unknown"
                 if job.state != JobState.WAITING_LIMIT or job.waiting_reason != reason:
                     self.jobs.save(replace(job, state=JobState.WAITING_LIMIT, waiting_reason=reason))
                 return None
@@ -639,13 +735,15 @@ class PreparedWorker:
         return None
 
     def _deliver_sync(self, job: PreparedJob, execution_id: str,
-                      group_id: str, generation: int) -> None:
+                      group_id: str, generation: int,
+                      from_state: JobState = JobState.CLAIMED) -> None:
         if self.sync_coordinator is None:
             return
         now = self.clock()
-        if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
-                                 JobState.CLAIMED, JobState.PREPARING, now=now):
-            return
+        if from_state == JobState.CLAIMED:
+            if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
+                                     JobState.CLAIMED, JobState.PREPARING, now=now):
+                return
         try:
             ready = self.sync_coordinator.prepare(group_id)
         except Exception as exc:
@@ -730,11 +828,14 @@ class PreparedWorker:
                     group_id = self.sync_store.create(
                         job.prepared_id, receipt["trigger_event_id"], target_window, release_policy, specs, now
                     )
-                    self._deliver_sync(job, execution_id, group_id, generation)
+                    self._deliver_sync(job, execution_id, group_id, generation, from_state=current_state)
                 else:
+                    from audapack.launch_federation import ACCOUNT_BACKED_LEGACY_IDS, is_account_target
+                    unmapped = [m.account_id for m in sync_members if (is_account_target(m.launcher_id) or m.launcher_id in ACCOUNT_BACKED_LEGACY_IDS or m.account_id in ACCOUNT_BACKED_LEGACY_IDS) and m.account_id not in accounts]
+                    reason = f"ACCOUNT_MAPPING_REQUIRED: {', '.join(unmapped)}" if unmapped else "sync membership unavailable during recovery"
                     self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
                                       current_state, JobState.RECOVERY_REQUIRED,
-                                      result="sync membership unavailable during recovery", now=now)
+                                      result=reason, now=now)
             else:
                 self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
                                   current_state, JobState.RECOVERY_REQUIRED,
@@ -747,7 +848,8 @@ class PreparedWorker:
 
         if group_state in ("PENDING", "WAITING"):
             if self.sync_coordinator is not None:
-                self._deliver_sync(job, execution_id, group_id, generation)
+                from_st = current_state if current_state in (JobState.CLAIMED, JobState.PREPARING) else JobState.CLAIMED
+                self._deliver_sync(job, execution_id, group_id, generation, from_state=from_st)
             else:
                 self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
                                   current_state, JobState.WAITING_LIMIT,
@@ -854,16 +956,22 @@ class PreparedWorker:
         return None
 
     def _deliver_prime(self, job: PreparedJob, account: AccountIdentity,
-                       execution_id: str, prime_id: str, generation: int) -> None:
+                       execution_id: str, prime_id: str, generation: int,
+                       from_state: JobState = JobState.CLAIMED) -> None:
         if self.prime_coordinator is None:
             return
         now = self.clock()
-        if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
-                                 JobState.CLAIMED, JobState.PREPARING, now=now):
-            return
-        if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
-                                 JobState.PREPARING, JobState.LAUNCHING, now=now):
-            return
+        if from_state == JobState.CLAIMED:
+            if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
+                                     JobState.CLAIMED, JobState.PREPARING, now=now):
+                return
+            if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
+                                     JobState.PREPARING, JobState.LAUNCHING, now=now):
+                return
+        elif from_state == JobState.PREPARING:
+            if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
+                                     JobState.PREPARING, JobState.LAUNCHING, now=now):
+                return
         try:
             verdict = self.prime_coordinator.execute(prime_id, account, now)
         except Exception as exc:
@@ -920,7 +1028,10 @@ class PreparedWorker:
                 accounts = self._known_accounts()
                 account = accounts.get(job.account_id)
                 if account:
-                    self._deliver_prime(job, account, execution_id, prime_id, generation)
+                    from_st = current_state if current_state in (
+                        JobState.CLAIMED, JobState.PREPARING, JobState.LAUNCHING
+                    ) else JobState.CLAIMED
+                    self._deliver_prime(job, account, execution_id, prime_id, generation, from_state=from_st)
                 else:
                     self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
                                       current_state, JobState.WAITING_LIMIT,
@@ -968,7 +1079,7 @@ class PreparedWorker:
                                   result=prime_record.get("result") or f"prime {prime_id} failed", now=now)
 
     def _deliver_audit(self, job: PreparedJob, execution_id: str,
-                       generation: int) -> None:
+                       generation: int, from_state: JobState = JobState.CLAIMED) -> None:
         """Enter the canonical audit pipeline once for this execution.
 
         The prepared execution is already CLAIMED. Move it to PREPARING, then
@@ -978,9 +1089,10 @@ class PreparedWorker:
         """
         if self.audit_runtime is None:
             return
-        if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
-                                 JobState.CLAIMED, JobState.PREPARING, now=self.clock()):
-            return
+        if from_state == JobState.CLAIMED:
+            if not self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
+                                     JobState.CLAIMED, JobState.PREPARING, now=self.clock()):
+                return
         try:
             result = self.audit_runtime.start(job, execution_id)
         except Exception as exc:
@@ -1035,6 +1147,12 @@ class PreparedWorker:
             self.jobs.advance(execution_id, self.scheduler.owner_id, generation,
                               JobState.VERIFYING, JobState.DONE, now=now,
                               result=progress.detail[:240])
+            return
+        if progress.state is AuditProgressState.ABSENT and current in (
+            JobState.CLAIMED.value, JobState.PREPARING.value
+        ):
+            from_st = JobState(current)
+            self._deliver_audit(job, execution_id, generation, from_state=from_st)
             return
         classification, detail = audit_outcome(progress)
         if classification == "ACTIVE":
@@ -1109,8 +1227,29 @@ class PreparedWorker:
             if stored and stored[1] < next_wake:
                 next_wake = stored[1]
         active_tests = self.jobs.jobs_with_active_tests()
+        federated = bool(getattr(self.config.federation, "active", False))
+        donors: dict[str, str] = {}
+        proven: set[str] = set()
+        if federated:
+            # One derivation per tick, and only once this installation has
+            # federated: a standalone machine's legacy ids are still real local
+            # launcher rows, and re-pointing them there would be the split-brain
+            # in reverse. The donor table re-derives each legacy alias through
+            # the same identity locator the registry uses, so it can only ever
+            # map onto the account that genuinely shares that locator.
+            from audapack.launch_federation import account_id_of, legacy_donors
+
+            donors = legacy_donors(Path.home())
+            proven = {account_id_of(lc.id) for lc in self.config.launchers
+                      if account_id_of(lc.id)}
         for job in self.jobs.list():
             if self._stop.is_set() or not job.enabled:
+                continue
+            if job.state in TERMINAL_STATES:
+                # A finished row is what happened, not a candidate: this pass has
+                # nothing to decide about it, so it is never re-labelled (a
+                # WAITING_LIMIT rewrite would report an account as missing from a
+                # job that already ended) and never re-armed.
                 continue
             if job.prepared_id in active_tests:
                 continue
@@ -1120,6 +1259,11 @@ class PreparedWorker:
                 # The execution receipt owns the job until a terminal result.
                 # A second pass must neither edit it nor schedule it again.
                 continue
+            if federated:
+                settled = self._settle_binding(job, donors, proven)
+                if settled is None:
+                    continue    # BLOCKED on purpose: annotated, never launched
+                job = settled
             if job.payload == Payload.AUDIT:
                 self._tick_audit(job, accounts, now)
                 continue
