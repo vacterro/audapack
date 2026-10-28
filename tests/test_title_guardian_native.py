@@ -87,21 +87,27 @@ def _run_pythonw_worker(worker: Path, timeout: float) -> dict:
     """Run a worker under pythonw.exe -- the shape AUDAPACK ships in."""
     report_path = Path(tempfile.mkdtemp(prefix="audapack-t210-native-")) / "report.json"
     pythonw = Path(sys.executable).with_name("pythonw.exe")
-    executable = str(pythonw) if pythonw.exists() else sys.executable
+    # A uv virtualenv's pythonw trampoline can fail with permission denied
+    # even while its python.exe works. Detaching the active interpreter keeps
+    # that environment and the same console-less host contract; the worker
+    # independently asserts the console and standard-handle state.
+    executable = str(pythonw) if pythonw.exists() and sys.prefix == sys.base_prefix else sys.executable
     creationflags = 0
     if executable == sys.executable:
         # No pythonw available: detach so the worker still has no console.
         creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 
-    process = subprocess.Popen(
-        [executable, str(worker), str(report_path), str(ROOT)],
-        cwd=str(ROOT),
-        creationflags=creationflags,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    diagnostic_path = report_path.with_suffix(".log")
+    with diagnostic_path.open("wb") as diagnostic:
+        process = subprocess.Popen(
+            [executable, str(worker), str(report_path), str(ROOT)],
+            cwd=str(ROOT),
+            creationflags=creationflags,
+            stdin=subprocess.DEVNULL,
+            stdout=diagnostic,
+            stderr=diagnostic,
+            close_fds=True,
+        )
     report: dict = {}
     try:
         deadline = time.time() + timeout
@@ -119,7 +125,8 @@ def _run_pythonw_worker(worker: Path, timeout: float) -> dict:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=10)
-    assert report, "the native worker produced no report"
+    assert report, (f"native worker produced no report (exit {process.returncode}): "
+                    + diagnostic_path.read_text(encoding="utf-8", errors="replace"))
     return report
 
 

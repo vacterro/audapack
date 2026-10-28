@@ -984,7 +984,10 @@ class MainWindow(QMainWindow):
         # the INAUDIT tab directly, so the bottom textbox is the only editor.
 
         # Tab 3: Settings
-        self.settings_widget = SettingsWidget(service.config, self, on_saved=self._on_settings_saved)
+        self.settings_widget = SettingsWidget(
+            service.config, self, on_saved=self._on_settings_saved,
+            base_dir=_service_base_dir(service),
+        )
         self.limits_prepared_widget = LimitsPreparedWidget(service.config, self.task_runner, self.tabs)
         self.limits_prepared_widget.snapshots_changed.connect(self._on_limit_snapshots_changed)
 
@@ -3733,7 +3736,7 @@ QToolTip QLabel {
                         lc.resolved_is_cli = cfg.resolved_is_cli
                         break
 
-            if not scoped_config_write(_persist):
+            if not scoped_config_write(_persist, _service_base_dir(self._service)):
                 logger.warning("could not persist launcher resolution for %s", launcher_id)
 
         if resolution.is_plane_launch:
@@ -5024,7 +5027,7 @@ QToolTip QLabel {
         self._configure_auto_pack_timer()
         try:
             from audapack.config import load_config
-            persisted = load_config()
+            persisted = load_config(_service_base_dir(self._service))
             fingerprint = self._audit_config_fingerprint(persisted)
         except Exception:
             fingerprint = None

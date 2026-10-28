@@ -115,6 +115,8 @@ def sample_resources(process: psutil.Process, interval: float = 0.5) -> Resource
 
 
 def run_soak(duration_seconds: int = 300, rounds_count: int = 3, report_path: Optional[str] = None) -> dict:
+    proc = psutil.Process()
+    prior_children = {(child.pid, child.create_time()) for child in proc.children(recursive=True)}
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -250,7 +252,11 @@ def run_soak(duration_seconds: int = 300, rounds_count: int = 3, report_path: Op
     # Step 5: Check for orphan processes
     orphans = []
     for p in proc.children(recursive=True):
-        orphans.append(f"{p.name()} (pid={p.pid})")
+        try:
+            if (p.pid, p.create_time()) not in prior_children:
+                orphans.append(f"{p.name()} (pid={p.pid})")
+        except psutil.NoSuchProcess:
+            continue
     print(f"ORPHAN PROCESSES: {orphans or 'None'}")
 
     # Step 6: Verify recurring timers and close

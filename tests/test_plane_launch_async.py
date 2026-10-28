@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from audapack import sai_accounts as sai
-from audapack.config import AppConfig, LauncherConfig
+from audapack.config import AppConfig, LauncherConfig, save_config
 from audapack.launch_federation import account_id_of, target_id
 from audapack.models import Project
 from audapack.ui_qt.task_runner import TaskRunner
@@ -77,6 +77,9 @@ def launch_env(qapp, tmp_path):
     config.launchers = [LauncherConfig(target_id(AG), "Antigravity 1", "AG1",
                                        command_template="",
                                        resolved_stage="plane_launch")]
+    # The real registry refreshes from disk while the event loop runs. An
+    # in-memory-only project is correctly treated as removed at completion.
+    save_config(config, base_dir=tmp_path)
     window = MainWindow(ProjectService(config, base_dir=tmp_path))
     cfg = config.launchers[0]
     target = config.projects[0]
@@ -240,7 +243,8 @@ def test_c_a_success_registers_exactly_once_under_the_canonical_id(
     assert spy.calls == [(4242, env.cfg.id, env.target)]
     assert spy.count == 1
     # The plane was invoked with the exact canonical id and the project root.
-    assert installed.calls[-1] == ["launch", AG, "--workdir", str(env.project_dir)]
+    launches = [call for call in installed.calls if call and call[0] == "launch"]
+    assert launches == [["launch", AG, "--workdir", str(env.project_dir)]]
 
 
 def test_c_registration_uses_the_planes_pid_not_the_brokers(
@@ -562,7 +566,7 @@ def test_acceptance_click_path_stays_live_while_the_plane_is_stuck(
     import audapack.ui_qt.main_window as mw
 
     env = launch_env
-    monkeypatch.setattr(mw, "scoped_config_write", lambda _fn: True)
+    monkeypatch.setattr(mw, "scoped_config_write", lambda _fn, *_args: True)
     spy = _Spy()
     monkeypatch.setattr(env.window, "_register_agent_launch", spy)
     gate = _Gate(ok_verdict())

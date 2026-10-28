@@ -95,8 +95,9 @@ _OUTPUT_LAYOUT_OPTIONS = (
 class SettingsWidget(QWidget):
     saved = Signal()
 
-    def __init__(self, config, parent=None, on_saved=None):
+    def __init__(self, config, parent=None, on_saved=None, *, base_dir=None):
         super().__init__(parent)
+        self._base_dir = base_dir
         self._config = config
         self._on_saved = on_saved
 

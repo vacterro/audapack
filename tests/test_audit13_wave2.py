@@ -365,6 +365,13 @@ class TestW2001ResumableSpecializedRecovery:
 
 
 class TestW2002WorkerRestartLifecycle:
+    @pytest.fixture(autouse=True)
+    def _isolate_account_discovery(self, monkeypatch):
+        # Exercise real scheduler threads and executor ownership without
+        # discovering the operator's accounts and starting live quota probes.
+        monkeypatch.setattr("audapack.prepared_worker.discover_accounts",
+                            lambda *_args, **_kwargs: [])
+
     def test_worker_stop_start_recreates_executors_and_allows_submit(self) -> None:
         """Stopping and restarting PreparedWorker must recreate pools so submissions succeed."""
         cfg = AppConfig()
